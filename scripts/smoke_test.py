@@ -116,6 +116,22 @@ def main() -> None:
         except EngineError:
             check(f"blocked: {bad[:30]}", True)
 
+    print("== invented table names rejected with suggestions ==")
+    try:
+        engine.run_sql("SELECT * FROM PS_JRNL_LINE")
+        check("invented table rejected", False)
+    except EngineError as ex:
+        check("invented table rejected", "PS_JRNL_LN" in str(ex), str(ex)[:90])
+    try:
+        engine.describe_table("PS_JRNL_LINE")
+        check("describe suggests close match", False)
+    except EngineError as ex:
+        check("describe suggests close match", "PS_JRNL_LN" in str(ex))
+    check("CTE names not flagged as tables",
+          engine.run_sql("WITH x AS (SELECT 1 AS n) SELECT n FROM x")["rows"][0]["n"] == 1)
+    check("valid join still allowed",
+          engine.run_sql("SELECT COUNT(*) AS n FROM PS_JRNL_LN")["rows"][0]["n"] > 0)
+
     print("== no-data scopes must not read as clean/balanced ==")
     bogus = engine.trial_balance(business_unit="NOPE", fiscal_year=2026, period=6)
     check("bogus BU: in_balance is not True", bogus["totals"]["in_balance"] is not True,
@@ -183,6 +199,118 @@ def main() -> None:
     print("== variance excludes unchanged accounts ==")
     flat = engine.compare_trial_balance(fiscal_year=2026, period=7, vs_period=6)
     check("no zero-change movers", not flat["movers"], f"{len(flat['movers'])} movers")
+
+    print("== nVision-style reports (tree x ledger x timespan) ==")
+    from pstb.report import ReportError, ReportRunner, resolve_timespan
+    rr = ReportRunner(engine)
+    check("YTD -> periods 1..6",
+          resolve_timespan("YTD", 2026, 6)["segments"]
+          == [{"fiscal_year": 2026, "periods": [1, 2, 3, 4, 5, 6]}])
+    check("BAL includes balance forward",
+          0 in resolve_timespan("BAL", 2026, 6)["segments"][0]["periods"])
+    check("Q2 -> periods 4-6",
+          resolve_timespan("Q2", 2026, 6)["segments"][0]["periods"] == [4, 5, 6])
+    r12 = resolve_timespan("ROLL12", 2026, 6)["segments"]
+    check("ROLL12 spans two fiscal years",
+          [x["fiscal_year"] for x in r12] == [2025, 2026]
+          and r12[0]["periods"] == [7, 8, 9, 10, 11, 12])
+    check("YTD-1Y is prior year",
+          resolve_timespan("YTD-1Y", 2026, 6)["segments"][0]["fiscal_year"] == 2025)
+    check("custom period range 4-6",
+          resolve_timespan("4-6", 2026, 6)["segments"][0]["periods"] == [4, 5, 6])
+    lst = rr.list_reports()
+    check("3+ sample reports found", len(lst["reports"]) >= 3,
+          str([r["name"] for r in lst["reports"]]))
+
+    inc = rr.run(report="income_statement", fiscal_year=2026, period=6)
+    irows = {r["label"]: r for r in inc["rows"]}
+    check("income stmt revenue ties to REVENUE rollup (flipped)",
+          abs(irows["Revenue"]["cells"][0] - (-nodes["REVENUE"]["ending"])) < 0.01,
+          f"{irows['Revenue']['cells'][0]:,.2f}")
+    ni_expect = -(nodes["REVENUE"]["ending"] + nodes["EXPENSES"]["ending"])
+    check("income stmt net income ties to rollup",
+          abs(irows["Net Income"]["cells"][0] - ni_expect) < 0.01,
+          f"{irows['Net Income']['cells'][0]:,.2f}")
+    check("budget column differs from actuals",
+          abs(irows["Revenue"]["cells"][1] - irows["Revenue"]["cells"][0]) > 1)
+    check("variance = actuals - budget",
+          abs(irows["Revenue"]["cells"][2]
+              - (irows["Revenue"]["cells"][0] - irows["Revenue"]["cells"][1])) < 0.01)
+    check("expanded account detail rows present",
+          any(r["kind"] == "detail" and r["label"].startswith("4000")
+              for r in inc["rows"]))
+
+    bs = rr.run(report="balance_sheet", fiscal_year=2026, period=6)
+    brows = {r["label"]: r for r in bs["rows"]}
+    check("balance sheet assets tie to rollup",
+          abs(brows["Total Assets"]["cells"][0] - nodes["ASSETS"]["ending"]) < 0.01)
+    check("balance sheet balances (check row = 0)",
+          abs(brows["Check: Assets - L&E (should be 0)"]["cells"][0]) < 0.01)
+
+    qe = rr.run(report="quarterly_expenses", fiscal_year=2026, period=6)
+    ab5000 = engine.account_balance("5000", fiscal_year=2026, through_period=6)
+    q2sum = sum(x["activity"] for x in ab5000["periods"] if x["period"] in (4, 5, 6))
+    qrow = {r["label"]: r for r in qe["rows"]}["Cost of Goods Sold"]
+    check("Q2 column ties to account trend", abs(qrow["cells"][1] - q2sum) < 0.01)
+
+    leds = {l["ledger"] for sco in engine.list_financial_scopes()["scopes"]
+            for l in sco["ledgers"]}
+    check("BUDGET ledger seeded", "BUDGET" in leds, str(leds))
+    try:
+        rr.run(report="nope")
+        check("unknown report rejected", False)
+    except ReportError:
+        check("unknown report rejected", True)
+    adhoc = rr.run(rows="node:REVENUE:flip", columns="ACTUALS:Q2",
+                   fiscal_year=2026, period=6)
+    check("ad-hoc report works", abs(adhoc["rows"][0]["cells"][0]) > 1000,
+          f"{adhoc['rows'][0]['cells'][0]:,.2f}")
+
+    print("== report review-findings regressions ==")
+    # Subtotals must propagate no-data as None, never fabricate 0.00
+    bs25 = rr.run(report="balance_sheet", fiscal_year=2025, period=12)
+    b25 = {r["label"]: r for r in bs25["rows"]}
+    check("no-data prior-year column: value rows are None",
+          b25["Total Assets"]["cells"][1] is None)
+    check("no-data prior-year column: SUBTOTAL rows are None too",
+          b25["Total Liabilities & Equity"]["cells"][1] is None
+          and b25["Check: Assets - L&E (should be 0)"]["cells"][1] is None,
+          str(b25["Total Liabilities & Equity"]["cells"]))
+    check("computed Change column stays None without prior data",
+          b25["Total Liabilities & Equity"]["cells"][2] is None)
+    # Adjustment-period context: period 998 = post-adjustment year-end basis
+    inc12 = rr.run(report="income_statement", fiscal_year=2025, period=12)
+    inc12a = rr.run(report="income_statement", fiscal_year=2025, period=12,
+                    include_adjustments=True)
+    inc998 = rr.run(report="income_statement", fiscal_year=2025, period=998)
+    i12 = {r["label"]: r for r in inc12["rows"]}
+    i12a = {r["label"]: r for r in inc12a["rows"]}
+    i998 = {r["label"]: r for r in inc998["rows"]}
+    check("include_adjustments adds the 998 accrual to opex",
+          abs(i12a["Operating Expenses"]["cells"][0]
+              - i12["Operating Expenses"]["cells"][0] - 25_000.00) < 0.01,
+          f"{i12['Operating Expenses']['cells'][0]:,.2f} -> "
+          f"{i12a['Operating Expenses']['cells'][0]:,.2f}")
+    check("period=998 clamps to post-adjustment basis",
+          i998["Net Income"]["cells"][0] == i12a["Net Income"]["cells"][0]
+          and inc998["period"] == 12 and inc998["include_adjustments"] is True)
+    # Percent column math
+    rev = {r["label"]: r for r in rr.run(report="income_statement",
+                                         fiscal_year=2026, period=6)["rows"]}["Revenue"]
+    from pstb.engine import r2 as _r2
+    check("percent column = variance / |budget| * 100",
+          abs(rev["cells"][3] - _r2(rev["cells"][2] / abs(rev["cells"][1]) * 100)) < 0.05,
+          f"{rev['cells'][3]}%")
+    # Ad-hoc default column (no columns arg) -> single YTD
+    ad = rr.run(rows="acct:5000", fiscal_year=2026, period=6)
+    check("ad-hoc default column is YTD",
+          len(ad["columns"]) == 1 and ad["columns"][0]["timespan"] == "YTD")
+    # resolve_timespan rejects out-of-range periods plainly
+    try:
+        resolve_timespan("YTD", 2026, 998)
+        check("resolve_timespan rejects period 998", False)
+    except ReportError:
+        check("resolve_timespan rejects period 998", True)
 
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)

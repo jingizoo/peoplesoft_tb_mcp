@@ -1,0 +1,74 @@
+{
+  "name": "income_statement",
+  "title": "Income Statement",
+  "description": "Revenue, cost of sales and operating expenses vs budget, YTD basis, with prior year.",
+  "tree": "ACCOUNT",
+  "rows": [
+    {
+      "id": "revenue",
+      "label": "Revenue",
+      "node": "REVENUE",
+      "flip_sign": true,
+      "expand": true
+    },
+    {
+      "id": "cogs",
+      "label": "Cost of Goods Sold",
+      "account": "5000-5999"
+    },
+    {
+      "id": "gross",
+      "label": "Gross Margin",
+      "subtotal": [
+        "revenue",
+        "-cogs"
+      ]
+    },
+    {
+      "id": "opex",
+      "label": "Operating Expenses",
+      "account": "6000-6999",
+      "expand": true
+    },
+    {
+      "id": "net",
+      "label": "Net Income",
+      "subtotal": [
+        "gross",
+        "-opex"
+      ]
+    }
+  ],
+  "columns": [
+    {
+      "label": "Actuals YTD",
+      "ledger": "ACTUALS",
+      "timespan": "YTD"
+    },
+    {
+      "label": "Budget YTD",
+      "ledger": "BUDGET",
+      "timespan": "YTD"
+    },
+    {
+      "label": "Variance",
+      "subtract": [
+        "Actuals YTD",
+        "Budget YTD"
+      ]
+    },
+    {
+      "label": "Var %",
+      "percent": [
+        "Variance",
+        "Budget YTD"
+      ]
+    },
+    {
+      "label": "Prior Year YTD",
+      "ledger": "ACTUALS",
+      "timespan": "YTD-1Y"
+    }
+  ],
+  "note": "Variance = Actuals - Budget of the displayed values: a POSITIVE variance on Revenue, Gross Margin or Net Income means BETTER than budget (favorable); a positive variance on an expense row means over budget."
+}

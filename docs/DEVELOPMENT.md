@@ -42,6 +42,8 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   lowercase-keyed dicts.
 - `pstb/wiki.py` — Confluence REST or a local markdown folder, with automatic
   fallback.
+- `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
+  PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
 - `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py` and
   `llm_gemini.py` (google-genai with `vertexai=True`; the older
   `vertexai.generative_models` module was retired in June 2026).
@@ -79,7 +81,7 @@ silently pick up the next breaking SDK major.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 47 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 77 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.

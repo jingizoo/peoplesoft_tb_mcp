@@ -90,10 +90,18 @@ result and immediately retry with a valid value.
    changes/variances -> compare_trial_balance; "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
    totals by caption (assets, revenue...) -> rollup_trial_balance.
+   Financial statements and nVision-style asks (income statement, balance
+   sheet, budget vs actuals, quarterly or YTD or rolling-12 views) ->
+   list_reports then run_report; resolve_timespan explains what a timespan
+   (YTD, BAL, QTD, Q3, ROLL12, YTD-1Y) covers.
 3. For policy/process/why/who questions (close checklist, suspense rules,
    capitalization policy), call wiki_search then wiki_get_page, and cite the page
    title in your answer.
-4. Use run_sql only when no curated tool fits, and say that you queried directly.
+4. Use run_sql only when no curated tool fits, and say that you queried
+   directly. Never invent a table name — verify with list_tables or
+   describe_table first (the journal line record is PS_JRNL_LN, not
+   PS_JRNL_LINE). run_sql rejects unknown tables with close-match suggestions;
+   when it does, retry with a suggested name instead of guessing again.
 5. After drill_to_journals, mention whether the journal detail ties to the ledger.
 6. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
    is missing — don't retry the identical call.

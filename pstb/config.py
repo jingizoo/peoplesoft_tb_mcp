@@ -64,6 +64,7 @@ class WikiCfg:
 class ToolsCfg:
     allow_raw_sql: bool = True
     max_rows: int = 200
+    reports_path: str = "reports"
 
 
 @dataclass

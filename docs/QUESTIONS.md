@@ -67,6 +67,16 @@ routes through. Use these as acceptance tests when trying a new model.
 47. When is adjustment period 998 used, and who can post to it?
 48. Combined: "Is the suspense balance within policy?" *(TB number + wiki rule)*
 
+## Financial statements & nVision-style → `list_reports`, `run_report`, `resolve_timespan`
+48a. Run the income statement for period 6.
+48b. Balance sheet as of Q2 — compared to last year.
+48c. Budget vs actuals YTD; which lines are over budget?
+48d. Quarterly expense trend for this year.
+48e. Rolling 12-month revenue.
+48f. What periods does the BAL timespan cover?
+48g. Income statement including audit adjustments (post-998 basis).
+See docs/NVISION.md for migrating existing nVision layouts.
+
 ## Anything else → guarded `run_sql` (+ `list_tables`, `describe_table`)
 49. How many journals were posted in FY2026 by source?
 50. Which operator posted the most journal lines this year?

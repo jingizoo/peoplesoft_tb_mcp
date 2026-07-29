@@ -923,6 +923,60 @@ class TBEngine:
         return {"business_unit": bu, "ledgers": [r["ledger"] for r in rows]}
 
     # ------------------------------------------------------------- raw SQL
+    _TABLE_REF_RE = re.compile(
+        r"(?is)\b(?:FROM|JOIN)\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)"
+    )
+    _CTE_RE = re.compile(r"(?is)\b([A-Za-z_]\w*)\s+AS\s*\(")
+
+    def _table_exists(self, name: str) -> bool:
+        n = name.upper()
+        if self.db.dialect == "sqlite":
+            rows, _ = self.db.query(
+                "SELECT 1 AS x FROM sqlite_master WHERE type IN ('table','view') "
+                "AND UPPER(name) = :n", {"n": n}, max_rows=1)
+            return bool(rows)
+        if self.db.dialect == "oracle":
+            owner = self.cfg.db.schema.strip().rstrip(".").upper()
+            if owner:
+                rows, _ = self.db.query(
+                    "SELECT 1 AS x FROM ALL_OBJECTS WHERE OWNER = :o "
+                    "AND OBJECT_NAME = :n AND OBJECT_TYPE IN "
+                    "('TABLE','VIEW','SYNONYM','MATERIALIZED VIEW')",
+                    {"o": owner, "n": n}, max_rows=1)
+            else:
+                rows, _ = self.db.query(
+                    "SELECT 1 AS x FROM USER_OBJECTS WHERE OBJECT_NAME = :n "
+                    "AND OBJECT_TYPE IN ('TABLE','VIEW','SYNONYM',"
+                    "'MATERIALIZED VIEW')", {"n": n}, max_rows=1)
+            return bool(rows)
+        rows, _ = self.db.query(
+            "SELECT 1 AS x FROM INFORMATION_SCHEMA.TABLES WHERE UPPER(TABLE_NAME) = :n",
+            {"n": n}, max_rows=1)
+        return bool(rows)
+
+    def _suggest_tables(self, name: str) -> list[str]:
+        """Close matches for a nonexistent table name, so 'PS_JRNL_LINE' comes
+        back with 'did you mean PS_JRNL_LN'. Prefix-probes the catalog rather
+        than loading it (a real PS schema has tens of thousands of objects)."""
+        import difflib
+
+        base = name.split(".")[-1].upper()
+        for cut in (len(base), 12, 10, 8, 7, 6, 5, 4):
+            pre = base[:cut].rstrip("_%")
+            if len(pre) < 3:
+                break
+            params: dict = {"pat": pre + "%"}
+            try:
+                rows, _ = self.db.query(q.table_list(self.db, params), params,
+                                        max_rows=25)
+            except Exception:
+                return []
+            names = [str(r["table_name"]).upper() for r in rows]
+            if names:
+                ranked = difflib.get_close_matches(base, names, n=5, cutoff=0.0)
+                return ranked or names[:5]
+        return []
+
     def run_sql(self, sql: str, max_rows: int = 100) -> dict:
         if not self.cfg.tools.allow_raw_sql:
             raise EngineError("Raw SQL is disabled (tools.allow_raw_sql: false)")
@@ -937,6 +991,27 @@ class TBEngine:
         m = _SQL_DENY.search(scrubbed)
         if m:
             raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
+        # Validate every referenced table against the live catalog BEFORE
+        # executing. A model-invented name (PS_JRNL_LINE for PS_JRNL_LN) should
+        # come back instantly with a correction, not as an opaque ORA-00942 —
+        # or worse, burn the query timeout first.
+        ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
+        problems = []
+        for ref in {r for r in self._TABLE_REF_RE.findall(scrubbed)}:
+            bare = ref.split(".")[-1]
+            if bare.upper() in ctes or bare.upper() == "DUAL":
+                continue
+            if not self._table_exists(bare):
+                sugg = self._suggest_tables(bare)
+                problems.append(
+                    f"{bare} does not exist"
+                    + (f" — did you mean: {', '.join(sugg)}?" if sugg else "")
+                )
+        if problems:
+            raise EngineError(
+                "Rejected before execution: " + "; ".join(sorted(problems))
+                + ". Verify names with list_tables or describe_table."
+            )
         cap = min(max(int(max_rows or 100), 1), 500)
         rows, truncated = self.db.query(s, {}, max_rows=cap)
         return {"rows": rows, "row_count": len(rows), "truncated": truncated}
@@ -968,4 +1043,11 @@ class TBEngine:
                  "nullable": "N" if r["notnull"] else "Y"}
                 for r in rows
             ]
+        if not rows:
+            sugg = self._suggest_tables(table_name.strip())
+            raise EngineError(
+                f"Table {table_name.strip()} not found"
+                + (f". Close matches: {', '.join(sugg)}" if sugg else "")
+                + ". Use list_tables to browse."
+            )
         return {"table": table_name.strip(), "columns": rows}

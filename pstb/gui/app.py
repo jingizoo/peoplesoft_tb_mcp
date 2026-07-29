@@ -16,6 +16,7 @@ from typing import Optional
 from ..config import load_config
 from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
+from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
 
 try:
@@ -33,6 +34,7 @@ STATIC = Path(__file__).parent / "static"
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+report_runner = ReportRunner(engine)
 try:
     wiki = make_wiki(cfg)
 except WikiError:
@@ -47,7 +49,7 @@ _chat_state: dict = {"provider": None, "name": None}
 def _guard(fn, **kw):
     try:
         return fn(**kw)
-    except (EngineError, DbError) as e:
+    except (EngineError, DbError, ReportError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # surface the reason instead of a bare 500
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
@@ -82,7 +84,7 @@ def meta():
     except Exception:
         out["business_units"] = []
     try:
-        out["ledgers"] = engine.list_ledgers()["ledgers"]
+        out["ledgers"] = engine.list_ledgers(d.business_unit)["ledgers"]
     except Exception:
         out["ledgers"] = [d.ledger]
     try:
@@ -175,6 +177,23 @@ def compare(
         engine.compare_trial_balance, business_unit=business_unit, ledger=ledger,
         fiscal_year=fiscal_year, period=period, vs_fiscal_year=vs_fiscal_year,
         vs_period=vs_period, top=top, min_abs_change=min_abs_change,
+    )
+
+
+@app.get("/api/reports")
+def reports_list():
+    return _guard(report_runner.list_reports)
+
+
+@app.get("/api/report")
+def report_run(
+    name: str, business_unit: str = "", ledger: str = "",
+    fiscal_year: int = 0, period: int = 0, include_adjustments: bool = False,
+):
+    return _guard(
+        report_runner.run, report=name, business_unit=business_unit,
+        ledger=ledger, fiscal_year=fiscal_year, period=period,
+        include_adjustments=include_adjustments,
     )
 
 

@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    18 tools     │  TB engine + guarded SQL  │
+│  pstb.client.chat    │    21 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (47 checks) and the MCP server end to end. Then install
+verifies both the engine (77 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
@@ -137,7 +137,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 18 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 21 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -146,7 +146,8 @@ no chat client needed.
 `drill_to_journals` · `search_accounts` · `resolve_period` · `list_periods` ·
 `tb_integrity_check` · `rollup_trial_balance` · `list_trees` ·
 `list_financial_scopes` · `list_business_units` · `list_ledgers` ·
-`wiki_search` · `wiki_get_page` ·
+`list_reports` · `run_report` · `resolve_timespan` (nVision-style statements —
+see [docs/NVISION.md](docs/NVISION.md)) · `wiki_search` · `wiki_get_page` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.
 
@@ -156,6 +157,10 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 
 ## Roadmap: from TB to all of PeopleSoft Finance
 
+- **nVision replacement:** report definitions in [reports/](reports/) replicate
+  layouts (tree/ledger/timespan) — see [docs/NVISION.md](docs/NVISION.md) for
+  the migration guide. Sample income statement, balance sheet, and quarterly
+  trend run against the bundled ACTUALS + BUDGET ledgers.
 - **Tool packs per module:** AP open vouchers/aging, AR customer aging,
   Asset Management roll-forward tie-outs, budget vs actuals (KK/LEDGER_BUDG),
   allocations, intercompany eliminations (see the end of docs/QUESTIONS.md).

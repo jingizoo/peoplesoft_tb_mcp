@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (47 checks) and
+clients, builds the sample ledger, and then verifies the engine (77 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:
@@ -216,6 +216,7 @@ Five views sharing one scope bar (business unit, ledger, fiscal year, period):
 | Close & controls | One card per control: balance, suspense, unposted journals, out-of-balance journals, inactive/orphan accounts, retained-earnings roll. |
 | Statement rollup | Assets / liabilities / equity / revenue / expenses by tree node, with net income and an A = L + E check. |
 | Variance | Largest movers between two periods with change, % and a magnitude bar. |
+| Reports | nVision-style statements (income statement, balance sheet, quarterly trend): tree/account rows × ledger + timespan columns, budget vs actuals. See [NVISION.md](NVISION.md). |
 | Ask | Chat that renders each tool result inline as a table, chart or control card. |
 
 Every figure on screen is computed by the engine and rendered by the browser.
