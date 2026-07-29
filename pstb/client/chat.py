@@ -129,7 +129,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession, user_text: s
     return resp.text or "(no response)"
 
 
-async def run(args: argparse.Namespace) -> None:
+async def run(args: argparse.Namespace) -> int:
     cfg_path = args.config or os.environ.get("PSTB_CONFIG") or str(_repo_root() / "config.yaml")
     cfg = load_config(cfg_path)
     provider_name = (args.provider or cfg.llm.provider).lower()
@@ -150,7 +150,25 @@ async def run(args: argparse.Namespace) -> None:
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = tool_specs(await session.list_tools())
-            provider = build_provider(provider_name, cfg, tools)
+            try:
+                provider = build_provider(provider_name, cfg, tools)
+            except (RuntimeError, SystemExit) as e:
+                # Setup problems (missing project, no credentials, package not
+                # installed) are user-fixable; show the fix, not a traceback.
+                print(f"\nCannot start the {provider_name} provider:\n  {e}\n", file=sys.stderr)
+                if provider_name == "gemini":
+                    print(
+                        "Gemini on Vertex AI needs, in order:\n"
+                        "  1. gcloud CLI installed  (macOS: brew install --cask google-cloud-sdk)\n"
+                        "  2. gcloud auth application-default login\n"
+                        "  3. GOOGLE_CLOUD_PROJECT=<project-id> in .env\n"
+                        "  4. Vertex AI API enabled on that project\n"
+                        "See docs/SETUP.md for the full walkthrough.",
+                        file=sys.stderr,
+                    )
+                # Return rather than raise: an exception here would surface as an
+                # anyio ExceptionGroup traceback and bury the message above.
+                return 1
             banner = (
                 f"{BOLD}PeopleSoft TB agent{RESET} — {provider.name}:{provider.model} | "
                 f"{len(tools)} tools | BU {cfg.defaults.business_unit}, ledger {cfg.defaults.ledger}"
@@ -166,7 +184,7 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"\n{BOLD}you>{RESET} {args.ask}")
                 answer = await agent_turn(provider, session, args.ask)
                 print(f"\n{answer}")
-                return
+                return 0
 
             print("Type a question ( /tools /reset /provider ollama|gemini /quit )")
             while True:
@@ -204,6 +222,7 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"\n[provider error] {e}")
                     continue
                 print(f"\n{answer}")
+            return 0
 
 
 def main() -> None:
@@ -215,7 +234,7 @@ def main() -> None:
     ap.add_argument("--show-tools", action="store_true", help="print tool list at startup")
     args = ap.parse_args()
     try:
-        asyncio.run(run(args))
+        sys.exit(asyncio.run(run(args)) or 0)
     except KeyboardInterrupt:
         pass
 

@@ -104,24 +104,78 @@ cannot connect, start the server with `ollama serve` and retry.
 
 ### Option B — Gemini on Vertex AI
 
-Needs the gcloud CLI and a GCP project with the Vertex AI API enabled:
+No code changes are needed — only credentials and one config value. Four steps,
+in order:
+
+**1. Install the gcloud CLI**
 
 ```bash
+# macOS
+brew install --cask google-cloud-sdk
+# Windows / Linux: https://cloud.google.com/sdk/docs/install
+```
+
+**2. Authenticate with Application Default Credentials**
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
 gcloud auth application-default login
 ```
 
-Put your project in `.env`:
+The third command is the one that matters — the SDK reads ADC, not your
+`gcloud` login. Skipping it produces `DefaultCredentialsError`.
+
+**3. Enable the API and grant yourself access**
+
+```bash
+gcloud services enable aiplatform.googleapis.com --project YOUR_PROJECT_ID
+```
+
+Your account needs **`roles/aiplatform.user`** on the project. Without it the
+first call fails with `PermissionDenied: 403`, which reads like a bad model
+name — check IAM before changing the model.
+
+**4. Point the agent at your project**
+
+In `.env`:
 
 ```
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
-Then:
+Then run it — no other change required:
 
 ```bash
 .venv/bin/python -m pstb.client.chat --provider gemini
 ```
+
+To make Gemini the permanent default instead of passing `--provider` each time,
+set `llm.provider: gemini` in `config.yaml`. You can also switch mid-session in
+the REPL with `/provider gemini`, or override per run with the
+`PSTB_LLM_PROVIDER` environment variable.
+
+**Choosing a model.** `config.yaml` ships `gemini-2.5-flash`. Newer models may
+be available in your project and region; list what you can actually call with:
+
+```bash
+gcloud ai models list --region=us-central1 --project=YOUR_PROJECT_ID
+```
+
+Override without editing config using `--model`:
+
+```bash
+.venv/bin/python -m pstb.client.chat --provider gemini --model gemini-2.5-pro
+```
+
+Model availability is region-specific — if a model 404s, try
+`GOOGLE_CLOUD_LOCATION=us-central1`, which has the broadest coverage.
+
+**Expect better results than a local model.** In testing, `llama3.1:8b`
+invented parameter names and misstated verdicts even with correct tool data.
+Gemini's tool-calling is substantially stronger, which matters for a 17-tool
+surface. The trade-off is in the data note below.
 
 **Data note:** with Gemini, tool results — ledger amounts, operator IDs, and
 journal descriptions — are sent to Google Cloud. Ollama keeps everything local.
