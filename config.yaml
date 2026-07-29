@@ -36,3 +36,4 @@ wiki:
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
   max_rows: 200           # cap on rows returned to the LLM
+  reports_path: reports   # folder of nVision-style report definitions (JSON)

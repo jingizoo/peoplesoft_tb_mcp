@@ -1,0 +1,19 @@
+{
+  "name": "balance_sheet",
+  "title": "Balance Sheet",
+  "description": "Assets vs liabilities and equity as of the period (BAL timespan, includes balance forward).",
+  "tree": "ACCOUNT",
+  "rows": [
+    {"id": "assets", "label": "Total Assets", "node": "ASSETS", "expand": true},
+    {"id": "liab", "label": "Total Liabilities", "node": "LIABILITIES", "flip_sign": true, "expand": true},
+    {"id": "equity", "label": "Equity (opening + contributed)", "node": "EQUITY", "flip_sign": true},
+    {"id": "ni", "label": "Current-Year Net Income", "account": "4000-6999", "flip_sign": true},
+    {"id": "total_le", "label": "Total Liabilities & Equity", "subtotal": ["liab", "equity", "ni"]},
+    {"label": "Check: Assets - L&E (should be 0)", "subtotal": ["assets", "-total_le"]}
+  ],
+  "columns": [
+    {"label": "Current BAL", "ledger": "ACTUALS", "timespan": "BAL"},
+    {"label": "Prior Year BAL", "ledger": "ACTUALS", "timespan": "BAL-1Y"},
+    {"label": "Change", "subtract": ["Current BAL", "Prior Year BAL"]}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "quarterly_expenses",
+  "title": "Quarterly Expense Trend",
+  "description": "Operating expense activity by fiscal quarter, ACTUALS ledger.",
+  "rows": [
+    {"id": "cogs", "label": "Cost of Goods Sold", "account": "5000-5999"},
+    {"label": "Salaries & Benefits", "account": "6000-6199"},
+    {"label": "Facilities & Utilities", "account": "6200-6399"},
+    {"label": "Travel & Entertainment", "account": "6400-6499"},
+    {"label": "Depreciation & Other", "account": "6500-6999"},
+    {"label": "Total Expenses", "account": "5000-6999"}
+  ],
+  "columns": [
+    {"label": "Q1", "timespan": "Q1"},
+    {"label": "Q2", "timespan": "Q2"},
+    {"label": "Q3", "timespan": "Q3"},
+    {"label": "Q4", "timespan": "Q4"},
+    {"label": "Full Year", "timespan": "YR"}
+  ]
+}

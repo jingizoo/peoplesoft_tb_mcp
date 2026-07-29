@@ -19,11 +19,13 @@ except ImportError:  # mcp SDK 1.x
 from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
+from .report import ReportError, ReportRunner
 from .wiki import WikiError, make_wiki
 
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+report_runner = ReportRunner(engine)
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:
@@ -36,7 +38,7 @@ mcp = FastMCP("peoplesoft-tb")
 def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
-    except (EngineError, DbError, WikiError) as e:
+    except (EngineError, DbError, WikiError, ReportError) as e:
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}
@@ -205,6 +207,65 @@ def rollup_trial_balance(
 
 
 @mcp.tool()
+def list_reports() -> dict:
+    """Named financial reports (PS/nVision equivalents): income_statement,
+    balance_sheet, quarterly_expenses, plus any added to reports/. Shows each
+    report's columns and the available timespans. Use before run_report when
+    the user asks for a statement, budget comparison, or quarterly view."""
+    return _safe(report_runner.list_reports)
+
+
+@mcp.tool()
+def run_report(
+    report: str = "",
+    business_unit: str = "",
+    fiscal_year: int = 0,
+    period: int = 0,
+    ledger: str = "",
+    rows: str = "",
+    columns: str = "",
+    include_adjustments: bool = False,
+) -> dict:
+    """Run a financial-statement style report grid (the PS/nVision pattern):
+    rows from account-tree nodes or account ranges, columns as
+    ledger + timespan, amounts summed from the ledger in base currency.
+
+    report: a name from list_reports (e.g. income_statement). fiscal_year and
+    period set the context — LEAVE AS 0 for current unless the user named them.
+    Timespans: PER, YTD, BAL (includes balance forward), YR, QTD, Q1-Q4,
+    ROLL12, PER-1Y, YTD-1Y, BAL-1Y, YR-1Y, or a period range like "4-6".
+    Ad-hoc without a saved report: rows="node:REVENUE:flip,acct:5000-5999",
+    columns="ACTUALS:YTD,BUDGET:YTD" (:flip shows credit balances positive)."""
+    return _safe(
+        report_runner.run,
+        report=report, business_unit=business_unit, fiscal_year=fiscal_year,
+        period=period, ledger=ledger, rows=rows, columns=columns,
+        include_adjustments=include_adjustments,
+    )
+
+
+@mcp.tool()
+def resolve_timespan(timespan: str, fiscal_year: int = 0, period: int = 0) -> dict:
+    """Show exactly which fiscal periods a timespan covers in context (YTD, BAL,
+    QTD, Q1-Q4, ROLL12, the -1Y prior-year variants, or "4-6"). Use when the
+    user asks what a report basis means or wants period math confirmed."""
+    def _res(timespan: str, fiscal_year: int, period: int) -> dict:
+        from .report import resolve_timespan as rts
+
+        _, fy, per, _ = engine._defaults("", fiscal_year, period, "")
+        maxreg = engine._max_regular_period(fy)
+        clamped = per > maxreg
+        out = rts(timespan, fy, min(per, maxreg), maxreg)
+        if clamped:
+            out["context_note"] = (
+                f"Period {per} is an adjustment period; resolved at the "
+                f"post-adjustment year-end context (period {maxreg})."
+            )
+        return out
+    return _safe(_res, timespan=timespan, fiscal_year=fiscal_year, period=period)
+
+
+@mcp.tool()
 def list_trees() -> dict:
     """List available PeopleSoft trees (name, setid, latest effective date)."""
     return _safe(engine.list_trees)
@@ -238,7 +299,10 @@ if cfg.tools.allow_raw_sql:
     @mcp.tool()
     def run_sql(sql: str, max_rows: int = 100) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database. Guarded:
-        single SELECT/WITH statement only, DML/DDL rejected, rows capped at 500.
+        single SELECT/WITH statement only, DML/DDL rejected, rows capped at 500,
+        and every table name is validated against the catalog before execution.
+        NEVER invent a table name — the journal line table is PS_JRNL_LN (not
+        PS_JRNL_LINE); check with list_tables/describe_table when unsure.
         Use only when no curated tool answers the question; PS_ tables use signed
         amounts (credits negative)."""
         return _safe(engine.run_sql, sql=sql, max_rows=max_rows)

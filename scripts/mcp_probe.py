@@ -41,7 +41,7 @@ async def main() -> None:
             # only tool names hid that failure until runtime.
             specs = tool_specs(listed)
             assert len(specs) == len(listed.tools), "tool spec count mismatch"
-            NO_ARG_TOOLS = {"list_trees", "list_business_units", "list_financial_scopes"}
+            NO_ARG_TOOLS = {"list_trees", "list_business_units", "list_financial_scopes", "list_reports"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"
@@ -70,6 +70,12 @@ async def main() -> None:
             titles = [r["title"] for r in w["results"]]
             assert titles, w
             print(f"wiki_search('suspense') via {w['provider']}: {titles}")
+
+            rep = await call("run_report", report="income_statement",
+                             fiscal_year=2026, period=6)
+            assert rep.get("rows"), rep
+            print(f"run_report income_statement: {len(rep['rows'])} rows x "
+                  f"{len(rep['columns'])} cols ✔")
 
             sql = await call("run_sql", sql="SELECT COUNT(*) AS n FROM PS_JRNL_HEADER")
             print(f"run_sql journal count: {sql['rows'][0]['n']}")

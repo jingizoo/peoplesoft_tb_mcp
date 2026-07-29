@@ -79,6 +79,7 @@ class Seeder:
         self.headers: list[tuple] = []
         self.lines: list[tuple] = []
         self.ledger: dict[tuple, float] = defaultdict(float)
+        self.budget: dict[tuple, float] = {}
         self.seq = 0
 
     def jrnl(self, fy, per, pfx, source, oprid, descr, jlines, date=None, status="P"):
@@ -227,6 +228,27 @@ def build() -> Seeder:
         ("6200", "10000", rent, "Monthly rent"),
         ("1000", "10000", -rent, "Rent payment"),
     ], status="V")
+
+    # Synthetic BUDGET ledger for the P&L accounts, so budget-vs-actual report
+    # columns work out of the box. Real budgets are set before the year; here we
+    # derive them deterministically from actuals: revenue budget slightly under
+    # actuals (favorable), expense budget slightly over (favorable), except
+    # travel (6400), budgeted under so the P4 kickoff spike blows through it.
+    def bfactor(acct: str, atype: str) -> float:
+        if acct == "6400":
+            return 0.95
+        return 0.97 if atype == "R" else 1.06
+
+    for (fy, per, acct, dept), amt in list(s.ledger.items()):
+        t = ATYPE.get(acct)
+        if t in ("R", "E") and 1 <= per <= 12:
+            s.budget[(fy, per, acct, dept)] = r2(amt * bfactor(acct, t))
+    # FY2026 has actuals only through P6; extend its budget to a full year from
+    # FY2025 actuals scaled by the same growth used for FY2026 activity.
+    for (fy, per, acct, dept), amt in list(s.ledger.items()):
+        t = ATYPE.get(acct)
+        if fy == 2025 and 7 <= per <= 12 and t in ("R", "E"):
+            s.budget[(2026, per, acct, dept)] = r2(amt * 1.12 * bfactor(acct, t))
     return s
 
 
@@ -346,6 +368,12 @@ def main() -> None:
         for (fy, per, acct, dept), amt in sorted(seeder.ledger.items())
         if abs(amt) >= 0.005
     ]
+    ledger_rows += [
+        (BU, "BUDGET", acct, "", dept, "", "", "", "", "", "", "", "", CURR, "",
+         fy, per, r2(amt), r2(amt), r2(amt), CURR)
+        for (fy, per, acct, dept), amt in sorted(seeder.budget.items())
+        if abs(amt) >= 0.005
+    ]
     con.executemany(
         "INSERT INTO PS_LEDGER VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ledger_rows,
@@ -410,9 +438,12 @@ def main() -> None:
 
     for fy in (2025, 2026):
         total = one(
-            "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER WHERE FISCAL_YEAR=?", fy
+            "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER "
+            "WHERE FISCAL_YEAR=? AND LEDGER='ACTUALS'", fy
         )
-        assert abs(total) < 0.01, f"FY{fy} ledger does not net to zero: {total}"
+        assert abs(total) < 0.01, f"FY{fy} ACTUALS ledger does not net to zero: {total}"
+    n_bud = one("SELECT COUNT(*) FROM PS_LEDGER WHERE LEDGER='BUDGET'")
+    assert n_bud > 0, "BUDGET ledger missing"
     n_led = one("SELECT COUNT(*) FROM PS_LEDGER")
     n_hdr = one("SELECT COUNT(*) FROM PS_JRNL_HEADER")
     n_ln = one("SELECT COUNT(*) FROM PS_JRNL_LN")
@@ -425,7 +456,8 @@ def main() -> None:
     print(f"  PS_LEDGER rows:      {n_led}")
     print(f"  PS_JRNL_HEADER rows: {n_hdr}")
     print(f"  PS_JRNL_LN rows:     {n_ln}")
-    print(f"  FY2025 and FY2026 ledgers net to zero ✔")
+    print(f"  BUDGET ledger rows:  {n_bud}")
+    print(f"  FY2025 and FY2026 ACTUALS net to zero ✔")
     print(f"  Cash (1000) ending FY2026 P6: {cash_p6:,.2f}")
 
 

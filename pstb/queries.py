@@ -335,6 +335,34 @@ def tree_rollup(db: Database, params: dict, amount_basis: str = "base",
  GROUP BY N.TREE_NODE, L.ACCOUNTING_PERIOD"""
 
 
+def tree_node_span(db: Database) -> str:
+    """Node-number span of one named tree node (for leaf-range lookup)."""
+    p, d = db.prefix, db.date_bind("teffdt")
+    return f"""SELECT TREE_NODE_NUM AS a, TREE_NODE_NUM_END AS b
+  FROM {p}PSTREENODE
+ WHERE SETID = :tsetid AND TREE_NAME = :tree AND EFFDT = {d}
+   AND TREE_NODE = :node"""
+
+
+def tree_leaf_ranges(db: Database) -> str:
+    """Account ranges attached at or under a node span. Blank RANGE_TO ('' or
+    ' ') means a single-value leaf."""
+    p, d = db.prefix, db.date_bind("teffdt")
+    return f"""SELECT LF.RANGE_FROM AS range_from,
+       COALESCE(NULLIF(NULLIF(LF.RANGE_TO, ''), ' '), LF.RANGE_FROM) AS range_to
+  FROM {p}PSTREELEAF LF
+ WHERE LF.SETID = :tsetid AND LF.TREE_NAME = :tree AND LF.EFFDT = {d}
+   AND LF.TREE_NODE_NUM BETWEEN :a AND :b"""
+
+
+def tree_nodes_list(db: Database) -> str:
+    p, d = db.prefix, db.date_bind("teffdt")
+    return f"""SELECT TREE_NODE AS tree_node, TREE_LEVEL_NUM AS level_num
+  FROM {p}PSTREENODE
+ WHERE SETID = :tsetid AND TREE_NAME = :tree AND EFFDT = {d}
+ ORDER BY TREE_NODE_NUM"""
+
+
 def business_units(db: Database) -> str:
     return f"""SELECT BUSINESS_UNIT AS business_unit, DESCR AS descr,
        BASE_CURRENCY AS base_currency

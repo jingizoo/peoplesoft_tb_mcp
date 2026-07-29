@@ -131,6 +131,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px;
   font-size:12px;cursor:pointer;color:var(--muted)}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
+.rpt-sub td{font-weight:700;border-top:2px solid var(--line)}
 
 /* drawer */
 .scrim{position:fixed;inset:0;background:rgba(8,12,18,.45);opacity:0;pointer-events:none;
@@ -165,6 +166,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="tb" class="on">Trial balance</button>
     <button data-v="close">Close &amp; controls</button>
     <button data-v="rollup">Statement rollup</button>
+    <button data-v="reports">Reports</button>
     <button data-v="compare">Variance</button>
     <button data-v="chat">Ask</button>
     <div class="navfoot" id="navfoot"></div>
@@ -458,12 +460,66 @@ function renderToolResult(name,data){
     if(name==='get_account_balance') return renderAccount(data);
     if(name==='drill_to_journals') return renderJournals(data);
     if(name==='list_financial_scopes') return renderScopes(data);
+    if(name==='run_report') return renderReport(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';
       b.textContent=data.text||'';c.append(b);return c;}
     return renderGeneric(name,data);
   }catch(e){ return null; }
+}
+
+function renderReport(d){
+  if(d.scope_status && d.scope_status!=='ok') return noData(d);
+  const c=el('div','card');
+  c.append(el('h2',null,esc(d.title||d.report)+' <span class="sub">'+esc(d.business_unit)+
+    ' · FY'+d.fiscal_year+' P'+d.period+' · base currency'+
+    (d.include_adjustments?' · incl. adjustments':'')+'</span>'));
+  const sc=el('div'); sc.style.overflow='auto';
+  const t=el('table');
+  t.innerHTML='<thead><tr><th></th>'+d.columns.map(cl=>'<th class="num">'+esc(cl.label)+'</th>').join('')+'</tr></thead>';
+  const b=el('tbody');
+  d.rows.forEach(r=>{
+    const tr=el('tr', r.kind==='subtotal'?'rpt-sub':'');
+    const pad=r.indent?' style="padding-left:'+(12+r.indent*22)+'px;color:var(--muted)"':'';
+    tr.innerHTML='<td'+pad+'>'+esc(r.label)+'</td>'+r.cells.map((v,i)=>{
+      if(v===null||v===undefined) return '<td class="num" style="color:var(--muted)">\u2014</td>';
+      if(d.columns[i].kind==='percent') return '<td class="num">'+(v>=0?'+':'')+v.toFixed(1)+'%</td>';
+      return '<td class="num'+(v<0?' cr':'')+'">'+money(v)+'</td>';
+    }).join('');
+    b.append(tr);
+  });
+  t.append(b); sc.append(t); c.append(sc);
+  if(d.note) c.append(el('div','pad','<span style="color:var(--muted);font-size:12px">'+esc(d.note)+'</span>'));
+  return c;
+}
+let REPORTLIST=null;
+async function viewReports(){
+  const w=$('#wrap'); w.innerHTML='';
+  try{ REPORTLIST=REPORTLIST||await api('/api/reports'); }catch(e){ return oops(e.message); }
+  const list=REPORTLIST.reports||[];
+  const bar=el('div','card');
+  bar.append(el('h2',null,'Financial reports <span class="sub">rows from trees/accounts \u00d7 columns of ledger + timespan \u2014 the nVision pattern</span>'));
+  const pad=el('div','pad'); pad.style.display='flex'; pad.style.gap='10px'; pad.style.alignItems='center'; pad.style.flexWrap='wrap';
+  const sel=el('select');
+  sel.style.cssText='background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-weight:600;max-width:100%';
+  list.forEach(r=>sel.append(new Option(r.title+' \u2014 '+(r.description||'').slice(0,70), r.name)));
+  const btn=el('button','btn','Run');
+  pad.append(sel,btn); bar.append(pad); w.append(bar);
+  const holder=el('div'); holder.style.display='grid'; holder.style.gap='16px'; w.append(holder);
+  async function runIt(){
+    holder.innerHTML=''; holder.append(el('div','empty','<span class="spin"></span> Running\u2026'));
+    const s2=scope();
+    try{
+      const d=await api('/api/report?'+qs({name:sel.value,business_unit:s2.bu,ledger:s2.ledger,
+        fiscal_year:s2.fy,period:s2.per,include_adjustments:$('#f-adj').value}));
+      holder.innerHTML=''; holder.append(renderReport(d));
+    }catch(e){ holder.innerHTML='';
+      holder.append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>')); }
+  }
+  btn.onclick=runIt; sel.onchange=runIt;
+  if(list.length) runIt();
+  else holder.append(el('div','empty','No report definitions found in reports/.'));
 }
 
 /* ---------- boot ---------- */
@@ -496,14 +552,14 @@ function renderToolResult(name,data){
 })();
 
 function chrome(){
-  const isTB=VIEW==='tb', isChat=VIEW==='chat';
+  const isTB=VIEW==='tb', isChat=VIEW==='chat', isRpt=VIEW==='reports';
   $('#scope').classList.toggle('hide',isChat);
   $('#l-group').classList.toggle('hide',!isTB);
   $('#l-acct').classList.toggle('hide',!isTB);
-  $('#l-adj').classList.toggle('hide',!isTB);
+  $('#l-adj').classList.toggle('hide',!(isTB||isRpt));
   $('#csv').classList.toggle('hide',!isTB);
 }
-function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,compare:viewCompare,chat:viewChat}[VIEW])(); }
+function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,compare:viewCompare,chat:viewChat}[VIEW])(); }
 
 /* ---------- tab views (same renderers the chat uses) ---------- */
 async function viewTB(){
@@ -607,7 +663,7 @@ function viewChat(){
   msgs.append(el('div','empty','Ask about the ledger. Figures come from the same tools the tabs use.'));
   const chips=el('div','chips');
   ['Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','What are total assets?',
+   'Is the suspense balance within policy?','Run the income statement','What are total assets?',
    'Are there unposted journals?'].forEach(q=>{
     const c=el('div','chip',esc(q)); c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });
