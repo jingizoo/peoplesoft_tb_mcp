@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+sample_data/*.db
+.DS_Store
+
+# editor / local tooling settings
+.vscode/
+.idea/
+*.local.json
