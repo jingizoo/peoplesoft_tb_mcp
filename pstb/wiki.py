@@ -6,6 +6,8 @@ any wiki credentials exist.
 """
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -114,11 +116,13 @@ class LocalDocsWiki:
 class ConfluenceWiki:
     provider_name = "confluence"
 
-    def __init__(self, base_url: str, email: str, token: str, space: str = ""):
+    def __init__(self, base_url: str, email: str, token: str, space: str = "",
+                 labels: Optional[list] = None):
         import httpx  # deferred so the sample works without httpx installed
 
         self.base = base_url.rstrip("/")
         self.space = space
+        self.labels = [l for l in (labels or []) if l]
         if email:
             auth: object = (email, token)
             headers = {}
@@ -135,9 +139,15 @@ class ConfluenceWiki:
         cql = f'type = page AND text ~ "{clean}"'
         if self.space:
             cql += f' AND space = "{self.space}"'
+        if self.labels:
+            # Label scoping keeps finance answers inside pages Finance owns,
+            # instead of whatever the full-text index happens to rank first.
+            joined = ", ".join(f'"{l}"' for l in self.labels)
+            cql += f" AND label IN ({joined})"
         r = self.client.get(
             "/rest/api/content/search",
-            params={"cql": cql, "limit": max(int(limit or 5), 1)},
+            params={"cql": cql, "limit": max(int(limit or 5), 1),
+                    "expand": "space,version,history.lastUpdated"},
         )
         if r.status_code >= 400:
             raise WikiError(f"Confluence search failed ({r.status_code}): {r.text[:300]}")
@@ -148,6 +158,8 @@ class ConfluenceWiki:
                 {
                     "id": item.get("id"),
                     "title": item.get("title"),
+                    "space": (item.get("space") or {}).get("key"),
+                    "version": (item.get("version") or {}).get("number"),
                     "url": f"{self.base}{link}" if link else None,
                 }
             )
@@ -161,13 +173,25 @@ class ConfluenceWiki:
         if r.status_code >= 400:
             raise WikiError(f"Confluence get_page failed ({r.status_code}): {r.text[:300]}")
         data = r.json()
+        space = (data.get("space") or {}).get("key")
+        if self.space and space and space != self.space:
+            # A page id can point anywhere; re-check scope after the fetch so a
+            # configured space filter cannot be bypassed by id alone.
+            raise WikiError(
+                f"Page {page_id} is in space {space!r}, outside the configured "
+                f"space {self.space!r}"
+            )
         html = data.get("body", {}).get("storage", {}).get("value", "")
         text = html_to_text(html)
         link = data.get("_links", {}).get("webui", "")
         return {
             "id": data.get("id"),
             "title": data.get("title"),
-            "space": data.get("space", {}).get("key"),
+            "space": space,
+            "version": (data.get("version") or {}).get("number"),
+            "last_modified": ((data.get("version") or {}).get("when")),
+            "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "content_sha256": hashlib.sha256(text.encode()).hexdigest()[:16],
             "text": text[:MAX_PAGE_CHARS],
             "truncated": len(text) > MAX_PAGE_CHARS,
             "url": f"{self.base}{link}" if link else None,
@@ -175,9 +199,17 @@ class ConfluenceWiki:
 
 
 def make_wiki(cfg: Config):
+    """Build the wiki provider.
+
+    'confluence' fails closed: if it is configured but unreachable the server
+    reports no wiki rather than silently serving the bundled sample policies,
+    which would pair a live ledger with fictional thresholds. Use 'auto' only
+    for local development.
+    """
     w = cfg.wiki
     mode = (w.provider or "auto").lower()
     confluence_ready = bool(w.confluence_base_url and w.confluence_api_token)
+    labels = [l.strip() for l in (w.confluence_labels or "").split(",") if l.strip()]
     if mode == "confluence" or (mode == "auto" and confluence_ready):
         if not confluence_ready:
             raise WikiError(
@@ -185,6 +217,9 @@ def make_wiki(cfg: Config):
                 "CONFLUENCE_API_TOKEN are not set"
             )
         return ConfluenceWiki(
-            w.confluence_base_url, w.confluence_email, w.confluence_api_token, w.confluence_space
+            w.confluence_base_url, w.confluence_email, w.confluence_api_token,
+            w.confluence_space, labels,
         )
-    return LocalDocsWiki(cfg.resolve_path(w.localdocs_path))
+    if mode == "localdocs" or mode == "auto":
+        return LocalDocsWiki(cfg.resolve_path(w.localdocs_path))
+    raise WikiError(f"Unknown wiki.provider {mode!r} — use confluence, localdocs, or auto")

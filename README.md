@@ -29,15 +29,26 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (39 checks) and the MCP server end to end. Then install
+verifies both the engine (47 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
 ollama pull llama3.1:8b
+```
+
+Then either the web UI:
+
+```bash
+.venv/bin/python -m pstb.gui --open
+```
+
+or the terminal chat:
+
+```bash
 .venv/bin/python -m pstb.client.chat
 ```
 
-On Windows the last command is `.venv\Scripts\python -m pstb.client.chat`.
+On Windows use `.venv\Scripts\python` in place of `.venv/bin/python`.
 
 Full step-by-step instructions, including work-laptop and offline notes, are in
 [docs/SETUP.md](docs/SETUP.md). On macOS/Linux there are also `make` shortcuts:

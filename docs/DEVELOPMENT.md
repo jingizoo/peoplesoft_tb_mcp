@@ -22,6 +22,7 @@ python -m pstb.client.chat                     # chat REPL
 python -m pstb.client.chat --provider gemini   # chat via Gemini on Vertex AI
 python -m pstb.client.chat --ask "..."         # one-shot question
 python -m pstb.server                          # run the server standalone
+python -m pstb.gui --open                      # web UI on 127.0.0.1:8000
 ```
 
 macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
@@ -78,7 +79,7 @@ silently pick up the next breaking SDK major.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 39 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 47 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.
