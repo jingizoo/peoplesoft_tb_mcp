@@ -235,6 +235,7 @@ class TBEngine:
         currency: str = "",
         account: str = "",
         include_adj: bool = False,
+        amount_basis: str = "base",
     ) -> list[dict]:
         extras = extras or []
         params: dict = {
@@ -253,6 +254,7 @@ class TBEngine:
             currency=currency,
             account=account,
             params=params,
+            amount_basis=amount_basis,
         )
         if self.cfg.db.use_views:
             params.pop("setid", None)
@@ -373,6 +375,8 @@ class TBEngine:
             "row_count": len(out_rows),
             "truncated": truncated,
             "scope_status": "ok",
+            "amount_basis": "base",
+            "currency_filter": currency or "base currency only",
             "totals": {
                 "beginning": r2(tot_beg),
                 "period_activity": r2(tot_act),
@@ -382,7 +386,8 @@ class TBEngine:
                 "ending_cr": r2(tot_cr),
                 "in_balance": abs(tot_end) < BALANCE_EPS,
             },
-            "note": "Amounts are signed: debits positive, credits negative.",
+            "note": ("Amounts are signed: debits positive, credits negative. "
+                     "Base-currency rows only; statistical rows excluded."),
         }
         if not out_rows:
             diag = self._scope_diagnosis(bu, led, fy)
@@ -503,7 +508,10 @@ class TBEngine:
             c_end = c["ending"] if c else 0.0
             b_end = b["ending"] if b else 0.0
             delta = c_end - b_end
-            if abs(delta) < max(float(min_abs_change or 0.0), 0.0):
+            # A zero change is not a "mover". Without this, min_abs_change=0
+            # lets every unchanged account through and the caller sees a long
+            # list of +0.00 rows.
+            if abs(delta) < max(float(min_abs_change or 0.0), BALANCE_EPS):
                 continue
             meta = (c or b)["meta"]
             rows.append(
@@ -674,7 +682,7 @@ class TBEngine:
         if inactive:
             issues.append(f"{len(inactive)} inactive account(s) carry balances")
 
-        params = {"bu": bu, "fy": fy, "maxper": per}
+        params = {"bu": bu, "fy": fy, "maxper": per, "ledger": led}
         unposted, _ = self.db.query(q.unposted_journals(self.db), params, max_rows=50)
         for u in unposted:
             u["status_descr"] = JRNL_STATUS.get(u.get("status"), u.get("status"))
@@ -792,7 +800,7 @@ class TBEngine:
             "fy": fy,
             "maxper": per,
         }
-        raw, _ = self.db.query(q.tree_rollup(self.db), params, max_rows=INTERNAL_ROW_CAP)
+        raw, _ = self.db.query(q.tree_rollup(self.db, params), params, max_rows=INTERNAL_ROW_CAP)
         piv = self._pivot(raw, ["tree_node"], per, False)
         nodes = []
         order = {r["tree_node"]: r["node_ord"] for r in raw}
@@ -831,9 +839,61 @@ class TBEngine:
         rows, _ = self.db.query(q.business_units(self.db), {}, max_rows=200)
         return {"business_units": rows}
 
+    def list_financial_scopes(self) -> dict:
+        """Business units with base currency, their ledgers, and the fiscal
+        years/periods that hold data — in one round trip.
+
+        Two separate calls (list_business_units then list_ledgers) cannot be
+        chained reliably by a model: both are emitted in the same turn, so the
+        second runs before the first returns and silently falls back to the
+        configured default.
+        """
+        p = self.db.prefix
+        rows, _ = self.db.query(
+            f"""SELECT L.BUSINESS_UNIT AS business_unit, L.LEDGER AS ledger,
+       MIN(L.FISCAL_YEAR) AS first_fy, MAX(L.FISCAL_YEAR) AS last_fy,
+       MAX(L.BASE_CURRENCY) AS base_currency, COUNT(*) AS row_count
+  FROM {p}PS_LEDGER L
+ GROUP BY L.BUSINESS_UNIT, L.LEDGER
+ ORDER BY L.BUSINESS_UNIT, L.LEDGER""",
+            {}, max_rows=500,
+        )
+        descr = {}
+        try:
+            for b in self.list_business_units()["business_units"]:
+                descr[b["business_unit"]] = b.get("descr")
+        except Exception:
+            pass
+        scopes: dict = {}
+        for r in rows:
+            bu = r["business_unit"]
+            s = scopes.setdefault(bu, {
+                "business_unit": bu, "descr": descr.get(bu),
+                "base_currency": r.get("base_currency"), "ledgers": [],
+            })
+            s["ledgers"].append({
+                "ledger": r["ledger"],
+                "fiscal_years": [int(r["first_fy"]), int(r["last_fy"])],
+                "row_count": int(r["row_count"]),
+            })
+        return {
+            "scopes": list(scopes.values()),
+            "default": {"business_unit": self.cfg.defaults.business_unit,
+                        "ledger": self.cfg.defaults.ledger},
+            "note": "Use these exact values; do not invent a business unit, ledger, or year.",
+        }
+
     def list_ledgers(self, business_unit: str = "") -> dict:
-        bu = (business_unit or "").strip() or self.cfg.defaults.business_unit
+        bu = (business_unit or "").strip()
+        if not bu:
+            raise EngineError(
+                "business_unit is required. Call list_financial_scopes to get "
+                "business units and their ledgers together in one call."
+            )
         rows, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=50)
+        if not rows:
+            return {"business_unit": bu, "ledgers": [],
+                    **self._scope_diagnosis(bu, self.cfg.defaults.ledger, 0)}
         return {"business_unit": bu, "ledgers": [r["ledger"] for r in rows]}
 
     # ------------------------------------------------------------- raw SQL

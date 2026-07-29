@@ -32,6 +32,44 @@ GROUPABLE_CHARTFIELDS = {
 IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#.]{0,63}$")
 
 
+def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
+                 alias: str = "L") -> str:
+    """Currency / amount-basis contract, applied identically by every tool.
+
+    PS_LEDGER holds one row per currency AND per statistics code. Summing
+    POSTED_TOTAL_AMT without these predicates mixes transaction-currency rows
+    and non-monetary statistical rows into the total, which is the usual reason
+    a generated trial balance does not tie to PeopleSoft.
+
+      base        -> POSTED_TOTAL_AMT where CURRENCY_CD = BASE_CURRENCY
+      transaction -> POSTED_TRAN_AMT, caller groups by CURRENCY_CD
+    Statistical rows (STATISTICS_CODE populated) are always excluded; they are
+    headcount/area/units, not money.
+    """
+    if db.cfg.db.use_views:
+        # The XX_TB_* views encode the same contract; don't double-apply it.
+        clause = ""
+    else:
+        clause = (
+            f" AND ({alias}.STATISTICS_CODE IS NULL OR "
+            f"TRIM({alias}.STATISTICS_CODE) = '')"
+        )
+        if (amount_basis or "base").lower() == "base" and not currency:
+            clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
+    if currency and currency.lower() != "detail":
+        params["curr"] = currency.upper()
+        clause += f" AND {alias}.CURRENCY_CD = :curr"
+    return clause
+
+
+def amount_col(db: Database, amount_basis: str, alias: str = "L") -> str:
+    if db.cfg.db.use_views:
+        return f"{alias}.POSTED_TOTAL_AMT"
+    if (amount_basis or "base").lower() == "transaction":
+        return f"{alias}.POSTED_TRAN_AMT"
+    return f"{alias}.POSTED_TOTAL_AMT"
+
+
 def acct_join(db: Database) -> str:
     """Effective-dated LEFT JOIN from ledger alias L to PS_GL_ACCOUNT_TBL alias A."""
     p, today = db.prefix, db.today_expr()
@@ -84,6 +122,7 @@ def tb_period_sums(
     currency: str,
     account: str,
     params: dict,
+    amount_basis: str = "base",
 ) -> str:
     """Period-level sums by account (+extras), through :maxper for :bu/:ledger/:fy."""
     p = db.prefix
@@ -93,10 +132,9 @@ def tb_period_sums(
     if dept:
         params["dept"] = dept
         where_extra += " AND L.DEPTID = :dept"
-    if currency and currency.lower() != "detail":
-        params["curr"] = currency.upper()
-        where_extra += " AND L.CURRENCY_CD = :curr"
+    where_extra += basis_clause(db, amount_basis, currency, params)
     where_extra += account_filter(account, params)
+    amt = amount_col(db, amount_basis)
 
     if db.cfg.db.use_views:
         src = f"{p}XX_TB_BAL_VW L"
@@ -110,7 +148,7 @@ def tb_period_sums(
         join = acct_join(db)
 
     return f"""SELECT L.ACCOUNT AS account, {attr_sel}{extra_sel},
-       L.ACCOUNTING_PERIOD AS period, SUM(L.POSTED_TOTAL_AMT) AS amt
+       L.ACCOUNTING_PERIOD AS period, SUM({amt}) AS amt
   FROM {src}
   {join}
  WHERE L.BUSINESS_UNIT = :bu
@@ -156,6 +194,7 @@ def unposted_journals(db: Database) -> str:
    AND FISCAL_YEAR = :fy
    AND ACCOUNTING_PERIOD BETWEEN 1 AND :maxper
    AND JRNL_HDR_STATUS NOT IN ('P', 'D')
+   AND (LEDGER_GROUP = :ledger OR :ledger IS NULL OR LEDGER_GROUP IS NULL)
  ORDER BY ACCOUNTING_PERIOD, JOURNAL_DATE, JOURNAL_ID"""
 
 
@@ -229,7 +268,7 @@ def tree_effdt(db: Database) -> str:
  WHERE SETID = :setid AND TREE_NAME = :tree AND EFFDT <= {today}"""
 
 
-def tree_rollup(db: Database) -> str:
+def tree_rollup(db: Database, params: dict, amount_basis: str = "base") -> str:
     """Ending-balance components by tree node at a given level.
 
     Leaf ranges attach to nodes; ancestor containment uses the node-number span.
@@ -237,8 +276,10 @@ def tree_rollup(db: Database) -> str:
     """
     p = db.prefix
     d = db.date_bind("teffdt")
+    amt = amount_col(db, amount_basis)
+    basis = basis_clause(db, amount_basis, "", params)
     return f"""SELECT N.TREE_NODE AS tree_node, MIN(N.TREE_NODE_NUM) AS node_ord,
-       L.ACCOUNTING_PERIOD AS period, SUM(L.POSTED_TOTAL_AMT) AS amt
+       L.ACCOUNTING_PERIOD AS period, SUM({amt}) AS amt
   FROM {p}PS_LEDGER L
   JOIN {p}PSTREELEAF LF
     ON LF.SETID = :tsetid AND LF.TREE_NAME = :tree AND LF.EFFDT = {d}
@@ -249,7 +290,7 @@ def tree_rollup(db: Database) -> str:
    AND LF.TREE_NODE_NUM BETWEEN N.TREE_NODE_NUM AND N.TREE_NODE_NUM_END
    AND N.TREE_LEVEL_NUM = :lvl
  WHERE L.BUSINESS_UNIT = :bu AND L.LEDGER = :ledger AND L.FISCAL_YEAR = :fy
-   AND L.ACCOUNTING_PERIOD BETWEEN 0 AND :maxper
+   AND L.ACCOUNTING_PERIOD BETWEEN 0 AND :maxper{basis}
  GROUP BY N.TREE_NODE, L.ACCOUNTING_PERIOD"""
 
 

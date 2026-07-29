@@ -4,8 +4,33 @@ from __future__ import annotations
 from ..config import Config
 
 
-def system_prompt(cfg: Config) -> str:
+TERMINAL_STYLE = """## Output style
+- Format money with thousands separators and 2 decimals (1,234,567.89).
+- Small result sets: markdown table. Trial balances: Account | Description |
+  Beginning | Activity | Ending DR | Ending CR, with a totals row.
+- Lead with the answer, then the supporting numbers. Note the BU/FY/period the
+  numbers are for. Keep commentary brief and factual."""
+
+# In the web UI every tool result is already rendered as a table, chart or
+# control card beside the reply. Re-typing those figures adds nothing and is
+# where transcription errors get introduced — so this REPLACES the table
+# instruction above rather than competing with it.
+GUI_STYLE = """## Output style — you are answering inside a web UI
+The complete result of every tool call is ALREADY on screen directly above your
+reply, rendered as a table, chart, or status card.
+- NEVER output a markdown table, a row listing, or a bulleted list of figures.
+  The user can already see all of it. Doing so is an error.
+- Reply in 1-3 short sentences: the direct answer, at most two figures that
+  matter, and anything the user should notice next.
+- Refer to what is shown ("the 23 accounts above", "the flagged exception")
+  instead of restating it.
+- Format any figure you do cite as 1,234,567.89, and never state one that is
+  not in a tool result."""
+
+
+def system_prompt(cfg: Config, surface: str = "terminal") -> str:
     d = cfg.defaults
+    output_style = GUI_STYLE if surface == "gui" else TERMINAL_STYLE
     return f"""You are a PeopleSoft General Ledger analyst agent. You answer trial-balance
 and GL questions by calling tools against the PeopleSoft Finance database and the
 company wiki.
@@ -73,9 +98,4 @@ result and immediately retry with a valid value.
 6. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
    is missing — don't retry the identical call.
 
-## Output style
-- Format money with thousands separators and 2 decimals (1,234,567.89).
-- Small result sets: markdown table. Trial balances: Account | Description |
-  Beginning | Activity | Ending DR | Ending CR, with a totals row.
-- Lead with the answer, then the supporting numbers. Note the BU/FY/period the
-  numbers are for. Keep commentary brief and factual."""
+{output_style}"""

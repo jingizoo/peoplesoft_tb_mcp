@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (39 checks) and
+clients, builds the sample ledger, and then verifies the engine (47 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:
@@ -198,6 +198,36 @@ Expected: the trial balance balances, with debits and credits both
 
 A ~50-question catalog is in [QUESTIONS.md](QUESTIONS.md).
 
+## 5b. Use the web UI
+
+```bash
+.venv/bin/python -m pstb.gui --open
+```
+
+Windows: `.venv\Scripts\python -m pstb.gui --open`. Opens
+http://127.0.0.1:8000 (add `--port 8777` to change it, `--host 0.0.0.0` to
+expose it on the network — see the security note below).
+
+Five views sharing one scope bar (business unit, ledger, fiscal year, period):
+
+| View | What it gives you |
+|---|---|
+| Trial balance | Grid with pinned DR/CR totals, chartfield grouping, account filter, CSV export. Click any row for the account drawer. |
+| Close & controls | One card per control: balance, suspense, unposted journals, out-of-balance journals, inactive/orphan accounts, retained-earnings roll. |
+| Statement rollup | Assets / liabilities / equity / revenue / expenses by tree node, with net income and an A = L + E check. |
+| Variance | Largest movers between two periods with change, % and a magnitude bar. |
+| Ask | Chat that renders each tool result inline as a table, chart or control card. |
+
+Every figure on screen is computed by the engine and rendered by the browser.
+The model never produces a number that is displayed — in the Ask view its reply
+is limited to a short comment and labelled as commentary. This is deliberate:
+in testing, a small local model produced incorrect prose next to a correct
+table.
+
+**Security:** the UI has no login and no per-user authorization. Bind it to
+`127.0.0.1` (the default) and treat it as a single-user tool until an
+authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
+
 ## 6. Point it at a real PeopleSoft database
 
 1. Get a **read-only** Oracle account with SELECT on the GL tables.
@@ -236,19 +266,101 @@ Optionally have a DBA deploy the views in [`sql/oracle/`](../sql/oracle) and set
 basis contract, no user authorization boundary, and raw SQL is enabled in the
 shipped config (`tools.allow_raw_sql: false` turns it off).
 
-## 7. Connect the wiki (optional)
+## 7. Connect the company wiki (Confluence)
 
-In `.env`:
+The wiki supplies policy context — suspense rules, capitalization thresholds,
+close checklists — so the agent can answer "is this within policy", not just
+"what is the balance".
+
+### 7.1 Get credentials
+
+**Confluence Cloud:** create an API token at
+https://id.atlassian.com/manage-profile/security/api-tokens, then in `.env`:
 
 ```
 CONFLUENCE_BASE_URL=https://yourco.atlassian.net/wiki
 CONFLUENCE_EMAIL=you@yourco.com
-CONFLUENCE_API_TOKEN=...
+CONFLUENCE_API_TOKEN=<token>
 ```
 
-Confluence Data Center instead of Cloud: leave `CONFLUENCE_EMAIL` empty and use
-a personal access token. Until these are set, the agent serves the sample
-policy pages in `sample_wiki/`, so policy questions still work.
+**Confluence Data Center / Server:** create a personal access token in your
+profile settings, leave the email blank, and use the site root:
+
+```
+CONFLUENCE_BASE_URL=https://wiki.yourco.com
+CONFLUENCE_EMAIL=
+CONFLUENCE_API_TOKEN=<personal access token>
+```
+
+The token inherits *your* permissions. Use a service account limited to the
+finance space if the agent will be shared.
+
+### 7.2 Scope it — do this, don't skip it
+
+Unscoped, a question like "what is our suspense policy" runs a full-text search
+across everything you can read and trusts whatever ranks first. Two filters fix
+that, in `config.yaml`:
+
+```yaml
+wiki:
+  provider: confluence        # not "auto" — see 7.4
+  confluence_space: FIN       # space key
+  confluence_labels: "gl-policy,gl-close,gl-coa"
+```
+
+`confluence_space` restricts lookups to one space. `confluence_labels` further
+restricts them to pages carrying a label, which is the part that makes answers
+predictable.
+
+### 7.3 What to do in Confluence itself
+
+This is the manual step, and it is what turns search into mapping:
+
+1. Pick the space that holds finance policy (or create one).
+2. Label the pages the agent should be allowed to cite. A workable starter set:
+
+   | Label | Apply to |
+   |---|---|
+   | `gl-policy` | suspense rules, capitalization threshold, adjustment-period rules, materiality |
+   | `gl-close` | month-end checklist, close calendar, sign-off procedure |
+   | `gl-coa` | chart-of-accounts policy, account ranges, naming conventions |
+
+3. Make sure each page states its rule explicitly ("cleared within 30 days",
+   "capitalization threshold is $5,000"). The agent quotes what is written; a
+   page that only implies a threshold produces a vague answer.
+4. Keep one page per topic. Two pages describing the same rule differently is
+   the most common source of a wrong policy answer.
+
+Start with three or four pages covering the questions people actually ask, then
+widen.
+
+### 7.4 Fail closed
+
+With `provider: confluence`, the server reports the wiki as unavailable if
+Confluence cannot be reached — it will **not** fall back to the sample pages in
+`sample_wiki/`. That fallback exists only under `provider: auto`, for local
+development. Never leave `auto` set against a production ledger: it can pair
+real balances with the demo thresholds shipped in this repo.
+
+Page fetches are re-checked against the configured space after retrieval, so a
+page id outside the allowed space is rejected rather than returned.
+
+### 7.5 Verify
+
+```bash
+.venv/bin/python -m pstb.client.chat --ask "What is our suspense account policy?"
+```
+
+The reply should cite a page title from your space. Each page result carries
+`space`, `version`, `last_modified`, `retrieved_at`, and a content hash, so a
+policy citation can be audited later.
+
+### 7.6 Known gap
+
+Concept-to-page binding is by label and search, not an explicit map. If you want
+deterministic lookups for recurring questions — always read page 12345 for
+"suspense policy" — that mapping file does not exist yet. Labels get you most of
+the way; tell me your space and page ids if you want the explicit binding.
 
 ## 8. Troubleshooting
 

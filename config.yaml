@@ -30,6 +30,7 @@ wiki:
   provider: auto          # confluence | localdocs | auto (confluence when configured, else local docs)
   localdocs_path: sample_wiki
   confluence_space: ""    # optional space key filter, e.g. FIN
+  confluence_labels: ""   # optional label filter, e.g. "gl-policy,gl-close,gl-coa"
 
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools

@@ -155,6 +155,35 @@ def main() -> None:
     check("through_period=12 excludes adjustments from ending",
           abs(ab12["ending_through_period"] - ab998["ending_through_period"]) < 0.01)
 
+    print("== currency / amount basis contract ==")
+    from pstb import queries as q
+    _p = {}
+    _sql = q.tb_period_sums(Database(cfg), extras=[], include_adj=False,
+                            adj_periods=[998], dept="", currency="", account="", params=_p)
+    check("statistical rows excluded", "STATISTICS_CODE" in _sql)
+    check("base-currency rows only", "CURRENCY_CD = L.BASE_CURRENCY" in _sql)
+    check("basis declared on result", tb.get("amount_basis") == "base", str(tb.get("amount_basis")))
+    _txn = q.tb_period_sums(Database(cfg), extras=[], include_adj=False, adj_periods=[998],
+                            dept="", currency="", account="", params={}, amount_basis="transaction")
+    check("transaction basis uses POSTED_TRAN_AMT", "POSTED_TRAN_AMT" in _txn)
+
+    print("== scope discovery in one call ==")
+    sc = engine.list_financial_scopes()
+    check("scopes returns BU + ledgers together",
+          sc["scopes"][0]["business_unit"] == "US001"
+          and sc["scopes"][0]["ledgers"][0]["ledger"] == "ACTUALS",
+          str(sc["scopes"][0]))
+    check("base currency reported", sc["scopes"][0]["base_currency"] == "USD")
+    try:
+        engine.list_ledgers()
+        check("list_ledgers rejects missing business_unit", False)
+    except EngineError:
+        check("list_ledgers rejects missing business_unit", True)
+
+    print("== variance excludes unchanged accounts ==")
+    flat = engine.compare_trial_balance(fiscal_year=2026, period=7, vs_period=6)
+    check("no zero-change movers", not flat["movers"], f"{len(flat['movers'])} movers")
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

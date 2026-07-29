@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    17 tools     │  TB engine + guarded SQL  │
+│  pstb.client.chat    │    18 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,15 +29,26 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (39 checks) and the MCP server end to end. Then install
+verifies both the engine (47 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
 ollama pull llama3.1:8b
+```
+
+Then either the web UI:
+
+```bash
+.venv/bin/python -m pstb.gui --open
+```
+
+or the terminal chat:
+
+```bash
 .venv/bin/python -m pstb.client.chat
 ```
 
-On Windows the last command is `.venv\Scripts\python -m pstb.client.chat`.
+On Windows use `.venv\Scripts\python` in place of `.venv/bin/python`.
 
 Full step-by-step instructions, including work-laptop and offline notes, are in
 [docs/SETUP.md](docs/SETUP.md). On macOS/Linux there are also `make` shortcuts:
@@ -100,7 +111,13 @@ CONFLUENCE_API_TOKEN=...
 
 `wiki.provider: auto` uses Confluence once those are set; until then it serves
 the sample pages in [sample_wiki/](sample_wiki/) so policy questions still work.
-Optionally scope with `wiki.confluence_space: FIN`.
+
+For production set `wiki.provider: confluence` explicitly — it then **fails
+closed** rather than falling back to this repo's demo policy pages, which would
+otherwise pair real balances with fictional thresholds. Scope lookups with
+`wiki.confluence_space: FIN` and `wiki.confluence_labels: "gl-policy,gl-close"`,
+and label the pages in Confluence accordingly. Full procedure, including the
+manual labelling step, is in [docs/SETUP.md](docs/SETUP.md) section 7.
 
 ## Using the server from another MCP host
 
@@ -120,7 +137,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 17 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 18 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -128,7 +145,8 @@ no chat client needed.
 `get_trial_balance` · `get_account_balance` · `compare_trial_balance` ·
 `drill_to_journals` · `search_accounts` · `resolve_period` · `list_periods` ·
 `tb_integrity_check` · `rollup_trial_balance` · `list_trees` ·
-`list_business_units` · `list_ledgers` · `wiki_search` · `wiki_get_page` ·
+`list_financial_scopes` · `list_business_units` · `list_ledgers` ·
+`wiki_search` · `wiki_get_page` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.
 
@@ -150,10 +168,11 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 ## Layout
 
 ```
-pstb/            server.py (FastMCP) · engine.py (TB math) · queries.py ·
-                 db.py · wiki.py · client/ (chat REPL + ollama/gemini providers)
+pstb/            server.py (MCP) · engine.py (TB math) · queries.py · db.py ·
+                 wiki.py · client/ (chat REPL + providers) · gui/ (web UI)
 scripts/         seed_sample_data.py · smoke_test.py · mcp_probe.py
 sql/oracle/      XX_TB_* view DDL for the real database
-docs/            QUESTIONS.md (question catalog) · VIEWS.md (view design)
+docs/            SETUP.md (install) · QUESTIONS.md (catalog) · VIEWS.md ·
+                 REVIEW_RESPONSE.md (open items) · DEVELOPMENT.md
 sample_wiki/     sample policy pages served by the local wiki provider
 ```

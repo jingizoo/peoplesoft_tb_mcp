@@ -41,8 +41,9 @@ async def main() -> None:
             # only tool names hid that failure until runtime.
             specs = tool_specs(listed)
             assert len(specs) == len(listed.tools), "tool spec count mismatch"
+            NO_ARG_TOOLS = {"list_trees", "list_business_units", "list_financial_scopes"}
             missing = [s.name for s in specs if not s.schema.get("properties")
-                       and s.name not in ("list_trees", "list_business_units")]
+                       and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"
             for s in specs:
                 clean_schema(s.schema)  # must not raise for either provider

@@ -56,6 +56,7 @@ class WikiCfg:
     confluence_email: str = ""
     confluence_api_token: str = ""
     confluence_space: str = ""
+    confluence_labels: str = ""
 
 
 @dataclass
@@ -136,6 +137,7 @@ def load_config(path: Optional[str] = None) -> Config:
     l.gemini_project = _env("GOOGLE_CLOUD_PROJECT", l.gemini_project)
     l.gemini_location = _env("GOOGLE_CLOUD_LOCATION", l.gemini_location)
     w.confluence_base_url = _env("CONFLUENCE_BASE_URL", w.confluence_base_url)
+    w.confluence_labels = _env("CONFLUENCE_LABELS", w.confluence_labels)
     w.confluence_email = _env("CONFLUENCE_EMAIL", w.confluence_email)
     w.confluence_api_token = _env("CONFLUENCE_API_TOKEN", w.confluence_api_token)
     return cfg
