@@ -60,6 +60,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up the PeopleSoft TB agent")
     ap.add_argument("--no-llm", action="store_true",
                     help="skip the ollama and google-genai clients")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="skip the web UI dependencies")
     ap.add_argument("--oracle", action="store_true",
                     help="also install the Oracle driver (python-oracledb)")
     ap.add_argument("--sqlserver", action="store_true",
@@ -91,6 +93,8 @@ def main() -> int:
     extras = []
     if not args.no_llm:
         extras.append("llm")
+    if not args.no_gui:
+        extras.append("gui")
     if args.oracle:
         extras.append("oracle")
     if args.sqlserver:
@@ -119,12 +123,14 @@ def main() -> int:
     rel = os.path.relpath(venv_python(), ROOT)
     print("\nSetup complete.\n")
     print("Next steps:")
-    print("  1. Install a local model, then chat:")
+    print("  1. Start the web UI:")
+    print(f"       {rel} -m pstb.gui --open")
+    print("  2. Or install a local model and use the terminal chat:")
     print("       ollama pull llama3.1:8b")
     print(f"       {rel} -m pstb.client.chat")
     print("     (or use Gemini: set GOOGLE_CLOUD_PROJECT in .env, then")
     print(f"       {rel} -m pstb.client.chat --provider gemini)")
-    print("  2. Ask something:")
+    print("  3. Ask something from the terminal:")
     print(f"       {rel} -m pstb.client.chat --ask \"Does the trial balance balance?\"")
     print("\nEverything above runs on the bundled sample ledger — no PeopleSoft")
     print("connection needed. See README.md to point it at a real database.")

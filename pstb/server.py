@@ -211,14 +211,25 @@ def list_trees() -> dict:
 
 
 @mcp.tool()
+def list_financial_scopes() -> dict:
+    """Business units, their ledgers, base currency, and which fiscal years hold
+    data — all in ONE call. Use this first when you don't know the scope.
+    Do not call list_business_units and list_ledgers together to work this out:
+    both run in the same turn, so the second cannot use the first's result."""
+    return _safe(engine.list_financial_scopes)
+
+
+@mcp.tool()
 def list_business_units() -> dict:
     """List GL business units with descriptions and base currency."""
     return _safe(engine.list_business_units)
 
 
 @mcp.tool()
-def list_ledgers(business_unit: str = "") -> dict:
-    """List ledgers that hold data for a business unit (e.g. ACTUALS, BUDGET)."""
+def list_ledgers(business_unit: str) -> dict:
+    """Ledgers holding data for ONE business unit (e.g. ACTUALS, BUDGET).
+    business_unit is required — prefer list_financial_scopes, which returns
+    business units and ledgers together."""
     return _safe(engine.list_ledgers, business_unit=business_unit)
 
 
