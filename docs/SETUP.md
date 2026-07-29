@@ -362,6 +362,27 @@ deterministic lookups for recurring questions — always read page 12345 for
 "suspense policy" — that mapping file does not exist yet. Labels get you most of
 the way; tell me your space and page ids if you want the explicit binding.
 
+## 7b. When a query hangs
+
+If the UI or chat sits on a tool call and never returns, time each database
+step:
+
+```bash
+.venv/bin/python scripts/diagnose_db.py --bu YOUR_BU --ledger ACTUALS --fy 2024 --period 6
+```
+
+It reports elapsed time per statement and flags anything over 5 seconds, then
+tells you how to read the result. Add `--sql` to print the statement itself.
+
+Queries now abort rather than hang: `db.query_timeout_seconds` (default 120)
+becomes an Oracle `call_timeout`, and the browser gives up after 180 s with an
+explanation. Raise the config value for genuinely large scopes.
+
+If the aggregate is slow on a real ledger, confirm the delivered PS_LEDGER index
+on `(BUSINESS_UNIT, LEDGER, FISCAL_YEAR, ACCOUNTING_PERIOD, ACCOUNT)` exists and
+that optimiser statistics are current, then narrow the scope (one fiscal year,
+one period range, an account filter) before widening again.
+
 ## 8. Troubleshooting
 
 | Symptom | Fix |
@@ -373,6 +394,7 @@ the way; tell me your space and page ids if you want the explicit binding.
 | `model requires more system memory` | use a smaller model: `ollama pull llama3.2:3b` and `--model llama3.2:3b` |
 | `Set GOOGLE_CLOUD_PROJECT in .env` | fill it in, then `gcloud auth application-default login` |
 | `ORA-12541` / `ORA-12154` | DSN wrong or blocked; confirm `host:port/service_name` and firewall access |
+| Tool call hangs, no result | run `scripts/diagnose_db.py` (section 7b); check the PS_LEDGER index and `db.query_timeout_seconds` |
 | pip TLS/certificate errors | corporate TLS inspection — point pip at the internal mirror (step 3) |
 | PowerShell blocks activation | you do not need to activate; call `.venv\Scripts\python` directly |
 

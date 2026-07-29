@@ -33,7 +33,7 @@ IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#.]{0,63}$")
 
 
 def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
-                 alias: str = "L") -> str:
+                 alias: str = "L", base_currency: str = "") -> str:
     """Currency / amount-basis contract, applied identically by every tool.
 
     PS_LEDGER holds one row per currency AND per statistics code. Summing
@@ -50,12 +50,25 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
         # The XX_TB_* views encode the same contract; don't double-apply it.
         clause = ""
     else:
+        # Oracle treats '' as NULL, so TRIM(' ') yields NULL and a plain
+        # `TRIM(x) = ''` test is UNKNOWN — which would silently exclude every
+        # monetary row on Oracle while passing on SQLite. Test both forms.
         clause = (
-            f" AND ({alias}.STATISTICS_CODE IS NULL OR "
-            f"TRIM({alias}.STATISTICS_CODE) = '')"
+            f" AND ({alias}.STATISTICS_CODE IS NULL"
+            f" OR TRIM({alias}.STATISTICS_CODE) IS NULL"
+            f" OR TRIM({alias}.STATISTICS_CODE) = '')"
         )
         if (amount_basis or "base").lower() == "base" and not currency:
-            clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
+            if base_currency:
+                # Bind the resolved currency rather than comparing
+                # CURRENCY_CD to BASE_CURRENCY column-to-column: Oracle cannot
+                # use the PS_LEDGER index for a column-to-column predicate and
+                # may switch to a full scan, which on a real ledger reads as a
+                # hang.
+                params["base_curr"] = base_currency
+                clause += f" AND {alias}.CURRENCY_CD = :base_curr"
+            else:
+                clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
     if currency and currency.lower() != "detail":
         params["curr"] = currency.upper()
         clause += f" AND {alias}.CURRENCY_CD = :curr"
@@ -123,6 +136,7 @@ def tb_period_sums(
     account: str,
     params: dict,
     amount_basis: str = "base",
+    base_currency: str = "",
 ) -> str:
     """Period-level sums by account (+extras), through :maxper for :bu/:ledger/:fy."""
     p = db.prefix
@@ -132,31 +146,57 @@ def tb_period_sums(
     if dept:
         params["dept"] = dept
         where_extra += " AND L.DEPTID = :dept"
-    where_extra += basis_clause(db, amount_basis, currency, params)
+    where_extra += basis_clause(db, amount_basis, currency, params,
+                                base_currency=base_currency)
     where_extra += account_filter(account, params)
     amt = amount_col(db, amount_basis)
 
-    if db.cfg.db.use_views:
-        src = f"{p}XX_TB_BAL_VW L"
-        attr_sel = "L.DESCR AS descr, L.ACCOUNT_TYPE AS acct_type, L.EFF_STATUS AS eff_status"
-        attr_grp = ", L.DESCR, L.ACCOUNT_TYPE, L.EFF_STATUS"
-        join = ""
-    else:
-        src = f"{p}PS_LEDGER L"
-        attr_sel = "A.DESCR AS descr, A.ACCOUNT_TYPE AS acct_type, A.EFF_STATUS AS eff_status"
-        attr_grp = ", A.DESCR, A.ACCOUNT_TYPE, A.EFF_STATUS"
-        join = acct_join(db)
+    period_filter = (
+        f"(L.ACCOUNTING_PERIOD BETWEEN 0 AND :maxper"
+        f"{_adj_clause(include_adj, adj_periods)})"
+    )
 
-    return f"""SELECT L.ACCOUNT AS account, {attr_sel}{extra_sel},
+    if db.cfg.db.use_views:
+        # The view already carries account attributes, so a single pass is fine.
+        return f"""SELECT L.ACCOUNT AS account, L.DESCR AS descr,
+       L.ACCOUNT_TYPE AS acct_type, L.EFF_STATUS AS eff_status{extra_sel},
        L.ACCOUNTING_PERIOD AS period, SUM({amt}) AS amt
-  FROM {src}
-  {join}
+  FROM {p}XX_TB_BAL_VW L
  WHERE L.BUSINESS_UNIT = :bu
    AND L.LEDGER = :ledger
    AND L.FISCAL_YEAR = :fy
-   AND (L.ACCOUNTING_PERIOD BETWEEN 0 AND :maxper{_adj_clause(include_adj, adj_periods)})
+   AND {period_filter}
    {where_extra}
- GROUP BY L.ACCOUNT{attr_grp}{extra_grp}, L.ACCOUNTING_PERIOD"""
+ GROUP BY L.ACCOUNT, L.DESCR, L.ACCOUNT_TYPE, L.EFF_STATUS{extra_grp},
+          L.ACCOUNTING_PERIOD"""
+
+    # Aggregate the ledger FIRST, then attach account attributes to the small
+    # aggregated result. Joining the effective-dated account table directly to
+    # PS_LEDGER makes the optimiser evaluate a correlated MAX(EFFDT) subquery
+    # against every ledger row, which is unusably slow on a real ledger.
+    extra_inner_sel = "".join(f", L.{c}" for c in extras)
+    extra_outer_sel = "".join(f", T.{c} AS {c.lower()}" for c in extras)
+    today = db.today_expr()
+    return f"""SELECT T.account AS account, A.DESCR AS descr,
+       A.ACCOUNT_TYPE AS acct_type, A.EFF_STATUS AS eff_status{extra_outer_sel},
+       T.period AS period, T.amt AS amt
+  FROM (SELECT L.ACCOUNT AS account{extra_inner_sel},
+               L.ACCOUNTING_PERIOD AS period, SUM({amt}) AS amt
+          FROM {p}PS_LEDGER L
+         WHERE L.BUSINESS_UNIT = :bu
+           AND L.LEDGER = :ledger
+           AND L.FISCAL_YEAR = :fy
+           AND {period_filter}
+           {where_extra}
+         GROUP BY L.ACCOUNT{extra_inner_sel}, L.ACCOUNTING_PERIOD) T
+  LEFT JOIN (SELECT A2.ACCOUNT, A2.DESCR, A2.ACCOUNT_TYPE, A2.EFF_STATUS
+               FROM {p}PS_GL_ACCOUNT_TBL A2
+              WHERE A2.SETID = :setid
+                AND A2.EFFDT = (SELECT MAX(AX.EFFDT) FROM {p}PS_GL_ACCOUNT_TBL AX
+                                 WHERE AX.SETID = A2.SETID
+                                   AND AX.ACCOUNT = A2.ACCOUNT
+                                   AND AX.EFFDT <= {today})) A
+    ON A.ACCOUNT = T.account"""
 
 
 def journal_lines(db: Database, dept: str, params: dict) -> str:
@@ -268,7 +308,8 @@ def tree_effdt(db: Database) -> str:
  WHERE SETID = :setid AND TREE_NAME = :tree AND EFFDT <= {today}"""
 
 
-def tree_rollup(db: Database, params: dict, amount_basis: str = "base") -> str:
+def tree_rollup(db: Database, params: dict, amount_basis: str = "base",
+                base_currency: str = "") -> str:
     """Ending-balance components by tree node at a given level.
 
     Leaf ranges attach to nodes; ancestor containment uses the node-number span.
@@ -277,7 +318,7 @@ def tree_rollup(db: Database, params: dict, amount_basis: str = "base") -> str:
     p = db.prefix
     d = db.date_bind("teffdt")
     amt = amount_col(db, amount_basis)
-    basis = basis_clause(db, amount_basis, "", params)
+    basis = basis_clause(db, amount_basis, "", params, base_currency=base_currency)
     return f"""SELECT N.TREE_NODE AS tree_node, MIN(N.TREE_NODE_NUM) AS node_ord,
        L.ACCOUNTING_PERIOD AS period, SUM({amt}) AS amt
   FROM {p}PS_LEDGER L
