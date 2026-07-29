@@ -35,6 +35,7 @@ class DbCfg:
     oracle_user: str = ""
     oracle_password: str = ""
     mssql_conn_str: str = ""
+    query_timeout_seconds: int = 120
 
 
 @dataclass

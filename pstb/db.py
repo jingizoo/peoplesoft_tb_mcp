@@ -58,6 +58,16 @@ class Database:
             "sqlserver": "CAST(GETDATE() AS DATE)",
         }[self.dialect]
 
+    def exists_sql(self, sql: str) -> str:
+        """Wrap a SELECT so it stops at the first matching row."""
+        if self.dialect == "oracle":
+            return f"SELECT * FROM ({sql}) WHERE ROWNUM = 1"
+        if self.dialect == "sqserver":  # pragma: no cover
+            return sql
+        if self.dialect == "sqlserver":
+            return sql.replace("SELECT 1", "SELECT TOP 1 1", 1)
+        return f"{sql} LIMIT 1"
+
     def date_bind(self, name: str) -> str:
         """Expression that binds an ISO yyyy-mm-dd string as a date."""
         if self.dialect == "oracle":
@@ -89,6 +99,11 @@ class Database:
             self._conn = oracledb.connect(
                 user=c.oracle_user, password=c.oracle_password, dsn=c.oracle_dsn
             )
+            # Without this a slow query blocks forever and the caller just
+            # appears to hang. call_timeout is milliseconds.
+            timeout_s = int(getattr(c, "query_timeout_seconds", 120) or 0)
+            if timeout_s > 0:
+                self._conn.call_timeout = timeout_s * 1000
         else:  # sqlserver
             try:
                 import pyodbc
@@ -97,6 +112,9 @@ class Database:
             if not c.mssql_conn_str:
                 raise DbError("Set MSSQL_CONN_STR in .env")
             self._conn = pyodbc.connect(c.mssql_conn_str)
+            timeout_s = int(getattr(c, "query_timeout_seconds", 120) or 0)
+            if timeout_s > 0:
+                self._conn.timeout = timeout_s
         return self._conn
 
     # ---- querying --------------------------------------------------------
@@ -121,6 +139,16 @@ class Database:
                 rows = [
                     {k: _jsonable(v) for k, v in zip(cols, r)} for r in raw[:cap]
                 ]
+            except Exception as ex:
+                msg = str(ex)
+                if "DPY-4024" in msg or "call timeout" in msg.lower() or "timeout" in msg.lower():
+                    raise DbError(
+                        f"Query exceeded the {self.cfg.db.query_timeout_seconds}s timeout. "
+                        "Narrow the scope (business unit, fiscal year, period, account "
+                        "range), confirm PS_LEDGER indexes, or raise "
+                        "db.query_timeout_seconds in config.yaml."
+                    ) from ex
+                raise
             finally:
                 cur.close()
         return rows, truncated

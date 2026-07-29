@@ -17,6 +17,7 @@ db:
   sqlite_path: sample_data/ps_sample.db
   schema: ""              # e.g. SYSADM when querying the PS schema from another user
   use_views: false        # set true once sql/oracle/XX_TB_*.sql views are deployed
+  query_timeout_seconds: 120   # abort a query rather than hanging the UI        # set true once sql/oracle/XX_TB_*.sql views are deployed
 
 llm:
   provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)

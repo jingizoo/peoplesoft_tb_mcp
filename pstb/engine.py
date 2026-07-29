@@ -142,13 +142,16 @@ class TBEngine:
         ledger, or no data for that fiscal year. Never let 'nothing found' be
         reported as a clean, balanced ledger."""
         p = self.db.prefix
+        # Existence checks only. COUNT(*) here means a full scan of a real
+        # PS_LEDGER (tens of millions of rows) purely to say "not found", which
+        # is how a mistyped business unit turns into an apparent hang.
         rows, _ = self.db.query(
-            f"SELECT COUNT(*) AS n FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu",
+            self.db.exists_sql(f"SELECT 1 FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu"),
             {"bu": bu}, max_rows=1,
         )
-        if not int(rows[0]["n"] or 0):
+        if not rows:
             known, _ = self.db.query(
-                f"SELECT DISTINCT BUSINESS_UNIT AS bu FROM {p}PS_LEDGER ORDER BY BUSINESS_UNIT",
+                f"SELECT BUSINESS_UNIT AS bu FROM {p}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT",
                 {}, max_rows=25,
             )
             return {
@@ -157,11 +160,12 @@ class TBEngine:
                 "known_business_units": [r["bu"] for r in known],
             }
         rows, _ = self.db.query(
-            f"SELECT COUNT(*) AS n FROM {p}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led",
+            self.db.exists_sql(
+                f"SELECT 1 FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu AND LEDGER = :led"
+            ),
             {"bu": bu, "led": led}, max_rows=1,
         )
-        if not int(rows[0]["n"] or 0):
+        if not rows:
             known, _ = self.db.query(
                 f"SELECT DISTINCT LEDGER AS l FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu",
                 {"bu": bu}, max_rows=25,
@@ -186,6 +190,24 @@ class TBEngine:
             ),
             "fiscal_years_with_data": years,
         }
+
+    def base_currency_for(self, business_unit: str) -> str:
+        """Base currency of a GL business unit, cached. Used to bind a literal
+        currency into ledger queries instead of a column-to-column predicate."""
+        key = ("__basecur__", business_unit)
+        if key not in self._setid_cache:
+            cur = ""
+            try:
+                rows, _ = self.db.query(
+                    f"SELECT BASE_CURRENCY AS c FROM {self.db.prefix}PS_BUS_UNIT_TBL_GL "
+                    "WHERE BUSINESS_UNIT = :bu",
+                    {"bu": business_unit}, max_rows=1,
+                )
+                cur = (rows[0]["c"] or "").strip() if rows else ""
+            except Exception:
+                cur = ""
+            self._setid_cache[key] = cur or (self.cfg.defaults.base_currency or "")
+        return self._setid_cache[key]
 
     def _max_regular_period(self, fy: int) -> int:
         """Highest non-adjustment period in the calendar for this year (supports
@@ -255,6 +277,7 @@ class TBEngine:
             account=account,
             params=params,
             amount_basis=amount_basis,
+            base_currency=self.base_currency_for(bu),
         )
         if self.cfg.db.use_views:
             params.pop("setid", None)
@@ -800,7 +823,10 @@ class TBEngine:
             "fy": fy,
             "maxper": per,
         }
-        raw, _ = self.db.query(q.tree_rollup(self.db, params), params, max_rows=INTERNAL_ROW_CAP)
+        raw, _ = self.db.query(
+            q.tree_rollup(self.db, params, base_currency=self.base_currency_for(bu)),
+            params, max_rows=INTERNAL_ROW_CAP,
+        )
         piv = self._pivot(raw, ["tree_node"], per, False)
         nodes = []
         order = {r["tree_node"]: r["node_ord"] for r in raw}

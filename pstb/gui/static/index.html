@@ -206,8 +206,22 @@ const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(und
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='tb', LAST=null;
 
+const REQ_TIMEOUT_MS=180000;
 async function api(path,opts){
-  const r=await fetch(path,opts);
+  // A hung database query must surface as an error, not an endless spinner.
+  const ctl=new AbortController();
+  const timer=setTimeout(()=>ctl.abort(),REQ_TIMEOUT_MS);
+  let r;
+  try{ r=await fetch(path,Object.assign({signal:ctl.signal},opts||{})); }
+  catch(e){
+    clearTimeout(timer);
+    if(e.name==='AbortError')
+      throw new Error('Request timed out after '+(REQ_TIMEOUT_MS/1000)+'s. The database query '+
+        'is still running or the scope is too broad — narrow the business unit, fiscal year, '+
+        'period or account range.');
+    throw e;
+  }
+  clearTimeout(timer);
   const j=await r.json().catch(()=>({detail:'bad response'}));
   if(!r.ok) throw new Error(j.detail||j.error||('HTTP '+r.status));
   return j;
@@ -614,8 +628,13 @@ async function send(){
   const think=el('div','msg bot','<span class="spin"></span> Working…');
   msgs.append(think); msgs.scrollTop=msgs.scrollHeight;
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:m})});
+    const ctl=new AbortController();
+    const timer=setTimeout(()=>ctl.abort(),REQ_TIMEOUT_MS);
+    let r;
+    try{
+      r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message:m}),signal:ctl.signal});
+    } finally { clearTimeout(timer); }
     const j=await r.json();
     think.remove();
     (j.tool_calls||[]).forEach(c=>{
@@ -633,7 +652,14 @@ async function send(){
       b.innerHTML='<div class="who">Assistant commentary — figures above are from the ledger</div>'+esc(j.answer);
       msgs.append(b);
     }
-  }catch(e){ think.remove(); msgs.append(el('div','msg err',esc(e.message))); }
+  }catch(e){
+    think.remove();
+    const m2=e.name==='AbortError'
+      ? 'Timed out after '+(REQ_TIMEOUT_MS/1000)+'s. The tool call is still running against the '+
+        'database — narrow the scope, or raise db.query_timeout_seconds.'
+      : e.message;
+    msgs.append(el('div','msg err',esc(m2)));
+  }
   msgs.scrollTop=msgs.scrollHeight;
 }
 
