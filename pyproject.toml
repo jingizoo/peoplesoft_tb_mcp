@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peoplesoft-tb-mcp"
+version = "0.1.0"
+description = "MCP server + LLM chat client for querying a PeopleSoft trial balance (Ollama or Gemini on Vertex AI)"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+llm = [
+    "ollama>=0.4.7",
+    "google-genai>=1.16.0",
+]
+oracle = ["oracledb>=2.4"]
+sqlserver = ["pyodbc>=5.1"]
+
+[project.scripts]
+pstb-server = "pstb.server:main"
+pstb-chat = "pstb.client.chat:main"
+
+[tool.setuptools.packages.find]
+include = ["pstb*"]

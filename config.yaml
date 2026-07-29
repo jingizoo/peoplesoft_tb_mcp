@@ -1,0 +1,36 @@
+# PeopleSoft TB agent configuration.
+# Secrets (DB passwords, API tokens, GCP project) live in .env — see .env.example.
+
+defaults:
+  business_unit: US001
+  ledger: ACTUALS
+  setid: SHARE            # SETID for chartfield tables when SET_CNTRL lookup is unavailable
+  calendar_id: "01"       # detail calendar used to resolve dates -> fiscal year/period
+  base_currency: USD
+  adjustment_periods: [998]
+  suspense_accounts: ["1999"]
+  retained_earnings_account: "3500"
+  account_tree: ACCOUNT   # default PSTREE name for rollups
+
+db:
+  backend: sqlite         # sqlite | oracle | sqlserver
+  sqlite_path: sample_data/ps_sample.db
+  schema: ""              # e.g. SYSADM when querying the PS schema from another user
+  use_views: false        # set true once sql/oracle/XX_TB_*.sql views are deployed
+
+llm:
+  provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)
+  ollama_host: http://localhost:11434
+  ollama_model: llama3.1:8b
+  gemini_model: gemini-2.5-flash
+  gemini_location: us-central1
+  temperature: 0.2
+
+wiki:
+  provider: auto          # confluence | localdocs | auto (confluence when configured, else local docs)
+  localdocs_path: sample_wiki
+  confluence_space: ""    # optional space key filter, e.g. FIN
+
+tools:
+  allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
+  max_rows: 200           # cap on rows returned to the LLM
