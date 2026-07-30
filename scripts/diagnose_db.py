@@ -119,6 +119,24 @@ def main() -> int:
                             base_currency=engine.base_currency_for(bu))
     timed("TB aggregate, accounts 1%", lambda: db.query(sql2, params2, max_rows=100_000))
 
+    print("\n6. AR / Billing record shapes (what the curated tools adapt to)")
+    try:
+        from pstb.ar import ARBilling
+        arb = ARBilling(engine)
+        for t in ("PS_ITEM", "PS_CUSTOMER", "PS_BI_HDR", "PS_INTFC_BI"):
+            cols = sorted(arb._cols(t))
+            print(f"   {t}: " + (", ".join(cols) if cols
+                                 else "NOT READABLE (missing table or grants)"))
+        shape = arb._item_shape()
+        print(f"   -> item dating column: {shape['date'] or '(none; DUE_DT only)'}"
+              f" | due: {shape['due'] or '-'}"
+              f" | dispute: {shape['dispute'] or '-'}"
+              f" | currency: {shape['currency'] or '-'}")
+        for n in shape["notes"]:
+            print(f"   note: {n}")
+    except Exception as e:
+        print(f"   AR shape check failed: {e}")
+
     print("""
 Reading this:
   - Step 4 slow but step 5 fast    -> volume; narrow the scope or add an index

@@ -564,6 +564,10 @@ function renderAging(d){
   if(d.warning){
     frag.append(el('div','card','<div class="pad" style="color:var(--warn)">'+esc(d.warning)+'</div>'));
   }
+  if(d.record_notes&&d.record_notes.length){
+    frag.append(el('div','card','<div class="pad" style="color:var(--muted);font-size:12px">'+
+      d.record_notes.map(esc).join('<br>')+'</div>'));
+  }
   const c=el('div','card');
   c.append(el('h2',null,'Aging by customer <span class="sub">as of '+esc(d.as_of)+
     (d.display_currency?' · in '+esc(d.display_currency):'')+'</span>'));
@@ -671,9 +675,16 @@ function renderBilling(d){
   const frag=document.createDocumentFragment();
   const issue=d.issues.length;
   frag.append(tiles([
-    ['Pipeline health',issue?issue+' issue'+(issue>1?'s':''):'Clean',issue?'need review':'no exceptions',issue?'cr':'dr'],
+    ['Pipeline health',
+      issue?issue+' issue'+(issue>1?'s':''):(d.control_status==='checks_incomplete'?'Incomplete':'Clean'),
+      issue?'need review':(d.control_status==='checks_incomplete'?'some checks skipped':'no exceptions'),
+      issue?'cr':'dr'],
     ...d.statuses.slice(0,3).map(st=>[esc(st.descr),money(st.amount),st.n+' invoice'+(st.n>1?'s':''),''])
   ]));
+  if(d.record_notes&&d.record_notes.length){
+    frag.append(el('div','card','<div class="pad" style="color:var(--muted);font-size:12px">'+
+      d.record_notes.map(esc).join('<br>')+'</div>'));
+  }
   const mk=(title,ok,rows,cols)=>{
     const c=el('div','card');
     c.append(el('h2',null,esc(title)+' <span class="badge '+(ok?'ok':'warn')+'">'+(ok?'Pass':'Review')+'</span>'));

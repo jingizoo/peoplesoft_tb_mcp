@@ -7,8 +7,12 @@ Semantics (deliberate, reviewed):
     NOT reconstruct history — items closed since then are gone, partial
     payments show today's residual. Such results are labeled an approximation;
     true historical aging needs PS_ITEM_ACTIVITY reconstruction (future work).
-  - Aging buckets classify by days past COALESCE(DUE_DT, ACCTG_DT) at the
-    as-of date; items count when ACCTG_DT <= as-of.
+  - Aging buckets classify by days past COALESCE(DUE_DT, <item date>) at the
+    as-of date; items count when <item date> <= as-of. The item-date column
+    VARIES BY SITE (ACCTG_DT on some releases, ASOF_DT on others), so the
+    PS_ITEM shape is introspected at runtime and every adaptation is
+    disclosed in record_notes — curated SQL adapts to the database in front
+    of it, never assumes the reference layout.
   - The GL tie-out is decoupled from the as-of date: it compares ALL current
     open items against the AR control balance through the LATEST POSTED
     period, and says so ("basis"). Comparing a date-cut subledger to a
@@ -25,6 +29,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Optional
 
+from . import queries as q
+from .db import DbError
 from .engine import EngineError, TBEngine, r2
 
 BILL_STATUS_DESCR = {
@@ -67,6 +73,8 @@ class ARBilling:
         self.cfg = engine.cfg
         self.db = engine.db
         self._latest_posted: dict[str, tuple] = {}
+        self._colcache: dict[str, set] = {}
+        self._shapes: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ utils
     def _asof(self, as_of_date: str) -> str:
@@ -146,6 +154,90 @@ class ARBilling:
         self._latest_posted[bu] = (fy, per, end_dt)
         return self._latest_posted[bu]
 
+    # -------------------------------------------------- record-shape adaption
+    _ITEM_REQUIRED = ("BUSINESS_UNIT", "CUST_ID", "ITEM", "ITEM_STATUS",
+                      "BAL_AMT")
+
+    def _cols(self, table: str) -> set:
+        """Column names a record ACTUALLY has at this site (cached). Record
+        shapes differ by PeopleSoft release and customization — curated SQL
+        must adapt to the database in front of it, not assume a layout."""
+        t = table.upper()
+        if t not in self._colcache:
+            names: set = set()
+            try:
+                params: dict = {}
+                sql = q.table_describe(self.db, t, params)
+                rows, _ = self.db.query(sql, params, max_rows=500)
+                names = {str(r.get("column_name") or r.get("name") or "").upper()
+                         for r in rows} - {""}
+            except Exception:
+                names = set()
+            if not names:
+                # A transient failure (or missing table) must not poison the
+                # cache for the life of the process — retry next call.
+                return set()
+            self._colcache[t] = names
+        return self._colcache[t]
+
+    def _item_shape(self) -> dict:
+        """Which optional PS_ITEM columns exist here, with fallbacks: item
+        date ACCTG_DT -> ASOF_DT -> due-date-only aging; DISPUTE_STATUS and
+        BAL_CURRENCY may be absent. Every adaptation becomes a record_note."""
+        if "PS_ITEM" in self._shapes:
+            return self._shapes["PS_ITEM"]
+        cols = self._cols("PS_ITEM")
+        if not cols:
+            # Not cached: if introspection heals on a later call, adapt then.
+            return {"date": "ACCTG_DT", "due": "DUE_DT",
+                    "dispute": "DISPUTE_STATUS", "currency": "BAL_CURRENCY",
+                    "notes": ["Could not read PS_ITEM's column list "
+                              "(permissions?); assuming the reference shape."]}
+        missing = [c for c in self._ITEM_REQUIRED if c not in cols]
+        if missing:
+            raise ARError(
+                f"PS_ITEM at this site is missing required column(s) "
+                f"{', '.join(missing)} — AR tools cannot run against it. "
+                "Check that db.schema in config.yaml names the record owner "
+                "(usually SYSADM) and run python scripts/diagnose_db.py."
+            )
+        notes: list[str] = []
+        date_c = next((c for c in ("ACCTG_DT", "ASOF_DT") if c in cols), "")
+        due_c = "DUE_DT" if "DUE_DT" in cols else ""
+        if not date_c and not due_c:
+            raise ARError(
+                "PS_ITEM at this site has none of ACCTG_DT, ASOF_DT, DUE_DT — "
+                "aging needs at least one date column. Run "
+                "python scripts/diagnose_db.py to see the real shape."
+            )
+        if date_c != "ACCTG_DT":
+            notes.append(
+                f"PS_ITEM here has no ACCTG_DT; item dating uses "
+                f"{date_c or 'DUE_DT only'}."
+                + ("" if date_c else " The as-of cutoff cannot be applied — "
+                   "items shown are the current open set, and items without "
+                   "a due date are bucketed as current.")
+            )
+        if not due_c:
+            notes.append(f"PS_ITEM here has no DUE_DT; buckets age by days "
+                         f"since {date_c}.")
+        dispute_c = "DISPUTE_STATUS" if "DISPUTE_STATUS" in cols else ""
+        if not dispute_c:
+            notes.append("PS_ITEM here has no DISPUTE_STATUS; dispute "
+                         "amounts are not available.")
+        cur_c = "BAL_CURRENCY" if "BAL_CURRENCY" in cols else ""
+        if not cur_c:
+            notes.append("PS_ITEM here has no BAL_CURRENCY; amounts are "
+                         "assumed to be in the BU base currency.")
+        shape = {"date": date_c, "due": due_c, "dispute": dispute_c,
+                 "currency": cur_c, "notes": notes}
+        self._shapes["PS_ITEM"] = shape
+        return shape
+
+    def _aging_basis(self, shape: dict) -> str:
+        parts = [f"I.{c}" for c in (shape["due"], shape["date"]) if c]
+        return f"COALESCE({', '.join(parts)})" if len(parts) > 1 else parts[0]
+
     # ------------------------------------------------------------ GL tie-out
     def _gl_tie(self, bu: str) -> dict:
         """Reconcile ALL current open items to the AR control through the
@@ -154,12 +246,21 @@ class ARBilling:
         accounts = [str(a) for a in (self.cfg.defaults.ar_control_accounts or ["1100"])]
         p = self.db.prefix
         base = self.e.base_currency_for(bu) or "USD"
-        rows, _ = self.db.query(
-            f"SELECT BAL_CURRENCY AS currency, SUM(BAL_AMT) AS bal "
-            f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O' "
-            "GROUP BY BAL_CURRENCY",
-            {"bu": bu}, max_rows=50,
-        )
+        shape = self._item_shape()
+        if shape["currency"]:
+            rows, _ = self.db.query(
+                f"SELECT {shape['currency']} AS currency, SUM(BAL_AMT) AS bal "
+                f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O' "
+                f"GROUP BY {shape['currency']}",
+                {"bu": bu}, max_rows=50,
+            )
+        else:
+            one, _ = self.db.query(
+                f"SELECT SUM(BAL_AMT) AS bal FROM {p}PS_ITEM "
+                "WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'",
+                {"bu": bu}, max_rows=1,
+            )
+            rows = [{"currency": "", "bal": one[0]["bal"] if one else 0.0}]
         # Convert at PERIOD-END rates: the GL side is the balance through the
         # latest posted period, so a rate that changed after period end must
         # not move the subledger side and fabricate a break.
@@ -222,10 +323,13 @@ class ARBilling:
 
     # ------------------------------------------------------------------ aging
     def _summary_sql(self, edges: list[int], labels: list[str],
-                     cust_filter: bool) -> str:
+                     cust_filter: bool, shape: dict) -> str:
         p = self.db.prefix
-        dd = self.db.days_past_expr("COALESCE(I.DUE_DT, I.ACCTG_DT)", "asof")
-        cases = [f"SUM(CASE WHEN {dd} <= 0 THEN I.BAL_AMT ELSE 0 END) AS b0"]
+        dd = self.db.days_past_expr(self._aging_basis(shape), "asof")
+        # A NULL aging basis (item with no usable date) must land in a bucket,
+        # not silently fall out of every CASE and vanish from the totals.
+        cases = [f"SUM(CASE WHEN {dd} <= 0 OR ({dd}) IS NULL "
+                 "THEN I.BAL_AMT ELSE 0 END) AS b0"]
         lo = 1
         for i, e in enumerate(edges, start=1):
             cases.append(
@@ -237,33 +341,52 @@ class ARBilling:
             f"SUM(CASE WHEN {dd} > {int(edges[-1])} THEN I.BAL_AMT ELSE 0 END) "
             f"AS b{len(edges) + 1}"
         )
-        dispute = _NONBLANK.format(col="I.DISPUTE_STATUS")
+        if shape["dispute"]:
+            dispute = _NONBLANK.format(col=f"I.{shape['dispute']}")
+            disp_term = (f"SUM(CASE WHEN {dispute} THEN I.BAL_AMT ELSE 0 END) "
+                         "AS disputed_amt")
+        else:
+            disp_term = "SUM(0) AS disputed_amt"
+        cur_sel = (f"I.{shape['currency']} AS currency" if shape["currency"]
+                   else "'' AS currency")
+        group_cur = f", I.{shape['currency']}" if shape["currency"] else ""
+        asof_cut = (f"\n   AND I.{shape['date']} <= {self.db.date_bind('asof')}"
+                    if shape["date"] else "")
         cust_clause = " AND I.CUST_ID = :cust" if cust_filter else ""
         return f"""SELECT I.CUST_ID AS cust_id, C.NAME1 AS name,
-       C.CUST_STATUS AS cust_status, I.BAL_CURRENCY AS currency,
+       C.CUST_STATUS AS cust_status, {cur_sel},
        {', '.join(cases)},
        SUM(I.BAL_AMT) AS total,
        SUM(CASE WHEN I.BAL_AMT < 0 THEN I.BAL_AMT ELSE 0 END) AS credit_amt,
-       SUM(CASE WHEN {dispute} THEN I.BAL_AMT ELSE 0 END) AS disputed_amt,
+       {disp_term},
        MAX(CASE WHEN {dd} > 0 THEN {dd} ELSE 0 END) AS oldest_days,
        COUNT(*) AS item_count
   FROM {p}PS_ITEM I
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = I.CUST_ID
  WHERE I.BUSINESS_UNIT = :bu
-   AND I.ITEM_STATUS = 'O'
-   AND I.ACCTG_DT <= {self.db.date_bind('asof')}{cust_clause}
- GROUP BY I.CUST_ID, C.NAME1, C.CUST_STATUS, I.BAL_CURRENCY"""
+   AND I.ITEM_STATUS = 'O'{asof_cut}{cust_clause}
+ GROUP BY I.CUST_ID, C.NAME1, C.CUST_STATUS{group_cur}"""
 
-    def _detail_sql(self, cust_filter: bool) -> str:
+    def _detail_sql(self, cust_filter: bool, shape: dict) -> str:
         p = self.db.prefix
         cust_clause = " AND I.CUST_ID = :cust" if cust_filter else ""
+        date_sel = (f"I.{shape['date']} AS acctg_dt" if shape["date"]
+                    else "NULL AS acctg_dt")
+        due_sel = (f"I.{shape['due']} AS due_dt" if shape["due"]
+                   else "NULL AS due_dt")
+        cur_sel = (f"I.{shape['currency']} AS currency" if shape["currency"]
+                   else "'' AS currency")
+        disp_sel = (f"I.{shape['dispute']} AS dispute" if shape["dispute"]
+                    else "NULL AS dispute")
+        asof_cut = (f"\n   AND I.{shape['date']} <= {self.db.date_bind('asof')}"
+                    if shape["date"] else "")
+        order_c = shape["due"] or shape["date"]
         return f"""SELECT I.CUST_ID AS cust_id, I.ITEM AS item, I.BAL_AMT AS bal_amt,
-       I.BAL_CURRENCY AS currency,
-       I.ACCTG_DT AS acctg_dt, I.DUE_DT AS due_dt, I.DISPUTE_STATUS AS dispute
+       {cur_sel},
+       {date_sel}, {due_sel}, {disp_sel}
   FROM {p}PS_ITEM I
- WHERE I.BUSINESS_UNIT = :bu AND I.ITEM_STATUS = 'O'
-   AND I.ACCTG_DT <= {self.db.date_bind('asof')}{cust_clause}
- ORDER BY I.CUST_ID, I.DUE_DT"""
+ WHERE I.BUSINESS_UNIT = :bu AND I.ITEM_STATUS = 'O'{asof_cut}{cust_clause}
+ ORDER BY I.CUST_ID, I.{order_c}"""
 
     def _rate_to(self, cur: str, disp: str, asof: str,
                  cache: dict, base: str = "") -> float:
@@ -305,11 +428,13 @@ class ARBilling:
         setid = self.e.resolve_setid(bu, "CUSTOMER")
         cust = (customer_id or "").strip()
 
+        shape = self._item_shape()
         params: dict = {"bu": bu, "setid": setid, "asof": asof}
         if cust:
             params["cust"] = cust
-        rows, _ = self.db.query(self._summary_sql(edges, labels, bool(cust)),
-                                params, max_rows=10_000)
+        rows, _ = self.db.query(
+            self._summary_sql(edges, labels, bool(cust), shape),
+            params, max_rows=10_000)
         if not rows and not self._bu_exists(bu):
             known, _ = self.db.query(
                 f"SELECT BUSINESS_UNIT AS bu FROM {self.db.prefix}PS_BUS_UNIT_TBL_GL "
@@ -380,6 +505,8 @@ class ARBilling:
         if any(len(c["currencies"]) > 1 or c["currencies"] != [disp]
                for c in customers):
             out["fx_applied"] = sorted(n for _, n in fx_cache.values())
+        if shape["notes"]:
+            out["record_notes"] = list(shape["notes"])
 
         _fy, _per, latest_end = self._latest_posted_period(bu)
         if latest_end and asof < latest_end:
@@ -393,8 +520,17 @@ class ARBilling:
             )
 
         if detail or cust:
-            items, truncated = self.db.query(self._detail_sql(bool(cust)),
-                                             params, max_rows=DETAIL_ROW_CAP)
+            # Pass ONLY the binds the detail SQL actually references — a
+            # stray bind name is a DPY-4008 on Oracle thin mode (sqlite
+            # silently ignores extras, so tests here cannot catch it).
+            dparams: dict = {"bu": bu}
+            if cust:
+                dparams["cust"] = cust
+            if shape["date"]:
+                dparams["asof"] = asof
+            items, truncated = self.db.query(
+                self._detail_sql(bool(cust), shape),
+                dparams, max_rows=DETAIL_ROW_CAP)
             det = []
             for r in items:
                 basis = _iso_opt(r["due_dt"]) or _iso_opt(r["acctg_dt"])
@@ -458,7 +594,8 @@ class ARBilling:
             "note": result["note"],
         }
         out["display_currency"] = result.get("display_currency")
-        for k in ("historical_approximation", "warning", "fx_applied"):
+        for k in ("historical_approximation", "warning", "fx_applied",
+                  "record_notes"):
             if k in result:
                 out[k] = result[k]
         return out
@@ -499,15 +636,34 @@ class ARBilling:
                  ).isoformat()
         p = self.db.prefix
         setid = self.e.resolve_setid(bu, "CUSTOMER")
+        bi = self._cols("PS_BI_HDR")
+        record_notes: list[str] = []
+        if bi:
+            need = [c for c in ("INVOICE_DT", "INVOICE_AMOUNT",
+                                "BILL_TO_CUST_ID") if c not in bi]
+            if need:
+                raise ARError(
+                    f"PS_BI_HDR at this site is missing {', '.join(need)} — "
+                    "cannot rank billing volume. Run "
+                    "python scripts/diagnose_db.py to see the real shape."
+                )
+        has_cur = (not bi) or ("BI_CURRENCY_CD" in bi)
+        cur_sel = ("H.BI_CURRENCY_CD AS currency" if has_cur
+                   else "'' AS currency")
+        group_cur = ", H.BI_CURRENCY_CD" if has_cur else ""
+        if not has_cur:
+            record_notes.append("PS_BI_HDR here has no BI_CURRENCY_CD; "
+                                "invoice amounts are assumed to be in the BU "
+                                "base currency.")
         rows, _ = self.db.query(
             f"""SELECT H.BILL_TO_CUST_ID AS cust_id, C.NAME1 AS name,
-       H.BI_CURRENCY_CD AS currency, COUNT(*) AS invoices,
+       {cur_sel}, COUNT(*) AS invoices,
        SUM(H.INVOICE_AMOUNT) AS billed
   FROM {p}PS_BI_HDR H
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
  WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
- GROUP BY H.BILL_TO_CUST_ID, C.NAME1, H.BI_CURRENCY_CD""",
+ GROUP BY H.BILL_TO_CUST_ID, C.NAME1{group_cur}""",
             {"bu": bu, "setid": setid, "since": since}, max_rows=10_000,
         )
         base = self.e.base_currency_for(bu) or "USD"
@@ -550,6 +706,7 @@ class ARBilling:
                     "summed across currencies. Pass display_currency (e.g. "
                     "'USD' or 'INR') to rank on converted totals."
                 ),
+                **({"record_notes": record_notes} if record_notes else {}),
             }
         ranked = sorted(by_cust.values(), key=lambda c: -c["billed"])
         total = sum(c["billed"] for c in ranked) or 1.0
@@ -576,6 +733,8 @@ class ARBilling:
             out["fx_applied"] = fx_notes
             out["fx_note"] = ("Converted server-side at effective-dated "
                               "PS_RT_RATE_TBL rates — copy figures verbatim.")
+        if record_notes:
+            out["record_notes"] = record_notes
         return out
 
     # ---------------------------------------------------------------- billing
@@ -586,9 +745,40 @@ class ARBilling:
         asof_d = _iso(asof)
         p = self.db.prefix
 
+        # Adapt to this site's PS_BI_HDR shape; unknown shape (introspection
+        # failed) assumes the reference layout.
+        bi = self._cols("PS_BI_HDR")
+        record_notes: list[str] = []
+        if bi:
+            req = [c for c in ("INVOICE", "BILL_STATUS") if c not in bi]
+            if req:
+                raise ARError(
+                    f"PS_BI_HDR at this site is missing required column(s) "
+                    f"{', '.join(req)} — run python scripts/diagnose_db.py "
+                    "and check db.schema in config.yaml."
+                )
+        def _h(col: str, alias: str) -> str:
+            if bi and col not in bi:
+                return f"NULL AS {alias}"
+            return f"{col} AS {alias}"
+        has_amt = (not bi) or ("INVOICE_AMOUNT" in bi)
+        has_dt = (not bi) or ("INVOICE_DT" in bi)
+        if not has_amt:
+            record_notes.append("PS_BI_HDR here has no INVOICE_AMOUNT; "
+                                "billing amounts are not available.")
+        if not has_dt:
+            record_notes.append("PS_BI_HDR here has no INVOICE_DT; "
+                                "days-pending and the not-loaded-to-AR check "
+                                "are not available.")
+        for c_, what in (("BILL_TO_CUST_ID", "customer ids"),
+                         ("BILL_SOURCE_ID", "billing sources")):
+            if bi and c_ not in bi:
+                record_notes.append(f"PS_BI_HDR here has no {c_}; "
+                                    f"{what} are not shown.")
+
         rows, _ = self.db.query(
             f"""SELECT BILL_STATUS AS status, COUNT(*) AS n,
-       SUM(INVOICE_AMOUNT) AS amount
+       {'SUM(INVOICE_AMOUNT)' if has_amt else 'SUM(0)'} AS amount
   FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu GROUP BY BILL_STATUS""",
             {"bu": bu}, max_rows=25,
         )
@@ -600,12 +790,12 @@ class ARBilling:
 
         pend, pend_trunc = self.db.query(
             f"""SELECT INVOICE AS invoice, BILL_STATUS AS status,
-       BILL_TO_CUST_ID AS cust_id, INVOICE_DT AS invoice_dt,
-       INVOICE_AMOUNT AS amount, BILL_SOURCE_ID AS source
+       {_h('BILL_TO_CUST_ID', 'cust_id')}, {_h('INVOICE_DT', 'invoice_dt')},
+       {_h('INVOICE_AMOUNT', 'amount')}, {_h('BILL_SOURCE_ID', 'source')}
   FROM {p}PS_BI_HDR
  WHERE BUSINESS_UNIT = :bu
    AND BILL_STATUS IN ({", ".join("'" + s + "'" for s in NOT_FINAL)})
- ORDER BY INVOICE_DT""",
+ ORDER BY {'INVOICE_DT' if has_dt else 'INVOICE'}""",
             {"bu": bu}, max_rows=1_000,
         )
         stuck = []
@@ -621,31 +811,44 @@ class ARBilling:
                     entry["no_invoice_date"] = True
                 stuck.append(entry)
 
-        intfc, _ = self.db.query(
-            f"""SELECT LOAD_STATUS_BI AS status, COUNT(*) AS n
+        # The billing interface table may be absent or unreadable at a site —
+        # degrade that section with a note rather than failing the workbench.
+        try:
+            intfc, _ = self.db.query(
+                f"""SELECT LOAD_STATUS_BI AS status, COUNT(*) AS n
   FROM {p}PS_INTFC_BI WHERE BUSINESS_UNIT = :bu GROUP BY LOAD_STATUS_BI""",
-            {"bu": bu}, max_rows=10,
-        )
-        interface = [
-            {**r, "descr": LOAD_STATUS_DESCR.get(r["status"], r["status"])}
-            for r in intfc
-        ]
-        errs, _ = self.db.query(
-            f"""SELECT INTFC_ID AS intfc_id, INTFC_LINE_NUM AS line,
+                {"bu": bu}, max_rows=10,
+            )
+            interface = [
+                {**r, "descr": LOAD_STATUS_DESCR.get(r["status"], r["status"])}
+                for r in intfc
+            ]
+            errs, _ = self.db.query(
+                f"""SELECT INTFC_ID AS intfc_id, INTFC_LINE_NUM AS line,
        BILL_TO_CUST_ID AS cust_id, BILL_SOURCE_ID AS source
   FROM {p}PS_INTFC_BI
  WHERE BUSINESS_UNIT = :bu AND LOAD_STATUS_BI = 'ERR'
  ORDER BY INTFC_ID, INTFC_LINE_NUM""",
-            {"bu": bu}, max_rows=100,
-        )
+                {"bu": bu}, max_rows=100,
+            )
+        except DbError as e:
+            interface, errs = [], []
+            intfc_ok = False
+            record_notes.append(
+                f"Billing interface (PS_INTFC_BI) not readable here — "
+                f"interface checks skipped: {e}"
+            )
+        else:
+            intfc_ok = True
 
         # Date-floored: an unfloored NOT EXISTS over all finalized history is a
         # full-history anti-join on a real PS_BI_HDR.
         since = (asof_d - dt.timedelta(days=max(int(lookback_days or 365), 1))
                  ).isoformat()
-        orphans, orph_trunc = self.db.query(
-            f"""SELECT H.INVOICE AS invoice, H.BILL_TO_CUST_ID AS cust_id,
-       H.INVOICE_DT AS invoice_dt, H.INVOICE_AMOUNT AS amount
+        if has_dt:
+            orphans, orph_trunc = self.db.query(
+                f"""SELECT H.INVOICE AS invoice, {_h('BILL_TO_CUST_ID', 'cust_id')},
+       H.INVOICE_DT AS invoice_dt, {_h('INVOICE_AMOUNT', 'amount')}
   FROM {p}PS_BI_HDR H
  WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
@@ -653,10 +856,12 @@ class ARBilling:
                     WHERE I.BUSINESS_UNIT = H.BUSINESS_UNIT
                       AND I.ITEM = H.INVOICE)
  ORDER BY H.INVOICE_DT""",
-            {"bu": bu, "since": since}, max_rows=50,
-        )
-        for o in orphans:
-            o["amount"] = r2(o["amount"] or 0)
+                {"bu": bu, "since": since}, max_rows=50,
+            )
+            for o in orphans:
+                o["amount"] = r2(o["amount"] or 0)
+        else:
+            orphans, orph_trunc = [], False
 
         issues = []
         if stuck:
@@ -677,7 +882,13 @@ class ARBilling:
             "finalized_not_in_ar": orphans,
             "lookback_days": int(lookback_days or 365),
             "issues": issues,
-            "control_status": "exceptions_found" if issues else "passed",
+            # A skipped check is NOT a pass: when days-pending, the AR-load
+            # check, or the interface checks could not run, say so.
+            "control_status": (
+                "exceptions_found" if issues
+                else ("checks_incomplete" if (not has_dt or not intfc_ok)
+                      else "passed")
+            ),
             "note": (
                 "Lifecycle: NEW/PND -> HLD -> RDY -> INV (finalized) or CAN. "
                 "'Finalized not in AR' means the invoice exists in Billing but "
@@ -686,4 +897,6 @@ class ARBilling:
         }
         if pend_trunc or orph_trunc:
             out["truncated"] = True
+        if record_notes:
+            out["record_notes"] = record_notes
         return out

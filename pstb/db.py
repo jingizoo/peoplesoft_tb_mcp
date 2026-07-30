@@ -149,12 +149,32 @@ class Database:
                 ]
             except Exception as ex:
                 msg = str(ex)
-                if "DPY-4024" in msg or "call timeout" in msg.lower() or "timeout" in msg.lower():
+                low = msg.lower()
+                if "DPY-4024" in msg or "call timeout" in low or "timeout" in low:
                     raise DbError(
                         f"Query exceeded the {self.cfg.db.query_timeout_seconds}s timeout. "
                         "Narrow the scope (business unit, fiscal year, period, account "
                         "range), confirm PS_LEDGER indexes, or raise "
                         "db.query_timeout_seconds in config.yaml."
+                    ) from ex
+                if "ora-00904" in low or "invalid identifier" in low \
+                        or "no such column" in low:
+                    raise DbError(
+                        f"Column not found — {msg.strip()}. This database's "
+                        "record shape differs from the reference layout "
+                        "(PeopleSoft records vary by release and site). Use "
+                        "describe_table to see the real columns before "
+                        "run_sql; run python scripts/diagnose_db.py to report "
+                        "the record shapes the curated tools adapt to."
+                    ) from ex
+                if "ora-00942" in low or "no such table" in low \
+                        or "table or view does not exist" in low:
+                    raise DbError(
+                        f"Table or view not found — {msg.strip()}. Check that "
+                        "db.schema in config.yaml names the record owner "
+                        "(usually SYSADM) and that the read-only user has "
+                        "SELECT grants; use list_tables to browse what is "
+                        "visible."
                     ) from ex
                 raise
             finally:

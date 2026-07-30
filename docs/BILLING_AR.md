@@ -78,6 +78,30 @@ Open items carry `BAL_CURRENCY`, and a real book mixes them. The rules:
   rather than a fabricated pass. A residual difference on real data can also
   be unrevalued FX — items booked to GL at transaction-date rates.
 
+## Record shapes vary by site
+
+Real record layouts differ by PeopleSoft release and customization: some
+sites' PS_ITEM has `ACCTG_DT`, others only `ASOF_DT`; `DISPUTE_STATUS` or
+`BAL_CURRENCY` may be absent. The AR tools **introspect the record at
+runtime** (column list cached per process) and adapt instead of assuming the
+reference layout:
+
+- Item dating: `ACCTG_DT` → `ASOF_DT` → due-date-only (the as-of cutoff is
+  then skipped, since open items are current-state anyway).
+- Missing `DISPUTE_STATUS` → dispute amounts reported as unavailable.
+- Missing `BAL_CURRENCY` / `BI_CURRENCY_CD` → amounts treated as BU base
+  currency.
+- Missing `PS_BI_HDR.INVOICE_DT` → days-pending and the not-loaded-to-AR
+  check are skipped with a note; an unreadable `PS_INTFC_BI` degrades the
+  interface section, not the whole workbench.
+
+Every adaptation is disclosed in `record_notes` (shown in the GUI and relayed
+by the model). A shape the tools cannot adapt to returns a precise error
+naming the record and columns — and any raw "invalid identifier" /
+"table does not exist" from `run_sql` is translated into the same actionable
+form. Run `python scripts/diagnose_db.py` (step 6) to print the shapes your
+site actually has.
+
 ## Relationship to the Billing/Top-20 review
 
 This pack implements the read-only core of the earlier
