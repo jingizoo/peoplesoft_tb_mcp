@@ -495,6 +495,31 @@ def main() -> None:
                  (Path(td) / "q.jsonl").read_text().splitlines()]
         check("greeting without tools not flagged", lines[-1]["failed"] is False)
 
+    print("== wiki health / demo-content disclosure ==")
+    wiki_h = LocalDocsWiki(ROOT / "sample_wiki")
+    h = wiki_h.health()
+    check("localdocs health reports connected", h["connected"] is True)
+    check("bundled sample pages flagged as demo",
+          h["is_bundled_demo_content"] is True and "fictional" in h["verdict"])
+    check("health lists the pages it serves", h["page_count"] == 3,
+          str(h["page_count"]))
+    from pstb.wiki import LocalDocsWiki as _LD
+    other = _LD(ROOT / "docs").health()
+    check("non-sample local folder NOT flagged as demo",
+          other["is_bundled_demo_content"] is False and other["page_count"] > 0)
+    # The Confluence health path needs httpx; this suite is stdlib-only, so it
+    # is covered by scripts/mcp_probe.py instead.
+    cfg_cf = Config.sample(ROOT)
+    cfg_cf.wiki.provider = "confluence"
+    cfg_cf.wiki.confluence_base_url = ""
+    try:
+        from pstb.wiki import make_wiki as _mw
+        _mw(cfg_cf)
+        check("provider=confluence fails closed without credentials", False)
+    except Exception as ex:
+        check("provider=confluence fails closed without credentials",
+              "CONFLUENCE_BASE_URL" in str(ex))
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

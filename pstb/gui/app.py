@@ -78,6 +78,11 @@ def meta():
         "backend": cfg.db.backend,
         "use_views": cfg.db.use_views,
         "wiki": getattr(wiki, "provider_name", None),
+        "wiki_demo": bool(
+            wiki is not None
+            and getattr(wiki, "provider_name", "") == "localdocs"
+            and (wiki.health() or {}).get("is_bundled_demo_content")
+        ),
         "llm": {"provider": cfg.llm.provider,
                 "model": cfg.llm.ollama_model if cfg.llm.provider == "ollama"
                 else cfg.llm.gemini_model},
@@ -268,6 +273,18 @@ def billing(business_unit: str = "", days_stuck: int = 5, as_of_date: str = ""):
 @app.get("/api/accounts")
 def accounts(query: str = "", account_type: str = "", limit: int = 300):
     return _guard(engine.search_accounts, query=query, account_type=account_type, limit=limit)
+
+
+@app.get("/api/wiki/health")
+def wiki_health():
+    if wiki is None:
+        return {"provider": None, "connected": False,
+                "verdict": "No wiki provider configured."}
+    try:
+        return wiki.health()
+    except Exception as e:
+        return {"provider": getattr(wiki, "provider_name", None),
+                "connected": False, "error": str(e)}
 
 
 @app.get("/api/wiki/search")
