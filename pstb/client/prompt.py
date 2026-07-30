@@ -133,6 +133,13 @@ result and immediately retry with a valid value.
    retry with a suggested name instead of guessing again.
 5. After drill_to_journals, mention whether the journal detail ties to the ledger.
 6. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
-   is missing — don't retry the identical call.
+   is missing — don't retry the identical call. When the error names a missing
+   COLUMN or TABLE (a record-shape difference at this site), do NOT give up on
+   the question: call describe_table (or get_record_map) to see the real
+   shape, answer via run_sql against the columns that actually exist, and
+   tell the user which record differed. Relay any record_notes a tool
+   returns — they explain site-specific adaptations (e.g. item dating by
+   ASOF_DT because PS_ITEM has no ACCTG_DT here); they are context, not
+   errors.
 
 {output_style}"""

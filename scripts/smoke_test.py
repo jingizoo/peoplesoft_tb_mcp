@@ -454,6 +454,129 @@ def main() -> None:
           "at 2026-06-30 rates" in inr["gl_tie"]["basis"],
           inr["gl_tie"]["basis"])
 
+    print("== AR record-shape adaptation ==")
+    # Simulate a real site whose PS_ITEM has ASOF_DT (not ACCTG_DT) and no
+    # DISPUTE_STATUS — the exact mismatch that raised ORA-00904 on Oracle.
+    import shutil as _sh
+    import sqlite3 as _sq
+    import tempfile as _tf
+    from pstb.db import DbError
+    _tmpd = Path(_tf.mkdtemp(prefix="pstb_shape_"))
+    _var = _tmpd / "variant.db"
+    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _var)
+    _vc = _sq.connect(_var)
+    _vc.executescript("""
+ALTER TABLE PS_ITEM RENAME TO PS_ITEM_OLD;
+CREATE TABLE PS_ITEM (BUSINESS_UNIT TEXT, CUST_ID TEXT, ITEM TEXT, ITEM_LINE INTEGER,
+  ITEM_STATUS TEXT, BAL_AMT REAL, ORIG_ITEM_AMT REAL, BAL_CURRENCY TEXT,
+  ASOF_DT TEXT, DUE_DT TEXT, PO_REF TEXT);
+INSERT INTO PS_ITEM SELECT BUSINESS_UNIT, CUST_ID, ITEM, ITEM_LINE, ITEM_STATUS,
+  BAL_AMT, ORIG_ITEM_AMT, BAL_CURRENCY, ACCTG_DT, DUE_DT, PO_REF FROM PS_ITEM_OLD;
+DROP TABLE PS_ITEM_OLD;
+""")
+    _vc.commit(); _vc.close()
+    cfg_v = Config.sample(ROOT)
+    cfg_v.db.sqlite_path = str(_var)
+    arv = ARBilling(TBEngine(Database(cfg_v), cfg_v))
+    agv = arv.aging(as_of_date="2026-07-30", detail=True)
+    check("aging adapts when ACCTG_DT is absent (ASOF_DT dating)",
+          agv["gl_tie"]["ties"]
+          and agv["totals"]["total"] == ag["totals"]["total"],
+          str(agv["totals"]["total"]))
+    check("adaptation disclosed via record_notes",
+          any("ASOF_DT" in n for n in agv.get("record_notes", []))
+          and any("DISPUTE_STATUS" in n for n in agv.get("record_notes", [])),
+          str(agv.get("record_notes")))
+    check("missing dispute column degrades to zero, not a crash",
+          agv["totals"]["disputed_amt"] == 0.0
+          and len(agv["items"]) == len(agd["items"]))
+    inrv = arv.aging(as_of_date="2026-07-30", display_currency="INR")
+    check("display currency still converts on the adapted shape",
+          inrv["gl_tie"]["ties"]
+          and abs(inrv["totals"]["total"] - inr["totals"]["total"]) < 0.01)
+    cuv = arv.customer("beacon", as_of_date="2026-07-30")
+    check("customer 360 works on the adapted shape and carries notes",
+          cuv["customer"]["cust_id"] == "C1004" and "record_notes" in cuv)
+    wbv = arv.billing_workbench(as_of_date="2026-07-30")
+    check("workbench unaffected by the PS_ITEM shape",
+          wbv["control_status"] == "exceptions_found")
+    check("reference shape produces no record_notes", "record_notes" not in ag)
+    try:
+        arv.db.query("SELECT NO_SUCH_COL FROM PS_ITEM", {}, max_rows=1)
+        check("missing column translates to remediation", False)
+    except DbError as e:
+        check("missing column translates to remediation",
+              "record shape" in str(e) and "describe_table" in str(e),
+              str(e)[:90])
+    try:
+        arv.db.query("SELECT 1 FROM PS_NOPE_TBL", {}, max_rows=1)
+        check("missing table translates to remediation", False)
+    except DbError as e:
+        check("missing table translates to remediation",
+              "list_tables" in str(e), str(e)[:90])
+    check("failed introspection is not cached (no poison)",
+          arv._cols("PS_NOPE_TBL") == set()
+          and "PS_NOPE_TBL" not in arv._colcache)
+    # No stray binds on ANY AR SQL: a bind name absent from the statement is a
+    # DPY-4008 on Oracle thin mode; sqlite ignores extras, so assert directly.
+    import re as _re
+    def _bind_audit(a, **kw):
+        seen, orig = [], a.db.query
+        def spy(sql, params=None, max_rows=None):
+            seen.append((sql, dict(params or {})))
+            return orig(sql, params, max_rows=max_rows)
+        a.db.query = spy
+        try:
+            a.aging(**kw)
+        finally:
+            a.db.query = orig
+        return [(s[:60], sorted(set(p) - set(_re.findall(r":(\w+)", s))))
+                for s, p in seen if set(p) - set(_re.findall(r":(\w+)", s))]
+    check("no stray binds in reference-shape aging (detail+filter)",
+          _bind_audit(arb, as_of_date="2026-07-30", detail=True,
+                      customer_id="C1006") == [], "")
+    check("no stray binds in adapted-shape aging",
+          _bind_audit(arv, as_of_date="2026-07-30", detail=True) == [], "")
+
+    # Due-only shape (neither ACCTG_DT nor ASOF_DT): the NULL-DUE_DT item must
+    # land in a bucket, never vanish from the totals
+    _var2 = _tmpd / "due_only.db"
+    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _var2)
+    _vc2 = _sq.connect(_var2)
+    _vc2.executescript("""
+ALTER TABLE PS_ITEM RENAME TO PS_ITEM_OLD;
+CREATE TABLE PS_ITEM (BUSINESS_UNIT TEXT, CUST_ID TEXT, ITEM TEXT, ITEM_LINE INTEGER,
+  ITEM_STATUS TEXT, BAL_AMT REAL, ORIG_ITEM_AMT REAL, BAL_CURRENCY TEXT,
+  DUE_DT TEXT, PO_REF TEXT);
+INSERT INTO PS_ITEM SELECT BUSINESS_UNIT, CUST_ID, ITEM, ITEM_LINE, ITEM_STATUS,
+  BAL_AMT, ORIG_ITEM_AMT, BAL_CURRENCY, DUE_DT, PO_REF FROM PS_ITEM_OLD;
+DROP TABLE PS_ITEM_OLD;
+DROP TABLE PS_INTFC_BI;
+""")
+    _vc2.commit(); _vc2.close()
+    cfg_v2 = Config.sample(ROOT)
+    cfg_v2.db.sqlite_path = str(_var2)
+    arv2 = ARBilling(TBEngine(Database(cfg_v2), cfg_v2))
+    agv2 = arv2.aging(as_of_date="2026-07-30", detail=True)
+    check("due-only shape: undated items stay in the totals",
+          agv2["totals"]["total"] == ag["totals"]["total"]
+          and agv2["gl_tie"]["ties"],
+          f"{agv2['totals']['total']} vs {ag['totals']['total']}")
+    check("due-only shape: bucket sums still equal the grand total",
+          abs(sum(agv2["totals"][b] for b in agv2["buckets"])
+              - agv2["totals"]["total"]) < 0.01)
+    check("no stray binds in due-only aging",
+          _bind_audit(arv2, as_of_date="2026-07-30", detail=True) == [], "")
+    # A skipped check is not a pass: interface table dropped + nothing stuck
+    # in window must yield checks_incomplete, never 'passed'
+    wb2 = arv2.billing_workbench(as_of_date="2026-07-30", days_stuck=99_999,
+                                 lookback_days=1)
+    check("workbench never fabricates 'passed' when checks were skipped",
+          wb2["control_status"] == "checks_incomplete"
+          and any("PS_INTFC_BI" in n for n in wb2.get("record_notes", [])),
+          str(wb2["control_status"]))
+    _sh.rmtree(_tmpd)
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",

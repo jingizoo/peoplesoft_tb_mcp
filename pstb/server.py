@@ -276,6 +276,9 @@ def get_ar_aging(
     ranking, so use this (never convert amounts yourself) when the user wants
     figures "in USD terms" etc. Empty = the BU's base currency. fx_applied in
     the result lists the conversions performed.
+    The PS_ITEM record shape is introspected at runtime (some sites have
+    ACCTG_DT, some ASOF_DT; DISPUTE_STATUS/BAL_CURRENCY may be absent) —
+    record_notes in the result lists any adaptations; relay them.
     Positive = owed by customer; negative = credit memo / on-account receipt."""
     return _safe(
         ar.aging, business_unit=business_unit, as_of_date=as_of_date,

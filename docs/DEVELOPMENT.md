@@ -48,7 +48,10 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
 - `pstb/guards.py` — structural answer guards: continue on a promised-but-
   unmade tool call; flag a compliance verdict missing rule or figure.
 - `pstb/ar.py` — AR aging (with GL control tie-out) and billing pipeline
-  over PS_ITEM / PS_CUSTOMER / PS_BI_HDR / INTFC_BI.
+  over PS_ITEM / PS_CUSTOMER / PS_BI_HDR / INTFC_BI. Record shapes are
+  introspected at runtime (ACCTG_DT vs ASOF_DT dating, optional
+  DISPUTE_STATUS/BAL_CURRENCY) and adaptations disclosed via record_notes —
+  never assume the reference layout survives contact with a real site.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
   PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
 - `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py` and
@@ -103,7 +106,7 @@ failure mode.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 153 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 169 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.
