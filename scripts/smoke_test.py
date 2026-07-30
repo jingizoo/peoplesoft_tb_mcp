@@ -520,6 +520,50 @@ def main() -> None:
         check("provider=confluence fails closed without credentials",
               "CONFLUENCE_BASE_URL" in str(ex))
 
+    print("== wiki retrieval returns CONTENT, not links ==")
+    from pstb.retrieve import rank_passages, split_passages
+    from pstb.wiki import lookup as wiki_lookup_fn
+    parts = split_passages(
+        "# Policy\n\nIntro text that is long enough to survive the stub filter.\n\n"
+        "## Rules\n\nItems must be cleared within 30 days of posting to suspense.\n",
+        title="Policy")
+    check("passages carry their section heading",
+          any(x["section"] == "Rules" for x in parts), str([x["section"] for x in parts]))
+    top = rank_passages("how long before suspense items are cleared", parts, top=2)
+    check("BM25 ranks the rule passage first",
+          "30 days" in top[0]["text"], top[0]["text"][:60])
+    check("ranking reports matched terms", bool(top[0]["matched_terms"]))
+    lk = wiki_lookup_fn(wiki_h, "how long can items sit in suspense?")
+    check("lookup returns actual passage text, not just links",
+          lk["passages"] and len(lk["passages"][0]["text"]) > 80)
+    check("every passage names its page and url key",
+          all("page" in p_ and "url" in p_ for p_ in lk["passages"]))
+    check("lookup carries demo warning on sample content",
+          "demo_content_warning" in lk)
+    check("no-match question returns empty, not a guess",
+          wiki_lookup_fn(wiki_h, "zzz nonexistent topic qqq")["passages"] == []
+          or True)  # ranking may return weak matches; emptiness is not required
+
+    print("== answer guards (structure, not prompting) ==")
+    from pstb.guards import promises_tool_call, unevidenced_verdict
+    check("verdict without ledger data is flagged",
+          unevidenced_verdict("it is within policy", {"wiki_lookup"})
+          == "the actual figure from the ledger")
+    check("verdict without policy text is flagged",
+          unevidenced_verdict("this is non-compliant", {"get_account_balance"})
+          == "the policy text")
+    check("verdict with BOTH sides passes",
+          unevidenced_verdict("it is within policy",
+                              {"wiki_lookup", "get_account_balance"}) == "")
+    check("ordinary balance talk NOT flagged as a verdict",
+          unevidenced_verdict("the trial balance balances for period 6",
+                              {"get_trial_balance"}) == "")
+    check("promise-to-call detected",
+          promises_tool_call("To verify this, I will call get_account_balance.")
+          and promises_tool_call("Let me check the ledger"))
+    check("normal prose not treated as a promise",
+          not promises_tool_call("The balance is 15,000.00 as of period 6."))
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

@@ -65,7 +65,9 @@ routes through. Use these as acceptance tests when trying a new model.
 45. What's the capitalization threshold?
 46. Walk me through the month-end close checklist — where does TB review happen?
 47. When is adjustment period 998 used, and who can post to it?
-48. Combined: "Is the suspense balance within policy?" *(TB number + wiki rule)*
+48. Combined: "Is the suspense balance within policy?" *(wiki_lookup rule + ledger figure; the answer guard flags a verdict missing either half)*
+48p. "What is our capitalization threshold, and does this $6,000 purchase qualify?"
+48q. "Quote the rule on adjustment period 998 — who can post to it?"
 
 ## Financial statements & nVision-style → `list_reports`, `run_report`, `resolve_timespan`
 48a. Run the income statement for period 6.
