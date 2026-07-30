@@ -369,6 +369,91 @@ def business_units(db: Database) -> str:
   FROM {db.prefix}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT"""
 
 
+def ledger_business_units(db: Database) -> str:
+    """Business units that actually have GL data.
+
+    PS_BUS_UNIT_TBL_GL is useful setup metadata, but it is not a safe discovery
+    source: reporting users are often granted PS_LEDGER without the setup
+    table, and setup can contain inactive units with no accessible ledger data.
+    """
+    return f"""SELECT DISTINCT BUSINESS_UNIT AS business_unit
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT IS NOT NULL
+ ORDER BY BUSINESS_UNIT"""
+
+
+def financial_scope_pairs(db: Database) -> str:
+    """Accessible BU/ledger pairs from the leading PS_LEDGER index columns."""
+    return f"""SELECT DISTINCT BUSINESS_UNIT AS business_unit, LEDGER AS ledger
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT IS NOT NULL AND LEDGER IS NOT NULL
+ ORDER BY BUSINESS_UNIT, LEDGER"""
+
+
+def _regular_period_predicate(
+    column: str, adjustment_periods: tuple[int, ...] | list[int] = ()
+) -> str:
+    """Site-aware regular-period predicate for scope discovery.
+
+    Period zero is balance forward and 999 is year-end close. Other
+    adjustment periods are installation-specific and come from configuration,
+    so a legitimate period 13 is not silently treated as an adjustment.
+    """
+    excluded = sorted(
+        {int(value) for value in adjustment_periods if 0 < int(value) < 999}
+    )
+    predicate = f"{column} > 0 AND {column} <> 999"
+    if excluded:
+        predicate += (
+            f" AND {column} NOT IN ({', '.join(str(value) for value in excluded)})"
+        )
+    return predicate
+
+
+def scope_year_bounds(
+    db: Database, adjustment_periods: tuple[int, ...] | list[int] = ()
+) -> str:
+    """Small, indexed-scope aggregate; deliberately never counts ledger rows."""
+    regular = _regular_period_predicate(
+        "ACCOUNTING_PERIOD", adjustment_periods
+    )
+    return f"""SELECT MIN(FISCAL_YEAR) AS first_fy,
+       MAX(FISCAL_YEAR) AS last_fy,
+       MAX(CASE WHEN {regular}
+                THEN FISCAL_YEAR END) AS last_regular_fy
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT = :bu AND LEDGER = :led"""
+
+
+def scope_last_regular_period(
+    db: Database, adjustment_periods: tuple[int, ...] | list[int] = ()
+) -> str:
+    regular = _regular_period_predicate(
+        "ACCOUNTING_PERIOD", adjustment_periods
+    )
+    return f"""SELECT MAX(ACCOUNTING_PERIOD) AS last_period
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT = :bu AND LEDGER = :led AND FISCAL_YEAR = :fy
+   AND {regular}"""
+
+
+def scope_base_currency(db: Database) -> str:
+    """One representative ledger currency for setup-table-free discovery."""
+    sql = f"""SELECT BASE_CURRENCY AS base_currency
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT = :bu AND LEDGER = :led
+   AND BASE_CURRENCY IS NOT NULL"""
+    return db.exists_sql(sql)
+
+
+def business_unit_base_currency(db: Database) -> str:
+    """One PS_LEDGER base currency for a BU when setup metadata is unavailable."""
+    sql = f"""SELECT BASE_CURRENCY AS base_currency
+  FROM {db.prefix}PS_LEDGER
+ WHERE BUSINESS_UNIT = :bu AND BASE_CURRENCY IS NOT NULL"""
+    return db.exists_sql(sql)
+
+
 def ledgers_for_bu(db: Database) -> str:
     return f"""SELECT DISTINCT LEDGER AS ledger FROM {db.prefix}PS_LEDGER
  WHERE BUSINESS_UNIT = :bu ORDER BY LEDGER"""

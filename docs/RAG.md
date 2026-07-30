@@ -35,6 +35,18 @@ Two contributing factors made it worse:
 Every passage carries page title, section heading, URL and version, so an
 answer can quote a sentence and name where it came from.
 
+For a combined data-and-policy question, the agent loop now enforces the source
+order rather than trusting the model to remember it:
+
+1. validate the user-selected PeopleSoft scope;
+2. retrieve successful financial evidence from the database;
+3. only then run `wiki_lookup`;
+4. synthesize the two separately identified sources.
+
+An error, invalid scope, or `NO DATA` result stops the chain. Wiki text is never
+used as a numerical fallback. Pure policy questions may still use the wiki
+directly, and data-only questions cannot call wiki tools.
+
 ## When a vector database *is* the right call
 
 Adopt embeddings when you can point at one of these, measured — not assumed:

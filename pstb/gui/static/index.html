@@ -31,8 +31,10 @@ body{
 button,input,select{font:inherit;color:inherit}
 
 /* layout */
-.app{display:grid;grid-template-columns:210px 1fr;height:100vh}
-nav{background:var(--panel);border-right:1px solid var(--line);padding:16px 12px;display:flex;flex-direction:column;gap:2px}
+.app{display:grid;grid-template-columns:1fr;height:100vh}
+/* Ask is the product. The former browse navigation remains in the source only
+   so its proven renderers can be reused for tool results generated in chat. */
+nav{display:none}
 .brand{font-weight:650;letter-spacing:-.01em;padding:4px 10px 14px;font-size:15px}
 .brand small{display:block;font-weight:400;color:var(--muted);font-size:11.5px;letter-spacing:0}
 nav button{
@@ -50,7 +52,7 @@ nav button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
 .navfoot{margin-top:auto;padding:10px;color:var(--muted);font-size:11.5px;line-height:1.7;border-top:1px solid var(--line)}
 .navfoot b{color:var(--ink);font-weight:600}
 
-main{overflow:auto;display:flex;flex-direction:column}
+main{overflow:hidden;display:flex;flex-direction:column}
 .scope{
   position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);
   padding:10px 18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;box-shadow:var(--shadow)
@@ -110,11 +112,12 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .badge.dim{background:var(--bg);color:var(--muted)}
 
 /* chat */
-.chatwrap{display:grid;grid-template-rows:1fr auto;height:calc(100vh - 56px)}
+.chatwrap{display:grid;grid-template-rows:1fr auto auto auto;height:100vh}
 .msgs{overflow:auto;padding:18px;display:flex;flex-direction:column;gap:14px}
 .msg{max-width:min(760px,92%);padding:11px 14px;border-radius:12px;white-space:pre-wrap;line-height:1.6}
 .msg.me{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
-.fb{margin-top:8px;cursor:pointer;opacity:.45;font-size:13px;user-select:none;width:fit-content}
+.fb{margin-top:8px;cursor:pointer;opacity:.45;font-size:13px;user-select:none;width:fit-content;
+  background:none;border:0;color:inherit;padding:0}
 .fb:hover{opacity:1}
 .msg.bot .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
   font-weight:650;margin-bottom:6px}
@@ -125,6 +128,16 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .composer{border-top:1px solid var(--line);background:var(--panel);padding:12px 18px;display:flex;gap:10px}
 .composer input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
 .composer input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.chat-context{display:flex;align-items:center;gap:8px;padding:8px 18px 0;background:var(--panel);
+  color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+.scope-chip{border:1px solid var(--line);background:var(--bg);border-radius:20px;padding:5px 10px;
+  cursor:pointer;color:var(--ink);font-weight:600}
+.scope-chip:hover{border-color:var(--accent);color:var(--accent)}
+.scope-choice{display:grid;grid-template-columns:minmax(90px,1fr) minmax(90px,1fr) minmax(120px,1.4fr) auto;
+  align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)}
+.scope-choice:last-child{border-bottom:0}
+.scope-choice .scope-meta{font-size:11.5px;color:var(--muted)}
+.scope-choice .btn{justify-self:end}
 .step{align-self:stretch;display:flex;align-items:center;gap:9px;font-size:12px;color:var(--muted);
   padding:5px 2px;max-width:100%}
 .step b{color:var(--ink);font-weight:600;font-family:ui-monospace,Menlo,monospace;font-size:12px}
@@ -162,8 +175,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .hide{display:none!important}
 @media (max-width:820px){
   .app{grid-template-columns:1fr}
-  nav{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);align-items:center}
-  .brand,.navfoot{display:none}
+  .scope-choice{grid-template-columns:1fr 1fr}
+  .scope-choice .scope-meta{grid-column:1/-1}
 }
 </style>
 </head>
@@ -216,7 +229,16 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!==undefined)n.innerHTML=h;return n;};
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let META={}, VIEW='chat', LAST=null;
+let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null;
+const makeSessionId=()=>{
+  if(globalThis.crypto&&crypto.randomUUID) return crypto.randomUUID();
+  return 'chat-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
+};
+// A fresh page gets a fresh server-side history. Persisting only the session
+// id across reloads would retain invisible model context after the messages
+// themselves disappear from the page.
+let CHAT_SESSION_ID=makeSessionId();
+let CHAT_RESETTING=false;
 
 const REQ_TIMEOUT_MS=180000;
 async function api(path,opts){
@@ -242,6 +264,119 @@ const scope=()=>({bu:$('#f-bu').value,ledger:$('#f-ledger').value,fy:$('#f-fy').
 const qs=o=>Object.entries(o).filter(([,v])=>v!==''&&v!==undefined).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
 const busy=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','empty','<span class="spin"></span> '+m));};
 const oops=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(m)+'</div>'));};
+function rebuildPeriodOptions(maxRegular,selected){
+  const per=$('#f-per');
+  const maximum=Math.max(12,Number(maxRegular)||12);
+  per.innerHTML='';
+  for(let i=1;i<=maximum;i++) per.append(new Option('Period '+i,i));
+  (META.defaults?.adjustment_periods||[]).forEach(a=>per.append(new Option('Adj '+a,a)));
+  const wanted=Number(selected||0);
+  if(wanted&&!Array.from(per.options).some(o=>Number(o.value)===wanted))
+    per.append(new Option('Period '+wanted,wanted));
+  if(wanted) per.value=String(wanted);
+}
+
+function flattenScopes(scopes){
+  return (scopes||[]).flatMap(s=>(s.ledgers||[]).map(l=>{
+    const last=l.last_posted||{};
+    return {
+      business_unit:s.business_unit,descr:s.descr,base_currency:s.base_currency,
+      ledger:l.ledger,fiscal_year:Number(last.fiscal_year||0),period:Number(last.period||0),
+      fiscal_years:l.fiscal_years||[]
+    };
+  }));
+}
+function canonicalScope(value){
+  if(!value||!value.business_unit||!value.ledger) return null;
+  return {
+    business_unit:String(value.business_unit),ledger:String(value.ledger),
+    fiscal_year:Number(value.fiscal_year||0),period:Number(value.period||0)
+  };
+}
+function scopeLabel(value){
+  return value
+    ? value.business_unit+' · '+value.ledger+' · FY'+value.fiscal_year+' P'+value.period
+    : 'Choose financial scope';
+}
+function syncScopeControls(value){
+  if(!value) return;
+  const bu=$('#f-bu'),lg=$('#f-ledger'),fy=$('#f-fy'),per=$('#f-per');
+  if(![...bu.options].some(o=>o.value===value.business_unit))
+    bu.append(new Option(value.business_unit,value.business_unit));
+  bu.value=value.business_unit;
+  if(![...lg.options].some(o=>o.value===value.ledger))
+    lg.append(new Option(value.ledger,value.ledger));
+  if(![...per.options].some(o=>Number(o.value)===Number(value.period)))
+    per.append(new Option('Period '+value.period,value.period));
+  lg.value=value.ledger; fy.value=value.fiscal_year; per.value=value.period;
+}
+function updateScopeChip(){
+  const chip=$('#active-scope');
+  if(chip) chip.textContent=scopeLabel(CHAT_SCOPE);
+}
+function setChatScope(value,announce){
+  const next=canonicalScope(value);
+  if(!next) return;
+  const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
+  CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
+  if(announce&&changed&&$('#msgs')){
+    $('#msgs').append(el('div','msg bot',
+      '<div class="who">New database context</div>'+esc(scopeLabel(next))+
+      '<br><span style="color:var(--muted)">Conversation history is isolated from every other scope.</span>'));
+    $('#msgs').scrollTop=$('#msgs').scrollHeight;
+  }
+}
+function renderScopeChooser(options,onChoose,title){
+  const choices=(options||[]).map(o=>canonicalScope(o)?o:null).filter(Boolean);
+  const c=el('div','card');
+  c.append(el('h2',null,esc(title||'Choose a database scope')+
+    '<span class="sub">'+choices.length+' BU / ledger combination'+(choices.length===1?'':'s')+'</span>'));
+  if(!choices.length){
+    c.append(el('div','empty','No financial scopes were returned by PS_LEDGER.'));
+    return c;
+  }
+  const body=el('div');
+  choices.forEach(o=>{
+    const row=el('div','scope-choice');
+    row.append(
+      el('div','mono',esc(o.business_unit)),
+      el('div',null,esc(o.ledger)),
+      el('div','scope-meta',
+        esc((o.descr||o.base_currency||'')+
+          ((o.descr&&o.base_currency)?' · ':'')+(o.base_currency||''))+
+        '<br>'+(Number(o.fiscal_year||0)&&Number(o.period||0)
+          ?'Latest: FY'+Number(o.fiscal_year)+' P'+Number(o.period)
+          :'Latest period loads when selected')),
+    );
+    const use=el('button','btn','Use this scope');
+    use.onclick=async()=>{
+      let chosen=o;
+      if(!Number(o.fiscal_year||0)||!Number(o.period||0)){
+        use.disabled=true;use.textContent='Loading…';
+        try{
+          const latest=await api('/api/scope?'+qs({
+            business_unit:o.business_unit,ledger:o.ledger
+          }));
+          chosen={...o,...latest};
+        }catch(e){
+          use.disabled=false;use.textContent='Retry';
+          return;
+        }
+      }
+      setChatScope(chosen,true);
+      if(onChoose) onChoose(canonicalScope(chosen));
+    };
+    row.append(use); body.append(row);
+  });
+  c.append(body); return c;
+}
+function showScopeChooser(){
+  const msgs=$('#msgs'); if(!msgs) return;
+  const options=flattenScopes(META.financial_scopes||[]);
+  const holder=el('div','inline');
+  const chooser=renderScopeChooser(options,()=>holder.remove(),'Choose active scope');
+  holder.append(chooser);msgs.append(holder);msgs.scrollTop=msgs.scrollHeight;
+}
 
 
 /* ===== inline renderers — the UI, not the model, produces every figure ===== */
@@ -264,16 +399,24 @@ function noData(d){
 }
 function renderTB(d,opts){
   if(d.scope_status&&d.scope_status!=='ok') return noData(d);
-  const t=d.totals,bal=t.in_balance,frag=document.createDocumentFragment();
+  const t=d.totals,bal=t.in_balance,filtered=Boolean(opts&&opts.filtered);
+  const frag=document.createDocumentFragment();
   frag.append(tiles([
     ['Total debits',money(t.ending_dr),d.row_count+' accounts','dr'],
     ['Total credits',money(t.ending_cr),'','cr'],
-    ['Difference',money(Math.abs(t.ending_dr-t.ending_cr)),bal?'debits equal credits':'OUT OF BALANCE',bal?'':'cr'],
+    [filtered?'Net selected balance':'Difference',
+      money(Math.abs(t.ending_dr-t.ending_cr)),
+      filtered?'filtered rows — not a whole-ledger balance test':
+        (bal?'debits equal credits':'OUT OF BALANCE'),
+      filtered?'':(bal?'':'cr')],
     ['Period activity',money(t.period_activity),'FY'+d.fiscal_year+' P'+d.period]
   ]));
   const card=el('div','card');
-  card.append(el('h2',null,'Trial balance <span class="badge '+(bal?'ok':'bad')+'">'+(bal?'Balanced':'Out of balance')+
+  card.append(el('h2',null,(filtered?'Filtered trial-balance rows':'Trial balance')+
+    ' <span class="badge '+(filtered?'dim':(bal?'ok':'bad'))+'">'+
+    (filtered?'Selection only':(bal?'Balanced':'Out of balance'))+
     '</span><span class="sub">'+esc(d.business_unit)+' · '+esc(d.ledger)+' · FY'+d.fiscal_year+' P'+d.period+
+    (filtered&&opts.filterLabel?' · '+esc(opts.filterLabel):'')+
     ' · '+esc(d.amount_basis||'base')+' currency'+(d.include_adjustments?' · incl. adjustments':'')+'</span>'));
   const extras=(d.group_by||[]).filter(g=>g!=='ACCOUNT');
   const sc=el('div',opts&&opts.compact?'':'tscroll');
@@ -432,15 +575,9 @@ function renderJournals(d){
   sc.append(t);c.append(sc);return c;
 }
 function renderScopes(d){
-  const c=el('div','card');
-  c.append(el('h2',null,'Available scopes'));
-  const t=el('table');
-  t.innerHTML='<thead><tr><th>Business unit</th><th>Description</th><th>Base currency</th><th>Ledger</th>'+
-    '<th>Fiscal years</th></tr></thead><tbody>'+
-    d.scopes.flatMap(s=>s.ledgers.map(l=>'<tr><td class="mono">'+esc(s.business_unit)+'</td><td>'+
-      esc(s.descr||'')+'</td><td>'+esc(s.base_currency||'')+'</td><td>'+esc(l.ledger)+'</td><td>'+
-      l.fiscal_years.join(' – ')+'</td></tr>')).join('')+'</tbody>';
-  c.append(t);return c;
+  return renderScopeChooser(
+    flattenScopes(d.scopes||[]), null, 'Available database scopes'
+  );
 }
 function renderGeneric(name,d){
   const rows=Array.isArray(d)?d:(d.rows||d.accounts||d.periods||d.nodes||d.results||d.trees||d.business_units||null);
@@ -462,12 +599,21 @@ function renderGeneric(name,d){
   }
   return c;
 }
-function renderToolResult(name,data){
+function renderToolResult(name,data,args){
   if(!data||typeof data!=='object') return null;
   if(data.error) { const c=el('div','card'); c.append(el('h2',null,esc(name)+' <span class="badge bad">error</span>'),
       el('div','pad',esc(data.error))); return c; }
   try{
-    if(name==='get_trial_balance') return renderTB(data,{compact:true});
+    if(name==='get_trial_balance'){
+      const filters=[];
+      if(args&&args.account) filters.push('account '+args.account);
+      if(args&&args.dept) filters.push('department '+args.dept);
+      return renderTB(data,{
+        compact:true,
+        filtered:filters.length>0,
+        filterLabel:filters.join(' · ')
+      });
+    }
     if(name==='tb_integrity_check') return renderIntegrity(data);
     if(name==='rollup_trial_balance') return renderRollup(data);
     if(name==='compare_trial_balance') return renderCompare(data);
@@ -759,10 +905,14 @@ async function viewAR(){
   (sc0.ledgers&&sc0.ledgers.length?sc0.ledgers:[META.defaults.ledger])
     .forEach(l=>lg.append(new Option(l,l)));
   lg.value=sc0.ledger||META.defaults.ledger;
-  for(let i=1;i<=12;i++) per.append(new Option('Period '+i,i));
-  (META.defaults.adjustment_periods||[]).forEach(a=>per.append(new Option('Adj '+a,a)));
+  rebuildPeriodOptions(sc0.max_regular_period,
+    sc0.period||META.last_period_with_data||META.current.period);
   $('#f-fy').value=sc0.fiscal_year||META.current.fiscal_year;
   per.value=sc0.period||META.last_period_with_data||META.current.period;
+  const chatOptions=flattenScopes(META.financial_scopes||[]);
+  // Auto-select only when the database is unambiguous. With multiple choices,
+  // the conversation itself asks the user instead of inheriting a sample BU.
+  if(chatOptions.length===1) setChatScope(chatOptions[0],false);
   async function rescope(keepLedger){
     try{
       const d=await api('/api/scope?'+qs({business_unit:bu.value,
@@ -770,7 +920,10 @@ async function viewAR(){
       const cur=lg.value; lg.innerHTML='';
       (d.ledgers.length?d.ledgers:[d.ledger]).forEach(l=>lg.append(new Option(l,l)));
       lg.value=d.ledgers.includes(cur)&&keepLedger?cur:d.ledger;
-      if(d.fiscal_year){ $('#f-fy').value=d.fiscal_year; per.value=d.period; }
+      if(d.fiscal_year){
+        $('#f-fy').value=d.fiscal_year;
+        rebuildPeriodOptions(d.max_regular_period,d.period);
+      }
     }catch(e){ /* keep whatever is set */ }
   }
   bu.addEventListener('change',async()=>{await rescope(false); render();});
@@ -902,31 +1055,75 @@ function viewChat(){
   const w=$('#wrap'); w.style.padding='0'; w.innerHTML='';
   const wrap=el('div','chatwrap');
   const msgs=el('div','msgs'); msgs.id='msgs';
+  msgs.setAttribute('role','log');
+  msgs.setAttribute('aria-live','polite');
+  msgs.setAttribute('aria-relevant','additions');
   const hero=el('div','hero');
-  hero.innerHTML='<h1>Ask PeopleSoft Finance</h1>'+
-    '<p>Trial balance, close controls, statements, budget vs actuals, AR aging, billing pipeline — '+
-    'the relevant dashboard renders inline with each answer. Browse views are in the sidebar if you want them.</p>';
+  hero.innerHTML='<h1>Ask PeopleSoft Finance anything</h1>'+
+    '<p>Ask in plain language. The agent queries PeopleSoft first and dynamically builds the relevant '+
+    'tables, controls, statements, customer views, and approved wiki evidence inside this conversation.</p>';
   msgs.append(hero);
+  if(!CHAT_SCOPE){
+    const holder=el('div','inline');
+    holder.append(renderScopeChooser(
+      flattenScopes(META.financial_scopes||[]),()=>holder.remove(),
+      'Choose a scope for financial questions'
+    ));
+    msgs.append(holder);
+  }
   const chips=el('div','chips');
-  ['Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','What is our capitalization threshold?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 10 billing customers in INR',
+  ['What business units and ledgers exist?','Does the trial balance balance?','Why did travel expense change this period?',
+   'Is the suspense balance within policy?','What is our capitalization threshold?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 20 billing customers in INR',
    'Are there unposted journals?'].forEach(q=>{
-    const c=el('div','chip',esc(q)); c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
+    const c=el('button','chip',esc(q)); c.type='button';
+    c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });
+  const context=el('div','chat-context','<span>Active data context</span>');
+  const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
+  contextButton.id='active-scope';contextButton.onclick=showScopeChooser;context.append(contextButton);
   const comp=el('div','composer');
-  comp.innerHTML='<input id="q" placeholder="Ask a question…" autocomplete="off">'+
+  comp.innerHTML='<input id="q" aria-label="Ask a question about PeopleSoft Finance" '+
+    'placeholder="Ask a question…" autocomplete="off">'+
     '<button class="btn" id="send">Send</button><button class="btn ghost" id="clr">Clear</button>';
-  wrap.append(msgs,el('div',null,''),comp); wrap.children[1].replaceWith(chips);
+  wrap.append(msgs,chips,context,comp);
   w.append(wrap);
-  $('#send').onclick=send; $('#clr').onclick=async()=>{await api('/api/chat/reset',{method:'POST'});
-    msgs.innerHTML=''; msgs.append(el('div','empty','History cleared.'));};
+  $('#send').onclick=send; $('#clr').onclick=async()=>{
+    if(CHAT_RESETTING) return;
+    CHAT_RESETTING=true;
+    const oldSessionId=CHAT_SESSION_ID;
+    // Detach the browser from the old provider history immediately. Disabling
+    // the composer prevents a new turn from becoming invisible while the
+    // server waits for any in-flight old turn to finish resetting.
+    CHAT_SESSION_ID=makeSessionId();
+    const q=$('#q'), sendButton=$('#send'), clearButton=$('#clr');
+    q.disabled=true;sendButton.disabled=true;clearButton.disabled=true;
+    msgs.innerHTML='';msgs.append(el('div','empty','Clearing history…'));
+    try{
+      await api('/api/chat/reset',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({session_id:oldSessionId})
+      });
+      msgs.innerHTML='';msgs.append(el('div','empty','History cleared. Ask a new question.'));
+    }catch(e){
+      msgs.innerHTML='';msgs.append(el('div','msg err',
+        esc('A new chat was started, but old history cleanup failed: '+e.message)));
+    }finally{
+      CHAT_RESETTING=false;
+      q.disabled=false;sendButton.disabled=false;clearButton.disabled=false;q.focus();
+    }
+  };
   $('#q').onkeydown=e=>{if(e.key==='Enter')send()};
   $('#q').focus();
 }
-async function send(){
-  const i=$('#q'), m=i.value.trim(); if(!m) return;
+async function send(messageOverride,appendUser){
+  if(CHAT_RESETTING) return;
+  const i=$('#q');
+  const supplied=typeof messageOverride==='string';
+  const m=supplied?messageOverride.trim():i.value.trim();
+  if(!m) return;
+  if(appendUser===undefined) appendUser=true;
   const msgs=$('#msgs'); if(msgs.querySelector('.empty')) msgs.innerHTML='';
-  i.value=''; msgs.append(el('div','msg me',esc(m)));
+  i.value=''; if(appendUser) msgs.append(el('div','msg me',esc(m)));
   const think=el('div','msg bot','<span class="spin"></span> Working…');
   msgs.append(think); msgs.scrollTop=msgs.scrollHeight;
   try{
@@ -935,24 +1132,36 @@ async function send(){
     let r;
     try{
       r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({message:m}),signal:ctl.signal});
+        body:JSON.stringify({
+          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{}
+        }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
     const j=await r.json();
     think.remove();
+    if(j.scope_required){
+      const holder=el('div','inline');
+      holder.append(renderScopeChooser(j.scope_options||[],()=>{
+        holder.remove();send(m,false);
+      },j.answer||'Choose a scope'));
+      msgs.append(holder);msgs.scrollTop=msgs.scrollHeight;
+      return;
+    }
+    if(j.scope) setChatScope(j.scope,false);
     (j.tool_calls||[]).forEach(c=>{
       const step=el('div','step');
       step.innerHTML='<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
         '<span class="args">'+esc(JSON.stringify(c.args||{}).slice(0,120))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       msgs.append(step);
-      const node=renderToolResult(c.tool,c.result);
+      const node=renderToolResult(c.tool,c.result,c.args||{});
       if(node){ const holder=el('div','inline'); holder.append(node); msgs.append(holder); }
     });
     if(!r.ok||j.error) msgs.append(el('div','msg err',esc(j.error||j.detail||'Request failed')));
     else if(j.answer){
       const b=el('div','msg bot');
-      b.innerHTML='<div class="who">Assistant commentary — figures above are from the ledger</div>'+esc(j.answer)+
-        (j.turn_id?'<div class="fb" data-turn="'+esc(j.turn_id)+'" title="Flag this answer as wrong/unhelpful">&#128078;</div>':'');
+      b.innerHTML='<div class="who">Assistant commentary — cards above are verified source results</div>'+esc(j.answer)+
+        (j.turn_id?'<button class="fb" type="button" data-turn="'+esc(j.turn_id)+
+          '" aria-label="Flag this answer as wrong or unhelpful">&#128078;</button>':'');
       const fb=b.querySelector('.fb');
       if(fb) fb.onclick=async()=>{ fb.textContent='logged \u2713'; fb.style.pointerEvents='none';
         try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},

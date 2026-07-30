@@ -8,8 +8,8 @@ documentation from **Confluence** (or a local docs folder).
 
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
-│  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    30 tools     │  TB engine + guarded SQL  │
+│ dynamic chat / REPL  │◄───────────────►│  MCP server (pstb.server) │
+│ GUI + client agent   │    30 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -42,6 +42,17 @@ Then either the web UI:
 .venv/bin/python -m pstb.gui --open
 ```
 
+The web product is one **Ask PeopleSoft Finance** conversation, not a set of
+fixed dashboards. It discovers authorized BU/ledger combinations from
+`PS_LEDGER`, asks for scope when the database is ambiguous, and renders the
+appropriate trial balance, reconciliation, statement, AR, billing-customer,
+or wiki-evidence card inline. Each browser tab and selected scope has isolated
+model history.
+
+Conversation history is currently in-process. Run one GUI worker for the pilot,
+or use sticky routing if a gateway starts multiple replicas; an external
+session store is a production-scale follow-up.
+
 or the terminal chat:
 
 ```bash
@@ -56,7 +67,9 @@ Full step-by-step instructions, including work-laptop and offline notes, are in
 
 Try: *"Does the trial balance balance for period 6?"*, *"Why did travel spike
 in April?"*, *"Is the suspense balance within policy?"* — the last one combines
-a ledger number with the wiki's 30-day suspense rule. More in
+a ledger number with the wiki's 30-day suspense rule. For combined questions,
+the client enforces PeopleSoft evidence first and retrieves wiki policy only
+after the database result succeeds. More in
 [docs/QUESTIONS.md](docs/QUESTIONS.md) (a ~50-question catalog).
 
 One-shot mode: `.venv/bin/python -m pstb.client.chat --ask "total assets as of period 6?"`
@@ -159,6 +172,8 @@ PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
 [docs/RAG.md](docs/RAG.md)) · `wiki_search` · `wiki_get_page` · `wiki_health` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.
+`list_financial_scopes` returns a fast BU/ledger inventory by default; request
+activity detail only when fiscal-year ranges or latest periods are needed.
 
 Key semantics baked in: signed amounts (credits negative), period 0 beginning
 balances, adjustment period 998, ending(P) = Σ periods 0..P, effective-dated
