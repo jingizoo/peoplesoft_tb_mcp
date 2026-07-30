@@ -23,9 +23,18 @@ from .llm_base import LLMProvider, LLMResponse, ToolResult, ToolSpec
 from .prompt import system_prompt
 
 MAX_TOOL_ROUNDS = 10
-MAX_TOOL_RESULT_CHARS = 24_000
+MAX_TOOL_RESULT_CHARS = 24_000  # mutable via set_tool_result_limit()
 
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+
+
+def set_tool_result_limit(cfg: Config, provider_name: str) -> None:
+    """Size tool results to the model. Local 8B models drown past ~24k chars;
+    Gemini 2.5 Pro has a 1M-token window and chains better when it sees whole
+    results instead of truncated rows."""
+    global MAX_TOOL_RESULT_CHARS
+    explicit = int(getattr(cfg.llm, "max_tool_result_chars", 0) or 0)
+    MAX_TOOL_RESULT_CHARS = explicit or (120_000 if provider_name == "gemini" else 24_000)
 
 
 def _repo_root() -> Path:
@@ -150,6 +159,7 @@ async def run(args: argparse.Namespace) -> int:
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = tool_specs(await session.list_tools())
+            set_tool_result_limit(cfg, provider_name)
             try:
                 provider = build_provider(provider_name, cfg, tools)
             except (RuntimeError, SystemExit) as e:

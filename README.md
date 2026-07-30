@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    21 tools     │  TB engine + guarded SQL  │
+│  pstb.client.chat    │    25 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (77 checks) and the MCP server end to end. Then install
+verifies both the engine (103 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
@@ -78,8 +78,8 @@ gcloud CLI if you don't have it (`brew install google-cloud-sdk`), then:
 gcloud auth application-default login
 ```
 
-Models are set in `config.yaml` (`gemini-2.5-flash` default — bump to a newer
-Gemini as available in your region; `llama3.1:8b` default for Ollama, with
+Models are set in `config.yaml` (`gemini-2.5-pro` default, with thinking-budget
+and retry tuning built in — `gemini-2.5-flash` is the cheaper/faster option; `llama3.1:8b` default for Ollama, with
 `qwen3` / larger llama models giving better tool use).
 
 ## Connecting your real PeopleSoft database (Oracle)
@@ -137,7 +137,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 21 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 25 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -147,7 +147,10 @@ no chat client needed.
 `tb_integrity_check` · `rollup_trial_balance` · `list_trees` ·
 `list_financial_scopes` · `list_business_units` · `list_ledgers` ·
 `list_reports` · `run_report` · `resolve_timespan` (nVision-style statements —
-see [docs/NVISION.md](docs/NVISION.md)) · `wiki_search` · `wiki_get_page` ·
+see [docs/NVISION.md](docs/NVISION.md)) · `get_ar_aging` · `get_customer_ar` ·
+`search_customers` · `get_billing_workbench` (AR aging with GL tie-out and
+billing pipeline — see [docs/BILLING_AR.md](docs/BILLING_AR.md)) ·
+`wiki_search` · `wiki_get_page` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.
 
@@ -161,9 +164,12 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
   layouts (tree/ledger/timespan) — see [docs/NVISION.md](docs/NVISION.md) for
   the migration guide. Sample income statement, balance sheet, and quarterly
   trend run against the bundled ACTUALS + BUDGET ledgers.
-- **Tool packs per module:** AP open vouchers/aging, AR customer aging,
-  Asset Management roll-forward tie-outs, budget vs actuals (KK/LEDGER_BUDG),
-  allocations, intercompany eliminations (see the end of docs/QUESTIONS.md).
+- **Billing & AR (shipped):** aging with GL tie-out, customer 360, billing
+  pipeline health — [docs/BILLING_AR.md](docs/BILLING_AR.md). Next tier:
+  delivery status, credit/rebill graph, customer hierarchies, payments.
+- **Tool packs per module:** AP open vouchers/aging, Asset Management
+  roll-forward tie-outs, commitment control, allocations, intercompany
+  eliminations (see the end of docs/QUESTIONS.md).
 - **Semantic layer:** `list_tables`/`describe_table` already let the model
   explore; next step is a curated record dictionary (PSRECDEFN-driven) so
   free-form questions ground in the right records.

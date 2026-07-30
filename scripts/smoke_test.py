@@ -312,6 +312,94 @@ def main() -> None:
     except ReportError:
         check("resolve_timespan rejects period 998", True)
 
+    print("== AR aging & billing workbench ==")
+    from pstb.ar import ARBilling, ARError
+    arb = ARBilling(engine)
+    sc_ = arb.search_customers("acme")
+    check("customer search finds ACME", sc_["customers"][0]["cust_id"] == "C1001",
+          str(sc_["customers"]))
+    ag = arb.aging(as_of_date="2026-07-30")
+    check("aging ties to GL control exactly",
+          ag["gl_tie"]["ties"] and ag["gl_tie"]["difference"] == 0.0,
+          f"diff {ag['gl_tie']['difference']}")
+    check("aging subledger equals GL AR balance",
+          abs(ag["gl_tie"]["subledger_total"] - ag["gl_tie"]["gl_balance"]) < 0.01,
+          f"{ag['gl_tie']['subledger_total']:,.2f}")
+    check("bucket sums equal grand total",
+          abs(sum(ag["totals"][b] for b in ag["buckets"]) - ag["totals"]["total"]) < 0.01)
+    cmap = {c["cust_id"]: c for c in ag["customers"]}
+    check("disputed 42,000 lands in over_90 for C1004",
+          abs(cmap["C1004"]["over_90"] - 42_000.00) < 0.01
+          and abs(cmap["C1004"]["disputed_amt"] - 42_000.00) < 0.01)
+    check("credit memo negative for C1002",
+          abs(cmap["C1002"]["credit_amt"] - (-8_400.00)) < 0.01)
+    check("inactive customer flagged", cmap["C1008"]["customer_status"] == "I")
+    # bucket shift: C1007's 122,600 is current at 07-30, overdue at 08-20
+    ag2 = arb.aging(as_of_date="2026-08-20")
+    c7a, c7b = cmap["C1007"], {c["cust_id"]: c for c in ag2["customers"]}["C1007"]
+    check("buckets shift with as_of date",
+          c7a["current"] > 0 and c7b["current"] == 0.0 and c7b["1-30"] > 0,
+          f"current {c7a['current']:,.2f} -> {c7b['current']:,.2f}")
+    cu_ = arb.customer("beacon", as_of_date="2026-07-30")
+    check("customer lookup by name fragment", cu_["customer"]["cust_id"] == "C1004")
+    check("customer items carry days past due",
+          any(i["days_past_due"] > 200 for i in cu_["items"]))
+    wb = arb.billing_workbench(as_of_date="2026-07-30", days_stuck=5)
+    st = {x["status"]: x for x in wb["statuses"]}
+    check("2 invoices ready-not-finalized", st["RDY"]["n"] == 2, str(st.get("RDY")))
+    check("stuck list respects threshold",
+          {x["invoice"] for x in wb["stuck_invoices"]}
+          >= {"INV-260701", "INV-260703"}
+          and "INV-260704" not in {x["invoice"] for x in wb["stuck_invoices"]},
+          str([x["invoice"] for x in wb["stuck_invoices"]]))
+    check("interface errors found", len(wb["interface_errors"]) == 2)
+    check("finalized-not-in-AR catches the orphan",
+          [o["invoice"] for o in wb["finalized_not_in_ar"]] == ["INV-2606ORPH"],
+          str(wb["finalized_not_in_ar"]))
+    check("workbench control_status distinct from data",
+          wb["control_status"] == "exceptions_found")
+
+    print("== AR review-findings regressions ==")
+    # Tie basis is decoupled from as-of: mid-period and future as-of both tie
+    for asod in ("2026-06-15", "2026-07-30", "2026-08-20"):
+        agx = arb.aging(as_of_date=asod)
+        check(f"tie evaluated and ties at as_of {asod}",
+              agx["gl_tie"]["evaluated"] and agx["gl_tie"]["ties"],
+              str(agx["gl_tie"].get("difference")))
+    check("tie basis labeled",
+          "latest posted period" in ag["gl_tie"]["basis"], ag["gl_tie"]["basis"])
+    # Backdated as-of is flagged as an approximation
+    back = arb.aging(as_of_date="2026-03-31")
+    check("backdated as-of carries historical warning",
+          back.get("historical_approximation") is True and "warning" in back)
+    check("current as-of carries no historical warning",
+          "historical_approximation" not in ag)
+    # Bogus scope must not fabricate a green tie
+    bogus_ar = arb.aging(business_unit="XX999", as_of_date="2026-07-30")
+    check("bogus BU aging reports scope, not a tie",
+          bogus_ar.get("scope_status") == "business_unit_not_found",
+          str(bogus_ar.get("scope_status")))
+    # Bad control account must not report a pass
+    cfg_bad = Config.sample(ROOT)
+    cfg_bad.defaults.ar_control_accounts = ["9999X"]
+    from pstb.ar import ARBilling as _AB
+    bad_tie = _AB(TBEngine(Database(cfg_bad), cfg_bad)).aging(
+        as_of_date="2026-07-30")["gl_tie"]
+    check("failed control lookup -> evaluated=false, never a pass",
+          bad_tie["evaluated"] is False and "9999X" in bad_tie["reason"],
+          str(bad_tie.get("reason"))[:80])
+    # NULL DUE_DT must not crash; buckets by ACCTG_DT fallback
+    agd = arb.aging(as_of_date="2026-07-30", detail=True)
+    ndd = [i for i in agd["items"] if i.get("no_due_date")]
+    check("null-due-date item survives and is flagged",
+          len(ndd) == 1 and ndd[0]["item"] == "DM-260620"
+          and ndd[0]["bucket"] == "31-60", str(ndd))
+    wbn = arb.billing_workbench(as_of_date="2026-07-30")
+    check("workbench tolerates date guards", wbn["control_status"] == "exceptions_found")
+    check("orphan check is date-floored",
+          wbn["lookback_days"] == 365
+          and "365" in next(i for i in wbn["issues"] if "not loaded" in i))
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

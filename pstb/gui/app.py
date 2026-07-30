@@ -16,6 +16,7 @@ from typing import Optional
 from ..config import load_config
 from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
+from ..ar import ARBilling, ARError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
 
@@ -35,6 +36,7 @@ cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
+ar = ARBilling(engine)
 try:
     wiki = make_wiki(cfg)
 except WikiError:
@@ -49,7 +51,7 @@ _chat_state: dict = {"provider": None, "name": None}
 def _guard(fn, **kw):
     try:
         return fn(**kw)
-    except (EngineError, DbError, ReportError) as e:
+    except (EngineError, DbError, ReportError, ARError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # surface the reason instead of a bare 500
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
@@ -197,6 +199,30 @@ def report_run(
     )
 
 
+@app.get("/api/ar/aging")
+def ar_aging(business_unit: str = "", as_of_date: str = "",
+             customer_id: str = "", detail: bool = False):
+    return _guard(ar.aging, business_unit=business_unit, as_of_date=as_of_date,
+                  customer_id=customer_id, detail=detail)
+
+
+@app.get("/api/ar/customer")
+def ar_customer(customer: str, business_unit: str = "", as_of_date: str = ""):
+    return _guard(ar.customer, customer=customer, business_unit=business_unit,
+                  as_of_date=as_of_date)
+
+
+@app.get("/api/ar/customers")
+def ar_customers(query: str = "", limit: int = 25):
+    return _guard(ar.search_customers, query=query, limit=limit)
+
+
+@app.get("/api/billing")
+def billing(business_unit: str = "", days_stuck: int = 5, as_of_date: str = ""):
+    return _guard(ar.billing_workbench, business_unit=business_unit,
+                  days_stuck=days_stuck, as_of_date=as_of_date)
+
+
 @app.get("/api/accounts")
 def accounts(query: str = "", account_type: str = "", limit: int = 300):
     return _guard(engine.search_accounts, query=query, account_type=account_type, limit=limit)
@@ -234,7 +260,7 @@ async def chat(payload: dict):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    from ..client.chat import agent_turn, tool_specs
+    from ..client.chat import agent_turn, set_tool_result_limit, tool_specs
     from ..client.prompt import system_prompt
 
     env = dict(os.environ)
@@ -247,6 +273,7 @@ async def chat(payload: dict):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = tool_specs(await session.list_tools())
+                set_tool_result_limit(cfg, provider_name)
                 if _chat_state["provider"] is None or _chat_state["name"] != provider_name:
                     prompt = system_prompt(cfg, surface="gui")
                     if provider_name == "gemini":

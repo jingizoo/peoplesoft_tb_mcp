@@ -23,6 +23,8 @@ class Defaults:
     suspense_accounts: list = field(default_factory=lambda: ["1999"])
     retained_earnings_account: str = "3500"
     account_tree: str = "ACCOUNT"
+    ar_control_accounts: list = field(default_factory=lambda: ["1100"])
+    aging_buckets: list = field(default_factory=lambda: [30, 60, 90])
 
 
 @dataclass
@@ -43,10 +45,15 @@ class LlmCfg:
     provider: str = "ollama"  # ollama | gemini
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-2.5-pro"
     gemini_project: str = ""
     gemini_location: str = "us-central1"
+    # -1 = model default (dynamic thinking); 0 disables thinking (flash only —
+    # 2.5-pro enforces a minimum); >0 caps the thinking token budget.
+    gemini_thinking_budget: int = -1
     temperature: float = 0.2
+    # 0 = auto: 24k chars for local models, 120k for Gemini (1M-token context).
+    max_tool_result_chars: int = 0
 
 
 @dataclass

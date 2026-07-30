@@ -68,6 +68,14 @@ class Database:
             return sql.replace("SELECT 1", "SELECT TOP 1 1", 1)
         return f"{sql} LIMIT 1"
 
+    def days_past_expr(self, date_col: str, asof_bind: str) -> str:
+        """Whole days from date_col to the :asof bind (positive = past due)."""
+        if self.dialect == "oracle":
+            return f"TRUNC(TO_DATE(:{asof_bind}, 'YYYY-MM-DD') - {date_col})"
+        if self.dialect == "sqlserver":
+            return f"DATEDIFF(day, {date_col}, :{asof_bind})"
+        return f"CAST(julianday(:{asof_bind}) - julianday({date_col}) AS INTEGER)"
+
     def date_bind(self, name: str) -> str:
         """Expression that binds an ISO yyyy-mm-dd string as a date."""
         if self.dialect == "oracle":

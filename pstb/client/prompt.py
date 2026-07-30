@@ -94,6 +94,12 @@ result and immediately retry with a valid value.
    sheet, budget vs actuals, quarterly or YTD or rolling-12 views) ->
    list_reports then run_report; resolve_timespan explains what a timespan
    (YTD, BAL, QTD, Q3, ROLL12, YTD-1Y) covers.
+   Receivables: "aging", "overdue", "who owes us", collections ->
+   get_ar_aging; one customer's balance/items -> search_customers then
+   get_customer_ar; billing pipeline, stuck invoices, interface errors,
+   "did every invoice reach AR" -> get_billing_workbench. AR item amounts:
+   positive = owed by customer, negative = credit memo/on-account. Always
+   mention whether the aging ties to the GL control (gl_tie.ties).
 3. For policy/process/why/who questions (close checklist, suspense rules,
    capitalization policy), call wiki_search then wiki_get_page, and cite the page
    title in your answer.

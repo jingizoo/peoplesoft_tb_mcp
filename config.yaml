@@ -11,6 +11,8 @@ defaults:
   suspense_accounts: ["1999"]
   retained_earnings_account: "3500"
   account_tree: ACCOUNT   # default PSTREE name for rollups
+  ar_control_accounts: ["1100"]   # GL account(s) the AR subledger must tie to
+  aging_buckets: [30, 60, 90]     # aging day edges -> current, 1-30, 31-60, 61-90, over_90
 
 db:
   backend: sqlite         # sqlite | oracle | sqlserver
@@ -23,9 +25,11 @@ llm:
   provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)
   ollama_host: http://localhost:11434
   ollama_model: llama3.1:8b
-  gemini_model: gemini-2.5-flash
+  gemini_model: gemini-2.5-pro    # gemini-2.5-flash is cheaper/faster, weaker chaining
   gemini_location: us-central1
+  gemini_thinking_budget: -1      # -1 model default; >0 caps thinking tokens (latency/cost)
   temperature: 0.2
+  max_tool_result_chars: 0        # 0 = auto (24k local models, 120k gemini)
 
 wiki:
   provider: auto          # confluence | localdocs | auto (confluence when configured, else local docs)

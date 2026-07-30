@@ -281,6 +281,20 @@ CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
   SETID TEXT, CALENDAR_ID TEXT, FISCAL_YEAR INTEGER, ACCOUNTING_PERIOD INTEGER,
   BEGIN_DT TEXT, END_DT TEXT);
+CREATE TABLE PS_CUSTOMER (
+  SETID TEXT, CUST_ID TEXT, NAME1 TEXT, CUST_STATUS TEXT);
+CREATE TABLE PS_ITEM (
+  BUSINESS_UNIT TEXT, CUST_ID TEXT, ITEM TEXT, ITEM_LINE INTEGER,
+  ITEM_STATUS TEXT, BAL_AMT REAL, ORIG_ITEM_AMT REAL, BAL_CURRENCY TEXT,
+  ACCTG_DT TEXT, DUE_DT TEXT, ASOF_DT TEXT, DISPUTE_STATUS TEXT, PO_REF TEXT);
+CREATE TABLE PS_BI_HDR (
+  BUSINESS_UNIT TEXT, INVOICE TEXT, BILL_STATUS TEXT, BILL_TO_CUST_ID TEXT,
+  INVOICE_DT TEXT, ACCOUNTING_DT TEXT, INVOICE_AMOUNT REAL,
+  BI_CURRENCY_CD TEXT, BILL_TYPE_ID TEXT, BILL_SOURCE_ID TEXT);
+CREATE TABLE PS_INTFC_BI (
+  INTFC_ID INTEGER, INTFC_LINE_NUM INTEGER, TRANS_TYPE_BI TEXT,
+  BUSINESS_UNIT TEXT, BILL_TO_CUST_ID TEXT, BILL_SOURCE_ID TEXT,
+  LOAD_STATUS_BI TEXT, TARGET_INVOICE TEXT);
 CREATE TABLE PSTREEDEFN (SETID TEXT, SETCNTRLVALUE TEXT, TREE_NAME TEXT, EFFDT TEXT, DESCR TEXT);
 CREATE TABLE PSTREENODE (
   SETID TEXT, SETCNTRLVALUE TEXT, TREE_NAME TEXT, EFFDT TEXT, TREE_NODE TEXT,
@@ -356,6 +370,9 @@ def main() -> None:
     con = sqlite3.connect(str(DB_PATH))
     con.executescript(DDL)
 
+    def one(sql, *p):
+        return con.execute(sql, p).fetchone()[0]
+
     con.executemany(
         "INSERT INTO PS_JRNL_HEADER VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", seeder.headers
     )
@@ -428,14 +445,92 @@ def main() -> None:
         [(SETID, "", "ACCOUNT", effdt, num, lo, hi) for num, lo, hi in leaves],
     )
 
+    # ---- AR / Billing sample (column subsets of the delivered records) ----
+    customers = [
+        ("C1001", "ACME Industrial"), ("C1002", "Northwind Retail"),
+        ("C1003", "Cascade Foods"), ("C1004", "Beacon Health Systems"),
+        ("C1005", "Orion Logistics"), ("C1006", "Summit Media"),
+        ("C1007", "Redwood Utilities"),
+    ]
+    cust_rows = [(SETID, cid, name, "A") for cid, name in customers]
+    cust_rows.append((SETID, "C1008", "Harborview Hotels", "I"))
+    con.executemany("INSERT INTO PS_CUSTOMER VALUES (?,?,?,?)", cust_rows)
+    con.execute("INSERT INTO PS_SET_CNTRL_REC VALUES (?,?,?)", (BU, "CUSTOMER", SETID))
+
+    # Open items sum EXACTLY to the GL AR control (1100) balance at 2026-06-30,
+    # via a computed plug — so aging ties to the ledger to the penny.
+    # (cust, item, orig, bal, acctg_dt, due_dt, dispute)
+    ar_target = one(
+        "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER WHERE LEDGER='ACTUALS' "
+        "AND ACCOUNT='1100' AND FISCAL_YEAR=2026 AND ACCOUNTING_PERIOD BETWEEN 0 AND 6"
+    )
+    items = [
+        ("C1001", "INV-260501", 38_500.00, "2026-05-14", "2026-06-14", ""),
+        ("C1001", "INV-260602", 61_250.00, "2026-06-12", "2026-07-12", ""),
+        ("C1002", "INV-260420", 27_300.00, "2026-04-20", "2026-05-20", ""),
+        ("C1002", "INV-260605", 44_800.00, "2026-06-20", "2026-07-20", ""),
+        ("C1002", "CM-260012", -8_400.00, "2026-06-25", "2026-06-25", ""),
+        ("C1003", "INV-260610", 96_000.00, "2026-06-25", "2026-07-25", ""),
+        ("C1003", "INV-260618", 58_700.00, "2026-06-30", "2026-08-15", ""),
+        ("C1004", "INV-251120", 42_000.00, "2025-11-20", "2025-12-20", "DSP"),
+        ("C1004", "INV-260601", 88_400.00, "2026-06-15", "2026-07-15", ""),
+        ("C1005", "INV-260528", 73_900.00, "2026-05-28", "2026-06-27", ""),
+        ("C1005", "OA-260701", -15_000.00, "2026-06-30", "2026-07-01", ""),
+        ("C1006", "INV-260612", 49_300.00, "2026-06-27", "2026-07-27", ""),
+        ("C1007", "INV-260609", 122_600.00, "2026-06-17", "2026-08-01", ""),
+        ("C1007", "INV-260415", 31_800.00, "2026-04-15", "2026-05-15", ""),
+        ("C1008", "INV-260210", 12_500.00, "2026-02-10", "2026-03-12", ""),
+    ]
+    # real PS_ITEM rows can carry NULL DUE_DT; one is seeded deliberately
+    items.append(("C1006", "DM-260620", 4_200.00, "2026-06-20", None, ""))
+    plug = r2(ar_target - sum(a for _, _, a, _, _, _ in items))
+    assert plug > 0, f"AR plug went negative: {plug}"
+    items.append(("C1001", "INV-260614", plug, "2026-06-29", "2026-08-08", ""))
+    item_rows = [
+        (BU, cid, item, 1, "O", amt, amt, CURR, acctg, due, acctg, disp, "")
+        for cid, item, amt, acctg, due, disp in items
+    ]
+    # a few closed items for realism (excluded by ITEM_STATUS filters)
+    item_rows += [
+        (BU, "C1001", "INV-260301", 1, "C", 0.0, 52_000.00, CURR,
+         "2026-03-05", "2026-04-04", "2026-03-05", "", ""),
+        (BU, "C1006", "INV-260315", 1, "C", 0.0, 18_750.00, CURR,
+         "2026-03-18", "2026-04-17", "2026-03-18", "", ""),
+    ]
+    con.executemany("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", item_rows)
+
+    # Billing headers: one finalized (INV) header per AR invoice item, plus a
+    # pipeline of not-yet-finalized work and one finalized-but-not-in-AR orphan.
+    hdrs = [
+        (BU, item, "INV", cid, acctg, acctg, amt, CURR, "STD", "CRM")
+        for cid, item, amt, acctg, _due, _d in items
+        if item.startswith("INV-")
+    ]
+    hdrs += [
+        (BU, "INV-260701", "RDY", "C1003", "2026-07-18", "2026-07-18", 21_400.00, CURR, "STD", "CRM"),
+        (BU, "INV-260702", "RDY", "C1006", "2026-07-24", "2026-07-24", 9_850.00, CURR, "SVC", "PROJ"),
+        (BU, "INV-260703", "HLD", "C1004", "2026-07-10", "2026-07-10", 33_000.00, CURR, "STD", "CRM"),
+        (BU, "INV-260704", "NEW", "C1002", "2026-07-28", "2026-07-28", 5_600.00, CURR, "SVC", "MAN"),
+        (BU, "INV-260630", "CAN", "C1005", "2026-06-30", "2026-06-30", 14_000.00, CURR, "STD", "CRM"),
+        (BU, "INV-2606ORPH", "INV", "C1007", "2026-06-28", "2026-06-28", 27_500.00, CURR, "STD", "CRM"),
+    ]
+    con.executemany("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)", hdrs)
+
+    con.executemany(
+        "INSERT INTO PS_INTFC_BI VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (4001, 1, "LINE", BU, "C1002", "CRM", "DON", "INV-260605"),
+            (4001, 2, "LINE", BU, "C1003", "CRM", "ERR", ""),
+            (4001, 3, "LINE", BU, "C1006", "PROJ", "NEW", ""),
+            (4002, 1, "LINE", BU, "C9999", "MAN", "ERR", ""),
+        ],
+    )
+
     con.executescript(VIEWS)
     con.executescript(INDEXES)
     con.commit()
 
     # ---- verification ----------------------------------------------------
-    def one(sql, *p):
-        return con.execute(sql, p).fetchone()[0]
-
     for fy in (2025, 2026):
         total = one(
             "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER "
@@ -444,6 +539,12 @@ def main() -> None:
         assert abs(total) < 0.01, f"FY{fy} ACTUALS ledger does not net to zero: {total}"
     n_bud = one("SELECT COUNT(*) FROM PS_LEDGER WHERE LEDGER='BUDGET'")
     assert n_bud > 0, "BUDGET ledger missing"
+    ar_items = one("SELECT SUM(BAL_AMT) FROM PS_ITEM WHERE ITEM_STATUS='O'")
+    ar_gl = one(
+        "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER WHERE LEDGER='ACTUALS' "
+        "AND ACCOUNT='1100' AND FISCAL_YEAR=2026 AND ACCOUNTING_PERIOD BETWEEN 0 AND 6"
+    )
+    assert abs(ar_items - ar_gl) < 0.01, f"AR subledger {ar_items} != GL {ar_gl}"
     n_led = one("SELECT COUNT(*) FROM PS_LEDGER")
     n_hdr = one("SELECT COUNT(*) FROM PS_JRNL_HEADER")
     n_ln = one("SELECT COUNT(*) FROM PS_JRNL_LN")
@@ -457,6 +558,7 @@ def main() -> None:
     print(f"  PS_JRNL_HEADER rows: {n_hdr}")
     print(f"  PS_JRNL_LN rows:     {n_ln}")
     print(f"  BUDGET ledger rows:  {n_bud}")
+    print(f"  AR open items tie to GL 1100: {ar_items:,.2f} ✔")
     print(f"  FY2025 and FY2026 ACTUALS net to zero ✔")
     print(f"  Cash (1000) ending FY2026 P6: {cash_p6:,.2f}")
 

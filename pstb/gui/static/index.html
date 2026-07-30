@@ -167,6 +167,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="close">Close &amp; controls</button>
     <button data-v="rollup">Statement rollup</button>
     <button data-v="reports">Reports</button>
+    <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
     <button data-v="chat">Ask</button>
     <div class="navfoot" id="navfoot"></div>
@@ -461,6 +462,9 @@ function renderToolResult(name,data){
     if(name==='drill_to_journals') return renderJournals(data);
     if(name==='list_financial_scopes') return renderScopes(data);
     if(name==='run_report') return renderReport(data);
+    if(name==='get_ar_aging') return renderAging(data);
+    if(name==='get_customer_ar') return renderCustomerAR(data);
+    if(name==='get_billing_workbench') return renderBilling(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';
@@ -522,6 +526,139 @@ async function viewReports(){
   else holder.append(el('div','empty','No report definitions found in reports/.'));
 }
 
+function renderAging(d){
+  const frag=document.createDocumentFragment();
+  const t=d.totals, tie=d.gl_tie;
+  frag.append(tiles([
+    ['Total AR',money(t.total),d.customers.length+' customers','dr'],
+    ['Overdue',money(r2sum(d.buckets.slice(1).map(b=>t[b]))),'past due','cr'],
+    ['Credits / on-account',money(t.credit_amt),'','cr'],
+    ['Disputed',money(t.disputed_amt),'','cr']
+  ]));
+  const tiecard=el('div','card');
+  if(tie.evaluated===false){
+    tiecard.append(el('h2',null,'GL tie-out <span class="badge dim">Not evaluated</span>'+
+      '<span class="sub">control '+esc((tie.control_accounts||[]).join(', '))+'</span>'));
+    tiecard.append(el('div','pad',esc(tie.reason||'Could not evaluate the reconciliation.')));
+  } else {
+    tiecard.append(el('h2',null,'GL tie-out <span class="badge '+(tie.ties?'ok':'bad')+'">'+
+      (tie.ties?'Ties to GL':'Does not tie')+'</span><span class="sub">'+esc(tie.basis||'')+'</span>'));
+    tiecard.append(el('div','pad','Subledger '+money(tie.subledger_total)+' vs GL '+money(tie.gl_balance)+
+      ' · difference <b>'+money(tie.difference)+'</b><div style="color:var(--muted);font-size:12px;margin-top:4px">'+
+      esc(tie.note)+'</div>'));
+  }
+  frag.append(tiecard);
+  if(d.warning){
+    frag.append(el('div','card','<div class="pad" style="color:var(--warn)">'+esc(d.warning)+'</div>'));
+  }
+  const c=el('div','card');
+  c.append(el('h2',null,'Aging by customer <span class="sub">as of '+esc(d.as_of)+'</span>'));
+  const sc=el('div'); sc.style.maxHeight='420px'; sc.style.overflow='auto';
+  const tb=el('table');
+  tb.innerHTML='<thead><tr><th>Customer</th>'+d.buckets.map(b=>'<th class="num">'+esc(b.replace('_',' '))+'</th>').join('')+
+    '<th class="num">Total</th><th class="num">Oldest</th></tr></thead>';
+  const body=el('tbody');
+  d.customers.forEach(cu=>{
+    const tr=el('tr','click');
+    tr.innerHTML='<td><b>'+esc(cu.cust_id)+'</b> '+esc(cu.name||'')+
+      (cu.customer_status==='I'?' <span class="badge warn">inactive</span>':'')+
+      (cu.disputed_amt?' <span class="badge warn">dispute</span>':'')+'</td>'+
+      d.buckets.map(b=>'<td class="num'+(cu[b]<0?' cr':'')+'">'+(cu[b]?money(cu[b]):'')+'</td>').join('')+
+      '<td class="num"><b>'+money(cu.total)+'</b></td><td class="num">'+
+      (cu.oldest_days_past_due>0?cu.oldest_days_past_due+'d':'—')+'</td>';
+    tr.onclick=()=>openCustomer(cu.cust_id, cu.name);
+    body.append(tr);
+  });
+  tb.append(body);
+  const tf=el('tfoot');
+  tf.innerHTML='<tr><td>Total</td>'+d.buckets.map(b=>'<td class="num">'+money(t[b])+'</td>').join('')+
+    '<td class="num">'+money(t.total)+'</td><td></td></tr>';
+  tb.append(tf); sc.append(tb); c.append(sc); frag.append(c);
+  return frag;
+}
+function r2sum(a){return Math.round(a.reduce((x,y)=>x+(y||0),0)*100)/100;}
+function renderCustomerAR(d){
+  if(d.multiple_matches){
+    const c=el('div','card'); c.append(el('h2',null,'Multiple customers match'));
+    const t=el('table'); t.innerHTML='<thead><tr><th>ID</th><th>Name</th><th class="num">Open balance</th></tr></thead><tbody>'+
+      d.multiple_matches.map(m=>'<tr><td class="mono">'+esc(m.cust_id)+'</td><td>'+esc(m.name)+'</td><td class="num">'+
+      money(m.open_balance)+'</td></tr>').join('')+'</tbody>';
+    c.append(t); return c;
+  }
+  const cu=d.customer, frag=document.createDocumentFragment();
+  frag.append(tiles([
+    ['Open balance',money(cu.total||0),esc(cu.name||cu.cust_id),'dr'],
+    ['Oldest item',(cu.oldest_days_past_due>0?cu.oldest_days_past_due+' days past due':'none overdue'),''],
+    ['Disputed',money(cu.disputed_amt||0),''],
+    ['Credits',money(cu.credit_amt||0),'']
+  ]));
+  const c=el('div','card');
+  c.append(el('h2',null,'Open items <span class="sub">'+esc(cu.cust_id||'')+' · as of '+esc(d.as_of)+'</span>'));
+  if(!(d.items||[]).length){ c.append(el('div','empty','No open items.')); frag.append(c); return frag; }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Item</th><th>Due</th><th class="num">Days past due</th><th>Bucket</th>'+
+    '<th class="num">Balance</th><th>Flags</th></tr></thead><tbody>'+
+    d.items.map(i=>'<tr><td class="mono">'+esc(i.item)+'</td><td>'+esc(i.due_dt)+'</td><td class="num">'+
+      (i.days_past_due||0)+'</td><td>'+esc(i.bucket.replace('_',' '))+'</td><td class="num'+(i.balance<0?' cr':'')+'">'+
+      money(i.balance)+'</td><td>'+(i.dispute?'<span class="badge warn">dispute '+esc(i.dispute)+'</span>':'')+
+      (i.balance<0?'<span class="badge dim">credit</span>':'')+'</td></tr>').join('')+'</tbody>';
+  c.append(t); frag.append(c);
+  return frag;
+}
+function renderBilling(d){
+  const frag=document.createDocumentFragment();
+  const issue=d.issues.length;
+  frag.append(tiles([
+    ['Pipeline health',issue?issue+' issue'+(issue>1?'s':''):'Clean',issue?'need review':'no exceptions',issue?'cr':'dr'],
+    ...d.statuses.slice(0,3).map(st=>[esc(st.descr),money(st.amount),st.n+' invoice'+(st.n>1?'s':''),''])
+  ]));
+  const mk=(title,ok,rows,cols)=>{
+    const c=el('div','card');
+    c.append(el('h2',null,esc(title)+' <span class="badge '+(ok?'ok':'warn')+'">'+(ok?'Pass':'Review')+'</span>'));
+    if(rows&&rows.length){
+      const t=el('table');
+      t.innerHTML='<thead><tr>'+cols.map(k=>'<th'+(/amount|balance/.test(k)?' class="num"':'')+'>'+
+        esc(k.replace(/_/g,' '))+'</th>').join('')+'</tr></thead><tbody>'+
+        rows.map(r=>'<tr>'+cols.map(k=>{const v=r[k];
+          return typeof v==='number'&&/amount|balance/.test(k)?'<td class="num">'+money(v)+'</td>'
+            :'<td>'+esc(v??'')+'</td>';}).join('')+'</tr>').join('')+'</tbody>';
+      c.append(t);
+    }
+    return c;
+  };
+  frag.append(mk('Invoices by status',true,d.statuses,['status','descr','n','amount']));
+  frag.append(mk('Pending longer than threshold',!d.stuck_invoices.length,d.stuck_invoices,
+    ['invoice','status_descr','cust_id','invoice_dt','days_pending','amount']));
+  frag.append(mk('Billing interface errors',!d.interface_errors.length,d.interface_errors,
+    ['intfc_id','line','cust_id','source']));
+  frag.append(mk('Finalized but not loaded to AR',!d.finalized_not_in_ar.length,d.finalized_not_in_ar,
+    ['invoice','cust_id','invoice_dt','amount']));
+  return frag;
+}
+async function openCustomer(cust_id,name){
+  $('#dtitle').textContent=cust_id+(name?' · '+name:'');
+  $('#dbody').innerHTML='<div class="empty"><span class="spin"></span> Loading…</div>';
+  $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
+  try{
+    const d=await api('/api/ar/customer?'+qs({customer:cust_id,business_unit:scope().bu}));
+    $('#dbody').innerHTML=''; const pad=el('div','pad'); pad.append(renderCustomerAR(d)); $('#dbody').append(pad);
+  }catch(e){ $('#dbody').innerHTML='<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>'; }
+}
+async function viewAR(){
+  busy('Loading receivables…');
+  const s2=scope();
+  try{
+    const [ag,wb]=await Promise.all([
+      api('/api/ar/aging?'+qs({business_unit:s2.bu})),
+      api('/api/billing?'+qs({business_unit:s2.bu}))
+    ]);
+    const w=$('#wrap'); w.innerHTML='';
+    w.append(renderAging(ag));
+    const hdr=el('div','card'); hdr.append(el('h2',null,'Billing pipeline'));
+    w.append(hdr); w.append(renderBilling(wb));
+  }catch(e){ oops(e.message); }
+}
+
 /* ---------- boot ---------- */
 (async function(){
   try{ META=await api('/api/meta'); }catch(e){ oops('Cannot reach the server: '+e.message); return; }
@@ -559,7 +696,7 @@ function chrome(){
   $('#l-adj').classList.toggle('hide',!(isTB||isRpt));
   $('#csv').classList.toggle('hide',!isTB);
 }
-function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,compare:viewCompare,chat:viewChat}[VIEW])(); }
+function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,ar:viewAR,compare:viewCompare,chat:viewChat}[VIEW])(); }
 
 /* ---------- tab views (same renderers the chat uses) ---------- */
 async function viewTB(){
@@ -663,7 +800,7 @@ function viewChat(){
   msgs.append(el('div','empty','Ask about the ledger. Figures come from the same tools the tabs use.'));
   const chips=el('div','chips');
   ['Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','Run the income statement','What are total assets?',
+   'Is the suspense balance within policy?','Run the income statement','Show the AR aging','Any invoices stuck in billing?',
    'Are there unposted journals?'].forEach(q=>{
     const c=el('div','chip',esc(q)); c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });
