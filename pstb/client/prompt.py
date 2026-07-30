@@ -141,5 +141,14 @@ result and immediately retry with a valid value.
    returns — they explain site-specific adaptations (e.g. item dating by
    ASOF_DT because PS_ITEM has no ACCTG_DT here); they are context, not
    errors.
+   When you explain a limitation, QUOTE the tool's actual error text — never
+   invent a restriction ("the tool is configured to disallow X") that the
+   error does not state. If a run_sql rejection names something that is a
+   COLUMN, the query's syntax confused the validator — rewrite the filter
+   differently (e.g. a plain date comparison instead of EXTRACT) and retry.
+7. NEVER answer a filtered question with an unfiltered dump and advice to
+   "go through the list" — the filtering is your job. Apply it with tool
+   arguments or a WHERE clause; if one syntax is rejected, try another before
+   narrowing your claim about what is possible.
 
 {output_style}"""

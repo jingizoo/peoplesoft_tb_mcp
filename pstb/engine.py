@@ -1192,6 +1192,75 @@ class TBEngine:
         r"(?is)\b(?:FROM|JOIN)\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)"
     )
     _CTE_RE = re.compile(r"(?is)\b([A-Za-z_]\w*)\s+AS\s*\(")
+    _FUNC_FROM_HEAD = re.compile(r"(?is)\b(EXTRACT|TRIM|SUBSTRING)\s*\(")
+
+    @staticmethod
+    def _scrub_sql(s: str) -> str:
+        """Replace string literals with '' and comments with a space in ONE
+        character pass. Two regex passes desync on real input — an apostrophe
+        inside a comment ("-- don't") swallowed the FROM clause and let FOR
+        UPDATE past the deny list; '--' inside a literal would eat the rest of
+        the line. A literal-aware scanner has neither failure mode."""
+        out: list = []
+        i, n = 0, len(s)
+        while i < n:
+            c = s[i]
+            if c == "'":
+                out.append("''")
+                i += 1
+                while i < n:
+                    if s[i] == "'":
+                        if i + 1 < n and s[i + 1] == "'":  # '' escape
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+            elif c == "-" and s[i:i + 2] == "--":
+                j = s.find("\n", i)
+                i = n if j < 0 else j  # newline kept
+                out.append(" ")
+            elif c == "/" and s[i:i + 2] == "/*":
+                j = s.find("*/", i + 2)
+                i = n if j < 0 else j + 2
+                out.append(" ")
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+
+    @classmethod
+    def _neutralize_func_from(cls, t: str) -> str:
+        """ANSI functions carry a FROM that is NOT a table reference:
+        EXTRACT(YEAR FROM col) / TRIM(TRAILING CHR(32) FROM col) /
+        SUBSTRING(x FROM n). Rewrite the function's own FROM (the one at
+        paren depth 1 relative to the function) to a comma so the table-ref
+        scan does not read the COLUMN as a table (seen live: EXTRACT(YEAR
+        FROM INVOICE_DT) -> "INVOICE_DT does not exist"). Depth tracking
+        keeps a subquery inside TRIM(...) fully validated."""
+        out = list(t)
+        for m in cls._FUNC_FROM_HEAD.finditer(t):
+            depth, i = 1, m.end()
+            while i < len(t) and depth:
+                c = t[i]
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                elif (depth == 1 and t[i:i + 4].upper() == "FROM"
+                      and not (i and (t[i - 1].isalnum() or t[i - 1] == "_"))
+                      and not (i + 4 < len(t)
+                               and (t[i + 4].isalnum() or t[i + 4] == "_"))):
+                    out[i:i + 4] = list(",   ")
+                    break
+                i += 1
+        return "".join(out)
+
+    def _table_refs(self, scrubbed: str) -> set:
+        """Names referenced as tables by FROM/JOIN (input must already be
+        comment- and literal-scrubbed via _scrub_sql)."""
+        return set(self._TABLE_REF_RE.findall(
+            self._neutralize_func_from(scrubbed)))
 
     def _table_exists(self, name: str) -> bool:
         n = name.upper()
@@ -1253,9 +1322,9 @@ class TBEngine:
         s = (sql or "").strip().rstrip(";").strip()
         if not s:
             raise EngineError("Empty SQL")
-        if ";" in s:
+        scrubbed = self._scrub_sql(s)
+        if ";" in scrubbed:
             raise EngineError("Multiple statements are not allowed")
-        scrubbed = re.sub(r"'[^']*'", "''", s)
         if not re.match(r"(?is)^\s*(SELECT|WITH)\b", scrubbed):
             raise EngineError("Only SELECT/WITH statements are allowed")
         m = _SQL_DENY.search(scrubbed)
@@ -1267,7 +1336,7 @@ class TBEngine:
         # or worse, burn the query timeout first.
         ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
         problems = []
-        for ref in {r for r in self._TABLE_REF_RE.findall(scrubbed)}:
+        for ref in self._table_refs(scrubbed):
             bare = ref.split(".")[-1]
             if bare.upper() in ctes or bare.upper() == "DUAL":
                 continue
