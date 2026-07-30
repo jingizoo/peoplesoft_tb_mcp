@@ -724,7 +724,8 @@ async function viewAR(){
     ?'<span style="color:var(--warn)">scope discovered from DB</span><br>':'')+
     '<b>'+esc(META.backend)+'</b> data'+(META.use_views?' (views)':'')+
     '<br><b>'+esc(META.llm.provider)+'</b> '+esc(META.llm.model)+
-    '<br>wiki: <b>'+esc(META.wiki||'off')+'</b>';
+    '<br>wiki: <b>'+esc(META.wiki||'off')+'</b>'+
+    (META.wiki_demo?' <span style="color:var(--warn)">(demo pages — not your wiki)</span>':'');
   document.querySelectorAll('nav button[data-v]').forEach(b=>b.onclick=()=>{
     document.querySelectorAll('nav button[data-v]').forEach(x=>x.classList.remove('on'));
     b.classList.add('on'); VIEW=b.dataset.v; render();

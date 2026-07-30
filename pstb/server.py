@@ -426,12 +426,35 @@ if cfg.tools.allow_raw_sql:
 if wiki is not None:
 
     @mcp.tool()
+    def wiki_health() -> dict:
+        """Is the company wiki actually connected, and is it serving REAL pages?
+        Reports the active provider, auth mode, space/label scoping, and — most
+        importantly — whether the bundled fictional demo pages are being served
+        instead of Confluence. Call this whenever the user doubts a policy
+        answer, and NEVER cite a policy figure as authoritative when
+        is_bundled_demo_content is true."""
+        try:
+            return wiki.health()
+        except Exception as e:
+            return {"error": f"wiki_health failed: {e}"}
+
+    @mcp.tool()
     def wiki_search(query: str, limit: int = 5) -> dict:
         """Search the company wiki/documentation for policies, procedures, and
         context (close checklist, account policies, suspense rules). Use for
         'why/policy/process/who owns' questions; cite the page title in answers."""
         try:
-            return {"provider": wiki.provider_name, "results": wiki.search(query, limit)}
+            out = {"provider": wiki.provider_name,
+                   "results": wiki.search(query, limit)}
+            if getattr(wiki, "provider_name", "") == "localdocs":
+                h = wiki.health()
+                if h.get("is_bundled_demo_content"):
+                    out["demo_content_warning"] = (
+                        "These are the repo's FICTIONAL sample policy pages, not "
+                        "your company wiki. Do not present any figure from them "
+                        "as company policy — say the wiki is not connected."
+                    )
+            return out
         except Exception as e:
             return {"error": f"wiki_search failed: {e}"}
 

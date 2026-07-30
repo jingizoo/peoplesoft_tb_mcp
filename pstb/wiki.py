@@ -99,6 +99,24 @@ class LocalDocsWiki:
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[: max(int(limit or 5), 1)]
 
+    def health(self) -> dict:
+        files = self._files()
+        is_bundled = self.root.name == "sample_wiki"
+        return {
+            "provider": "localdocs",
+            "connected": bool(files),
+            "path": str(self.root),
+            "page_count": len(files),
+            "pages": [f.name for f in files[:20]],
+            "is_bundled_demo_content": is_bundled,
+            "verdict": ("DEMO CONTENT — these are the fictional sample policy "
+                        "pages shipped with this repo, not your company wiki. "
+                        "Any policy figure quoted from them (30-day suspense "
+                        "rule, $5,000 capitalization threshold) is made up."
+                        if is_bundled else
+                        f"Serving {len(files)} local file(s) from {self.root}."),
+        }
+
     def get_page(self, page_id: str) -> dict:
         target = (self.root / page_id).resolve()
         if not str(target).startswith(str(self.root.resolve())) or not target.exists():
@@ -123,6 +141,7 @@ class ConfluenceWiki:
         self.base = base_url.rstrip("/")
         self.space = space
         self.labels = [l for l in (labels or []) if l]
+        self._email = email or ""
         if email:
             auth: object = (email, token)
             headers = {}
@@ -133,6 +152,117 @@ class ConfluenceWiki:
             base_url=self.base, auth=auth, headers=headers, timeout=20.0,
             follow_redirects=True,
         )
+
+    def health(self) -> dict:
+        """Staged connectivity/auth/scope check. Never raises; never returns
+        the token. Each stage explains its own failure."""
+        out: dict = {
+            "provider": "confluence",
+            "base_url": self.base,
+            "auth_mode": "cloud (email + API token)" if self._email
+                         else "bearer token (Data Center PAT)",
+            "space_filter": self.space or None,
+            "label_filter": self.labels or None,
+            "connected": False,
+        }
+        # 1. reachability + auth
+        try:
+            r = self.client.get("/rest/api/space", params={"limit": 1})
+        except Exception as e:
+            out["stage_failed"] = "connect"
+            out["error"] = f"{type(e).__name__}: {e}"
+            out["verdict"] = (
+                "Cannot reach the Confluence base URL. Check CONFLUENCE_BASE_URL, "
+                "network/VPN access from this host, and any proxy settings."
+            )
+            return out
+        out["http_status"] = r.status_code
+        if r.status_code in (401, 403):
+            out["stage_failed"] = "auth"
+            out["verdict"] = (
+                f"Reached the server but authentication failed ({r.status_code}). "
+                "For Cloud: CONFLUENCE_EMAIL must be your account email and the "
+                "token an API token from id.atlassian.com. For Data Center: "
+                "leave CONFLUENCE_EMAIL empty and use a personal access token."
+            )
+            return out
+        if r.status_code >= 400:
+            out["stage_failed"] = "api"
+            out["verdict"] = (
+                f"Unexpected HTTP {r.status_code} from /rest/api/space. If the "
+                "base URL points at a page rather than the API root, fix it "
+                "(Cloud usually ends in /wiki)."
+            )
+            out["body_excerpt"] = r.text[:200]
+            return out
+        out["connected"] = True
+
+        # 2. who am I (best effort; endpoint differs across deployments)
+        try:
+            u = self.client.get("/rest/api/user/current")
+            if u.status_code < 400:
+                j = u.json()
+                out["authenticated_as"] = (j.get("email") or j.get("username")
+                                           or j.get("displayName") or j.get("accountId"))
+        except Exception:
+            pass
+
+        # 3. does the configured space exist and is it visible to this token?
+        if self.space:
+            try:
+                sp = self.client.get(f"/rest/api/space/{self.space}")
+                if sp.status_code < 400:
+                    out["space_ok"] = True
+                    out["space_name"] = sp.json().get("name")
+                else:
+                    out["space_ok"] = False
+                    out["verdict"] = (
+                        f"Connected, but space {self.space!r} returned HTTP "
+                        f"{sp.status_code} — wrong key, or this token cannot see "
+                        "it. Space keys are case-sensitive."
+                    )
+                    return out
+            except Exception as e:
+                out["space_ok"] = False
+                out["space_error"] = str(e)[:200]
+        else:
+            out["space_ok"] = None
+            out["scope_warning"] = (
+                "No space filter set — searches run across everything this token "
+                "can read, so an unrelated page can outrank the finance policy."
+            )
+
+        # 4. do the configured labels match any pages at all?
+        if self.labels:
+            joined = ", ".join(f'"{l}"' for l in self.labels)
+            cql = f"type = page AND label IN ({joined})"
+            if self.space:
+                cql += f' AND space = "{self.space}"'
+            try:
+                lr = self.client.get("/rest/api/content/search",
+                                     params={"cql": cql, "limit": 5})
+                if lr.status_code < 400:
+                    res = lr.json().get("results", [])
+                    out["labelled_page_count"] = lr.json().get("size", len(res))
+                    out["labelled_examples"] = [x.get("title") for x in res]
+                    if not res:
+                        out["verdict"] = (
+                            f"Connected, but NO pages carry the configured "
+                            f"labels {self.labels}. Policy lookups will return "
+                            "nothing. Add those labels to the pages in "
+                            "Confluence (see docs/SETUP.md section 7.3)."
+                        )
+                        return out
+                else:
+                    out["label_check_status"] = lr.status_code
+            except Exception as e:
+                out["label_error"] = str(e)[:200]
+
+        out["verdict"] = (
+            "Connected and scoped. Run a real question through wiki_search to "
+            "confirm the right pages rank first."
+        )
+        return out
 
     def search(self, query: str, limit: int = 5) -> list[dict]:
         clean = (query or "").replace('"', " ").strip()

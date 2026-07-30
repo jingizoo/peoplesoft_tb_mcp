@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (123 checks) and
+clients, builds the sample ledger, and then verifies the engine (128 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:
@@ -357,15 +357,36 @@ real balances with the demo thresholds shipped in this repo.
 Page fetches are re-checked against the configured space after retrieval, so a
 page id outside the allowed space is rejected rather than returned.
 
-### 7.5 Verify
+### 7.5 Verify — run the diagnostic
 
 ```bash
-.venv/bin/python -m pstb.client.chat --ask "What is our suspense account policy?"
+.venv/bin/python scripts/diagnose_wiki.py
 ```
 
-The reply should cite a page title from your space. Each page result carries
-`space`, `version`, `last_modified`, `retrieved_at`, and a content hash, so a
-policy citation can be audited later.
+Staged output: which provider is **actually** active, credential presence
+(never the token), connectivity and auth, whether the configured space and
+labels exist and match pages, a real search, and a real page fetch with
+provenance plus a content excerpt to compare against Confluence in a browser.
+It exits non-zero and lists fixes when anything is off.
+
+Test a specific question or page:
+
+```bash
+.venv/bin/python scripts/diagnose_wiki.py --query "capitalization threshold"
+```
+
+**The failure it is designed to catch:** with `provider: auto` and missing or
+partial credentials, the agent silently serves the fictional sample pages in
+`sample_wiki/` — the 30-day suspense rule and $5,000 threshold in them are
+made up. The diagnostic reports `bundled demo content` and refuses to call the
+setup trustworthy. In the app, the sidebar shows
+`wiki: localdocs (demo pages — not your wiki)`, the `wiki_health` tool reports
+it, and every `wiki_search` result carries a `demo_content_warning` so the
+agent states the wiki is not connected instead of quoting fake policy.
+
+Final confirmation once green: ask a policy question and check the cited page
+title is one of yours. Each page carries `space`, `version`, `last_modified`,
+`retrieved_at`, and a content hash for later audit.
 
 ### 7.6 Known gap
 

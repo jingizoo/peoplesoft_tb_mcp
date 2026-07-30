@@ -41,7 +41,7 @@ async def main() -> None:
             # only tool names hid that failure until runtime.
             specs = tool_specs(listed)
             assert len(specs) == len(listed.tools), "tool spec count mismatch"
-            NO_ARG_TOOLS = {"list_trees", "list_business_units", "list_financial_scopes", "list_reports", "get_record_map"}
+            NO_ARG_TOOLS = {"list_trees", "list_business_units", "list_financial_scopes", "list_reports", "get_record_map", "wiki_health"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"
@@ -79,6 +79,25 @@ async def main() -> None:
 
             sql = await call("run_sql", sql="SELECT COUNT(*) AS n FROM PS_JRNL_HEADER")
             print(f"run_sql journal count: {sql['rows'][0]['n']}")
+            wh = await call("wiki_health")
+            print(f"wiki_health: provider={wh.get('provider')}, "
+                  f"demo={wh.get('is_bundled_demo_content')}")
+            ws = await call("wiki_search", query="suspense")
+            if wh.get("is_bundled_demo_content"):
+                assert "demo_content_warning" in ws, \
+                    "demo content must carry an inline warning in wiki_search"
+                print("wiki_search carries demo_content_warning ✔")
+
+            # Confluence health must fail closed on an unreachable host and
+            # never raise or echo the token (needs httpx -> probe, not smoke).
+            from pstb.wiki import ConfluenceWiki
+            cw = ConfluenceWiki("https://nonexistent-host-xyz.invalid/wiki",
+                                "a@b.com", "SECRETTOKEN")
+            ch = cw.health()
+            assert ch["connected"] is False and ch["stage_failed"] == "connect", ch
+            assert "SECRETTOKEN" not in str(ch), "token leaked into health output"
+            print("Confluence health fails closed, no token leak ✔")
+
             print("\nMCP probe passed.")
 
 

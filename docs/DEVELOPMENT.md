@@ -18,6 +18,8 @@ With the virtualenv active:
 
 ```
 python scripts/mcp_probe.py                    # spawn the server over stdio, no LLM
+python scripts/diagnose_db.py                  # time each DB step (find slow queries)
+python scripts/diagnose_wiki.py                # prove the wiki is connected and real
 python -m pstb.client.chat                     # chat REPL
 python -m pstb.client.chat --provider gemini   # chat via Gemini on Vertex AI
 python -m pstb.client.chat --ask "..."         # one-shot question
@@ -98,7 +100,7 @@ failure mode.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 123 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 128 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.
