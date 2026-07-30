@@ -88,6 +88,10 @@ See docs/NVISION.md for migrating existing nVision layouts.
 48m. Are there billing interface errors?
 48n. Did every finalized invoice make it to AR?
 48o. Which customers are inactive but still carry a balance?
+48r. Top 10 customers by open AR in USD terms. *(display_currency="USD" — the
+     server converts each item at the effective rate and ranks; `fx_applied`
+     lists the conversions)*
+48s. Show the aging converted to INR. *(same — never per-row math in the model)*
 
 ## Anything else → guarded `run_sql` (+ `list_tables`, `describe_table`)
 49. How many journals were posted in FY2026 by source?

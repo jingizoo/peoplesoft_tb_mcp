@@ -486,7 +486,12 @@ def main() -> None:
     ]
     # real PS_ITEM rows can carry NULL DUE_DT; one is seeded deliberately
     items.append(("C1006", "DM-260620", 4_200.00, "2026-06-20", None, ""))
-    plug = r2(ar_target - sum(a for _, _, a, _, _, _ in items))
+    # One OPEN EUR item so multi-currency aging is exercised. Its USD
+    # equivalent (3,000 / 0.92 = 3,260.87 at the seeded EUR->USD rate) is
+    # carved out of the plug so the converted subledger still ties to GL 1100
+    # to the penny.
+    eur_open, eur_usd_equiv = 3_000.00, 3_260.87
+    plug = r2(ar_target - sum(a for _, _, a, _, _, _ in items) - eur_usd_equiv)
     assert plug > 0, f"AR plug went negative: {plug}"
     items.append(("C1001", "INV-260614", plug, "2026-06-29", "2026-08-08", ""))
     item_rows = [
@@ -547,6 +552,12 @@ def main() -> None:
     con.execute("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (BU, "C1006", "INV-2606EUR", 1, "C", 0.0, 2_000.00, "EUR",
                  "2026-06-22", "2026-07-22", "2026-06-22", "", ""))
+    con.execute("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (BU, "C1006", "INV-2606EU2", 1, "O", eur_open, eur_open, "EUR",
+                 "2026-06-24", "2026-07-24", "2026-06-24", "", ""))
+    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (BU, "INV-2606EU2", "INV", "C1006", "2026-06-24", "2026-06-24",
+                 eur_open, "EUR", "STD", "CRM"))
 
     con.executescript(VIEWS)
     con.executescript(INDEXES)
@@ -561,7 +572,9 @@ def main() -> None:
         assert abs(total) < 0.01, f"FY{fy} ACTUALS ledger does not net to zero: {total}"
     n_bud = one("SELECT COUNT(*) FROM PS_LEDGER WHERE LEDGER='BUDGET'")
     assert n_bud > 0, "BUDGET ledger missing"
-    ar_items = one("SELECT SUM(BAL_AMT) FROM PS_ITEM WHERE ITEM_STATUS='O'")
+    ar_usd = one("SELECT SUM(BAL_AMT) FROM PS_ITEM WHERE ITEM_STATUS='O' "
+                 "AND BAL_CURRENCY='USD'")
+    ar_items = r2(ar_usd + eur_usd_equiv)  # converted subledger
     ar_gl = one(
         "SELECT SUM(POSTED_TOTAL_AMT) FROM PS_LEDGER WHERE LEDGER='ACTUALS' "
         "AND ACCOUNT='1100' AND FISCAL_YEAR=2026 AND ACCOUNTING_PERIOD BETWEEN 0 AND 6"

@@ -540,8 +540,10 @@ async function viewReports(){
 function renderAging(d){
   const frag=document.createDocumentFragment();
   const t=d.totals, tie=d.gl_tie;
+  const curNote=esc(d.display_currency||'')+
+    (d.fx_applied&&d.fx_applied.length?' · '+esc(d.fx_applied.join(', ')):'');
   frag.append(tiles([
-    ['Total AR',money(t.total),d.customers.length+' customers','dr'],
+    ['Total AR',money(t.total),curNote||d.customers.length+' customers','dr'],
     ['Overdue',money(r2sum(d.buckets.slice(1).map(b=>t[b]))),'past due','cr'],
     ['Credits / on-account',money(t.credit_amt),'','cr'],
     ['Disputed',money(t.disputed_amt),'','cr']
@@ -563,7 +565,8 @@ function renderAging(d){
     frag.append(el('div','card','<div class="pad" style="color:var(--warn)">'+esc(d.warning)+'</div>'));
   }
   const c=el('div','card');
-  c.append(el('h2',null,'Aging by customer <span class="sub">as of '+esc(d.as_of)+'</span>'));
+  c.append(el('h2',null,'Aging by customer <span class="sub">as of '+esc(d.as_of)+
+    (d.display_currency?' · in '+esc(d.display_currency):'')+'</span>'));
   const sc=el('div'); sc.style.maxHeight='420px'; sc.style.overflow='auto';
   const tb=el('table');
   tb.innerHTML='<thead><tr><th>Customer</th>'+d.buckets.map(b=>'<th class="num">'+esc(b.replace('_',' '))+'</th>').join('')+

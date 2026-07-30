@@ -400,6 +400,60 @@ def main() -> None:
           wbn["lookback_days"] == 365
           and "365" in next(i for i in wbn["issues"] if "not loaded" in i))
 
+    print("== currency-aware aging (display_currency) ==")
+    # The seeded book is multi-currency: an open 3,000.00 EUR item for C1006.
+    check("default display currency is the BU base",
+          ag["display_currency"] == "USD", str(ag.get("display_currency")))
+    check("foreign item converted into the base aging (fx disclosed)",
+          any(n.startswith("EUR->USD") for n in ag.get("fx_applied", [])),
+          str(ag.get("fx_applied")))
+    check("converted customer lists its source currencies",
+          cmap["C1006"]["currencies"] == ["EUR", "USD"],
+          str(cmap["C1006"].get("currencies")))
+    eur_it = [i for i in agd["items"] if i.get("original_currency") == "EUR"]
+    check("converted detail keeps original amount and currency",
+          len(eur_it) == 1 and abs(eur_it[0]["balance"] - 3_260.87) < 0.01
+          and abs(eur_it[0]["original"] - 3_000.00) < 0.01, str(eur_it))
+    inr = arb.aging(as_of_date="2026-07-30", display_currency="INR")
+    rate_inr = engine.exchange_rate("USD", "INR", as_of_date="2026-07-30")["rate"]
+    check("display_currency converts totals server-side at the effective rate",
+          abs(inr["totals"]["total"] - ag["totals"]["total"] * rate_inr) < 1.0,
+          f"{inr['totals']['total']:,.2f} vs {ag['totals']['total'] * rate_inr:,.2f}")
+    check("converted bucket sums still equal the grand total",
+          abs(sum(inr["totals"][b] for b in inr["buckets"])
+              - inr["totals"]["total"]) < 0.01)
+    check("GL tie stays in base currency regardless of display",
+          inr["gl_tie"]["ties"] and "converted to base USD" in inr["gl_tie"]["basis"],
+          inr["gl_tie"]["basis"])
+    try:
+        arb.aging(as_of_date="2026-07-30", display_currency="JPY")
+        check("missing rate fails closed, never a silent skip", False)
+    except ARError as e:
+        check("missing rate fails closed, never a silent skip",
+              "JPY" in str(e), str(e)[:80])
+    cu6 = arb.customer("C1006", as_of_date="2026-07-30",
+                       display_currency="INR")
+    check("customer 360 honors display_currency",
+          cu6["display_currency"] == "INR"
+          and any(i.get("original_currency") for i in cu6["items"]),
+          str(cu6.get("display_currency")))
+    # Review findings: blank BAL_CURRENCY means base — it must convert into a
+    # foreign display currency, never pass through at 1.0
+    check("blank item currency treated as base, not as already-converted",
+          abs(arb._rate_to("", "INR", "2026-07-30", {}, base="USD")
+              - rate_inr) < 1e-9
+          and arb._rate_to("", "USD", "2026-07-30", {}, base="USD") == 1.0)
+    # Rounding: totals must derive from rounded buckets, so bucket sums can
+    # never drift a cent off the total after an FX multiply
+    check("per-customer bucket sums exact in converted view",
+          all(abs(sum(c[b] for b in inr["buckets"]) - c["total"]) < 0.005
+              for c in inr["customers"]))
+    # The tie converts at PERIOD-END rates (its GL side is period-end): a rate
+    # change after period end must not fabricate a break
+    check("GL tie converts at period-end rates and discloses the date",
+          "at 2026-06-30 rates" in inr["gl_tie"]["basis"],
+          inr["gl_tie"]["basis"])
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",

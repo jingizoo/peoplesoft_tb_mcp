@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (141 checks) and the MCP server end to end. Then install
+verifies both the engine (153 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
