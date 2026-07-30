@@ -474,6 +474,7 @@ function renderToolResult(name,data){
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
     if(name==='get_billing_workbench') return renderBilling(data);
+    if(name==='wiki_lookup') return renderWikiPassages(data);
     if(name==='get_top_billing_customers') return renderTopBilling(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
@@ -614,6 +615,32 @@ function renderCustomerAR(d){
       (i.balance<0?'<span class="badge dim">credit</span>':'')+'</td></tr>').join('')+'</tbody>';
   c.append(t); frag.append(c);
   return frag;
+}
+function renderWikiPassages(d){
+  const c=el('div','card');
+  const demo=d.demo_content_warning;
+  c.append(el('h2',null,'Wiki passages'+(demo?' <span class="badge bad">demo content</span>':'')+
+    '<span class="sub">'+(d.passages||[]).length+' of '+(d.passages_considered||0)+
+    ' passages · '+(d.sources||[]).length+' page(s)</span>'));
+  if(demo) c.append(el('div','pad','<span style="color:var(--bad)">'+esc(demo)+'</span>'));
+  if(!(d.passages||[]).length){
+    c.append(el('div','empty',esc(d.note||'No matching passages.')));
+    return c;
+  }
+  const body=el('div','pad');
+  d.passages.forEach(p=>{
+    const box=el('div');
+    box.style.cssText='border-left:3px solid var(--accent);padding:8px 12px;margin-bottom:12px;background:var(--bg);border-radius:0 8px 8px 0';
+    box.innerHTML='<div style="font-size:11px;color:var(--muted);font-weight:650;margin-bottom:4px">'+
+      esc(p.page||'')+(p.section&&p.section!==p.page?' &rsaquo; '+esc(p.section):'')+
+      (p.url?' · <a href="'+esc(p.url)+'" target="_blank" rel="noopener" style="color:var(--accent)">open</a>':'')+
+      '</div><div style="white-space:pre-wrap;line-height:1.55">'+esc(p.text)+'</div>'+
+      '<div style="font-size:11px;color:var(--muted);margin-top:6px">matched: '+
+      esc((p.matched_terms||[]).join(', '))+'</div>';
+    body.append(box);
+  });
+  c.append(body);
+  return c;
 }
 function renderTopBilling(d){
   const c=el('div','card');
@@ -853,7 +880,7 @@ function viewChat(){
   msgs.append(hero);
   const chips=el('div','chips');
   ['Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 10 billing customers in INR',
+   'Is the suspense balance within policy?','What is our capitalization threshold?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 10 billing customers in INR',
    'Are there unposted journals?'].forEach(q=>{
     const c=el('div','chip',esc(q)); c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });

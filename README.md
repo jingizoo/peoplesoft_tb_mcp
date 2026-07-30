@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    29 tools     │  TB engine + guarded SQL  │
+│  pstb.client.chat    │    30 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (128 checks) and the MCP server end to end. Then install
+verifies both the engine (141 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
@@ -139,7 +139,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 29 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 30 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -155,7 +155,8 @@ billing pipeline — see [docs/BILLING_AR.md](docs/BILLING_AR.md)) ·
 `get_top_billing_customers` · `get_exchange_rate` (effective-dated
 PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
 `get_record_map` (semantic record dictionary with live row counts) ·
-`wiki_search` · `wiki_get_page` · `wiki_health` ·
+`wiki_lookup` (searches, fetches and returns the actual passages — see
+[docs/RAG.md](docs/RAG.md)) · `wiki_search` · `wiki_get_page` · `wiki_health` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.
 
@@ -178,8 +179,10 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 - **Semantic layer:** `list_tables`/`describe_table` already let the model
   explore; next step is a curated record dictionary (PSRECDEFN-driven) so
   free-form questions ground in the right records.
-- **Wiki-augmented answers:** RAG over Confluence spaces for close calendars,
-  policy thresholds, and runbooks.
+- **Wiki-augmented answers (shipped):** `wiki_lookup` returns ranked passages
+  with page/section provenance so policy answers quote real text and combine
+  with ledger figures. Whether to add embeddings — and the evidence that would
+  justify it — is worked through in [docs/RAG.md](docs/RAG.md).
 
 ## Layout
 

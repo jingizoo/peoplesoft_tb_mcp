@@ -43,7 +43,10 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
 - `pstb/db.py` — SQLite / Oracle / SQL Server connections; rows come back as
   lowercase-keyed dicts.
 - `pstb/wiki.py` — Confluence REST or a local markdown folder, with automatic
-  fallback.
+  fallback; `lookup()` searches, fetches and returns ranked passages.
+- `pstb/retrieve.py` — heading-aware passage splitting + BM25 (stdlib).
+- `pstb/guards.py` — structural answer guards: continue on a promised-but-
+  unmade tool call; flag a compliance verdict missing rule or figure.
 - `pstb/ar.py` — AR aging (with GL control tie-out) and billing pipeline
   over PS_ITEM / PS_CUSTOMER / PS_BI_HDR / INTFC_BI.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
@@ -100,7 +103,7 @@ failure mode.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 128 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 141 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.

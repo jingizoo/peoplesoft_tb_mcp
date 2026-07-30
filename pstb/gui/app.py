@@ -287,6 +287,18 @@ def wiki_health():
                 "connected": False, "error": str(e)}
 
 
+@app.get("/api/wiki/lookup")
+def wiki_lookup(question: str, max_pages: int = 3, max_passages: int = 6):
+    if wiki is None:
+        raise HTTPException(status_code=503, detail="No wiki provider configured")
+    from ..wiki import lookup as _lookup
+    try:
+        return _lookup(wiki, question, max_pages=max_pages,
+                       max_passages=max_passages)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/api/wiki/search")
 def wiki_search(query: str, limit: int = 8):
     if wiki is None:

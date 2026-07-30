@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -19,11 +20,13 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from ..config import Config, load_config
+from ..guards import promises_tool_call, unevidenced_verdict
 from ..qlog import QuestionLog
 from .llm_base import LLMProvider, LLMResponse, ToolResult, ToolSpec
 from .prompt import system_prompt
 
 MAX_TOOL_ROUNDS = 10
+MAX_NUDGES = 2
 MAX_TOOL_RESULT_CHARS = 24_000  # mutable via set_tool_result_limit()
 
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
@@ -124,8 +127,19 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     logged_calls: list[dict] = []
     rounds = 0
     hit_limit = False
+    nudges = 0
     for _ in range(MAX_TOOL_ROUNDS):
         if not resp.tool_calls:
+            # Promised a tool call but made none — continue rather than
+            # handing the user an unfulfilled intention.
+            if nudges < MAX_NUDGES and promises_tool_call(resp.text):
+                nudges += 1
+                resp = provider.send_user(
+                    "You stated you would call a tool but did not. Issue that "
+                    "tool call now, then answer. Do not describe what you will "
+                    "do — do it."
+                )
+                continue
             break
         rounds += 1
         if resp.text.strip():
@@ -146,6 +160,20 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
         hit_limit = True
     answer = resp.text or ("(stopped: too many tool rounds)" if hit_limit
                            else "(no response)")
+
+    # A compliance verdict needs a rule AND a figure. If one side is missing,
+    # say so rather than letting a half-grounded judgement stand.
+    used = {c["tool"] for c in logged_calls}
+    missing = unevidenced_verdict(answer, used)
+    if missing:
+        if True:
+            answer += (
+                f"\n\n[unverified verdict: this turn never retrieved {missing}, "
+                "so the compliance judgement above is not fully evidenced. Ask "
+                "again for both the rule and the balance.]"
+            )
+            logged_calls.append({"tool": "_verdict_guard", "ok": False,
+                                 "error": f"verdict without {missing}"})
     if qlog is not None:
         turn_id = qlog.log_turn(surface=surface, provider=provider.name,
                                 question=user_text, calls=logged_calls,

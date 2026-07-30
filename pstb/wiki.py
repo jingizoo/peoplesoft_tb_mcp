@@ -53,6 +53,21 @@ def html_to_text(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _excerpt(text: str, query: str, width: int = 400) -> str:
+    """Text around the first query term, so a snippet shows the relevant part."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    pos = 0
+    for term in sorted((query or "").lower().split(), key=len, reverse=True):
+        if len(term) > 2 and term in low:
+            pos = low.find(term)
+            break
+    start = max(0, pos - width // 3)
+    return re.sub(r"\s+", " ", t[start:start + width]).strip()
+
+
 class LocalDocsWiki:
     provider_name = "localdocs"
 
@@ -277,13 +292,17 @@ class ConfluenceWiki:
         r = self.client.get(
             "/rest/api/content/search",
             params={"cql": cql, "limit": max(int(limit or 5), 1),
-                    "expand": "space,version,history.lastUpdated"},
+                    # body.storage is what turns a hyperlink list into readable
+                    # content — without it the model only ever sees titles.
+                    "expand": "space,version,history.lastUpdated,body.storage"},
         )
         if r.status_code >= 400:
             raise WikiError(f"Confluence search failed ({r.status_code}): {r.text[:300]}")
         out = []
         for item in r.json().get("results", []):
             link = item.get("_links", {}).get("webui", "")
+            body = ((item.get("body") or {}).get("storage") or {}).get("value", "")
+            text = html_to_text(body)
             out.append(
                 {
                     "id": item.get("id"),
@@ -291,6 +310,9 @@ class ConfluenceWiki:
                     "space": (item.get("space") or {}).get("key"),
                     "version": (item.get("version") or {}).get("number"),
                     "url": f"{self.base}{link}" if link else None,
+                    "snippet": _excerpt(text, clean),
+                    "text": text,
+                    "chars": len(text),
                 }
             )
         return out
@@ -326,6 +348,72 @@ class ConfluenceWiki:
             "truncated": len(text) > MAX_PAGE_CHARS,
             "url": f"{self.base}{link}" if link else None,
         }
+
+
+def lookup(wiki, question: str, max_pages: int = 3, max_passages: int = 6,
+           limit: int = 8) -> dict:
+    """Search, FETCH the top pages, and return the passages that answer the
+    question — with provenance. One call replaces search-then-read, which is
+    the step models skip (leaving the user with a list of hyperlinks)."""
+    from .retrieve import rank_passages, split_passages
+
+    hits = wiki.search(question, limit=max(int(limit or 8), 1))
+    if not hits:
+        return {"provider": wiki.provider_name, "question": question,
+                "passages": [], "sources": [],
+                "note": "No wiki pages matched. Try different wording, or widen "
+                        "the configured space/label scope."}
+
+    passages: list[dict] = []
+    sources: list[dict] = []
+    for hit in hits[: max(int(max_pages or 3), 1)]:
+        text = hit.get("text") or ""
+        page = None
+        if len(text) < 200:  # search gave little or nothing — fetch the page
+            try:
+                page = wiki.get_page(str(hit.get("id")))
+                text = page.get("text") or ""
+            except Exception as e:
+                sources.append({"title": hit.get("title"), "id": hit.get("id"),
+                                "error": f"fetch failed: {e}"})
+                continue
+        src = {
+            "title": hit.get("title") or (page or {}).get("title"),
+            "id": hit.get("id"),
+            "url": hit.get("url") or (page or {}).get("url"),
+            "space": hit.get("space") or (page or {}).get("space"),
+            "version": hit.get("version") or (page or {}).get("version"),
+            "last_modified": (page or {}).get("last_modified"),
+            "chars": len(text),
+        }
+        sources.append(src)
+        for p in split_passages(text, title=src["title"] or ""):
+            passages.append({**p, "page": src["title"], "page_id": src["id"],
+                             "url": src["url"]})
+
+    top = rank_passages(question, passages, top=max(int(max_passages or 6), 1))
+    out = {
+        "provider": wiki.provider_name,
+        "question": question,
+        "sources": sources,
+        "passages": top,
+        "passages_considered": len(passages),
+        "note": (
+            "These are the actual passages, not links. Answer from this text and "
+            "quote the sentence you rely on, naming the page. If the text does "
+            "not contain the answer, say so — do not infer policy from a title."
+        ),
+    }
+    try:
+        h = wiki.health()
+        if h.get("is_bundled_demo_content"):
+            out["demo_content_warning"] = (
+                "FICTIONAL sample pages, not your company wiki — do not present "
+                "any figure here as company policy."
+            )
+    except Exception:
+        pass
+    return out
 
 
 def make_wiki(cfg: Config):

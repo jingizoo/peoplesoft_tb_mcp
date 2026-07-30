@@ -21,6 +21,7 @@ from .db import Database, DbError
 from .engine import EngineError, TBEngine
 from .ar import ARBilling, ARError
 from .report import ReportError, ReportRunner
+from . import wiki as wiki_mod
 from .wiki import WikiError, make_wiki
 
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
@@ -439,13 +440,33 @@ if wiki is not None:
             return {"error": f"wiki_health failed: {e}"}
 
     @mcp.tool()
-    def wiki_search(query: str, limit: int = 5) -> dict:
-        """Search the company wiki/documentation for policies, procedures, and
-        context (close checklist, account policies, suspense rules). Use for
-        'why/policy/process/who owns' questions; cite the page title in answers."""
+    def wiki_lookup(question: str, max_pages: int = 3,
+                    max_passages: int = 6) -> dict:
+        """READ the wiki: searches, fetches the top pages, and returns the actual
+        PASSAGES that answer the question, each with page title, section, URL and
+        version. USE THIS for any policy/process/threshold/"why" question —
+        wiki_search alone returns links, and an answer built from titles is a
+        guess. Quote the sentence you rely on and name its page. If the passages
+        do not contain the answer, say so."""
         try:
-            out = {"provider": wiki.provider_name,
-                   "results": wiki.search(query, limit)}
+            return wiki_mod.lookup(wiki, question, max_pages=max_pages,
+                                   max_passages=max_passages)
+        except Exception as e:
+            return {"error": f"wiki_lookup failed: {e}"}
+
+    @mcp.tool()
+    def wiki_search(query: str, limit: int = 5) -> dict:
+        """Find candidate wiki pages (title, snippet, URL). This returns
+        POINTERS, not full content — for an actual answer call wiki_lookup,
+        which returns the passages. Never answer a policy question from these
+        titles/links alone."""
+        try:
+            hits = wiki.search(query, limit)
+            for h in hits:
+                h.pop("text", None)  # keep search light; wiki_lookup reads pages
+            out = {"provider": wiki.provider_name, "results": hits,
+                   "next_step": "Call wiki_lookup(question=...) to read the "
+                                "actual passages before answering."}
             if getattr(wiki, "provider_name", "") == "localdocs":
                 h = wiki.health()
                 if h.get("is_bundled_demo_content"):
