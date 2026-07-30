@@ -454,7 +454,11 @@ function renderGeneric(name,d){
         ?'<td class="num">'+money(v)+'</td>':'<td'+(typeof v==='number'?' class="num"':'')+'>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody>';
     sc.append(t);c.append(sc);
   } else {
-    c.append(el('pre','pad','')).textContent=JSON.stringify(d,null,1).slice(0,2000);
+    // DOM append() returns undefined — chaining .textContent off it threw,
+    // so every non-tabular payload silently rendered nothing.
+    const pre=el('pre','pad','');
+    pre.textContent=JSON.stringify(d,null,1).slice(0,2000);
+    c.append(pre);
   }
   return c;
 }
@@ -481,7 +485,17 @@ function renderToolResult(name,data){
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';
       b.textContent=data.text||'';c.append(b);return c;}
     return renderGeneric(name,data);
-  }catch(e){ return null; }
+  }catch(e){
+    // A renderer bug must degrade to visible raw data, never a silently
+    // missing dashboard.
+    try{
+      const c=el('div','card');
+      c.append(el('h2',null,esc(name)+' <span class="badge warn">raw view</span>'+
+        '<span class="sub">dashboard renderer hit an unexpected payload</span>'));
+      c.append(renderGeneric(name,data)||el('div','pad','(no data)'));
+      return c;
+    }catch(_){ return null; }
+  }
 }
 
 function renderReport(d){
@@ -538,6 +552,7 @@ async function viewReports(){
 }
 
 function renderAging(d){
+  if(d.scope_status&&d.scope_status!=='ok') return noData(d);
   const frag=document.createDocumentFragment();
   const t=d.totals, tie=d.gl_tie;
   const curNote=esc(d.display_currency||'')+
