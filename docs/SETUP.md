@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (103 checks) and
+clients, builds the sample ledger, and then verifies the engine (108 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:
@@ -261,7 +261,11 @@ authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
      suspense_accounts: ["1999"]
      retained_earnings_account: "3500"
    ```
-5. Sanity-check before trusting anything:
+5. The scope bar and blank tool arguments are **validated against the
+   database**: if the config defaults (business unit, ledger) don't exist in
+   your instance, the agent discovers real ones and says so — but set your
+   true defaults here anyway so the discovery note goes away.
+6. Sanity-check before trusting anything:
    ```bash
    .venv/bin/python -m pstb.client.chat --ask "List the business units and ledgers."
    ```

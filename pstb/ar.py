@@ -76,7 +76,8 @@ class ARBilling:
         return _iso(d).isoformat()
 
     def _bu(self, business_unit: str) -> str:
-        return (business_unit or "").strip() or self.cfg.defaults.business_unit
+        return ((business_unit or "").strip()
+                or self.e.effective_defaults()["business_unit"])
 
     def _bucket_edges(self) -> list[int]:
         edges = sorted(int(x) for x in (self.cfg.defaults.aging_buckets or [30, 60, 90]))
