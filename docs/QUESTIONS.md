@@ -77,6 +77,16 @@ routes through. Use these as acceptance tests when trying a new model.
 48g. Income statement including audit adjustments (post-998 basis).
 See docs/NVISION.md for migrating existing nVision layouts.
 
+## Receivables & Billing → `get_ar_aging`, `get_customer_ar`, `search_customers`, `get_billing_workbench`
+48h. Show the AR aging by customer. Does it tie to the GL?
+48i. Who owes us the most? What's overdue past 90 days?
+48j. What does Beacon Health owe, and is anything disputed?
+48k. Are there credit memos or unapplied receipts outstanding?
+48l. Any invoices stuck in billing — ready but not finalized, or on hold?
+48m. Are there billing interface errors?
+48n. Did every finalized invoice make it to AR?
+48o. Which customers are inactive but still carry a balance?
+
 ## Anything else → guarded `run_sql` (+ `list_tables`, `describe_table`)
 49. How many journals were posted in FY2026 by source?
 50. Which operator posted the most journal lines this year?

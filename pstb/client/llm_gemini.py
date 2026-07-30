@@ -8,6 +8,7 @@ Credentials (`gcloud auth application-default login`).
 from __future__ import annotations
 
 import json
+import time
 
 from ..config import Config
 from .llm_base import LLMProvider, LLMResponse, ToolCall, ToolResult, ToolSpec, clean_schema
@@ -53,25 +54,50 @@ class GeminiVertexProvider(LLMProvider):
                         name=t.name, description=t.description, parameters=schema
                     )
                 )
-        self.gen_config = types.GenerateContentConfig(
+        kwargs = dict(
             system_instruction=system_prompt,
             tools=[types.Tool(function_declarations=declarations)],
             temperature=cfg.llm.temperature,
         )
+        tb = getattr(cfg.llm, "gemini_thinking_budget", -1)
+        if tb is not None and tb >= 0:
+            try:
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=tb)
+            except (TypeError, AttributeError):
+                pass  # older google-genai without ThinkingConfig
+        self.gen_config = types.GenerateContentConfig(**kwargs)
         self.reset()
 
     def reset(self) -> None:
         self.contents: list = []
 
     def _generate(self) -> LLMResponse:
-        resp = self.client.models.generate_content(
-            model=self.model, contents=self.contents, config=self.gen_config
-        )
+        # Vertex rate limits (429) and transient 5xx are normal under load;
+        # retry briefly instead of dropping the user's turn.
+        resp = None
+        for attempt in range(4):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model, contents=self.contents, config=self.gen_config
+                )
+                break
+            except Exception as e:
+                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                msg = str(e)
+                transient = code in (429, 500, 503) or any(
+                    k in msg for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE")
+                )
+                if attempt == 3 or not transient:
+                    raise
+                time.sleep(1.5 * (2 ** attempt))
         if not resp.candidates:
             return LLMResponse(text="(Gemini returned no candidates — possibly blocked.)")
         cand = resp.candidates[0]
         if cand.content is None:
             return LLMResponse(text=f"(Gemini stopped: {cand.finish_reason})")
+        # Append the candidate content verbatim: Gemini 2.5 attaches thought
+        # signatures to function-call parts, and replaying them unmodified is
+        # what keeps multi-step tool chains coherent.
         self.contents.append(cand.content)
         text_parts, calls = [], []
         for i, part in enumerate(cand.content.parts or []):

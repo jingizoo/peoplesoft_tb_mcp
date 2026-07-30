@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (77 checks) and
+clients, builds the sample ledger, and then verifies the engine (103 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:
@@ -156,7 +156,7 @@ set `llm.provider: gemini` in `config.yaml`. You can also switch mid-session in
 the REPL with `/provider gemini`, or override per run with the
 `PSTB_LLM_PROVIDER` environment variable.
 
-**Choosing a model.** `config.yaml` ships `gemini-2.5-flash`. Newer models may
+**Choosing a model.** `config.yaml` ships `gemini-2.5-pro`. Newer models may
 be available in your project and region; list what you can actually call with:
 
 ```bash
@@ -172,9 +172,15 @@ Override without editing config using `--model`:
 Model availability is region-specific — if a model 404s, try
 `GOOGLE_CLOUD_LOCATION=us-central1`, which has the broadest coverage.
 
+**Gemini 2.5 Pro tuning built in.** The config defaults to `gemini-2.5-pro`.
+Tool results are sized up to 120k characters for Gemini (vs 24k for local
+models), transient 429/503 errors retry with backoff, and
+`llm.gemini_thinking_budget` caps thinking tokens if you want lower
+latency/cost (-1 = model default).
+
 **Expect better results than a local model.** In testing, `llama3.1:8b`
 invented parameter names and misstated verdicts even with correct tool data.
-Gemini's tool-calling is substantially stronger, which matters for a 17-tool
+Gemini's tool-calling is substantially stronger, which matters for a 25-tool
 surface. The trade-off is in the data note below.
 
 **Data note:** with Gemini, tool results — ledger amounts, operator IDs, and
@@ -217,6 +223,7 @@ Five views sharing one scope bar (business unit, ledger, fiscal year, period):
 | Statement rollup | Assets / liabilities / equity / revenue / expenses by tree node, with net income and an A = L + E check. |
 | Variance | Largest movers between two periods with change, % and a magnitude bar. |
 | Reports | nVision-style statements (income statement, balance sheet, quarterly trend): tree/account rows × ledger + timespan columns, budget vs actuals. See [NVISION.md](NVISION.md). |
+| Receivables | AR aging by customer with GL tie-out, customer drill-down, billing pipeline health (stuck invoices, interface errors, finalized-not-in-AR). |
 | Ask | Chat that renders each tool result inline as a table, chart or control card. |
 
 Every figure on screen is computed by the engine and rendered by the browser.

@@ -19,6 +19,7 @@ except ImportError:  # mcp SDK 1.x
 from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
+from .ar import ARBilling, ARError
 from .report import ReportError, ReportRunner
 from .wiki import WikiError, make_wiki
 
@@ -26,6 +27,7 @@ cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
+ar = ARBilling(engine)
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:
@@ -38,7 +40,7 @@ mcp = FastMCP("peoplesoft-tb")
 def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
-    except (EngineError, DbError, WikiError, ReportError) as e:
+    except (EngineError, DbError, WikiError, ReportError, ARError) as e:
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}
@@ -203,6 +205,59 @@ def rollup_trial_balance(
         engine.rollup_trial_balance,
         business_unit=business_unit, fiscal_year=fiscal_year, period=period,
         tree_name=tree_name, level=level, ledger=ledger,
+    )
+
+
+@mcp.tool()
+def get_ar_aging(
+    business_unit: str = "",
+    as_of_date: str = "",
+    customer_id: str = "",
+    detail: bool = False,
+) -> dict:
+    """AR aging by customer: current / 1-30 / 31-60 / 61-90 / over-90 buckets from
+    open items (PS_ITEM), with credits and disputes broken out, PLUS a tie-out of
+    the subledger total to the GL AR control account. Use for "aging", "overdue",
+    "who owes us", "collections", "does AR tie to the GL".
+    as_of_date: YYYY-MM-DD, empty = today. detail=true adds item-level rows.
+    Positive = owed by customer; negative = credit memo / on-account receipt."""
+    return _safe(
+        ar.aging, business_unit=business_unit, as_of_date=as_of_date,
+        customer_id=customer_id, detail=detail,
+    )
+
+
+@mcp.tool()
+def get_customer_ar(customer: str, business_unit: str = "", as_of_date: str = "") -> dict:
+    """One customer's open AR: every open item with days past due and bucket,
+    credit memos, disputes, and the customer's aging summary. customer can be an
+    ID (C1001) or a name fragment; ambiguous names return the candidates to ask
+    the user about."""
+    return _safe(
+        ar.customer, customer=customer, business_unit=business_unit,
+        as_of_date=as_of_date,
+    )
+
+
+@mcp.tool()
+def search_customers(query: str = "", limit: int = 25) -> dict:
+    """Find AR customers by name or ID; returns id, name, active/inactive status,
+    and open balance. Empty query lists customers."""
+    return _safe(ar.search_customers, query=query, limit=limit)
+
+
+@mcp.tool()
+def get_billing_workbench(
+    business_unit: str = "", days_stuck: int = 5, as_of_date: str = ""
+) -> dict:
+    """Billing pipeline health: invoice counts/amounts by status (NEW, HLD, RDY,
+    INV=finalized, CAN), invoices pending longer than days_stuck, billing
+    interface lines in error, and finalized invoices that never reached AR.
+    Use for "stuck invoices", "billing errors", "revenue not billed",
+    "did every invoice make it to AR"."""
+    return _safe(
+        ar.billing_workbench, business_unit=business_unit,
+        days_stuck=days_stuck, as_of_date=as_of_date,
     )
 
 
