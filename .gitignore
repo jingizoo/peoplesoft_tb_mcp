@@ -10,3 +10,4 @@ sample_data/*.db
 .vscode/
 .idea/
 *.local.json
+logs/

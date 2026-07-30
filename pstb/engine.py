@@ -991,6 +991,202 @@ class TBEngine:
                     **self._scope_diagnosis(bu, self.cfg.defaults.ledger, 0)}
         return {"business_unit": bu, "ledgers": [r["ledger"] for r in rows]}
 
+    # ------------------------------------------------ semantic record map / FX
+    # Curated concept -> record dictionary. kind='transaction' rows carry
+    # amounts and are expected to be LARGE in a live instance; kind='reference'
+    # rows are setup/master data and are legitimately small — the row-count
+    # sanity check applies ONLY to transaction records.
+    RECORD_MAP = {
+        "general_ledger": [
+            ("PS_LEDGER", "transaction", "period balances by chartfield (signed)",
+             "get_trial_balance / get_account_balance / run_report"),
+            ("PS_JRNL_HEADER", "transaction", "journal headers", "drill_to_journals"),
+            ("PS_JRNL_LN", "transaction",
+             "journal lines — the record is PS_JRNL_LN, NOT PS_JRNL_LINE",
+             "drill_to_journals"),
+        ],
+        "billing": [
+            ("PS_BI_HDR", "transaction",
+             "invoice headers; BILL_STATUS INV = finalized",
+             "get_billing_workbench / get_top_billing_customers"),
+            ("PS_BI_LINE", "transaction", "invoice lines", ""),
+            ("PS_INTFC_BI", "transaction", "billing interface staging",
+             "get_billing_workbench"),
+        ],
+        "receivables": [
+            ("PS_ITEM", "transaction", "open AR items (BAL_AMT signed)",
+             "get_ar_aging / get_customer_ar"),
+            ("PS_ITEM_ACTIVITY", "transaction", "AR item activity", ""),
+            ("PS_CUSTOMER", "reference", "customers", "search_customers"),
+        ],
+        "chartfields_setup": [
+            ("PS_GL_ACCOUNT_TBL", "reference", "accounts (effective-dated)",
+             "search_accounts"),
+            ("PS_DEPT_TBL", "reference", "departments", ""),
+            ("PS_BUS_UNIT_TBL_GL", "reference", "GL business units",
+             "list_business_units"),
+            ("PS_SET_CNTRL_REC", "reference", "setid indirection", ""),
+            ("PS_CAL_DETP_TBL", "reference", "period calendar", "resolve_period"),
+            ("PSTREENODE", "reference", "tree nodes", "rollup_trial_balance"),
+            ("PSTREELEAF", "reference", "tree leaf ranges", "rollup_trial_balance"),
+        ],
+        "currency": [
+            ("PS_RT_RATE_TBL", "reference",
+             "exchange rates FROM_CUR->TO_CUR by RT_TYPE, effective-dated",
+             "get_exchange_rate"),
+        ],
+    }
+
+    def _approx_rows(self, table: str) -> Optional[int]:
+        """Approximate row count without scanning: Oracle optimizer stats
+        (ALL_TABLES.NUM_ROWS); exact COUNT only on SQLite (sample-sized)."""
+        try:
+            if self.db.dialect == "oracle":
+                owner = self.cfg.db.schema.strip().rstrip(".").upper()
+                if owner:
+                    rows, _ = self.db.query(
+                        "SELECT NUM_ROWS AS n FROM ALL_TABLES "
+                        "WHERE OWNER = :o AND TABLE_NAME = :t",
+                        {"o": owner, "t": table.upper()}, max_rows=1)
+                else:
+                    rows, _ = self.db.query(
+                        "SELECT NUM_ROWS AS n FROM USER_TABLES WHERE TABLE_NAME = :t",
+                        {"t": table.upper()}, max_rows=1)
+                return int(rows[0]["n"]) if rows and rows[0]["n"] is not None else None
+            if self.db.dialect == "sqlite":
+                if not self._table_exists(table):
+                    return None
+                rows, _ = self.db.query(f"SELECT COUNT(*) AS n FROM {table}",
+                                        {}, max_rows=1)
+                return int(rows[0]["n"])
+        except Exception:
+            return None
+        return None
+
+    def get_record_map(self) -> dict:
+        threshold = int(getattr(self.cfg.tools, "txn_row_threshold", 1000) or 1000)
+        domains = {}
+        for domain, recs in self.RECORD_MAP.items():
+            out = []
+            for name, kind, descr, tool in recs:
+                exists = self._table_exists(name)
+                entry = {"record": name, "kind": kind, "descr": descr,
+                         "present": exists}
+                if tool:
+                    entry["prefer_tool"] = tool
+                if exists:
+                    n = self._approx_rows(name)
+                    entry["approx_rows"] = n
+                    if kind == "transaction":
+                        if n is not None and n < threshold:
+                            entry["warning"] = (
+                                f"only ~{n} rows — small for a transaction "
+                                "record; verify this is the table your "
+                                "organization actually posts to (fine in a "
+                                "demo/sample database)"
+                            )
+                else:
+                    entry["note"] = "not present in this database"
+                out.append(entry)
+            domains[domain] = out
+        return {
+            "domains": domains,
+            "txn_row_threshold": threshold,
+            "note": (
+                "Transaction records carry amounts and should be large in a "
+                "live instance; reference records are setup/master data and "
+                "are legitimately small. When a curated tool is listed under "
+                "prefer_tool, use it instead of run_sql."
+            ),
+        }
+
+    def exchange_rate(self, from_currency: str, to_currency: str,
+                      as_of_date: str = "", rate_type: str = "",
+                      amounts: str = "") -> dict:
+        """Effective-dated FX from PS_RT_RATE_TBL; converts amounts SERVER-SIDE
+        so the model never does the multiplication."""
+        fc = (from_currency or "").strip().upper()
+        tc = (to_currency or "").strip().upper()
+        if not fc or not tc:
+            raise EngineError("from_currency and to_currency are required")
+        rt = (rate_type or "").strip().upper() or             getattr(self.cfg.defaults, "rate_type", "CRRNT")
+        d = (as_of_date or "").strip() or dt.date.today().isoformat()
+        try:
+            d = dt.date.fromisoformat(d[:10]).isoformat()
+        except ValueError:
+            raise EngineError(f"Bad as_of_date {as_of_date!r} — use YYYY-MM-DD")
+        p = self.db.prefix
+        sql = (f"SELECT RATE_MULT AS m, RATE_DIV AS dv, EFFDT AS effdt "
+               f"FROM {p}PS_RT_RATE_TBL WHERE FROM_CUR = :f AND TO_CUR = :t "
+               f"AND RT_TYPE = :rt AND EFFDT = ("
+               f"SELECT MAX(EFFDT) FROM {p}PS_RT_RATE_TBL "
+               f"WHERE FROM_CUR = :f AND TO_CUR = :t AND RT_TYPE = :rt "
+               f"AND EFFDT <= {self.db.date_bind('d')})")
+        rows, _ = self.db.query(sql, {"f": fc, "t": tc, "rt": rt, "d": d},
+                                max_rows=1)
+        inverted = False
+        cross_via = None
+        if not rows:
+            rows, _ = self.db.query(sql, {"f": tc, "t": fc, "rt": rt, "d": d},
+                                    max_rows=1)
+            inverted = True
+        if rows:
+            m, dv = float(rows[0]["m"] or 0), float(rows[0]["dv"] or 1) or 1.0
+            rate = (dv / m) if inverted else (m / dv)
+            effdt = str(rows[0]["effdt"])[:10]
+        else:
+            # Triangulate through the base currency (standard FX practice when
+            # no direct pair is maintained): FROM->BASE then BASE->TO.
+            base = (self.cfg.defaults.base_currency or "USD").upper()
+            if fc != base and tc != base:
+                try:
+                    leg1 = self.exchange_rate(fc, base, as_of_date=d, rate_type=rt)
+                    leg2 = self.exchange_rate(base, tc, as_of_date=d, rate_type=rt)
+                    rate = leg1["rate"] * leg2["rate"]
+                    inverted = False
+                    cross_via = base
+                    effdt = min(leg1["effective_date"], leg2["effective_date"])
+                    rows = [True]
+                except EngineError:
+                    rows = []
+        if not rows:
+            pairs, _ = self.db.query(
+                f"SELECT DISTINCT FROM_CUR AS f, TO_CUR AS t "
+                f"FROM {p}PS_RT_RATE_TBL WHERE RT_TYPE = :rt",
+                {"rt": rt}, max_rows=50)
+            raise EngineError(
+                f"No {rt} rate for {fc}->{tc} on or before {d} (direct, "
+                f"inverse, or via base). Available pairs: "
+                f"{[(x['f'], x['t']) for x in pairs]}"
+            )
+        out = {
+            "from_currency": fc, "to_currency": tc, "rate_type": rt,
+            "as_of": d, "effective_date": effdt,
+            "rate": round(rate, 8),
+            "inverted_from_reverse_pair": inverted,
+            **({"cross_via": cross_via} if cross_via else {}),
+            "note": f"1 {fc} = {round(rate, 6)} {tc} "
+                    f"({rt}, effective {effdt}"
+                    + (f", triangulated via {cross_via}" if cross_via else "")
+                    + ")",
+        }
+        raw = [a.strip() for a in (amounts or "").split(",") if a.strip()]
+        if raw:
+            try:
+                vals = [float(a.replace(",", "")) for a in raw]
+            except ValueError as ex:
+                raise EngineError(f"amounts must be numbers: {ex}")
+            conv = [r2(v * rate) for v in vals]
+            out["conversions"] = [
+                {"amount": r2(v), "converted": c} for v, c in zip(vals, conv)
+            ]
+            out["converted_total"] = r2(sum(conv))
+            out["conversion_note"] = (
+                "Converted server-side at the quoted rate — copy these figures "
+                "verbatim; do not recompute."
+            )
+        return out
+
     # ------------------------------------------------------------- raw SQL
     _TABLE_REF_RE = re.compile(
         r"(?is)\b(?:FROM|JOIN)\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)"
@@ -1042,8 +1238,13 @@ class TBEngine:
                 return []
             names = [str(r["table_name"]).upper() for r in rows]
             if names:
-                ranked = difflib.get_close_matches(base, names, n=5, cutoff=0.0)
-                return ranked or names[:5]
+                ranked = difflib.get_close_matches(base, names, n=5, cutoff=0.0) \
+                    or names[:5]
+                # Among close matches, surface populated tables first — an
+                # empty look-alike is rarely the record the question means.
+                counts = {n: (self._approx_rows(n) or 0) for n in ranked}
+                ranked.sort(key=lambda n: -counts.get(n, 0))
+                return ranked
         return []
 
     def run_sql(self, sql: str, max_rows: int = 100) -> dict:

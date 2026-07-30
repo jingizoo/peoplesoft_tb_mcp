@@ -17,6 +17,7 @@ from ..config import load_config
 from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
 from ..ar import ARBilling, ARError
+from ..qlog import QuestionLog
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
 
@@ -37,6 +38,7 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
     wiki = make_wiki(cfg)
 except WikiError:
@@ -366,7 +368,8 @@ async def chat(payload: dict):
 
                 chat_mod.call_mcp_tool = traced
                 try:
-                    answer = await agent_turn(provider, session, message)
+                    answer = await agent_turn(provider, session, message,
+                                              qlog=qlog, surface="gui")
                 finally:
                     chat_mod.call_mcp_tool = original
     except RuntimeError as e:
@@ -387,7 +390,18 @@ async def chat(payload: dict):
             status_code=500,
             content={"error": f"{type(root).__name__}: {root}", "tool_calls": calls},
         )
-    return {"answer": answer, "tool_calls": calls, "provider": provider_name}
+    return {"answer": answer, "tool_calls": calls, "provider": provider_name,
+            "turn_id": getattr(agent_turn, "last_turn_id", None)}
+
+
+@app.post("/api/feedback")
+def feedback(payload: dict):
+    turn_id = (payload or {}).get("turn_id", "")
+    if not turn_id:
+        raise HTTPException(status_code=400, detail="turn_id required")
+    qlog.log_feedback(turn_id, (payload or {}).get("verdict", "bad"),
+                      (payload or {}).get("note", ""))
+    return {"ok": True}
 
 
 @app.post("/api/chat/reset")

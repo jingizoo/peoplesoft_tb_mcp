@@ -19,6 +19,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from ..config import Config, load_config
+from ..qlog import QuestionLog
 from .llm_base import LLMProvider, LLMResponse, ToolResult, ToolSpec
 from .prompt import system_prompt
 
@@ -117,11 +118,16 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     return _truncate_json(text, MAX_TOOL_RESULT_CHARS)
 
 
-async def agent_turn(provider: LLMProvider, session: ClientSession, user_text: str) -> str:
+async def agent_turn(provider: LLMProvider, session: ClientSession,
+                     user_text: str, qlog=None, surface: str = "terminal") -> str:
     resp: LLMResponse = provider.send_user(user_text)
+    logged_calls: list[dict] = []
+    rounds = 0
+    hit_limit = False
     for _ in range(MAX_TOOL_ROUNDS):
         if not resp.tool_calls:
             break
+        rounds += 1
         if resp.text.strip():
             print(f"{DIM}{resp.text.strip()}{RESET}")
         results = []
@@ -131,11 +137,22 @@ async def agent_turn(provider: LLMProvider, session: ClientSession, user_text: s
                 arg_preview = arg_preview[:140] + "…"
             print(f"{DIM}  ⚙ {call.name}({arg_preview}){RESET}")
             out = await call_mcp_tool(session, call.name, call.args)
+            err = out.startswith("TOOL ERROR") or '"error":' in out[:200]
+            logged_calls.append({"tool": call.name, "ok": not err,
+                                 **({"error": out[:200]} if err else {})})
             results.append(ToolResult(call_id=call.id, name=call.name, content=out))
         resp = provider.send_tool_results(results)
     else:
-        return resp.text or "(stopped: too many tool rounds)"
-    return resp.text or "(no response)"
+        hit_limit = True
+    answer = resp.text or ("(stopped: too many tool rounds)" if hit_limit
+                           else "(no response)")
+    if qlog is not None:
+        turn_id = qlog.log_turn(surface=surface, provider=provider.name,
+                                question=user_text, calls=logged_calls,
+                                rounds=rounds, answer=answer,
+                                hit_round_limit=hit_limit)
+        agent_turn.last_turn_id = turn_id  # for the GUI feedback button
+    return answer
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -179,6 +196,7 @@ async def run(args: argparse.Namespace) -> int:
                 # Return rather than raise: an exception here would surface as an
                 # anyio ExceptionGroup traceback and bury the message above.
                 return 1
+            qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
             banner = (
                 f"{BOLD}PeopleSoft TB agent{RESET} — {provider.name}:{provider.model} | "
                 f"{len(tools)} tools | BU {cfg.defaults.business_unit}, ledger {cfg.defaults.ledger}"
@@ -192,7 +210,8 @@ async def run(args: argparse.Namespace) -> int:
 
             if args.ask:
                 print(f"\n{BOLD}you>{RESET} {args.ask}")
-                answer = await agent_turn(provider, session, args.ask)
+                answer = await agent_turn(provider, session, args.ask,
+                                          qlog=qlog, surface="terminal")
                 print(f"\n{answer}")
                 return 0
 
@@ -227,7 +246,8 @@ async def run(args: argparse.Namespace) -> int:
                         print("usage: /provider ollama|gemini")
                     continue
                 try:
-                    answer = await agent_turn(provider, session, q)
+                    answer = await agent_turn(provider, session, q,
+                                              qlog=qlog, surface="terminal")
                 except RuntimeError as e:
                     print(f"\n[provider error] {e}")
                     continue

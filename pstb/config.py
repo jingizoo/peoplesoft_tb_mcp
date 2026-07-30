@@ -19,6 +19,7 @@ class Defaults:
     setid: str = "SHARE"
     calendar_id: str = "01"
     base_currency: str = "USD"
+    rate_type: str = "CRRNT"
     adjustment_periods: list = field(default_factory=lambda: [998])
     suspense_accounts: list = field(default_factory=lambda: ["1999"])
     retained_earnings_account: str = "3500"
@@ -72,6 +73,8 @@ class ToolsCfg:
     allow_raw_sql: bool = True
     max_rows: int = 200
     reports_path: str = "reports"
+    question_log: str = "logs/questions.jsonl"
+    txn_row_threshold: int = 1000
 
 
 @dataclass

@@ -281,6 +281,9 @@ CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
   SETID TEXT, CALENDAR_ID TEXT, FISCAL_YEAR INTEGER, ACCOUNTING_PERIOD INTEGER,
   BEGIN_DT TEXT, END_DT TEXT);
+CREATE TABLE PS_RT_RATE_TBL (
+  FROM_CUR TEXT, TO_CUR TEXT, RT_TYPE TEXT, EFFDT TEXT,
+  RATE_MULT REAL, RATE_DIV REAL);
 CREATE TABLE PS_CUSTOMER (
   SETID TEXT, CUST_ID TEXT, NAME1 TEXT, CUST_STATUS TEXT);
 CREATE TABLE PS_ITEM (
@@ -525,6 +528,25 @@ def main() -> None:
             (4002, 1, "LINE", BU, "C9999", "MAN", "ERR", ""),
         ],
     )
+
+    # Exchange rates (PS_RT_RATE_TBL subset): effective-dated FROM->TO
+    con.executemany(
+        "INSERT INTO PS_RT_RATE_TBL VALUES (?,?,?,?,?,?)",
+        [
+            ("USD", "INR", "CRRNT", "2026-01-01", 83.25, 1.0),
+            ("USD", "INR", "CRRNT", "2026-07-01", 84.10, 1.0),
+            ("USD", "EUR", "CRRNT", "2026-01-01", 0.92, 1.0),
+            ("EUR", "USD", "CRRNT", "2026-01-01", 1.0, 0.92),
+            ("USD", "GBP", "CRRNT", "2026-01-01", 0.79, 1.0),
+        ],
+    )
+    # One finalized EUR invoice (closed in AR so aging/tie stay single-currency)
+    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (BU, "INV-2606EUR", "INV", "C1006", "2026-06-22", "2026-06-22",
+                 2_000.00, "EUR", "STD", "CRM"))
+    con.execute("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (BU, "C1006", "INV-2606EUR", 1, "C", 0.0, 2_000.00, "EUR",
+                 "2026-06-22", "2026-07-22", "2026-06-22", "", ""))
 
     con.executescript(VIEWS)
     con.executescript(INDEXES)

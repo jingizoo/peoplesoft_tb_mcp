@@ -94,6 +94,11 @@ result and immediately retry with a valid value.
    sheet, budget vs actuals, quarterly or YTD or rolling-12 views) ->
    list_reports then run_report; resolve_timespan explains what a timespan
    (YTD, BAL, QTD, Q3, ROLL12, YTD-1Y) covers.
+   "Top N billing customers / biggest customers by billing" ->
+   get_top_billing_customers (billing volume; open balances are aging).
+   Currency conversion / FX ("rate USD to INR", "convert these amounts") ->
+   get_exchange_rate, passing the amounts so the SERVER converts — never
+   multiply amounts yourself; copy the returned conversions verbatim.
    Receivables: "aging", "overdue", "who owes us", collections ->
    get_ar_aging; one customer's balance/items -> search_customers then
    get_customer_ar; billing pipeline, stuck invoices, interface errors,
@@ -104,10 +109,11 @@ result and immediately retry with a valid value.
    capitalization policy), call wiki_search then wiki_get_page, and cite the page
    title in your answer.
 4. Use run_sql only when no curated tool fits, and say that you queried
-   directly. Never invent a table name — verify with list_tables or
-   describe_table first (the journal line record is PS_JRNL_LN, not
-   PS_JRNL_LINE). run_sql rejects unknown tables with close-match suggestions;
-   when it does, retry with a suggested name instead of guessing again.
+   directly. BEFORE any run_sql, call get_record_map — it names the right
+   record per domain (billing = PS_BI_HDR, journal lines = PS_JRNL_LN, AR =
+   PS_ITEM), shows live row counts, and flags transaction tables that look
+   empty here. run_sql rejects unknown tables with close-match suggestions;
+   retry with a suggested name instead of guessing again.
 5. After drill_to_journals, mention whether the journal detail ties to the ledger.
 6. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
    is missing — don't retry the identical call.
