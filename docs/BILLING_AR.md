@@ -51,6 +51,33 @@ PeopleTools version before trusting production numbers.
   to one customer — a filtered subtotal can never tie.
 - Billing lifecycle: `NEW`/`PND` → `HLD` → `RDY` → `INV` (finalized) or `CAN`.
 
+## Multi-currency
+
+Open items carry `BAL_CURRENCY`, and a real book mixes them. The rules:
+
+- **Amounts in different currencies are never summed raw.** Aging groups by
+  `(customer, currency)` first, converts each group server-side at the
+  effective `PS_RT_RATE_TBL` rate (direct → inverse → triangulated via the
+  base currency), then merges.
+- `display_currency` on `get_ar_aging` / `get_customer_ar` /
+  `get_top_billing_customers` picks the reporting currency; empty means the
+  BU's base. So "top 10 customers by open AR **in USD**" is one tool call —
+  the conversion and the ranking happen in the server, not in the model.
+- Every conversion is disclosed in `fx_applied` (pair, rate, and `via` when
+  triangulated); converted detail items keep `original` /
+  `original_currency`.
+- **Missing rate fails closed**: no rate for a pair on or before the as-of
+  date is an error naming the pair — never a silent skip or a raw sum.
+- The GL tie-out always converts the subledger to the **base** currency and
+  compares against GL there, independent of `display_currency` — GL balances
+  are stored in base, so that is the only honest comparison basis. It converts
+  at **period-end** rates (the GL side is the balance through the latest
+  posted period, so a rate that changed after period end must not fabricate a
+  break), and the `basis` string states the rate date. If a rate needed for
+  the tie is missing, the tie reports `evaluated: false` with the reason
+  rather than a fabricated pass. A residual difference on real data can also
+  be unrevalued FX — items booked to GL at transaction-date rates.
+
 ## Relationship to the Billing/Top-20 review
 
 This pack implements the read-only core of the earlier
@@ -64,8 +91,10 @@ once these read-only views prove out against real data.
 
 ## Sample data
 
-Eight customers; open items that sum **exactly** to the GL AR control balance
-(the seed computes a plug item, then asserts the tie); a disputed 42,000 item
-220+ days old; a credit memo and an on-account receipt; two ready-not-finalized
-invoices, one on hold, one canceled; two interface error lines (one for an
-unknown customer); and one finalized invoice deliberately missing from AR.
+Eight customers; open items whose **converted** total sums exactly to the GL
+AR control balance (the seed computes a plug item, then asserts the tie); an
+open 3,000.00 EUR item so the multi-currency path is exercised (its USD
+equivalent is carved out of the plug); a disputed 42,000 item 220+ days old; a
+credit memo and an on-account receipt; two ready-not-finalized invoices, one
+on hold, one canceled; two interface error lines (one for an unknown
+customer); and one finalized invoice deliberately missing from AR.

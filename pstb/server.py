@@ -264,28 +264,38 @@ def get_ar_aging(
     as_of_date: str = "",
     customer_id: str = "",
     detail: bool = False,
+    display_currency: str = "",
 ) -> dict:
     """AR aging by customer: current / 1-30 / 31-60 / 61-90 / over-90 buckets from
     open items (PS_ITEM), with credits and disputes broken out, PLUS a tie-out of
     the subledger total to the GL AR control account. Use for "aging", "overdue",
     "who owes us", "collections", "does AR tie to the GL".
     as_of_date: YYYY-MM-DD, empty = today. detail=true adds item-level rows.
+    display_currency: ISO code ("USD", "INR"...) — every item is converted
+    server-side at the effective PS_RT_RATE_TBL rate before bucketing and
+    ranking, so use this (never convert amounts yourself) when the user wants
+    figures "in USD terms" etc. Empty = the BU's base currency. fx_applied in
+    the result lists the conversions performed.
     Positive = owed by customer; negative = credit memo / on-account receipt."""
     return _safe(
         ar.aging, business_unit=business_unit, as_of_date=as_of_date,
-        customer_id=customer_id, detail=detail,
+        customer_id=customer_id, detail=detail, display_currency=display_currency,
     )
 
 
 @mcp.tool()
-def get_customer_ar(customer: str, business_unit: str = "", as_of_date: str = "") -> dict:
+def get_customer_ar(
+    customer: str, business_unit: str = "", as_of_date: str = "",
+    display_currency: str = "",
+) -> dict:
     """One customer's open AR: every open item with days past due and bucket,
     credit memos, disputes, and the customer's aging summary. customer can be an
     ID (C1001) or a name fragment; ambiguous names return the candidates to ask
-    the user about."""
+    the user about. display_currency converts every item server-side (empty =
+    BU base currency); converted items keep original/original_currency."""
     return _safe(
         ar.customer, customer=customer, business_unit=business_unit,
-        as_of_date=as_of_date,
+        as_of_date=as_of_date, display_currency=display_currency,
     )
 
 

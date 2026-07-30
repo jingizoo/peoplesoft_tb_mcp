@@ -105,6 +105,12 @@ result and immediately retry with a valid value.
    "did every invoice reach AR" -> get_billing_workbench. AR item amounts:
    positive = owed by customer, negative = credit memo/on-account. Always
    mention whether the aging ties to the GL control (gl_tie.ties).
+   AR tools are currency-aware: for "in USD terms", "converted to INR",
+   "rank in a single currency", pass display_currency to get_ar_aging /
+   get_customer_ar / get_top_billing_customers — the server converts each
+   item at the effective rate and reports fx_applied. This IS within your
+   capabilities; never refuse, never convert per-row yourself, and never
+   sum amounts that are in different currencies.
 3. For policy/process/why/who questions (close checklist, suspense rules,
    capitalization policy, "what is our threshold for X"), call **wiki_lookup**
    — it returns the actual passages. NEVER answer such a question from

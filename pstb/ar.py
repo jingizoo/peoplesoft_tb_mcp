@@ -153,14 +153,29 @@ class ARBilling:
         that could not be evaluated must not read as a pass."""
         accounts = [str(a) for a in (self.cfg.defaults.ar_control_accounts or ["1100"])]
         p = self.db.prefix
+        base = self.e.base_currency_for(bu) or "USD"
         rows, _ = self.db.query(
-            f"SELECT SUM(BAL_AMT) AS bal FROM {p}PS_ITEM "
-            "WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'",
-            {"bu": bu}, max_rows=1,
+            f"SELECT BAL_CURRENCY AS currency, SUM(BAL_AMT) AS bal "
+            f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O' "
+            "GROUP BY BAL_CURRENCY",
+            {"bu": bu}, max_rows=50,
         )
-        subledger = float(rows[0]["bal"] or 0.0) if rows else 0.0
+        # Convert at PERIOD-END rates: the GL side is the balance through the
+        # latest posted period, so a rate that changed after period end must
+        # not move the subledger side and fabricate a break.
+        fy, per, end_dt = self._latest_posted_period(bu)
+        rate_dt = end_dt or dt.date.today().isoformat()
+        subledger, fx_cache = 0.0, {}
+        try:
+            for r in rows:
+                rate = self._rate_to(r.get("currency"), base, rate_dt,
+                                     fx_cache, base=base)
+                subledger += float(r["bal"] or 0.0) * rate
+        except (EngineError, ARError) as e:
+            return {"evaluated": False, "control_accounts": accounts,
+                    "reason": f"Cannot convert subledger to base currency "
+                              f"{base}: {e}"}
 
-        fy, per, _end = self._latest_posted_period(bu)
         if not fy:
             return {"evaluated": False, "control_accounts": accounts,
                     "subledger_total": r2(subledger),
@@ -189,7 +204,8 @@ class ARBilling:
         return {
             "evaluated": True,
             "control_accounts": accounts,
-            "basis": (f"all current open items vs GL through FY{fy} P{per} "
+            "basis": (f"all current open items (converted to base {base} at "
+                      f"{rate_dt} rates) vs GL through FY{fy} P{per} "
                       "(latest posted period)"),
             "gl_balance": r2(gl_total),
             "subledger_total": r2(subledger),
@@ -198,8 +214,9 @@ class ARBilling:
             "note": (
                 "Open items reconcile to the GL AR control." if ties else
                 "Difference may be items or payments posted to one side and "
-                "not yet the other (in-transit), or direct journals to the "
-                "control account."
+                "not yet the other (in-transit), direct journals to the "
+                "control account, or foreign-currency items whose booked GL "
+                "rate differs from the period-end rate (unrevalued FX)."
             ),
         }
 
@@ -223,7 +240,7 @@ class ARBilling:
         dispute = _NONBLANK.format(col="I.DISPUTE_STATUS")
         cust_clause = " AND I.CUST_ID = :cust" if cust_filter else ""
         return f"""SELECT I.CUST_ID AS cust_id, C.NAME1 AS name,
-       C.CUST_STATUS AS cust_status,
+       C.CUST_STATUS AS cust_status, I.BAL_CURRENCY AS currency,
        {', '.join(cases)},
        SUM(I.BAL_AMT) AS total,
        SUM(CASE WHEN I.BAL_AMT < 0 THEN I.BAL_AMT ELSE 0 END) AS credit_amt,
@@ -235,17 +252,42 @@ class ARBilling:
  WHERE I.BUSINESS_UNIT = :bu
    AND I.ITEM_STATUS = 'O'
    AND I.ACCTG_DT <= {self.db.date_bind('asof')}{cust_clause}
- GROUP BY I.CUST_ID, C.NAME1, C.CUST_STATUS"""
+ GROUP BY I.CUST_ID, C.NAME1, C.CUST_STATUS, I.BAL_CURRENCY"""
 
     def _detail_sql(self, cust_filter: bool) -> str:
         p = self.db.prefix
         cust_clause = " AND I.CUST_ID = :cust" if cust_filter else ""
         return f"""SELECT I.CUST_ID AS cust_id, I.ITEM AS item, I.BAL_AMT AS bal_amt,
+       I.BAL_CURRENCY AS currency,
        I.ACCTG_DT AS acctg_dt, I.DUE_DT AS due_dt, I.DISPUTE_STATUS AS dispute
   FROM {p}PS_ITEM I
  WHERE I.BUSINESS_UNIT = :bu AND I.ITEM_STATUS = 'O'
    AND I.ACCTG_DT <= {self.db.date_bind('asof')}{cust_clause}
  ORDER BY I.CUST_ID, I.DUE_DT"""
+
+    def _rate_to(self, cur: str, disp: str, asof: str,
+                 cache: dict, base: str = "") -> float:
+        """Server-side conversion rate; raises (fail closed) when missing —
+        mixed currencies are NEVER silently summed. A blank BAL_CURRENCY means
+        the item is in the BU base currency — it must still be converted when
+        the display currency differs, never passed through at 1.0."""
+        cur = (cur or "").upper() or (base or "").upper() or disp
+        if cur == disp:
+            return 1.0
+        if cur not in cache:
+            try:
+                fx = self.e.exchange_rate(cur, disp, as_of_date=asof)
+            except EngineError as e:
+                raise ARError(
+                    f"Cannot express AR in {disp}: {e} "
+                    "Amounts in different currencies are never summed "
+                    "without a rate."
+                ) from e
+            cache[cur] = (fx["rate"],
+                          f"{cur}->{disp} @ {fx['rate']}"
+                          + (f" via {fx['cross_via']}" if fx.get("cross_via")
+                             else ""))
+        return cache[cur][0]
 
     def aging(
         self,
@@ -253,6 +295,7 @@ class ARBilling:
         as_of_date: str = "",
         customer_id: str = "",
         detail: bool = False,
+        display_currency: str = "",
     ) -> dict:
         bu = self._bu(business_unit)
         asof = self._asof(as_of_date)
@@ -276,36 +319,67 @@ class ARBilling:
                     "known_business_units": [r["bu"] for r in known],
                     "customers": [], "note": "NO DATA — not an empty aging."}
 
-        customers = []
+        # One SQL row per (customer, currency); convert server-side into the
+        # display currency and merge — an EUR and a USD item are never added
+        # raw, and a missing rate aborts rather than mis-summing.
+        base = self.e.base_currency_for(bu) or "USD"
+        disp = (display_currency or "").strip().upper() or base
+        fx_cache: dict = {}
+        by_cust: dict[str, dict] = {}
         for r in rows:
-            c = {"cust_id": r["cust_id"], "name": r.get("name"),
-                 "customer_status": r.get("cust_status")}
+            rate = self._rate_to(r.get("currency"), disp, asof, fx_cache,
+                                 base=base)
+            c = by_cust.setdefault(r["cust_id"], {
+                "cust_id": r["cust_id"], "name": r.get("name"),
+                "customer_status": r.get("cust_status"),
+                **{lb: 0.0 for lb in labels},
+                "total": 0.0, "credit_amt": 0.0, "disputed_amt": 0.0,
+                "oldest_days_past_due": 0, "item_count": 0,
+                "currencies": set(),
+            })
             for i, lb in enumerate(labels):
-                c[lb] = r2(r.get(f"b{i}") or 0)
-            c["total"] = r2(r.get("total") or 0)
-            c["credit_amt"] = r2(r.get("credit_amt") or 0)
-            c["disputed_amt"] = r2(r.get("disputed_amt") or 0)
-            c["oldest_days_past_due"] = int(r.get("oldest_days") or 0)
-            c["item_count"] = int(r.get("item_count") or 0)
+                c[lb] += float(r.get(f"b{i}") or 0) * rate
+            c["total"] += float(r.get("total") or 0) * rate
+            c["credit_amt"] += float(r.get("credit_amt") or 0) * rate
+            c["disputed_amt"] += float(r.get("disputed_amt") or 0) * rate
+            c["oldest_days_past_due"] = max(c["oldest_days_past_due"],
+                                            int(r.get("oldest_days") or 0))
+            c["item_count"] += int(r.get("item_count") or 0)
+            c["currencies"].add((r.get("currency") or "").upper() or base)
+        customers = []
+        for c in by_cust.values():
+            # Round buckets first, then derive the total FROM the rounded
+            # buckets — rounding each independently after an FX multiply can
+            # leave bucket sums a cent off the total.
+            for lb in labels + ["credit_amt", "disputed_amt"]:
+                c[lb] = r2(c[lb])
+            c["total"] = r2(sum(c[lb] for lb in labels))
+            c["currencies"] = sorted(c.pop("currencies"))
             customers.append(c)
         customers.sort(key=lambda c: -c["total"])
         totals = {lb: r2(sum(c[lb] for c in customers)) for lb in labels}
-        for k in ("total", "credit_amt", "disputed_amt"):
+        totals["total"] = r2(sum(totals[lb] for lb in labels))
+        for k in ("credit_amt", "disputed_amt"):
             totals[k] = r2(sum(c[k] for c in customers))
 
         out = {
             "business_unit": bu,
             "as_of": asof,
+            "display_currency": disp,
             "buckets": labels,
             "customers": customers,
             "totals": totals,
             "gl_tie": self._gl_tie(bu),
             "note": (
-                "Positive = owed by the customer; negative = credit memo or "
-                "on-account receipt. Buckets by days past DUE_DT (ACCTG_DT when "
-                "no due date) at the as-of date."
+                f"All amounts converted server-side to {disp}. Positive = owed "
+                "by the customer; negative = credit memo or on-account receipt. "
+                "Buckets by days past DUE_DT (ACCTG_DT when no due date) at the "
+                "as-of date."
             ),
         }
+        if any(len(c["currencies"]) > 1 or c["currencies"] != [disp]
+               for c in customers):
+            out["fx_applied"] = sorted(n for _, n in fx_cache.values())
 
         _fy, _per, latest_end = self._latest_posted_period(bu)
         if latest_end and asof < latest_end:
@@ -325,9 +399,14 @@ class ARBilling:
             for r in items:
                 basis = _iso_opt(r["due_dt"]) or _iso_opt(r["acctg_dt"])
                 days = (asof_d - basis).days if basis else 0
+                cur = (r.get("currency") or "").upper() or base
+                rate = self._rate_to(cur, disp, asof, fx_cache, base=base)
                 d = {
                     "cust_id": r["cust_id"], "item": r["item"],
-                    "balance": r2(float(r["bal_amt"] or 0)),
+                    "balance": r2(float(r["bal_amt"] or 0) * rate),
+                    "currency": disp,
+                    **({"original": r2(float(r["bal_amt"] or 0)),
+                        "original_currency": cur} if cur != disp else {}),
                     "due_dt": r["due_dt"],
                     "days_past_due": max(days, 0),
                     "bucket": self._bucket_of(days, edges, labels),
@@ -346,7 +425,7 @@ class ARBilling:
         return out
 
     def customer(self, customer: str, business_unit: str = "",
-                 as_of_date: str = "") -> dict:
+                 as_of_date: str = "", display_currency: str = "") -> dict:
         c = (customer or "").strip()
         if not c:
             raise ARError("customer is required (an ID like C1001, or a name)")
@@ -364,7 +443,8 @@ class ARBilling:
                     "note": "Ask the user which customer they mean, then call "
                             "again with the exact cust_id."}
         result = self.aging(business_unit=bu, as_of_date=as_of_date,
-                            customer_id=cust_id)
+                            customer_id=cust_id,
+                            display_currency=display_currency)
         me = next((x for x in result.get("customers", [])
                    if x["cust_id"] == cust_id), None)
         out = {
@@ -377,7 +457,8 @@ class ARBilling:
             "gl_tie": result["gl_tie"],
             "note": result["note"],
         }
-        for k in ("historical_approximation", "warning"):
+        out["display_currency"] = result.get("display_currency")
+        for k in ("historical_approximation", "warning", "fx_applied"):
             if k in result:
                 out[k] = result[k]
         return out
@@ -429,14 +510,17 @@ class ARBilling:
  GROUP BY H.BILL_TO_CUST_ID, C.NAME1, H.BI_CURRENCY_CD""",
             {"bu": bu, "setid": setid, "since": since}, max_rows=10_000,
         )
-        currencies = sorted({r["currency"] for r in rows if r["currency"]})
+        base = self.e.base_currency_for(bu) or "USD"
+        # A blank BI_CURRENCY_CD means the invoice is in the BU base currency
+        # — normalize it so mixed-currency detection and conversion see it.
+        currencies = sorted({(r["currency"] or "").upper() or base for r in rows})
         disp = (display_currency or "").strip().upper()
         mixed = len(currencies) > 1
         fx_notes = []
         by_cust: dict[str, dict] = {}
         for r in rows:
             amt = float(r["billed"] or 0)
-            cur = r["currency"]
+            cur = (r["currency"] or "").upper() or base
             if disp and cur != disp:
                 fx = self.e.exchange_rate(cur, disp, as_of_date=asof)
                 amt = amt * fx["rate"]
