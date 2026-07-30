@@ -400,6 +400,27 @@ def main() -> None:
           wbn["lookback_days"] == 365
           and "365" in next(i for i in wbn["issues"] if "not loaded" in i))
 
+    print("== DB-derived scope discovery ==")
+    eff = engine.effective_defaults()
+    check("healthy config validates without discovery",
+          eff["business_unit"] == "US001" and not eff["discovered"])
+    check("last posted period discovered", engine.last_posted_period() == (2026, 6))
+    cfg_bad2 = Config.sample(ROOT)
+    cfg_bad2.defaults.business_unit = "ZZ999"
+    cfg_bad2.defaults.ledger = "NOLEDGER"
+    e_bad = TBEngine(Database(cfg_bad2), cfg_bad2)
+    eff2 = e_bad.effective_defaults()
+    check("bogus config defaults discovered from DB",
+          eff2["business_unit"] == "US001" and eff2["ledger"] == "ACTUALS"
+          and eff2["discovered"], str(eff2["notes"]))
+    tb_disc = e_bad.trial_balance(fiscal_year=2026, period=6)
+    check("blank-arg call works despite bogus config",
+          tb_disc["business_unit"] == "US001" and tb_disc["totals"]["in_balance"])
+    sc_last = engine.list_financial_scopes()["scopes"][0]["ledgers"][0]
+    check("scopes carry last_posted per ledger",
+          sc_last["last_posted"] == {"fiscal_year": 2026, "period": 6},
+          str(sc_last["last_posted"]))
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

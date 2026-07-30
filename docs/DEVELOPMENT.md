@@ -83,7 +83,7 @@ silently pick up the next breaking SDK major.
 
 ## Testing
 
-`scripts/smoke_test.py` runs 103 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 108 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.

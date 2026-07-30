@@ -85,9 +85,29 @@ def meta():
         out["business_units"] = engine.list_business_units()["business_units"]
     except Exception:
         out["business_units"] = []
+    # Scope comes from the DATABASE, validated against config — not raw config.
+    # On a real instance the config defaults are often the sample values.
     try:
-        out["ledgers"] = engine.list_ledgers(d.business_unit)["ledgers"]
-    except Exception:
+        eff = engine.effective_defaults()
+        fy0, per0 = engine.last_posted_period(eff["business_unit"], eff["ledger"])
+        out["scope"] = {
+            "business_unit": eff["business_unit"],
+            "ledger": eff["ledger"],
+            "ledgers": eff["ledgers"] or [eff["ledger"]],
+            "fiscal_year": fy0,
+            "period": per0,
+            "discovered": eff["discovered"],
+            "notes": eff["notes"],
+        }
+        out["ledgers"] = out["scope"]["ledgers"]
+        if not any(b.get("business_unit") == eff["business_unit"]
+                   for b in out["business_units"]):
+            out["business_units"].append(
+                {"business_unit": eff["business_unit"], "descr": "(discovered)"})
+    except Exception as e:
+        out["scope"] = {"business_unit": d.business_unit, "ledger": d.ledger,
+                        "ledgers": [d.ledger], "fiscal_year": 0, "period": 0,
+                        "discovered": False, "notes": [f"scope discovery failed: {e}"]}
         out["ledgers"] = [d.ledger]
     try:
         cur = engine.resolve_period("")
@@ -180,6 +200,26 @@ def compare(
         fiscal_year=fiscal_year, period=period, vs_fiscal_year=vs_fiscal_year,
         vs_period=vs_period, top=top, min_abs_change=min_abs_change,
     )
+
+
+@app.get("/api/scope")
+def scope_for(business_unit: str = "", ledger: str = ""):
+    """Ledgers and last posted period for a business unit — feeds the cascading
+    scope bar so changing BU repopulates ledger/year/period from real data."""
+    def _scope(business_unit: str, ledger: str) -> dict:
+        bu = (business_unit or "").strip() or engine.effective_defaults()["business_unit"]
+        leds = engine.list_ledgers(bu)
+        ledgers = leds.get("ledgers") or []
+        led = (ledger or "").strip()
+        if not led or led not in ledgers:
+            led = next((l for l in ledgers if l.upper() == "ACTUALS"),
+                       ledgers[0] if ledgers else engine.effective_defaults()["ledger"])
+        fy, per = engine.last_posted_period(bu, led)
+        return {"business_unit": bu, "ledger": led, "ledgers": ledgers,
+                "fiscal_year": fy, "period": per,
+                **({"scope_status": leds["scope_status"], "detail": leds.get("detail")}
+                   if "scope_status" in leds else {})}
+    return _guard(_scope, business_unit=business_unit, ledger=ledger)
 
 
 @app.get("/api/reports")
@@ -276,6 +316,20 @@ async def chat(payload: dict):
                 set_tool_result_limit(cfg, provider_name)
                 if _chat_state["provider"] is None or _chat_state["name"] != provider_name:
                     prompt = system_prompt(cfg, surface="gui")
+                    try:
+                        eff = engine.effective_defaults()
+                        fy0, per0 = engine.last_posted_period(
+                            eff["business_unit"], eff["ledger"])
+                        prompt += (
+                            "\n\n## Live scope in THIS database (verified)\n"
+                            f"- Business unit: {eff['business_unit']} | Ledger: "
+                            f"{eff['ledger']} (available: {', '.join(eff['ledgers'])})\n"
+                            f"- Latest posted period: FY{fy0} P{per0}\n"
+                            "Use these when the user doesn't specify — they come "
+                            "from the database, not config."
+                        )
+                    except Exception:
+                        pass
                     if provider_name == "gemini":
                         from ..client.llm_gemini import GeminiVertexProvider as P
                     else:

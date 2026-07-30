@@ -41,6 +41,12 @@ nav button{
 }
 nav button:hover{background:var(--accent-soft);color:var(--ink)}
 nav button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.navsep{margin:14px 10px 4px;font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);font-weight:650}
+.hero{max-width:680px;margin:8vh auto 0;text-align:center;padding:0 20px}
+.hero h1{font-size:22px;letter-spacing:-.02em;margin:0 0 6px}
+.hero p{color:var(--muted);margin:0 0 22px}
+.hero .chips{justify-content:center;padding:0}
 .navfoot{margin-top:auto;padding:10px;color:var(--muted);font-size:11.5px;line-height:1.7;border-top:1px solid var(--line)}
 .navfoot b{color:var(--ink);font-weight:600}
 
@@ -163,13 +169,14 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 <div class="app">
   <nav>
     <div class="brand">Trial Balance<small id="brandsub">PeopleSoft General Ledger</small></div>
-    <button data-v="tb" class="on">Trial balance</button>
+    <button data-v="chat" class="on">Ask</button>
+    <div class="navsep">Browse</div>
+    <button data-v="tb">Trial balance</button>
     <button data-v="close">Close &amp; controls</button>
     <button data-v="rollup">Statement rollup</button>
     <button data-v="reports">Reports</button>
     <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
-    <button data-v="chat">Ask</button>
     <div class="navfoot" id="navfoot"></div>
   </nav>
 
@@ -207,7 +214,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!==undefined)n.innerHTML=h;return n;};
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let META={}, VIEW='tb', LAST=null;
+let META={}, VIEW='chat', LAST=null;
 
 const REQ_TIMEOUT_MS=180000;
 async function api(path,opts){
@@ -663,18 +670,34 @@ async function viewAR(){
 (async function(){
   try{ META=await api('/api/meta'); }catch(e){ oops('Cannot reach the server: '+e.message); return; }
   const bu=$('#f-bu'), lg=$('#f-ledger'), per=$('#f-per');
+  const sc0=META.scope||{};
   const bus=(META.business_units||[]).map(b=>b.business_unit);
-  if(!bus.length) bus.push(META.defaults.business_unit);
+  if(!bus.length) bus.push(sc0.business_unit||META.defaults.business_unit);
   bus.forEach(b=>bu.append(new Option(b,b)));
-  bu.value=META.defaults.business_unit;
-  (META.ledgers||[META.defaults.ledger]).forEach(l=>lg.append(new Option(l,l)));
-  lg.value=META.defaults.ledger;
+  bu.value=sc0.business_unit||META.defaults.business_unit;
+  (sc0.ledgers&&sc0.ledgers.length?sc0.ledgers:[META.defaults.ledger])
+    .forEach(l=>lg.append(new Option(l,l)));
+  lg.value=sc0.ledger||META.defaults.ledger;
   for(let i=1;i<=12;i++) per.append(new Option('Period '+i,i));
   (META.defaults.adjustment_periods||[]).forEach(a=>per.append(new Option('Adj '+a,a)));
-  $('#f-fy').value=META.current.fiscal_year;
-  per.value=META.last_period_with_data||META.current.period;
+  $('#f-fy').value=sc0.fiscal_year||META.current.fiscal_year;
+  per.value=sc0.period||META.last_period_with_data||META.current.period;
+  async function rescope(keepLedger){
+    try{
+      const d=await api('/api/scope?'+qs({business_unit:bu.value,
+        ledger:keepLedger?lg.value:''}));
+      const cur=lg.value; lg.innerHTML='';
+      (d.ledgers.length?d.ledgers:[d.ledger]).forEach(l=>lg.append(new Option(l,l)));
+      lg.value=d.ledgers.includes(cur)&&keepLedger?cur:d.ledger;
+      if(d.fiscal_year){ $('#f-fy').value=d.fiscal_year; per.value=d.period; }
+    }catch(e){ /* keep whatever is set */ }
+  }
+  bu.addEventListener('change',async()=>{await rescope(false); render();});
+  lg.addEventListener('change',async()=>{await rescope(true); render();});
   $('#brandsub').textContent=META.defaults.business_unit+' · '+META.defaults.ledger;
-  $('#navfoot').innerHTML='<b>'+esc(META.backend)+'</b> data'+(META.use_views?' (views)':'')+
+  $('#navfoot').innerHTML=((META.scope&&META.scope.discovered)
+    ?'<span style="color:var(--warn)">scope discovered from DB</span><br>':'')+
+    '<b>'+esc(META.backend)+'</b> data'+(META.use_views?' (views)':'')+
     '<br><b>'+esc(META.llm.provider)+'</b> '+esc(META.llm.model)+
     '<br>wiki: <b>'+esc(META.wiki||'off')+'</b>';
   document.querySelectorAll('nav button[data-v]').forEach(b=>b.onclick=()=>{
@@ -682,7 +705,7 @@ async function viewAR(){
     b.classList.add('on'); VIEW=b.dataset.v; render();
   });
   $('#go').onclick=render; $('#csv').onclick=exportCsv;
-  ['f-bu','f-ledger','f-fy','f-per','f-group','f-acct','f-adj'].forEach(id=>$('#'+id).onchange=render);
+  ['f-fy','f-per','f-group','f-acct','f-adj'].forEach(id=>$('#'+id).onchange=render);
   $('#dclose').onclick=closeDrawer; $('#scrim').onclick=closeDrawer;
   document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});
   render();
@@ -797,7 +820,11 @@ function viewChat(){
   const w=$('#wrap'); w.style.padding='0'; w.innerHTML='';
   const wrap=el('div','chatwrap');
   const msgs=el('div','msgs'); msgs.id='msgs';
-  msgs.append(el('div','empty','Ask about the ledger. Figures come from the same tools the tabs use.'));
+  const hero=el('div','hero');
+  hero.innerHTML='<h1>Ask PeopleSoft Finance</h1>'+
+    '<p>Trial balance, close controls, statements, budget vs actuals, AR aging, billing pipeline — '+
+    'the relevant dashboard renders inline with each answer. Browse views are in the sidebar if you want them.</p>';
+  msgs.append(hero);
   const chips=el('div','chips');
   ['Does the trial balance balance?','Why did travel expense change this period?',
    'Is the suspense balance within policy?','Run the income statement','Show the AR aging','Any invoices stuck in billing?',

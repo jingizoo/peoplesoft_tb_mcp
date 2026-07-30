@@ -105,29 +105,93 @@ class TBEngine:
             "calendar_id": params["cal"],
         }
 
+    def _bu_has_data(self, bu: str) -> bool:
+        rows, _ = self.db.query(
+            self.db.exists_sql(
+                f"SELECT 1 FROM {self.db.prefix}PS_LEDGER WHERE BUSINESS_UNIT = :bu"
+            ),
+            {"bu": bu}, max_rows=1,
+        )
+        return bool(rows)
+
+    def effective_defaults(self) -> dict:
+        """Config defaults validated against the connected database; when the
+        configured business unit or ledger has no data (typical right after
+        pointing at a real instance), discover real ones with bounded indexed
+        probes — never a full-ledger scan. Cached per process."""
+        if getattr(self, "_eff_defaults", None):
+            return self._eff_defaults
+        p = self.db.prefix
+        cfg_bu = self.cfg.defaults.business_unit
+        cfg_led = self.cfg.defaults.ledger
+        notes: list[str] = []
+
+        bu = cfg_bu
+        if not self._bu_has_data(bu):
+            cands, _ = self.db.query(
+                f"SELECT BUSINESS_UNIT AS bu FROM {p}PS_BUS_UNIT_TBL_GL "
+                "ORDER BY BUSINESS_UNIT", {}, max_rows=50,
+            )
+            bu = next((c["bu"] for c in cands if self._bu_has_data(c["bu"])), cfg_bu)
+            if bu != cfg_bu:
+                notes.append(
+                    f"configured business_unit {cfg_bu!r} has no ledger data; "
+                    f"using {bu!r} discovered from the database"
+                )
+        leds, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=50)
+        led_names = [r["ledger"] for r in leds]
+        led = cfg_led
+        if led_names and cfg_led not in led_names:
+            led = next((l for l in led_names if l.upper() == "ACTUALS"), None)                 or next((l for l in led_names if "ACTUAL" in l.upper()), led_names[0])
+            notes.append(
+                f"configured ledger {cfg_led!r} not found for {bu}; using {led!r}"
+            )
+        self._eff_defaults = {
+            "business_unit": bu, "ledger": led, "ledgers": led_names,
+            "discovered": bool(notes), "notes": notes,
+        }
+        return self._eff_defaults
+
+    def last_posted_period(self, bu: str = "", ledger: str = "") -> tuple[int, int]:
+        """Newest regular period with posted rows for the scope — targeted MAX
+        queries on the indexed (BU, LEDGER, FY, PERIOD) path."""
+        eff = self.effective_defaults()
+        bu = (bu or "").strip() or eff["business_unit"]
+        led = (ledger or "").strip() or eff["ledger"]
+        p = self.db.prefix
+        rows, _ = self.db.query(
+            f"SELECT MAX(FISCAL_YEAR) AS fy FROM {p}PS_LEDGER "
+            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led "
+            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
+            {"bu": bu, "led": led}, max_rows=1,
+        )
+        fy = int(rows[0]["fy"]) if rows and rows[0]["fy"] is not None else 0
+        if not fy:
+            return (0, 0)
+        rows, _ = self.db.query(
+            f"SELECT MAX(ACCOUNTING_PERIOD) AS p FROM {p}PS_LEDGER "
+            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led AND FISCAL_YEAR = :fy "
+            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
+            {"bu": bu, "led": led, "fy": fy}, max_rows=1,
+        )
+        return (fy, int(rows[0]["p"]) if rows and rows[0]["p"] is not None else 12)
+
     def _current_fy_period(self) -> tuple[int, int]:
         try:
             r = self.resolve_period("")
             return r["fiscal_year"], r["period"]
         except EngineError:
-            rows, _ = self.db.query(
-                f"SELECT MAX(FISCAL_YEAR) AS fy FROM {self.db.prefix}PS_LEDGER", {}, max_rows=1
-            )
-            fy = int(rows[0]["fy"]) if rows and rows[0]["fy"] is not None else dt.date.today().year
-            rows, _ = self.db.query(
-                f"SELECT MAX(ACCOUNTING_PERIOD) AS p FROM {self.db.prefix}PS_LEDGER "
-                "WHERE FISCAL_YEAR = :fy AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
-                {"fy": fy},
-                max_rows=1,
-            )
-            per = int(rows[0]["p"]) if rows and rows[0]["p"] is not None else 12
-            return fy, per
+            fy, per = self.last_posted_period()
+            if fy:
+                return fy, per
+            return dt.date.today().year, 12
 
     def _defaults(
         self, business_unit: str, fiscal_year: int, period: int, ledger: str
     ) -> tuple[str, int, int, str]:
-        bu = (business_unit or "").strip() or self.cfg.defaults.business_unit
-        led = (ledger or "").strip() or self.cfg.defaults.ledger
+        eff = self.effective_defaults()
+        bu = (business_unit or "").strip() or eff["business_unit"]
+        led = (ledger or "").strip() or eff["ledger"]
         fy, per = int(fiscal_year or 0), int(period or 0)
         if fy == 0 or per == 0:
             cur_fy, cur_per = self._current_fy_period()
@@ -878,6 +942,8 @@ class TBEngine:
         rows, _ = self.db.query(
             f"""SELECT L.BUSINESS_UNIT AS business_unit, L.LEDGER AS ledger,
        MIN(L.FISCAL_YEAR) AS first_fy, MAX(L.FISCAL_YEAR) AS last_fy,
+       MAX(CASE WHEN L.ACCOUNTING_PERIOD BETWEEN 1 AND 12
+                THEN L.FISCAL_YEAR * 100 + L.ACCOUNTING_PERIOD END) AS last_yp,
        MAX(L.BASE_CURRENCY) AS base_currency, COUNT(*) AS row_count
   FROM {p}PS_LEDGER L
  GROUP BY L.BUSINESS_UNIT, L.LEDGER
@@ -897,9 +963,12 @@ class TBEngine:
                 "business_unit": bu, "descr": descr.get(bu),
                 "base_currency": r.get("base_currency"), "ledgers": [],
             })
+            yp = int(r.get("last_yp") or 0)
             s["ledgers"].append({
                 "ledger": r["ledger"],
                 "fiscal_years": [int(r["first_fy"]), int(r["last_fy"])],
+                "last_posted": ({"fiscal_year": yp // 100, "period": yp % 100}
+                                if yp else None),
                 "row_count": int(r["row_count"]),
             })
         return {
