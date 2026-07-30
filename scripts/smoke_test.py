@@ -577,6 +577,70 @@ DROP TABLE PS_INTFC_BI;
           str(wb2["control_status"]))
     _sh.rmtree(_tmpd)
 
+    print("== run_sql validator: function-FROM is not a table ==")
+    # Live failure: EXTRACT(YEAR FROM INVOICE_DT) was rejected as table
+    # "INVOICE_DT does not exist" before ever reaching the database.
+    refs = engine._table_refs(
+        "SELECT BUSINESS_UNIT, COUNT(*) FROM PS_BI_HDR "
+        "WHERE EXTRACT(YEAR FROM INVOICE_DT) = 2026 "
+        "AND TRIM(LEADING '' FROM BILL_SOURCE_ID) <> '' "
+        "GROUP BY BUSINESS_UNIT")
+    check("EXTRACT/TRIM FROM-args are not table references",
+          refs == {"PS_BI_HDR"}, str(refs))
+    try:
+        engine.run_sql("SELECT COUNT(*) FROM PS_BI_HDR "
+                       "WHERE EXTRACT(YEAR FROM INVOICE_DT) = 2026")
+        extract_note = "executed"
+    except Exception as e:
+        extract_note = str(e)
+    check("EXTRACT query passes validation (any failure is db-side)",
+          "Rejected before execution" not in extract_note
+          and "does not exist" not in extract_note, extract_note[:90])
+    try:
+        engine.run_sql("SELECT COUNT(*) FROM PS_JRNL_LINE")
+        check("real table typos still rejected with suggestions", False)
+    except Exception as e:
+        check("real table typos still rejected with suggestions",
+              "Rejected before execution" in str(e) and "PS_JRNL_LN" in str(e),
+              str(e)[:90])
+    # A subquery inside TRIM(...) must still have its tables validated —
+    # neutralization is depth-aware, never blanket
+    refs2 = engine._table_refs(
+        "SELECT TRIM((SELECT X FROM PS_NOPE_TBL)) FROM PS_BI_HDR")
+    check("neutralization does not hide subquery table references",
+          refs2 == {"PS_NOPE_TBL", "PS_BI_HDR"}, str(refs2))
+    # Adversarial-review catches: function-arg TRIM, comments, apostrophes
+    refs3 = engine._table_refs(engine._scrub_sql(
+        "SELECT TRIM(TRAILING CHR(32) FROM A.DESCR) FROM PS_GL_ACCOUNT_TBL A"))
+    check("TRIM with function arg before FROM is not a table ref",
+          refs3 == {"PS_GL_ACCOUNT_TBL"}, str(refs3))
+    refs4 = engine._table_refs(engine._scrub_sql(
+        "SELECT A.ACCOUNT\n-- year handled below with EXTRACT(\n"
+        "FROM PS_LEDGER A GROUP BY A.ACCOUNT"))
+    check("an unbalanced function name in a comment cannot hide the FROM",
+          refs4 == {"PS_LEDGER"}, str(refs4))
+    refs5 = engine._table_refs(engine._scrub_sql(
+        "SELECT A.ACCOUNT -- don't include adjustments\n"
+        "FROM PS_LEDGER A WHERE A.LEDGER = 'ACTUALS'"))
+    check("an apostrophe in a comment cannot desync the literal scrubber",
+          refs5 == {"PS_LEDGER"}, str(refs5))
+    refs6 = engine._table_refs(engine._scrub_sql(
+        "SELECT X FROM PS_LEDGER WHERE CODE = 'A--B' AND LEDGER = 'ACTUALS'"))
+    check("'--' inside a literal is not a comment",
+          refs6 == {"PS_LEDGER"}, str(refs6))
+    try:
+        engine.run_sql("SELECT A.ACCOUNT FROM PS_LEDGER A "
+                       "-- don't include adjustments\n"
+                       "FOR UPDATE -- it's locked")
+        check("deny list sees keywords even between apostrophe comments", False)
+    except Exception as e:
+        check("deny list sees keywords even between apostrophe comments",
+              "UPDATE" in str(e), str(e)[:90])
+    ok_lead = engine.run_sql("/* count them */ SELECT COUNT(*) AS n "
+                             "FROM PS_JRNL_HEADER")
+    check("leading comment does not defeat the SELECT-only check",
+          ok_lead["rows"][0]["n"] > 0)
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
