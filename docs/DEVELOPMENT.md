@@ -81,9 +81,24 @@ missed a break that made the client unusable for every question.
 Dependencies are upper-bounded in `pyproject.toml` so a fresh install cannot
 silently pick up the next breaking SDK major.
 
+## Question log & multi-step chaining
+
+Every chat turn is appended to `logs/questions.jsonl` with auto failure flags
+(tool_error / no_tool_calls / max_rounds / gave_up) plus thumbs-down feedback
+from the web UI. Review the failure backlog with `python -m pstb.qlog`; each
+flagged question is a candidate for a new curated tool or record-map entry.
+
+Multi-step chaining is deliberately NOT LangChain/LangGraph: the agent loop
+already feeds tool results back for up to 10 rounds, and the reliable way to
+reduce chain errors is to move routing and arithmetic INTO deterministic
+tools — get_record_map kills table-guessing before run_sql, and
+get_exchange_rate converts amounts server-side so the model never multiplies.
+A framework on top of MCP would add a dependency without fixing either
+failure mode.
+
 ## Testing
 
-`scripts/smoke_test.py` runs 108 checks on the stdlib alone (no venv required)
+`scripts/smoke_test.py` runs 121 checks on the stdlib alone (no venv required)
 and covers ledger math, effective dating, journal tie-out, integrity controls,
 tree rollups, SQL guards, no-data scope handling, and adjustment-period basis.
 Run it plus `scripts/mcp_probe.py` before any commit.

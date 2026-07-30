@@ -406,6 +406,94 @@ class ARBilling:
         return {"customers": rows, "count": len(rows), "truncated": truncated,
                 "note": "status A=active, I=inactive; open_balance sums open items"}
 
+    def top_billing_customers(self, business_unit: str = "", n: int = 10,
+                              months: int = 12, as_of_date: str = "",
+                              display_currency: str = "") -> dict:
+        """Top customers by FINALIZED billing (BILL_STATUS='INV') over a
+        trailing window. Groups by customer AND currency — mixed currencies are
+        never silently summed; pass display_currency to convert server-side."""
+        bu = self._bu(business_unit)
+        asof = self._asof(as_of_date)
+        since = (_iso(asof) - dt.timedelta(days=max(int(months or 12), 1) * 30)
+                 ).isoformat()
+        p = self.db.prefix
+        setid = self.e.resolve_setid(bu, "CUSTOMER")
+        rows, _ = self.db.query(
+            f"""SELECT H.BILL_TO_CUST_ID AS cust_id, C.NAME1 AS name,
+       H.BI_CURRENCY_CD AS currency, COUNT(*) AS invoices,
+       SUM(H.INVOICE_AMOUNT) AS billed
+  FROM {p}PS_BI_HDR H
+  LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
+ WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
+   AND H.INVOICE_DT >= {self.db.date_bind('since')}
+ GROUP BY H.BILL_TO_CUST_ID, C.NAME1, H.BI_CURRENCY_CD""",
+            {"bu": bu, "setid": setid, "since": since}, max_rows=10_000,
+        )
+        currencies = sorted({r["currency"] for r in rows if r["currency"]})
+        disp = (display_currency or "").strip().upper()
+        mixed = len(currencies) > 1
+        fx_notes = []
+        by_cust: dict[str, dict] = {}
+        for r in rows:
+            amt = float(r["billed"] or 0)
+            cur = r["currency"]
+            if disp and cur != disp:
+                fx = self.e.exchange_rate(cur, disp, as_of_date=asof)
+                amt = amt * fx["rate"]
+                note = f"{cur}->{disp} @ {fx['rate']}"
+                if note not in fx_notes:
+                    fx_notes.append(note)
+            c = by_cust.setdefault(r["cust_id"], {
+                "cust_id": r["cust_id"], "name": r.get("name"),
+                "invoices": 0, "billed": 0.0, "currencies": set(),
+            })
+            c["invoices"] += int(r["invoices"] or 0)
+            c["billed"] += amt
+            c["currencies"].add(disp or cur)
+        if mixed and not disp:
+            return {
+                "business_unit": bu, "window_months": int(months or 12),
+                "since": since, "as_of": asof,
+                "mixed_currencies": currencies,
+                "by_currency": [
+                    {"cust_id": r["cust_id"], "name": r.get("name"),
+                     "currency": r["currency"], "invoices": int(r["invoices"] or 0),
+                     "billed": r2(float(r["billed"] or 0))}
+                    for r in sorted(rows, key=lambda x: -float(x["billed"] or 0))
+                ],
+                "note": (
+                    "Invoices exist in multiple currencies; totals are NOT "
+                    "summed across currencies. Pass display_currency (e.g. "
+                    "'USD' or 'INR') to rank on converted totals."
+                ),
+            }
+        ranked = sorted(by_cust.values(), key=lambda c: -c["billed"])
+        total = sum(c["billed"] for c in ranked) or 1.0
+        top = []
+        for c in ranked[: max(int(n or 10), 1)]:
+            top.append({
+                "cust_id": c["cust_id"], "name": c["name"],
+                "invoices": c["invoices"], "billed": r2(c["billed"]),
+                "share_pct": r2(c["billed"] / total * 100),
+                "currency": disp or (currencies[0] if currencies else ""),
+            })
+        out = {
+            "business_unit": bu, "window_months": int(months or 12),
+            "since": since, "as_of": asof,
+            "currency": disp or (currencies[0] if currencies else ""),
+            "customers": top,
+            "total_billed": r2(sum(c["billed"] for c in ranked)),
+            "customer_count": len(ranked),
+            "note": ("Finalized (INV) invoices only, by invoice date window. "
+                     "This is BILLING volume, not open AR — see get_ar_aging "
+                     "for what is owed."),
+        }
+        if fx_notes:
+            out["fx_applied"] = fx_notes
+            out["fx_note"] = ("Converted server-side at effective-dated "
+                              "PS_RT_RATE_TBL rates — copy figures verbatim.")
+        return out
+
     # ---------------------------------------------------------------- billing
     def billing_workbench(self, business_unit: str = "", days_stuck: int = 5,
                           as_of_date: str = "", lookback_days: int = 365) -> dict:

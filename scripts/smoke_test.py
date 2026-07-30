@@ -421,6 +421,80 @@ def main() -> None:
           sc_last["last_posted"] == {"fiscal_year": 2026, "period": 6},
           str(sc_last["last_posted"]))
 
+    print("== record map / row-count intelligence ==")
+    rm = engine.get_record_map()
+    bh = next(x for x in rm["domains"]["billing"] if x["record"] == "PS_BI_HDR")
+    check("billing maps to PS_BI_HDR with prefer_tool",
+          "get_top_billing_customers" in bh.get("prefer_tool", ""))
+    check("small TRANSACTION table warned", "warning" in bh, str(bh.get("approx_rows")))
+    cal = next(x for x in rm["domains"]["chartfields_setup"]
+               if x["record"] == "PS_CAL_DETP_TBL")
+    check("small REFERENCE table NOT warned", "warning" not in cal)
+    absent = next(x for x in rm["domains"]["billing"] if x["record"] == "PS_BI_LINE")
+    check("absent record reported honestly", absent["present"] is False)
+
+    print("== exchange rates (effective-dated, server-side math) ==")
+    fx_jun = engine.exchange_rate("USD", "INR", as_of_date="2026-06-15")
+    fx_jul = engine.exchange_rate("USD", "INR", as_of_date="2026-07-15",
+                                  amounts="1000, 2000.50")
+    check("effective dating picks the right rate",
+          fx_jun["rate"] == 83.25 and fx_jul["rate"] == 84.10)
+    check("server-side conversion exact",
+          fx_jul["conversions"][0]["converted"] == 84100.0
+          and fx_jul["converted_total"] == 252342.05,
+          str(fx_jul["conversions"]))
+    fx_x = engine.exchange_rate("EUR", "INR", as_of_date="2026-07-15")
+    check("triangulation via base currency",
+          fx_x.get("cross_via") == "USD" and abs(fx_x["rate"] - 91.413043) < 0.001)
+    try:
+        engine.exchange_rate("USD", "JPY")
+        check("unknown pair rejected with available list", False)
+    except EngineError as ex:
+        check("unknown pair rejected with available list", "pairs" in str(ex))
+
+    print("== top billing customers ==")
+    top_mixed = arb.top_billing_customers(as_of_date="2026-07-30")
+    check("mixed currencies never silently summed",
+          top_mixed.get("mixed_currencies") == ["EUR", "USD"])
+    top_usd = arb.top_billing_customers(as_of_date="2026-07-30", n=3,
+                                        display_currency="USD")
+    check("top billing ranked correctly in USD",
+          [c["cust_id"] for c in top_usd["customers"]] == ["C1001", "C1007", "C1003"],
+          str([(c["cust_id"], c["billed"]) for c in top_usd["customers"]]))
+    check("share percentages computed",
+          abs(sum(c["share_pct"] for c in top_usd["customers"]) - 100) < 40)
+    top_inr = arb.top_billing_customers(as_of_date="2026-07-30", n=1,
+                                        display_currency="INR")
+    check("INR conversion applied server-side",
+          top_inr["customers"][0]["currency"] == "INR"
+          and "fx_applied" in top_inr)
+
+    print("== question log ==")
+    import tempfile
+    from pstb.qlog import QuestionLog
+    with tempfile.TemporaryDirectory() as td:
+        ql = QuestionLog("q.jsonl", Path(td))
+        tid = ql.log_turn(surface="test", provider="x",
+                          question="top 10 billing customer",
+                          calls=[{"tool": "run_sql", "ok": False,
+                                  "error": "PS_BILL does not exist"}],
+                          rounds=1, answer="I could not find the table")
+        ql.log_feedback(tid, "bad")
+        import json as _j
+        lines = [_j.loads(l) for l in
+                 (Path(td) / "q.jsonl").read_text().splitlines()]
+        check("failed turn logged with flags",
+              lines[0]["failed"] and "tool_error" in lines[0]["flags"]
+              and "gave_up" in lines[0]["flags"], str(lines[0]["flags"]))
+        check("feedback record appended",
+              lines[1]["type"] == "feedback" and lines[1]["turn_id"] == tid)
+        ok_id = ql.log_turn(surface="test", provider="x",
+                            question="hello there", calls=[], rounds=0,
+                            answer="Hi!")
+        lines = [_j.loads(l) for l in
+                 (Path(td) / "q.jsonl").read_text().splitlines()]
+        check("greeting without tools not flagged", lines[-1]["failed"] is False)
+
     print("== views mode matches inline mode ==")
     cfg_v = Config.sample(ROOT)
     cfg_v.db.use_views = True

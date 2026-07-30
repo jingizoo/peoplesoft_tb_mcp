@@ -114,6 +114,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .msgs{overflow:auto;padding:18px;display:flex;flex-direction:column;gap:14px}
 .msg{max-width:min(760px,92%);padding:11px 14px;border-radius:12px;white-space:pre-wrap;line-height:1.6}
 .msg.me{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+.fb{margin-top:8px;cursor:pointer;opacity:.45;font-size:13px;user-select:none;width:fit-content}
+.fb:hover{opacity:1}
 .msg.bot .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
   font-weight:650;margin-bottom:6px}
 .msg.bot{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
@@ -472,6 +474,7 @@ function renderToolResult(name,data){
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
     if(name==='get_billing_workbench') return renderBilling(data);
+    if(name==='get_top_billing_customers') return renderTopBilling(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';
@@ -611,6 +614,28 @@ function renderCustomerAR(d){
       (i.balance<0?'<span class="badge dim">credit</span>':'')+'</td></tr>').join('')+'</tbody>';
   c.append(t); frag.append(c);
   return frag;
+}
+function renderTopBilling(d){
+  const c=el('div','card');
+  if(d.mixed_currencies){
+    c.append(el('h2',null,'Top billing customers <span class="badge warn">mixed currencies</span>'));
+    c.append(el('div','pad',esc(d.note)));
+    return c;
+  }
+  c.append(el('h2',null,'Top billing customers <span class="sub">finalized invoices, last '+
+    d.window_months+' months · '+esc(d.currency)+(d.fx_applied?' · FX applied server-side':'')+'</span>'));
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>#</th><th>Customer</th><th class="num">Invoices</th>'+
+    '<th class="num">Billed</th><th class="num">Share</th><th style="width:120px"></th></tr></thead><tbody>'+
+    d.customers.map((cu,i)=>'<tr><td>'+(i+1)+'</td><td><b>'+esc(cu.cust_id)+'</b> '+esc(cu.name||'')+
+      '</td><td class="num">'+cu.invoices+'</td><td class="num">'+money(cu.billed)+
+      '</td><td class="num">'+cu.share_pct.toFixed(1)+'%</td>'+
+      '<td><div style="height:7px;border-radius:4px;width:'+Math.max(3,Math.round(cu.share_pct))+
+      '%;background:var(--accent);opacity:.6"></div></td></tr>').join('')+'</tbody>';
+  c.append(t);
+  if(d.fx_applied) c.append(el('div','pad','<span style="color:var(--muted);font-size:12px">'+
+    esc((d.fx_applied||[]).join(' · '))+'</span>'));
+  return c;
 }
 function renderBilling(d){
   const frag=document.createDocumentFragment();
@@ -827,7 +852,7 @@ function viewChat(){
   msgs.append(hero);
   const chips=el('div','chips');
   ['Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','Run the income statement','Show the AR aging','Any invoices stuck in billing?',
+   'Is the suspense balance within policy?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 10 billing customers in INR',
    'Are there unposted journals?'].forEach(q=>{
     const c=el('div','chip',esc(q)); c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });
@@ -869,7 +894,12 @@ async function send(){
     if(!r.ok||j.error) msgs.append(el('div','msg err',esc(j.error||j.detail||'Request failed')));
     else if(j.answer){
       const b=el('div','msg bot');
-      b.innerHTML='<div class="who">Assistant commentary — figures above are from the ledger</div>'+esc(j.answer);
+      b.innerHTML='<div class="who">Assistant commentary — figures above are from the ledger</div>'+esc(j.answer)+
+        (j.turn_id?'<div class="fb" data-turn="'+esc(j.turn_id)+'" title="Flag this answer as wrong/unhelpful">&#128078;</div>':'');
+      const fb=b.querySelector('.fb');
+      if(fb) fb.onclick=async()=>{ fb.textContent='logged \u2713'; fb.style.pointerEvents='none';
+        try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({turn_id:fb.dataset.turn,verdict:'bad'})}); }catch(e){} };
       msgs.append(b);
     }
   }catch(e){

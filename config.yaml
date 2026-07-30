@@ -7,6 +7,7 @@ defaults:
   setid: SHARE            # SETID for chartfield tables when SET_CNTRL lookup is unavailable
   calendar_id: "01"       # detail calendar used to resolve dates -> fiscal year/period
   base_currency: USD
+  rate_type: CRRNT        # PS_RT_RATE_TBL rate type for FX lookups
   adjustment_periods: [998]
   suspense_accounts: ["1999"]
   retained_earnings_account: "3500"
@@ -41,3 +42,7 @@ tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
   max_rows: 200           # cap on rows returned to the LLM
   reports_path: reports   # folder of nVision-style report definitions (JSON)
+  question_log: logs/questions.jsonl   # every chat turn + failure flags ("" disables)
+  txn_row_threshold: 1000 # a TRANSACTION table under this row count is flagged
+                          # as probably-not-the-active-table; reference tables
+                          # are never flagged (small is normal for them)

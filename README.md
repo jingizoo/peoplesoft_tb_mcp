@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │  chat client (REPL)  │◄───────────────►│  MCP server (pstb.server) │
-│  pstb.client.chat    │    25 tools     │  TB engine + guarded SQL  │
+│  pstb.client.chat    │    28 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (108 checks) and the MCP server end to end. Then install
+verifies both the engine (121 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
@@ -137,7 +137,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 25 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 28 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -150,6 +150,9 @@ no chat client needed.
 see [docs/NVISION.md](docs/NVISION.md)) · `get_ar_aging` · `get_customer_ar` ·
 `search_customers` · `get_billing_workbench` (AR aging with GL tie-out and
 billing pipeline — see [docs/BILLING_AR.md](docs/BILLING_AR.md)) ·
+`get_top_billing_customers` · `get_exchange_rate` (effective-dated
+PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
+`get_record_map` (semantic record dictionary with live row counts) ·
 `wiki_search` · `wiki_get_page` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool
 is SELECT-only, single-statement, row-capped; pair it with a read-only DB user.

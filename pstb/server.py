@@ -209,6 +209,55 @@ def rollup_trial_balance(
 
 
 @mcp.tool()
+def get_record_map() -> dict:
+    """The semantic map of PeopleSoft records by domain (general ledger,
+    billing, receivables, currency, setup), with live row counts from THIS
+    database. Transaction records (they carry amounts) are flagged when
+    suspiciously small; reference records are legitimately small. Each entry
+    names the curated tool to prefer over raw SQL. CALL THIS BEFORE run_sql
+    whenever unsure which record answers a question."""
+    return _safe(engine.get_record_map)
+
+
+@mcp.tool()
+def get_exchange_rate(
+    from_currency: str,
+    to_currency: str,
+    as_of_date: str = "",
+    rate_type: str = "",
+    amounts: str = "",
+) -> dict:
+    """Effective-dated exchange rate from PS_RT_RATE_TBL (direct, inverse, or
+    triangulated via the base currency). Pass amounts as a comma list
+    ("185196.06, 96000") to have them converted SERVER-SIDE — never multiply
+    amounts yourself; copy the returned conversions verbatim."""
+    return _safe(
+        engine.exchange_rate, from_currency=from_currency,
+        to_currency=to_currency, as_of_date=as_of_date, rate_type=rate_type,
+        amounts=amounts,
+    )
+
+
+@mcp.tool()
+def get_top_billing_customers(
+    business_unit: str = "",
+    n: int = 10,
+    months: int = 12,
+    as_of_date: str = "",
+    display_currency: str = "",
+) -> dict:
+    """Top customers by FINALIZED billing volume (PS_BI_HDR, status INV) over a
+    trailing window, with invoice counts and share of total. Use for "top N
+    billing customers / who do we bill the most". Mixed currencies are never
+    summed — pass display_currency to rank on converted totals (rates applied
+    server-side). This is billing volume; open balances are get_ar_aging."""
+    return _safe(
+        ar.top_billing_customers, business_unit=business_unit, n=n,
+        months=months, as_of_date=as_of_date, display_currency=display_currency,
+    )
+
+
+@mcp.tool()
 def get_ar_aging(
     business_unit: str = "",
     as_of_date: str = "",
@@ -356,8 +405,9 @@ if cfg.tools.allow_raw_sql:
         """Run a read-only SQL SELECT against the PeopleSoft database. Guarded:
         single SELECT/WITH statement only, DML/DDL rejected, rows capped at 500,
         and every table name is validated against the catalog before execution.
-        NEVER invent a table name — the journal line table is PS_JRNL_LN (not
-        PS_JRNL_LINE); check with list_tables/describe_table when unsure.
+        NEVER invent a table name — call get_record_map FIRST to see which
+        record answers the question (billing = PS_BI_HDR, journal lines =
+        PS_JRNL_LN not PS_JRNL_LINE) and whether it is populated here.
         Use only when no curated tool answers the question; PS_ tables use signed
         amounts (credits negative)."""
         return _safe(engine.run_sql, sql=sql, max_rows=max_rows)
