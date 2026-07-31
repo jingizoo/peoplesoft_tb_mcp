@@ -428,16 +428,44 @@ def list_ledgers(business_unit: str) -> dict:
 if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
-    def run_sql(sql: str, max_rows: int = 100) -> dict:
-        """Run a read-only SQL SELECT against the PeopleSoft database. Guarded:
-        single SELECT/WITH statement only, DML/DDL rejected, rows capped at 500,
-        and every table name is validated against the catalog before execution.
-        NEVER invent a table name — call get_record_map FIRST to see which
-        record answers the question (billing = PS_BI_HDR, journal lines =
-        PS_JRNL_LN not PS_JRNL_LINE) and whether it is populated here.
-        Use only when no curated tool answers the question; PS_ tables use signed
-        amounts (credits negative)."""
-        return _safe(engine.run_sql, sql=sql, max_rows=max_rows)
+    def run_sql(sql: str, max_rows: int = 100, business_unit: str = "") -> dict:
+        """Run a read-only SQL SELECT against the PeopleSoft database — including
+        CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
+        only, DML/DDL rejected, rows capped at 500, every table validated against
+        the catalog before execution, and unqualified names are schema-qualified
+        automatically (write OTHER_OWNER.TBL to reach another schema).
+        NEVER invent a table name. For a custom or unfamiliar record call
+        search_records FIRST — it searches PeopleTools record descriptions and
+        field names — then describe_record/describe_table for its columns.
+        get_record_map covers the core GL/AR records (billing = PS_BI_HDR,
+        journal lines = PS_JRNL_LN not PS_JRNL_LINE).
+        business_unit: the active scope, used only to report whether the query
+        was actually restricted to it (scope_filtered / scope_note) — the SQL
+        is never rewritten. Relay scope_note when it says NOT restricted.
+        PS_ tables use signed amounts (credits negative)."""
+        return _safe(engine.run_sql, sql=sql, max_rows=max_rows,
+                     business_unit=business_unit)
+
+    @mcp.tool()
+    def search_records(query: str = "", limit: int = 25) -> dict:
+        """Find the right PeopleSoft record for a question by searching
+        PeopleTools metadata — record DESCRIPTIONS and field names, not just
+        table names. Use this whenever the question names a module, a document,
+        or a custom record you have not seen ("file interface", "voucher",
+        "asset profile", "TU_FILE"): searching descriptions finds records whose
+        table name gives no clue. Returns the PeopleTools record name, the
+        physical table to query (honoring a site's SQLTABLENAME override),
+        the description, and approximate row counts, most-populated first.
+        Follow with describe_record then run_sql."""
+        return _safe(engine.search_records, query=query, limit=limit)
+
+    @mcp.tool()
+    def describe_record(record: str) -> dict:
+        """Fields of one PeopleSoft record from PeopleTools (PSRECFIELD) plus
+        the physical column list, so you can see both the record definition and
+        what the database actually has. Accepts a record name (TU_FILE_INTFC)
+        or a table name (PS_TU_FILE_INTFC)."""
+        return _safe(engine.describe_record, record=record)
 
     @mcp.tool()
     def list_tables(pattern: str = "") -> dict:

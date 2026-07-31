@@ -144,11 +144,19 @@ result and immediately retry with a valid value.
    is_bundled_demo_content, say plainly that the company wiki is NOT connected
    and the text is sample content — never present it as company policy.
 4. Use run_sql only when no curated tool fits, and say that you queried
-   directly. BEFORE any run_sql, call get_record_map — it names the right
-   record per domain (billing = PS_BI_HDR, journal lines = PS_JRNL_LN, AR =
-   PS_ITEM), shows live row counts, and flags transaction tables that look
-   empty here. run_sql rejects unknown tables with close-match suggestions;
-   retry with a suggested name instead of guessing again.
+   directly. BEFORE any run_sql, find the right record — never invent one:
+   - core GL/AR/billing question -> get_record_map (billing = PS_BI_HDR,
+     journal lines = PS_JRNL_LN, AR = PS_ITEM), with live row counts;
+   - anything else, especially a CUSTOM or site-specific record ("file
+     interface", "TU_ tables", a module you have not seen) ->
+     **search_records**, which searches PeopleTools record DESCRIPTIONS and
+     field names, so a functional phrase finds a record whose table name
+     gives no clue. Then describe_record (or describe_table) for its columns.
+   Query the "table" value it returns. run_sql rejects unknown tables with
+   close-match suggestions; retry with a suggested name, never a guess.
+   When a business unit is in scope and the record has a BUSINESS_UNIT
+   column, filter on it. If the result comes back scope_filtered=false, say
+   so in your answer — the rows may span business units.
 5. After drill_to_journals, mention whether the journal detail ties to the ledger.
 6. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
    is missing — don't retry the identical call. When the error names a missing

@@ -67,6 +67,9 @@ FINANCIAL_EVIDENCE_TOOLS = {
 # a tool calls its period "through_period". Tools not listed do not accept
 # financial scope parameters and are left untouched.
 _TOOL_SCOPE_ARGS = {
+    # run_sql receives only the business unit, and only as context for the
+    # disclosure note — the SQL text itself is never rewritten.
+    "run_sql": {"business_unit": "business_unit"},
     "get_trial_balance": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
@@ -348,11 +351,11 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
     if tool_name == "list_financial_scopes":
         return out
     scope = normalize_request_scope(request_scope)
-    if tool_name == "run_sql" and scope:
-        raise ScopeConflict(
-            "run_sql cannot be proven to honor the request scope; use a "
-            "curated financial tool instead"
-        )
+    # run_sql is NOT refused under a scope. Refusing it made every ad-hoc and
+    # custom-record question ("list the files configured in PS_TU_FILE_INTFC")
+    # impossible in the GUI, where a scope is always active. Instead the
+    # active business unit is passed down so the result can state plainly
+    # whether the query was restricted to it — disclosure, not a blockade.
     supported = _TOOL_SCOPE_ARGS.get(tool_name, {})
     for field, tool_arg in supported.items():
         if field not in scope:

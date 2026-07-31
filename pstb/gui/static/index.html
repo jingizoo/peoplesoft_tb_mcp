@@ -579,6 +579,57 @@ function renderScopes(d){
     flattenScopes(d.scopes||[]), null, 'Available database scopes'
   );
 }
+function renderSql(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'Query result <span class="sub">'+d.row_count+' row'+
+    (d.row_count===1?'':'s')+(d.truncated?' (truncated)':'')+'</span>'));
+  // A cross-BU result must never be mistaken for a scoped one.
+  if(d.scope_filtered===false){
+    c.append(el('div','pad','<span class="badge warn">not scope-filtered</span> '+
+      esc(d.scope_note||'')));
+  } else if(d.scope_filtered===true){
+    c.append(el('div','pad','<span class="badge ok">scope-filtered</span> '+
+      esc(d.scope_note||'')));
+  }
+  const rows=d.rows||[];
+  if(rows.length){
+    const sc=el('div'); sc.style.maxHeight='340px'; sc.style.overflow='auto';
+    const t=el('table');
+    t.innerHTML='<thead><tr>'+Object.keys(rows[0]).map(k=>'<th'+
+      (typeof rows[0][k]==='number'?' class="num"':'')+'>'+esc(k.replace(/_/g,' '))+
+      '</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+
+      Object.values(r).map(v=>'<td'+(typeof v==='number'?' class="num"':'')+'>'+
+      esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody>';
+    sc.append(t); c.append(sc);
+  } else { c.append(el('div','pad','No rows returned.')); }
+  if(d.sql_executed){
+    const pre=el('pre','pad'); pre.style.fontSize='11px';
+    pre.style.color='var(--muted)'; pre.style.whiteSpace='pre-wrap';
+    pre.textContent=d.sql_executed; c.append(pre);
+  }
+  return c;
+}
+function renderRecords(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'PeopleSoft records matching “'+esc(d.query)+'”'+
+    '<span class="sub">via '+esc(d.source)+'</span>'));
+  (d.notes||[]).forEach(n=>c.append(el('div','pad',
+    '<span style="color:var(--warn)">'+esc(n)+'</span>')));
+  const rows=d.records||[];
+  if(!rows.length){ c.append(el('div','pad','No matching records.')); return c; }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Record</th><th>Table to query</th><th>Description</th>'+
+    '<th>Kind</th><th class="num">Approx rows</th><th>Matched on</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr><td class="mono">'+esc(r.record)+'</td><td class="mono">'+
+      esc(r.table)+'</td><td>'+esc(r.descr||'')+'</td><td><span class="badge dim">'+
+      esc(r.kind)+'</span></td><td class="num">'+
+      (r.approx_rows==null?'—':r.approx_rows.toLocaleString())+'</td><td>'+
+      esc(r.matched_on)+(r.matched_field?' ('+esc(r.matched_field)+')':'')+
+      '</td></tr>').join('')+'</tbody>';
+  const sc=el('div'); sc.style.maxHeight='340px'; sc.style.overflow='auto';
+  sc.append(t); c.append(sc);
+  return c;
+}
 function renderGeneric(name,d){
   const rows=Array.isArray(d)?d:(d.rows||d.accounts||d.periods||d.nodes||d.results||d.trees||d.business_units||null);
   const c=el('div','card');c.append(el('h2',null,esc(name)));
@@ -626,6 +677,8 @@ function renderToolResult(name,data,args){
     if(name==='get_billing_workbench') return renderBilling(data);
     if(name==='wiki_lookup') return renderWikiPassages(data);
     if(name==='get_top_billing_customers') return renderTopBilling(data);
+    if(name==='run_sql') return renderSql(data);
+    if(name==='search_records') return renderRecords(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';

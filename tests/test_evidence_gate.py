@@ -108,11 +108,27 @@ class RequestScopeTests(unittest.TestCase):
             args,
         )
 
-    def test_raw_sql_cannot_bypass_a_selected_scope(self):
-        with self.assertRaisesRegex(ScopeConflict, "cannot be proven"):
+    def test_raw_sql_under_a_scope_is_disclosed_not_refused(self):
+        # Refusing run_sql whenever a scope was active made every ad-hoc and
+        # custom-record question impossible in the GUI, where a scope is
+        # always set. The scope is now passed down so the RESULT can state
+        # whether the query was restricted to it; the SQL is never rewritten,
+        # and the business unit is the only field forwarded.
+        out = apply_request_scope(
+            "run_sql",
+            {"sql": "SELECT * FROM PS_LEDGER"},
+            {"business_unit": "US200", "ledger": "ACTUALS", "period": 6},
+        )
+        self.assertEqual(out["sql"], "SELECT * FROM PS_LEDGER")
+        self.assertEqual(out["business_unit"], "US200")
+        self.assertNotIn("ledger", out)
+        self.assertNotIn("period", out)
+
+    def test_raw_sql_still_cannot_contradict_the_selected_business_unit(self):
+        with self.assertRaises(ScopeConflict):
             apply_request_scope(
                 "run_sql",
-                {"sql": "SELECT * FROM PS_LEDGER"},
+                {"sql": "SELECT * FROM PS_LEDGER", "business_unit": "US001"},
                 {"business_unit": "US200", "ledger": "ACTUALS"},
             )
 
