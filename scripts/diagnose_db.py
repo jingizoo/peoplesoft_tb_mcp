@@ -150,7 +150,41 @@ def main() -> int:
                             base_currency=engine.base_currency_for(bu))
     timed("TB aggregate, accounts 1%", lambda: db.query(sql2, params2, max_rows=100_000))
 
-    print("\n6. Record-shape audit (every record the tools touch, one pass)")
+    print("\n6. AR aging (times the statements aging actually issues)")
+    try:
+        from pstb.ar import ARBilling as _AR
+        _ar = _AR(engine)
+        _calls = []
+        _orig = db.query
+
+        def _spy(sql, params=None, max_rows=None):
+            _t = time.perf_counter()
+            out = _orig(sql, params, max_rows=max_rows)
+            _calls.append(((time.perf_counter() - _t) * 1000,
+                           " ".join(str(sql).split())))
+            return out
+
+        db.query = _spy
+        try:
+            _t0 = time.perf_counter()
+            _ag = _ar.aging()
+            _total = (time.perf_counter() - _t0) * 1000
+        finally:
+            db.query = _orig
+        print(f"   aging total: {_total:,.0f} ms across {len(_calls)} queries")
+        for _ms, _sql in sorted(_calls, reverse=True)[:5]:
+            _flag = "  <-- SLOW" if _ms > 2000 else ""
+            print(f"     {_ms:8.0f} ms  {_sql[:88]}{_flag}")
+            if _ms > 2000:
+                PROBLEMS.append(f"aging statement {_ms:,.0f} ms: {_sql[:70]}")
+        if _total > 20000:
+            print("   -> aging is the bottleneck. The two candidates are the "
+                  "PS_ITEM group-by (needs an index on BUSINESS_UNIT, "
+                  "ITEM_STATUS) and the GL control lookup in PS_LEDGER.")
+    except Exception as e:
+        print(f"   AR timing failed: {type(e).__name__}: {e}")
+
+    print("\n7. Record-shape audit (every record the tools touch, one pass)")
     try:
         audit = engine.audit_record_shapes()
         for t in audit["unreadable"]:
