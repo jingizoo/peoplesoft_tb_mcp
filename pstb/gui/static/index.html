@@ -697,6 +697,43 @@ function renderScopes(d){
     flattenScopes(d.scopes||[]), null, 'Available database scopes'
   );
 }
+function renderPlaybook(d){
+  const frag=document.createDocumentFragment();
+  const cls={passed:'ok',exceptions_found:'warn',incomplete:'bad'}[d.verdict]||'dim';
+  const label={passed:'Ready',exceptions_found:'Needs attention',
+               incomplete:'Incomplete'}[d.verdict]||d.verdict;
+  frag.append(tiles([
+    [esc(d.title||d.playbook),label,esc(d.summary||''),
+     d.verdict==='passed'?'dr':'cr'],
+    ['Need attention',String(d.attention_count||0),'of '+(d.steps||[]).length+' checks',''],
+    ['Could not run',String(d.skipped_count||0),
+     d.skipped_count?'not a pass':'none','' ],
+    ['Scope',esc(d.business_unit||''),esc((d.ledger||'')+' · FY'+d.fiscal_year+' P'+d.period),'']
+  ]));
+  const c=el('div','card');
+  c.append(el('h2',null,esc(d.title||d.playbook)+
+    ' <span class="badge '+cls+'">'+esc(label)+'</span>'+
+    '<span class="sub">'+esc(d.summary||'')+'</span>'));
+  const t=el('table');
+  t.innerHTML='<thead><tr><th></th><th>Check</th><th>Finding</th></tr></thead><tbody>'+
+    (d.steps||[]).map(s=>{
+      const m={ok:'<span class="badge ok">pass</span>',
+               attention:'<span class="badge warn">review</span>',
+               skipped:'<span class="badge bad">not run</span>'}[s.status]||'';
+      return '<tr><td>'+m+'</td><td><b>'+esc(s.title)+'</b><br>'+
+        '<span style="color:var(--muted);font-size:11px">'+esc(s.why||'')+'</span></td>'+
+        '<td>'+esc(s.headline||'')+'</td></tr>';
+    }).join('')+'</tbody>';
+  const sc=el('div'); sc.style.maxHeight='420px'; sc.style.overflow='auto';
+  sc.append(t); c.append(sc);
+  if(d.verdict==='incomplete'){
+    c.append(el('div','pad','<span style="color:var(--warn)">'+
+      'One or more checks could not run. This is NOT a clean result — fix the '+
+      'skipped checks before treating the period as ready.</span>'));
+  }
+  frag.append(c);
+  return frag;
+}
 function renderSql(d){
   const c=el('div','card');
   c.append(el('h2',null,'Query result <span class="sub">'+d.row_count+' row'+
@@ -810,6 +847,7 @@ function renderToolResult(name,data,args){
     if(name==='get_billing_workbench') return renderBilling(data);
     if(name==='wiki_lookup') return renderWikiPassages(data);
     if(name==='get_top_billing_customers') return renderTopBilling(data);
+    if(name==='run_playbook') return renderPlaybook(data);
     if(name==='run_sql') return renderSql(data);
     if(name==='search_records') return renderRecords(data);
     if(name==='wiki_get_page'){const c=el('div','card');

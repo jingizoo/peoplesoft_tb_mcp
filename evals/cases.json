@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Graded acceptance cases. Each runs a real turn against the real MCP",
-    "server and asserts DETERMINISTIC properties — which tools were called,",
+    "server and asserts DETERMINISTIC properties \u2014 which tools were called,",
     "which figures appear, whether the answer was refused. No LLM judges the",
     "result, so a pass means the same thing every run.",
     "",
@@ -12,19 +12,37 @@
     {
       "id": "tb-balances",
       "question": "Does the trial balance balance?",
-      "scope": {"business_unit": "US001", "ledger": "ACTUALS", "fiscal_year": 2026, "period": 6},
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
       "expect": {
-        "any_tool": ["tb_integrity_check", "get_trial_balance"],
+        "any_tool": [
+          "tb_integrity_check",
+          "get_trial_balance"
+        ],
         "not_refused": true
       }
     },
     {
       "id": "tb-other-period",
       "question": "Show the trial balance for period 3",
-      "scope": {"business_unit": "US001", "ledger": "ACTUALS", "fiscal_year": 2026, "period": 6},
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
       "expect": {
-        "any_tool": ["get_trial_balance", "tb_integrity_check"],
-        "tool_args_contain": {"period": 3},
+        "any_tool": [
+          "get_trial_balance",
+          "tb_integrity_check"
+        ],
+        "tool_args_contain": {
+          "period": 3
+        },
         "not_refused": true,
         "_why": "period in scope is a DEFAULT: asking for another period must not be blocked"
       }
@@ -32,12 +50,21 @@
     {
       "id": "ar-aging",
       "question": "Show the AR aging",
-      "scope": {"business_unit": "US001", "ledger": "ACTUALS", "fiscal_year": 2026, "period": 6},
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
       "expect": {
-        "any_tool": ["get_ar_aging"],
-        "not_tool": ["list_financial_scopes"],
+        "any_tool": [
+          "get_ar_aging"
+        ],
+        "not_tool": [
+          "list_financial_scopes"
+        ],
         "not_refused": true,
-        "_why": "one question, one data tool — no gratuitous discovery calls"
+        "_why": "one question, one data tool \u2014 no gratuitous discovery calls"
       }
     },
     {
@@ -45,8 +72,13 @@
       "question": "What is our capitalization threshold?",
       "scope": {},
       "expect": {
-        "any_tool": ["wiki_lookup"],
-        "not_tool": ["get_trial_balance", "get_ar_aging"],
+        "any_tool": [
+          "wiki_lookup"
+        ],
+        "not_tool": [
+          "get_trial_balance",
+          "get_ar_aging"
+        ],
         "_why": "a pure policy question needs no scope and no financial tool"
       }
     },
@@ -55,27 +87,49 @@
       "question": "What is our travel expense policy?",
       "scope": {},
       "expect": {
-        "any_tool": ["wiki_lookup"],
+        "any_tool": [
+          "wiki_lookup"
+        ],
         "_why": "a domain noun inside a policy question must not force a financial gate"
       }
     },
     {
       "id": "ap-reachable",
       "question": "How many payments did we make to each vendor?",
-      "scope": {"business_unit": "US001", "ledger": "ACTUALS"},
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
       "expect": {
-        "any_tool": ["search_records", "run_sql", "get_record_map"],
-        "answer_lacks": ["do not have access", "don't have access", "limited to GL"],
+        "any_tool": [
+          "search_records",
+          "run_sql",
+          "get_record_map"
+        ],
+        "answer_lacks": [
+          "do not have access",
+          "don't have access",
+          "limited to GL"
+        ],
         "_why": "no curated AP tool exists; the agent must reach it, not refuse"
       }
     },
     {
       "id": "custom-record",
       "question": "What files are configured in the file interface?",
-      "scope": {"business_unit": "US001", "ledger": "ACTUALS"},
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
       "expect": {
-        "any_tool": ["search_records", "run_sql"],
-        "answer_lacks": ["do not have access", "cannot"],
+        "any_tool": [
+          "search_records",
+          "run_sql"
+        ],
+        "answer_lacks": [
+          "do not have access",
+          "cannot"
+        ],
         "_why": "custom records are reached by description search then SQL"
       }
     },
@@ -84,8 +138,30 @@
       "question": "What business units and ledgers exist?",
       "scope": {},
       "expect": {
-        "answer_contains": ["US001"],
+        "answer_contains": [
+          "US001"
+        ],
         "_why": "answered deterministically from the catalog, no scope needed"
+      }
+    },
+    {
+      "id": "playbook-close",
+      "question": "Are we ready to close the period?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 7
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook"
+        ],
+        "not_tool": [
+          "get_trial_balance"
+        ],
+        "not_refused": true,
+        "_why": "a broad readiness question runs the playbook, not ad-hoc steps"
       }
     }
   ]

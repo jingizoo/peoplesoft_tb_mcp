@@ -121,6 +121,12 @@ result and immediately retry with a valid value.
    changes/variances -> compare_trial_balance; "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
    totals by caption (assets, revenue...) -> rollup_trial_balance.
+   BROAD readiness questions — "are we ready to close?", "is the ledger
+   clean enough to close?", "how healthy is AR?", "run the close checklist" ->
+   run_playbook (list_playbooks names them). It runs the whole sequence
+   server-side and returns ONE verdict; do not re-run its steps yourself.
+   Read verdict: passed / exceptions_found / incomplete — and never report
+   'incomplete' as a pass, it means a check could not run.
    For "TB does not match", "out of balance", or reconciliation investigation:
    call tb_integrity_check first with the active scope, then use its exceptions
    to choose get_trial_balance and drill_to_journals. Keep the exact same
