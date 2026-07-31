@@ -75,6 +75,21 @@ or the terminal chat:
 
 On Windows use `.venv\Scripts\python` in place of `.venv/bin/python`.
 
+### Which build am I running?
+
+Every page shows it in the context bar (`v0.1.0 · 5e61755`), hover for detail.
+From the shell:
+
+```bash
+python -m pstb.version
+```
+
+`scripts/diagnose_db.py` prints the same line first. A ZIP deployment has no
+git metadata, so the fingerprint — a hash of the source on disk — is the
+identity that always works: two deployments showing the same fingerprint are
+running the same code. `+local` means the working tree differs from the
+commit.
+
 Full step-by-step instructions, including work-laptop and offline notes, are in
 [docs/SETUP.md](docs/SETUP.md). On macOS/Linux there are also `make` shortcuts:
 `make venv`, `make seed`, `make smoke`, `make probe`, `make chat`.

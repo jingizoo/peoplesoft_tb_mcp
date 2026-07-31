@@ -1017,6 +1017,14 @@ def step_preflight(state):
 
 def step_summary(state, preflight_ok):
     step("Ready")
+    try:
+        from pstb.version import label, write_build_info
+        write_build_info()
+        ok("running build: {0}".format(label()))
+        info("recorded in BUILD_INFO.json so a ZIP deployment still reports "
+             "its origin")
+    except Exception as e:
+        warn("could not record build identity: {0}".format(e))
     py = ".venv\\Scripts\\python" if platform.system() == "Windows" \
         else ".venv/bin/python"
     print("  Start the web UI:")

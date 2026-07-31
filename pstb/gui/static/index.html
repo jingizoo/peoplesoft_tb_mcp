@@ -130,6 +130,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .composer input:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .chat-context{display:flex;align-items:center;gap:8px;padding:8px 18px 0;background:var(--panel);
   color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+.build-tag{margin-left:auto;color:var(--muted);font-size:11px;font-family:ui-monospace,monospace;cursor:help}
 .scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .scope-chip{border:1px solid var(--line);background:var(--bg);border-radius:20px;padding:5px 10px;
   cursor:pointer;color:var(--ink);font-weight:600}
@@ -318,6 +319,18 @@ function syncScopeControls(value){
   lg.value=value.ledger;
   if(fy) fy.value=value.fiscal_year||'';
   if(per) per.value=value.period||'';
+}
+function renderBuildTag(node){
+  // Deployment identity, visible on every page. Most "the feature is
+  // missing" reports on this project were a stale process, a ZIP copy
+  // without git, or cached JavaScript — all invisible until now.
+  // Accept the node directly: at construction time the context bar is
+  // not in the document yet, so a querySelector finds nothing.
+  const tag=node||document.querySelector('#build-tag'); if(!tag) return;
+  const b=(META&&META.build)||{};
+  const short=b.commit?(b.commit+(b.dirty?'+local':'')):('build '+(b.fingerprint||'?'));
+  tag.textContent='v'+(b.version||'?')+' · '+short;
+  tag.title=Object.entries(b).map(([k,v])=>k+': '+v).join('\n');
 }
 function updateScopeChip(){
   const chip=$('#active-scope');
@@ -1034,6 +1047,7 @@ async function viewAR(){
 /* ---------- boot ---------- */
 (async function(){
   try{ META=await api('/api/meta'); }catch(e){ oops('Cannot reach the server: '+e.message); return; }
+  renderBuildTag();   // META carries the build; the tag renders before this resolves
   const bu=$('#f-bu'), lg=$('#f-ledger'), per=$('#f-per');
   const sc0=META.scope||{};
   const bus=(META.business_units||[]).map(b=>b.business_unit);
@@ -1220,6 +1234,10 @@ function viewChat(){
   const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
   contextButton.id='active-scope';contextButton.onclick=showScopeChooser;context.append(contextButton);
   buildTimeSelects().forEach(sel=>context.append(sel));
+  const build=el('span','build-tag');
+  build.id='build-tag';
+  context.append(build);
+  renderBuildTag(build);
   const comp=el('div','composer');
   comp.innerHTML='<input id="q" aria-label="Ask a question about PeopleSoft Finance" '+
     'placeholder="Ask a question…" autocomplete="off">'+
