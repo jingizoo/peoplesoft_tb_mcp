@@ -231,6 +231,7 @@ const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElemen
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[];
+let PENDING_TIME={}, SYNC_TIME_SELECTS=null;
 const makeSessionId=()=>{
   if(globalThis.crypto&&crypto.randomUUID) return crypto.randomUUID();
   return 'chat-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
@@ -323,14 +324,23 @@ function updateScopeChip(){
   if(chip) chip.textContent=scopeLabel(CHAT_SCOPE);
 }
 function setChatScope(value,announce){
-  const next=canonicalScope(value);
+  let next=canonicalScope(value);
   if(!next) return;
+  // A year/period chosen before any business unit must not be discarded.
+  if(!CHAT_SCOPE&&value&&value.__fromChooser&&Object.keys(PENDING_TIME).length)
+    next=canonicalScope({...next,...PENDING_TIME});
   const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
   CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
+  if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
   // Refresh the selectable fiscal years for this BU/ledger in the background;
   // the editor uses them next time it opens.
   api('/api/scope?'+qs({business_unit:next.business_unit,ledger:next.ledger}))
-    .then(d=>{if(d&&d.fiscal_years&&d.fiscal_years.length) SCOPE_YEARS=d.fiscal_years;})
+    .then(d=>{if(d&&d.fiscal_years&&d.fiscal_years.length){
+      SCOPE_YEARS=d.fiscal_years;
+      // Repopulate: the selects were built before this landed, so
+      // without this the year list offers only the latest year.
+      if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
+    }})
     .catch(()=>{});
   if(announce&&changed&&$('#msgs')){
     $('#msgs').append(el('div','msg bot',
@@ -339,37 +349,45 @@ function setChatScope(value,announce){
     $('#msgs').scrollTop=$('#msgs').scrollHeight;
   }
 }
-function renderTimeControls(){
-  // Fiscal year and period are DEFAULTS, not locks: set them to steer
-  // unqualified questions, or choose Any to let each question decide.
-  const box=el('div','pad');
-  box.style.borderTop='1px solid var(--line)';
+function scopeYearOptions(){
+  const found=(SCOPE_YEARS||[]).slice();
+  (META.financial_scopes||[]).forEach(s=>(s.ledgers||[]).forEach(l=>
+    (l.fiscal_years||[]).forEach(y=>{if(found.indexOf(y)<0)found.push(y);})));
   const cur=CHAT_SCOPE||{};
-  const years=(()=>{
-    const found=(SCOPE_YEARS||[]).slice();
-    (META.financial_scopes||[]).forEach(s=>(s.ledgers||[]).forEach(l=>
-      (l.fiscal_years||[]).forEach(y=>{if(found.indexOf(y)<0)found.push(y);})));
-    if(cur.fiscal_year&&found.indexOf(cur.fiscal_year)<0) found.push(cur.fiscal_year);
-    return found.sort((a,b)=>b-a);
-  })();
+  if(cur.fiscal_year&&found.indexOf(cur.fiscal_year)<0) found.push(cur.fiscal_year);
+  return found.sort((a,b)=>b-a);
+}
+function buildTimeSelects(){
+  // Year and period are DEFAULTS for questions that do not name their own.
+  // They live in the always-visible context bar: buried in the scope card
+  // they were undiscoverable, and they silently did nothing before a scope
+  // existed. PENDING_TIME remembers a choice made first and applies it the
+  // moment a business unit is picked.
   const fySel=el('select','scope-time');
-  fySel.append(new Option('Any year',''));
-  years.forEach(y=>fySel.append(new Option('FY'+y,y)));
-  fySel.value=cur.fiscal_year||'';
+  fySel.id='scope-fy'; fySel.title='Fiscal year for questions that do not name one';
   const perSel=el('select','scope-time');
-  perSel.append(new Option('Any period',''));
-  for(let i=1;i<=13;i++) perSel.append(new Option('Period '+i,i));
-  perSel.append(new Option('998 (adjustments)',998));
-  perSel.value=cur.period||'';
-  const apply=()=>{
-    if(!CHAT_SCOPE) return;
-    setChatScope({...CHAT_SCOPE,fiscal_year:fySel.value||null,
-                  period:perSel.value||null},true);
+  perSel.id='scope-per'; perSel.title='Period for questions that do not name one';
+  const fill=()=>{
+    const cur=CHAT_SCOPE||PENDING_TIME||{};
+    fySel.innerHTML='';perSel.innerHTML='';
+    fySel.append(new Option('Any year',''));
+    scopeYearOptions().forEach(y=>fySel.append(new Option('FY'+y,y)));
+    perSel.append(new Option('Any period',''));
+    for(let i=1;i<=13;i++) perSel.append(new Option('Period '+i,i));
+    perSel.append(new Option('998 (adjustments)',998));
+    fySel.value=cur.fiscal_year||'';perSel.value=cur.period||'';
   };
-  fySel.onchange=apply; perSel.onchange=apply;
-  const lbl=el('span','scope-meta','Applies to questions that do not name their own period:&nbsp;');
-  box.append(lbl,fySel,document.createTextNode(' '),perSel);
-  return box;
+  fill();
+  // Record ONLY the field the user actually touched: overlaying both meant
+  // setting a period silently blanked the discovered fiscal year.
+  const apply=()=>{
+    if(CHAT_SCOPE) setChatScope({...CHAT_SCOPE,...PENDING_TIME},true);
+    else updateScopeChip();
+  };
+  fySel.onchange=()=>{PENDING_TIME.fiscal_year=fySel.value||null;apply();};
+  perSel.onchange=()=>{PENDING_TIME.period=perSel.value||null;apply();};
+  SYNC_TIME_SELECTS=fill;
+  return [fySel,perSel];
 }
 function renderScopeChooser(options,onChoose,title){
   const choices=(options||[]).map(o=>canonicalScope(o)?o:null).filter(Boolean);
@@ -408,13 +426,12 @@ function renderScopeChooser(options,onChoose,title){
           return;
         }
       }
-      setChatScope(chosen,true);
+      setChatScope({...chosen,__fromChooser:true},true);
       if(onChoose) onChoose(canonicalScope(chosen));
     };
     row.append(use); body.append(row);
   });
   c.append(body);
-  c.append(renderTimeControls());
   return c;
 }
 function dismissScopeChoosers(){
@@ -1202,6 +1219,7 @@ function viewChat(){
   const context=el('div','chat-context','<span>Active data context</span>');
   const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
   contextButton.id='active-scope';contextButton.onclick=showScopeChooser;context.append(contextButton);
+  buildTimeSelects().forEach(sel=>context.append(sel));
   const comp=el('div','composer');
   comp.innerHTML='<input id="q" aria-label="Ask a question about PeopleSoft Finance" '+
     'placeholder="Ask a question…" autocomplete="off">'+
