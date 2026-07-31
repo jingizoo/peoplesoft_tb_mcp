@@ -299,6 +299,70 @@ class Database:
         with self._session() as (conn, _):
             return conn
 
+
+    def explain_plan(self, sql: str) -> dict:
+        """Optimizer plan for a SELECT, WITHOUT executing it.
+
+        On Oracle this is EXPLAIN PLAN + a read of PLAN_TABLE: the database
+        estimates cost and access paths for free, which is a far better cost
+        ceiling than hoping a model writes sargable SQL. On SQLite it is
+        EXPLAIN QUERY PLAN, which is enough to prove the mechanism in tests.
+
+        Returns {"available": False, ...} rather than raising when the plan
+        cannot be read — a missing PLAN_TABLE or a denied grant must degrade
+        to "unknown cost", never block a legitimate query.
+        """
+        if self.dialect == "oracle":
+            stmt_id = "pstb_{0}".format(abs(hash(sql)) % 10_000_000)
+            try:
+                with self._session() as (conn, _):
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(
+                            f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {sql}")
+                        cur.execute(
+                            "SELECT OPERATION, OPTIONS, OBJECT_NAME, "
+                            "CARDINALITY, COST FROM PLAN_TABLE "
+                            "WHERE STATEMENT_ID = :sid ORDER BY ID",
+                            {"sid": stmt_id})
+                        rows = [
+                            {"operation": r[0], "options": r[1],
+                             "object": r[2], "rows": r[3], "cost": r[4]}
+                            for r in cur.fetchall()
+                        ]
+                        cur.execute(
+                            "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = :sid",
+                            {"sid": stmt_id})
+                        conn.commit()
+                    finally:
+                        try:
+                            cur.close()
+                        except Exception:
+                            pass
+            except Exception as e:
+                return {"available": False, "reason": str(e)[:200]}
+            return {"available": True, "steps": rows}
+
+        if self.dialect == "sqlite":
+            try:
+                rows, _ = self.query("EXPLAIN QUERY PLAN " + sql, {},
+                                     max_rows=200)
+            except Exception as e:
+                return {"available": False, "reason": str(e)[:200]}
+            steps = []
+            for row in rows:
+                detail = str(row.get("detail") or "")
+                upper = detail.upper()
+                steps.append({
+                    "operation": "SCAN" if upper.startswith("SCAN") else "SEARCH",
+                    "options": "FULL" if upper.startswith("SCAN") else "",
+                    "object": detail.split()[1] if len(detail.split()) > 1 else "",
+                    "rows": None, "cost": None, "detail": detail,
+                })
+            return {"available": True, "steps": steps}
+
+        return {"available": False, "reason": f"no plan support for {self.dialect}"}
+
     # ---- querying --------------------------------------------------------
     def query(
         self, sql: str, params: Optional[dict] = None, max_rows: Optional[int] = None

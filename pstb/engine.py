@@ -1861,6 +1861,68 @@ class TBEngine:
             self._source_engines[name] = eng
         return self._source_engines[name]
 
+    # Records small enough that a full scan is not worth blocking. Setup and
+    # reference tables are read end-to-end all the time and that is correct.
+    _SCAN_ROW_FLOOR = 50_000
+
+    def _cost_gate(self, sql: str, scrubbed: str = "") -> dict:
+        """Refuse or flag a plan that scans a large table.
+
+        Refusing outright is reserved for the case that actually hurts: a
+        full scan of a record with a lot of rows. Everything else — an
+        unreadable plan, a scan of a small setup table — passes with a note,
+        because a cost gate that blocks legitimate work would just get turned
+        off.
+        """
+        plan = self.db.explain_plan(sql)
+        if not plan.get("available"):
+            return {"plan": {"available": False,
+                             "note": "optimizer plan unavailable; query ran "
+                                     "without a cost check",
+                             "reason": plan.get("reason", "")[:200]}}
+        scans = []
+        for step in plan.get("steps") or []:
+            operation = str(step.get("operation") or "").upper()
+            options = str(step.get("options") or "").upper()
+            is_scan = ("FULL" in options
+                       or (operation == "SCAN" and "INDEX" not in
+                           str(step.get("detail") or "").upper()))
+            if not is_scan:
+                continue
+            obj = str(step.get("object") or "").strip()
+            rows = self._approx_rows(obj) if obj else None
+            scans.append({"object": obj, "approx_rows": rows,
+                          "cost": step.get("cost")})
+        big = [x for x in scans
+               if (x["approx_rows"] or 0) >= self._SCAN_ROW_FLOOR]
+        if big:
+            names = ", ".join(
+                f"{x['object']} (~{x['approx_rows']:,} rows)" for x in big)
+            # Refuse only the CARELESS case: a large scan with no filter at
+            # all. A filtered query that still scans means the column has no
+            # index — the user cannot do better without a DBA, and blocking
+            # it would make every unindexed custom record unqueryable. Warn
+            # loudly instead, so the cost is visible but the work is possible.
+            filtered = " WHERE " in (scrubbed or sql).upper()
+            if not filtered:
+                raise EngineError(
+                    f"Refused: the optimizer plans a FULL SCAN of {names} with "
+                    "no filter at all. Add a WHERE clause — business unit, "
+                    "ledger, fiscal year, period, or a key column — and try "
+                    "again. The query was not executed."
+                )
+            return {"plan": {"available": True, "full_scans": big,
+                             "warning": (
+                                 f"This filtered query still scans {names} — "
+                                 "no usable index for those predicates. It "
+                                 "ran, but ask a DBA about an index if you "
+                                 "will repeat it.")}}
+        if scans:
+            return {"plan": {"available": True, "full_scans": scans,
+                             "note": "full scan of small table(s); acceptable "
+                                     "but narrow the query if it grows"}}
+        return {}
+
     def run_sql(self, sql: str, max_rows: int = 100,
                 business_unit: str = "") -> dict:
         if not self.cfg.tools.allow_raw_sql:
@@ -1906,10 +1968,18 @@ class TBEngine:
         # right after the validator confirmed the table exists. An explicitly
         # qualified name (OTHER_OWNER.CUSTOM_TBL) is left exactly as written.
         s = self._qualify_tables(s, unqualified) if self.db.prefix else s
+        # COST GATE. Ask the optimizer what this will do BEFORE running it:
+        # the database's own estimate is a far better ceiling than hoping a
+        # model wrote sargable SQL, and it costs nothing because EXPLAIN does
+        # not execute. This is what lets allow_raw_sql stay on with
+        # confidence against a real ledger.
+        plan_note = self._cost_gate(s, scrubbed)
         cap = min(max(int(max_rows or 100), 1), 500)
         rows, truncated = self.db.query(s, {}, max_rows=cap)
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}
+        if plan_note:
+            out.update(plan_note)
         # Disclose, never rewrite. When a business unit is selected, say
         # plainly whether this query was restricted to it, so a cross-BU
         # result is never mistaken for a scoped one.

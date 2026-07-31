@@ -951,6 +951,47 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 
+    print("== cost gate: the optimizer decides, not hope ==")
+    _cg = Path(_tf.mkdtemp(prefix="pstb_cost_"))
+    _cdbf = _cg / "big.db"
+    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _cdbf)
+    _cc = _sq.connect(_cdbf)
+    _cc.execute("CREATE TABLE PS_BIG_TXN (BUSINESS_UNIT TEXT, AMT REAL)")
+    _cc.executemany("INSERT INTO PS_BIG_TXN VALUES (?,?)",
+                    [("US001", float(i)) for i in range(60_000)])
+    _cc.commit(); _cc.execute("ANALYZE"); _cc.commit(); _cc.close()
+    cfg_cost = Config.sample(ROOT)
+    cfg_cost.db.sqlite_path = str(_cdbf)
+    eng_cost = TBEngine(Database(cfg_cost), cfg_cost)
+    _plan = eng_cost.db.explain_plan(
+        "SELECT * FROM PS_LEDGER WHERE BUSINESS_UNIT='US001' "
+        "AND LEDGER='ACTUALS' AND FISCAL_YEAR=2026")
+    check("an optimizer plan is readable",
+          _plan.get("available") and _plan.get("steps"))
+    check("an indexed query is not reported as a scan",
+          all(s.get("operation") != "SCAN" for s in _plan["steps"]),
+          str(_plan["steps"][:1]))
+    try:
+        eng_cost.run_sql("SELECT * FROM PS_BIG_TXN")
+        check("an UNFILTERED scan of a large record is refused", False)
+    except EngineError as e:
+        check("an UNFILTERED scan of a large record is refused",
+              "not executed" in str(e) and "60,000" in str(e), str(e)[:70])
+    # A filtered query that still scans means no usable index. Refusing it
+    # would make every unindexed custom record unqueryable, so it warns.
+    _warned = eng_cost.run_sql(
+        "SELECT * FROM PS_BIG_TXN WHERE BUSINESS_UNIT='US001'", max_rows=5)
+    check("a filtered query on an unindexed record runs, with a warning",
+          _warned["rows"] and "warning" in (_warned.get("plan") or {}))
+    check("a small table scan is allowed",
+          eng_cost.run_sql("SELECT * FROM PS_GL_ACCOUNT_TBL",
+                           max_rows=5)["rows"])
+    check("an indexed query carries no cost note",
+          "plan" not in eng_cost.run_sql(
+              "SELECT COUNT(*) n FROM PS_LEDGER WHERE BUSINESS_UNIT='US001' "
+              "AND LEDGER='ACTUALS' AND FISCAL_YEAR=2026"))
+    _sh.rmtree(_cg)
+
     print("== monitoring: what changed since last time ==")
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_mon", ROOT / "scripts" / "monitor.py")
