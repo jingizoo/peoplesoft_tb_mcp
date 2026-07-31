@@ -85,6 +85,11 @@ class ToolsCfg:
     # reviewable file so a human can see exactly what the agent believes.
     site_memory: str = "site_memory.json"
     txn_row_threshold: int = 1000
+    # Rows returned by profile_record/compare_records. These reach the
+    # configured model, and on the Gemini path that means they leave the
+    # network — sensitive columns are masked first (see pstb/profiles.py).
+    # Set to 0 to send no rows at all and keep only shape and value counts.
+    sample_rows: int = 3
 
 
 @dataclass

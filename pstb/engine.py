@@ -2213,6 +2213,39 @@ class TBEngine:
             ),
         }
 
+    def profile_record(self, table: str, sample_rows: int = -1) -> dict:
+        """Evidence about one record: shape, which columns this site actually
+        populates, the codes its status columns hold, and a few masked rows."""
+        if not self.cfg.tools.allow_raw_sql:
+            raise EngineError("Raw SQL tools are disabled")
+        from .profiles import RecordProfiler
+
+        rec = (table or "").strip()
+        # Accept a PeopleTools record name as readily as a physical table.
+        if rec and not rec.upper().startswith("PS") and not self._table_exists(rec):
+            try:
+                rec = self.describe_record(rec).get("table") or rec
+            except EngineError:
+                pass
+        try:
+            return RecordProfiler(self.db, self.cfg).profile(
+                rec, sample_rows=None if sample_rows < 0 else sample_rows)
+        except ValueError as e:
+            raise EngineError(str(e))
+
+    def compare_records(self, tables: list = None, sample_rows: int = -1) -> dict:
+        """Profile several candidate records side by side, so the one that
+        fits a question is chosen on evidence rather than on its name."""
+        if not self.cfg.tools.allow_raw_sql:
+            raise EngineError("Raw SQL tools are disabled")
+        from .profiles import RecordProfiler
+
+        try:
+            return RecordProfiler(self.db, self.cfg).compare(
+                tables or [], sample_rows=None if sample_rows < 0 else sample_rows)
+        except ValueError as e:
+            raise EngineError(str(e))
+
     def describe_record(self, record: str) -> dict:
         """Fields of a PeopleSoft record from PeopleTools, with the physical
         column list as a cross-check."""

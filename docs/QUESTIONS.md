@@ -111,6 +111,10 @@ absent or ungranted it names them so you can request exactly those grants.
      TU_FILE_INTFC, then run_sql against PS_TU_FILE_INTFC)*
 48u. Which record holds FILE_ID? *(field-name search)*
 48v. What columns does PS_TU_FILE_INTFC have? *(describe_record)*
+48z. Which of these records actually holds our open invoices? *(compare_records
+     profiles each candidate: which are populated, which columns this site
+     fills in, and what codes their status columns really hold — names alone
+     cannot separate a live record from its history shell or staging table)*
 Ad-hoc results carry `scope_filtered`: when a business unit is selected and the
 query did not filter on it, the answer says the rows span business units.
 

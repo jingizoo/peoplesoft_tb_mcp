@@ -135,6 +135,27 @@ async def main() -> None:
             print(f"run_playbook close_readiness: {pb['verdict']} — "
                   f"{pb['summary']}")
 
+            prof = await call("profile_record", table="PS_ITEM")
+            assert "error" not in prof, f"profile_record failed: {prof.get('error')}"
+            assert prof.get("value_counts", {}).get("ITEM_STATUS"), \
+                f"profile_record returned no status codes: {list(prof)}"
+
+            # The masking is a data-egress control, so assert it over the wire
+            # rather than only in-process: this is the payload a model sees.
+            cust = await call("profile_record", table="PS_CUSTOMER")
+            assert "error" not in cust, f"profile_record failed: {cust.get('error')}"
+            assert "NAME1" in (cust.get("masked_columns") or []), cust
+            assert "ACME Industrial" not in json.dumps(cust), \
+                "an unmasked customer name reached the tool payload"
+            print("profile_record reports status codes, masks names ✔")
+
+            cmp_ = await call("compare_records",
+                              tables=["PS_ITEM", "PS_BI_HDR", "PS_NOPE_XX"])
+            assert "error" not in cmp_, f"compare_records failed: {cmp_.get('error')}"
+            assert "PS_ITEM" in cmp_["readable_and_populated"], cmp_
+            assert "PS_NOPE_XX" in cmp_["empty_or_unreadable"], cmp_
+            print("compare_records separates populated from unreadable ✔")
+
             print("\nMCP probe passed.")
 
 
