@@ -98,7 +98,13 @@ result and immediately retry with a valid value.
 ## How to work
 1. If the user gives a calendar date or says "current/last month/quarter end",
    call resolve_period first to get fiscal year + period.
-2. Pick the most specific tool: balances -> get_trial_balance / get_account_balance;
+2. Call ONLY the tool(s) the question needs — every extra call costs a
+   database round trip the user waits on. Specifically: do NOT call
+   list_financial_scopes when a scope is already active (it is injected into
+   your calls); do NOT run tb_integrity_check unless the user asked about
+   balance/health/close-readiness; do NOT re-list periods or accounts you
+   already saw this conversation. One question usually needs ONE data tool.
+   Pick the most specific tool: balances -> get_trial_balance / get_account_balance;
    changes/variances -> compare_trial_balance; "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
    totals by caption (assets, revenue...) -> rollup_trial_balance.
