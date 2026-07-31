@@ -831,6 +831,20 @@ DROP TABLE OLD_BU;""")
           eng_b.trial_balance(fiscal_year=2026, period=6)["totals"]["in_balance"])
     _sh.rmtree(_tmpb)
 
+    # Launching any entry point from a subdirectory must still find the
+    # deployment's config.yaml — `cd scripts && python -m pstb.gui` silently
+    # served built-in sqlite defaults on a real deployment.
+    import subprocess as _sp
+    _r = _sp.run([sys.executable, "-c",
+                  "import sys; sys.path.insert(0, '..'); "
+                  "from pstb.config import resolve_config_path; "
+                  "print(resolve_config_path())"],
+                 cwd=str(ROOT / "scripts"), capture_output=True, text=True)
+    check("config resolves to the package root from any cwd",
+          _r.returncode == 0
+          and _r.stdout.strip() == str(ROOT / "config.yaml"),
+          _r.stdout.strip() or _r.stderr.strip()[:80])
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
