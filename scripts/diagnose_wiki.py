@@ -14,6 +14,7 @@ Never prints the API token.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -35,7 +36,8 @@ def main() -> int:
                     help="content excerpt length (default 600)")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config(os.environ.get('PSTB_CONFIG')
+                      or str(ROOT / 'config.yaml'))
     w = cfg.wiki
     problems: list[str] = []
 

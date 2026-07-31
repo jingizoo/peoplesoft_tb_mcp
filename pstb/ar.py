@@ -153,26 +153,9 @@ class ARBilling:
                       "BAL_AMT")
 
     def _cols(self, table: str) -> set:
-        """Column names a record ACTUALLY has at this site (cached). Record
-        shapes differ by PeopleSoft release and customization — curated SQL
-        must adapt to the database in front of it, not assume a layout."""
-        t = table.upper()
-        if t not in self._colcache:
-            names: set = set()
-            try:
-                params: dict = {}
-                sql = q.table_describe(self.db, t, params)
-                rows, _ = self.db.query(sql, params, max_rows=500)
-                names = {str(r.get("column_name") or r.get("name") or "").upper()
-                         for r in rows} - {""}
-            except Exception:
-                names = set()
-            if not names:
-                # A transient failure (or missing table) must not poison the
-                # cache for the life of the process — retry next call.
-                return set()
-            self._colcache[t] = names
-        return self._colcache[t]
+        """Column names a record ACTUALLY has at this site — the shared
+        db-level catalog (one cache, one mechanism, for every module)."""
+        return self.db.columns(table)
 
     def _item_shape(self) -> dict:
         """Which optional PS_ITEM columns exist here, with fallbacks: item

@@ -80,12 +80,57 @@ class Database:
         self._conn = None                      # sqlserver + legacy single conn
         self._pool = None                      # oracle session pool
         self._local = threading.local()        # per-thread sqlite connections
+        self._catalog: dict = {}               # table -> real column names
+        self._catalog_lock = threading.Lock()
 
     # ---- dialect helpers -------------------------------------------------
     @property
     def prefix(self) -> str:
         s = self.cfg.db.schema.strip().rstrip(".")
         return f"{s}." if s else ""
+
+    # ---- schema catalog --------------------------------------------------
+    def columns(self, table: str) -> set:
+        """Columns this site's copy of a record ACTUALLY has (cached).
+
+        PeopleSoft record shapes vary by release, by module install and by
+        customization: PS_ITEM may date items with ACCTG_DT or ASOF_DT,
+        PS_BUS_UNIT_TBL_GL may carry no DESCR at all. Every optional column
+        must therefore be checked here before a builder selects it, rather
+        than each query discovering its own ORA-00904 in production.
+
+        Returns an empty set when the catalog cannot be read, which callers
+        must treat as "assume the reference shape" — never as "no columns".
+        """
+        key = table.upper()
+        with self._catalog_lock:
+            if key in self._catalog:
+                return self._catalog[key]
+        names: set = set()
+        try:
+            from . import queries as _q
+
+            params: dict = {}
+            sql = _q.table_describe(self, key, params)
+            rows, _ = self.query(sql, params, max_rows=1000)
+            names = {str(r.get("column_name") or r.get("name") or "").upper()
+                     for r in rows} - {""}
+        except Exception:
+            return set()
+        if names:
+            with self._catalog_lock:
+                self._catalog[key] = names
+        return names
+
+    def has_column(self, table: str, column: str) -> bool:
+        """True when the column exists, or when the catalog is unreadable
+        (fall back to the reference shape rather than dropping the column)."""
+        cols = self.columns(table)
+        return (not cols) or column.upper() in cols
+
+    def clear_catalog(self) -> None:
+        with self._catalog_lock:
+            self._catalog.clear()
 
     def today_expr(self) -> str:
         return {

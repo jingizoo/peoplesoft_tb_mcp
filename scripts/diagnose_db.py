@@ -11,6 +11,7 @@ minutes is the one to index or narrow. Use --sql to print the statement.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -67,7 +68,11 @@ def main() -> int:
     ap.add_argument("--sql", action="store_true", help="print each statement")
     args = ap.parse_args()
 
-    cfg = load_config()
+    # Resolve config from the REPO, not the current directory: running
+    # `cd scripts && python diagnose_db.py` otherwise silently loads the
+    # built-in defaults (backend=sqlite) and reports the wrong database.
+    cfg = load_config(os.environ.get('PSTB_CONFIG')
+                      or str(ROOT / 'config.yaml'))
     db = Database(cfg)
     engine = TBEngine(db, cfg)
     bu = args.bu or cfg.defaults.business_unit
@@ -86,7 +91,8 @@ def main() -> int:
         return 1
 
     print("\n2. Dimension tables (should be milliseconds)")
-    timed("PS_BUS_UNIT_TBL_GL", lambda: db.query(q.business_units(db), {}, max_rows=50),
+    timed("PS_BUS_UNIT_TBL_GL",
+          lambda: db.query(q.business_units(db), {}, max_rows=50),
           expect_rows=True,
           remedy="No GL business units visible — check db.schema and SELECT grants.")
     timed("PS_SET_CNTRL_REC (setid)",
@@ -142,7 +148,25 @@ def main() -> int:
                             base_currency=engine.base_currency_for(bu))
     timed("TB aggregate, accounts 1%", lambda: db.query(sql2, params2, max_rows=100_000))
 
-    print("\n6. AR / Billing record shapes (what the curated tools adapt to)")
+    print("\n6. Record-shape audit (every record the tools touch, one pass)")
+    try:
+        audit = engine.audit_record_shapes()
+        for t in audit["unreadable"]:
+            print(f"   [WARN] {t}: not readable (missing table or grants)")
+            PROBLEMS.append(f"{t}: not readable")
+        for t, cols in audit["missing_required"].items():
+            print(f"   [FAIL] {t}: missing REQUIRED column(s) {', '.join(cols)}")
+            PROBLEMS.append(f"{t}: missing required {', '.join(cols)}")
+        for t, cols in audit["missing_optional"].items():
+            print(f"   [note] {t}: no {', '.join(cols)} here — the tools adapt "
+                  "and disclose it")
+        if audit["clean"]:
+            print(f"   [ok]   {len(audit['clean'])} record(s) match the "
+                  "reference shape exactly")
+    except Exception as e:
+        print(f"   shape audit failed: {e}")
+
+    print("\n6b. AR / Billing record shapes (what the curated tools adapt to)")
     try:
         from pstb.ar import ARBilling
         arb = ARBilling(engine)

@@ -32,6 +32,34 @@ GROUPABLE_CHARTFIELDS = {
 IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#.]{0,63}$")
 
 
+def opt(db: Database, table: str, column: str, alias: str,
+        qualifier: str = "") -> str:
+    """SELECT-list entry for an OPTIONAL column.
+
+    Emits `Q.COLUMN AS alias` when the record really has that column here and
+    `NULL AS alias` when it does not, so one absent descriptive column can
+    never take down the whole query with ORA-00904. This is the general
+    mechanism: builders declare which columns are optional, and the live
+    catalog decides. Required columns are NOT routed through this - a trial
+    balance without POSTED_TOTAL_AMT should fail loudly, not silently return
+    nulls.
+    """
+    prefix = "{0}.".format(qualifier) if qualifier else ""
+    if db.has_column(table, column):
+        return "{0}{1} AS {2}".format(prefix, column, alias)
+    return "NULL AS {0}".format(alias)
+
+
+def opt_expr(db: Database, table: str, column: str, present: str,
+             absent: str) -> str:
+    """Pick between two SQL fragments depending on whether a column exists.
+
+    For predicates and aggregates, where the fallback is not simply NULL
+    (e.g. SUM(0) when there is no DISPUTE_STATUS to test).
+    """
+    return present if db.has_column(table, column) else absent
+
+
 def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
                  alias: str = "L", base_currency: str = "") -> str:
     """Currency / amount-basis contract, applied identically by every tool.
@@ -430,8 +458,9 @@ def psrecfield_for_record(db: Database) -> str:
 
 
 def business_units(db: Database) -> str:
-    return f"""SELECT BUSINESS_UNIT AS business_unit, DESCR AS descr,
-       BASE_CURRENCY AS base_currency
+    return f"""SELECT BUSINESS_UNIT AS business_unit,
+       {opt(db, 'PS_BUS_UNIT_TBL_GL', 'DESCR', 'descr')},
+       {opt(db, 'PS_BUS_UNIT_TBL_GL', 'BASE_CURRENCY', 'base_currency')}
   FROM {db.prefix}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT"""
 
 
