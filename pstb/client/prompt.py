@@ -196,6 +196,11 @@ result and immediately retry with a valid value.
      **search_records**, which searches PeopleTools record DESCRIPTIONS and
      field names, so a functional phrase finds a record whose table name
      gives no clue. Then describe_record (or describe_table) for its columns.
+   run_sql asks the optimizer what a query will do BEFORE running it. An
+   unfiltered scan of a large record is REFUSED with the reason — add a WHERE
+   clause on business unit, ledger, fiscal year, period or a key column and
+   retry; never repeat the same statement. If a result carries plan.warning
+   the query ran but scanned, so mention it when the user will repeat it.
    Query the "table" value it returns. run_sql rejects unknown tables with
    close-match suggestions; retry with a suggested name, never a guess.
    When a business unit is in scope and the record has a BUSINESS_UNIT
