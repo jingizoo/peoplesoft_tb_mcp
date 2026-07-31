@@ -46,7 +46,10 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
 - `pstb/wiki.py` — Confluence REST or a local markdown folder, with automatic
   fallback; `lookup()` searches, fetches and returns ranked passages.
 - `pstb/retrieve.py` — heading-aware passage splitting + BM25 (stdlib).
-- `pstb/guards.py` — structural answer guards: continue on a promised-but-
+- `pstb/guards.py` — structural answer guards, including MECHANICAL number
+  grounding: every figure in an answer must appear in a tool payload from the
+  same turn or the answer is withheld. Prompts and verdict checks reduce
+  fabrication; this makes it impossible. Other guards: continue on a promised-but-
   unmade tool call; flag a compliance verdict missing rule or figure.
 - `pstb/ar.py` — AR aging (with GL control tie-out) and billing pipeline
   over PS_ITEM / PS_CUSTOMER / PS_BI_HDR / INTFC_BI. Record shapes are

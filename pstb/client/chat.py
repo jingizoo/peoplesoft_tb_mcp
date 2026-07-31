@@ -34,6 +34,7 @@ from ..guards import (
     promises_tool_call,
     question_financial_domains,
     tool_result_status,
+    ungrounded_figures,
     unevidenced_verdict,
 )
 from ..qlog import QuestionLog
@@ -236,6 +237,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     scope_blocked = False
     last_db_problem = ""
     last_policy_problem = ""
+    turn_payloads: list = []
 
     def has_relevant_financial_evidence() -> bool:
         if required_financial_domains:
@@ -403,6 +405,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 "ok": ok,
                 **({"error": (problem or blocked or out)[:240]} if not ok else {}),
             })
+            if ok:
+                turn_payloads.append(out)
             results_by_index[index] = ToolResult(
                 call_id=call.id, name=call.name, content=out
             )
@@ -454,6 +458,29 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                if last_policy_problem else "")
         )
         gate_replaced_answer = True
+
+    # MECHANICAL number grounding. The prompt forbids inventing figures and
+    # the verdict guard catches unevidenced judgements, but neither makes a
+    # fabricated amount IMPOSSIBLE to state. Every figure in the answer must
+    # appear in a tool payload from this turn; if one does not, the answer is
+    # refused rather than shown. Numbers have been fabricated by 8B models in
+    # this exact product ($1,234,567.89 alongside balanced=true), so this is
+    # the difference between "told not to" and "cannot".
+    if not gate_replaced_answer and turn_payloads:
+        invented = ungrounded_figures(answer, turn_payloads)
+        if invented:
+            answer = (
+                "I withheld that answer: it stated "
+                + ", ".join(invented[:3])
+                + (" and others" if len(invented) > 3 else "")
+                + ", which does not appear in any tool result from this turn. "
+                "Every figure must come from the database. Ask again and I "
+                "will requery rather than restate."
+            )
+            gate_replaced_answer = True
+            logged_calls.append({"tool": "_number_guard", "ok": False,
+                                 "error": "ungrounded figures: "
+                                          + ", ".join(invented[:5])})
 
     # A compliance verdict needs a rule AND a figure. If one side is missing,
     # say so rather than letting a half-grounded judgement stand.
