@@ -1,3 +1,6 @@
+setup:
+	python3 scripts/setup.py
+
 PY := .venv/bin/python
 
 .PHONY: venv seed unittest smoke probe qa chat chat-gemini server clean
