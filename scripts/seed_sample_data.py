@@ -277,6 +277,12 @@ CREATE TABLE PS_GL_ACCOUNT_TBL (
 CREATE TABLE PS_DEPT_TBL (
   SETID TEXT, DEPTID TEXT, EFFDT TEXT, EFF_STATUS TEXT, DESCR TEXT);
 CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, DESCR TEXT, BASE_CURRENCY TEXT);
+-- Ledger setup records. A real instance always has these, and the agent
+-- discovers its BU/ledger catalog from them: they hold one row per business
+-- unit / ledger group, so the lookup is a small indexed read instead of a
+-- DISTINCT over every balance row in PS_LEDGER.
+CREATE TABLE PS_BUS_UNIT_LED (BUSINESS_UNIT TEXT, LEDGER_GROUP TEXT);
+CREATE TABLE PS_LED_GRP_TBL (LEDGER_GROUP TEXT, LEDGER TEXT, DESCR TEXT);
 CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
   SETID TEXT, CALENDAR_ID TEXT, FISCAL_YEAR INTEGER, ACCOUNTING_PERIOD INTEGER,
@@ -410,6 +416,15 @@ def main() -> None:
     )
     con.execute(
         "INSERT INTO PS_BUS_UNIT_TBL_GL VALUES (?,?,?)", (BU, "US Operations", CURR)
+    )
+    con.executemany(
+        "INSERT INTO PS_BUS_UNIT_LED VALUES (?,?)",
+        [(BU, "ACTUALS"), (BU, "BUDGETS")],
+    )
+    con.executemany(
+        "INSERT INTO PS_LED_GRP_TBL VALUES (?,?,?)",
+        [("ACTUALS", LEDGER, "Actuals ledger group"),
+         ("BUDGETS", "BUDGET", "Budget ledger group")],
     )
     con.executemany(
         "INSERT INTO PS_SET_CNTRL_REC VALUES (?,?,?)",

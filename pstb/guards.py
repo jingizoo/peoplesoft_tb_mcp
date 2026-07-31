@@ -28,9 +28,15 @@ _PROMISE = re.compile(
     r"(?:call|use|check|query|run|look ?up|retrieve|fetch)\b"
 )
 _VERDICT = re.compile(
-    r"(?i)\b(?:(?:with)?in (?:our |the )?polic\w*|(?:non-?)?compliant|"
-    r"in compliance|violat\w+|breach\w*|"
-    r"exceeds? (?:the |our )?(?:policy|threshold|limit)\w*)"
+    r"(?i)(?:\b(?:with)?in (?:our |the )?polic\w*|\b(?:non-?)?compliant\b|"
+    r"\bin compliance\b|\bviolat\w+|\bbreach\w*|"
+    r"\bexceeds? (?:the |our )?(?:policy|threshold|limit)\w*|"
+    # "does this $6,000 purchase qualify" / "should this be capitalized" —
+    # applying a rule to a specific fact is a verdict and needs both halves.
+    r"\bdoes (?:this|that|it) .{0,40}\bqualif\w+|"
+    r"\bshould (?:this|that|it) .{0,40}\b(?:be capitali[sz]\w+|be expensed|"
+    r"be accrued|be written off)|"
+    r"\bare we (?:compliant|within|allowed)\b)"
 )
 POLICY_TOOLS = {"wiki_health", "wiki_lookup", "wiki_search", "wiki_get_page"}
 POLICY_EVIDENCE_TOOLS = {"wiki_lookup", "wiki_get_page"}
@@ -109,10 +115,15 @@ _SCOPE_ALIASES = {
 }
 
 _POLICY_QUERY = re.compile(
-    r"(?i)\b(?:polic(?:y|ies)|procedure|process|rule|guideline|standard|"
+    r"(?i)(?:\b(?:polic(?:y|ies)|procedure|process|rule|guideline|standard|"
     r"threshold|approv(?:e|ed|es|ing|al|als)|authori[sz](?:e|ed|es|ing|ation)|"
     r"allow(?:ed|ance)?|permission|compliance|compliant|"
-    r"capitali[sz](?:e|ed|ation)|close checklist|required documentation)\b"
+    r"capitali[sz](?:e|ed|ation)|close checklist|documentation|"
+    r"responsib\w+|sign-?off)\b|"
+    # "who can post to 998", "when is period 998 used" — process questions
+    # whose answer lives in the wiki, not the ledger.
+    r"\bwho (?:can|may|must|should|is allowed to|owns|approves)\b|"
+    r"\bwhen (?:is|are|should) .{0,40}\b(?:used|run|posted|closed)\b)"
 )
 _DATA_QUERY = re.compile(
     r"(?i)\b(?:amounts?|figures?|balances?|trial balances?|tb|ledgers?|accounts?|"
@@ -123,6 +134,37 @@ _DATA_QUERY = re.compile(
     r"owe[ds]?|owing|due|overdue|past[ -]due|collections?|"
     r"business units?|bu(?:s)?|periods?|fiscal years?|currenc(?:y|ies)|"
     r"exchange rates?|suspense|open items?|debits?|credits?)\b"
+)
+# A domain NOUN alone does not make a question a data question: "what is our
+# travel EXPENSE policy" is pure policy. Requiring an anchor — a request to
+# show/quantify, or a concrete scope like a year, period, account or amount —
+# is what separates "what is the rule" from "what is the number".
+_DATA_ANCHOR = re.compile(
+    r"(?i)(?:\bhow (?:much|many)\b|\bshow\b|\blist\b|\bdisplay\b|\brun\b|"
+    r"\bcalculat(?:e|ed|ion)\b|\bcomput(?:e|ed)\b|\btotals?\b|\bsum\b|"
+    r"\brank\b|\btop \d+\b|\bcompare\b|\bdrill\b|\bbreak ?down\b|"
+    r"\bwhat (?:is|are|was|were) (?:the|our|my)? ?(?:balance|total|amount|"
+    r"aging|figure|number|variance|position)\b|"
+    r"\bwho (?:owes|posted|paid)\b|\bas of\b|\bytd\b|\bmtd\b|\bqtd\b|"
+    r"\bperiod \d+\b|\bfy ?\d{2,4}\b|\bfiscal year\b|\bquarter\b|"
+    r"\baccount \d+\b|\b\d{4,}\b|[$€£₹]\s?\d|\b\d[\d,]*\.\d{2}\b|"
+    r"\b\d{1,3}(?:,\d{3})+\b)"
+)
+# Naming a period/year/account is not, on its own, a request for a figure —
+# "when is period 998 used" is a process question. Alongside policy wording,
+# only an explicit ask for a quantity makes a question genuinely mixed.
+_DATA_ANCHOR_STRONG = re.compile(
+    r"(?i)(?:\bhow (?:much|many)\b|\bshow\b|\blist\b|\bdisplay\b|"
+    r"\bcalculat(?:e|ed|ion)\b|\bcomput(?:e|ed)\b|\btotals?\b|\bsum\b|"
+    r"\brank\b|\btop \d+\b|\bcompare\b|\bdrill\b|\bbreak ?down\b|"
+    r"\bwhat (?:is|are|was|were) (?:the|our|my)? ?(?:balance|total|amount|"
+    r"aging|figure|number|variance|position)\b|"
+    r"\bwho (?:owes|posted|paid)\b|[$€£₹]\s?\d|\b\d[\d,]*\.\d{2}\b|"
+    r"\b\d{1,3}(?:,\d{3})+\b|"
+    # A concrete quantity noun ("...and the current suspense BALANCE") is a
+    # real figure request; domain nouns like expense/journal/invoice are not,
+    # because they occur naturally in policy wording.
+    r"\b(?:balances?|amounts?|totals?|aging|open items?)\b)"
 )
 _QUESTION_DOMAINS = {
     "balance": re.compile(
@@ -184,7 +226,13 @@ def evidence_intent(question: str) -> str:
     text = question or ""
     policy = bool(_POLICY_QUERY.search(text))
     data = bool(_DATA_QUERY.search(text))
+    if policy and data and not _DATA_ANCHOR_STRONG.search(text):
+        # Domain vocabulary inside a policy question ("travel expense policy",
+        # "who approves a journal over 50k") is not a request for a figure.
+        # Treating it as mixed blocked the wiki and refused the answer.
+        data = False
     if _VERDICT.search(text):
+        # A compliance verdict genuinely needs both halves: rule and figure.
         policy = data = True
     if policy and data:
         return "mixed"
@@ -342,11 +390,12 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
         return False, str(payload.get("detail") or status)[:240]
     if payload.get("control_status") == "not_run":
         return False, str(payload.get("summary") or "control did not run")[:240]
-    note = " ".join(
-        str(payload.get(k) or "") for k in ("note", "detail", "summary")
-    )
-    if re.search(r"(?i)\bNO DATA\b", note):
-        return False, note[:240]
+    # Evidence is judged on STRUCTURED fields only. Scanning prose for "no
+    # data" failed every successful run_report, whose note legitimately
+    # explains that "'—' means the ledger has no data for that column's
+    # scope" — the whole financial-statement pack became unanswerable.
+    if payload.get("no_data") is True:
+        return False, str(payload.get("detail") or "no data for this scope")[:240]
     if is_policy_tool(tool_name) and payload.get("demo_content_warning"):
         return False, str(payload["demo_content_warning"])[:240]
     if tool_name == "wiki_lookup":

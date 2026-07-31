@@ -21,7 +21,9 @@ from .db import Database, DbError
 
 BALANCE_EPS = 0.005
 INTERNAL_ROW_CAP = 100_000
-SCOPE_CACHE_TTL_SECONDS = 60.0
+SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
+SCOPE_PROBE_CAP = 250          # max existence probes when filtering the catalog
+SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balances
 
 _SQL_DENY = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|"
@@ -61,6 +63,7 @@ class TBEngine:
         self._eff_defaults: Optional[dict] = None
         self._eff_defaults_expires_at = 0.0
         self._scope_cache_ttl_seconds = SCOPE_CACHE_TTL_SECONDS
+        self._tree_ctl: dict = {}
 
     # ------------------------------------------------------------------ utils
     def _adj_periods(self) -> list[int]:
@@ -120,26 +123,88 @@ class TBEngine:
         )
         return bool(rows)
 
-    def _ledger_scope_pairs(self) -> tuple[list[tuple[str, str]], bool]:
-        """Return every accessible BU/ledger pair from PS_LEDGER.
-
-        The DISTINCT operates on the leading columns of the normal
-        (BUSINESS_UNIT, LEDGER, ...) ledger index and returns only the small
-        catalog, rather than aggregating/counting the underlying balance rows.
-        """
-        rows, truncated = self.db.query(
-            q.financial_scope_pairs(self.db), {}, max_rows=INTERNAL_ROW_CAP
+    def _pair_has_data(self, bu: str, ledger: str) -> bool:
+        """Cheap existence probe: equality on the leading index columns stops
+        at the first row (ROWNUM=1 / LIMIT 1). This is what makes a
+        setup-derived catalog safe to filter — unlike a DISTINCT, it never
+        reads the whole ledger."""
+        rows, _ = self.db.query(
+            self.db.exists_sql(
+                f"SELECT 1 FROM {self.db.prefix}PS_LEDGER "
+                "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led"
+            ),
+            {"bu": bu, "led": ledger}, max_rows=1,
         )
-        pairs: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            bu = str(row.get("business_unit") or "").strip()
-            ledger = str(row.get("ledger") or "").strip()
-            pair = (bu, ledger)
-            if bu and ledger and pair not in seen:
-                pairs.append(pair)
-                seen.add(pair)
-        return pairs, truncated
+        return bool(rows)
+
+    def _with_ledger_data(self, pairs: list) -> list:
+        """Drop catalog entries that carry no ledger rows, so the UI never
+        offers a scope that cannot answer. Probing is capped: past the cap the
+        catalog is returned unfiltered rather than paying thousands of
+        round-trips on a very large installation."""
+        if len(pairs) > SCOPE_PROBE_CAP:
+            return pairs
+        kept = []
+        for bu, ledger in pairs:
+            try:
+                if self._pair_has_data(bu, ledger):
+                    kept.append((bu, ledger))
+            except DbError:
+                kept.append((bu, ledger))  # can't prove empty — keep it
+        return kept or pairs
+
+    def _ledger_scope_pairs(self) -> tuple[list[tuple[str, str]], bool]:
+        """Accessible BU/ledger pairs, from SETUP tables wherever possible.
+
+        Order matters for a real instance: setup tables are small and indexed;
+        PS_LEDGER is not. Falling back to a DISTINCT over the balance table is
+        the last resort and is capped, because on Oracle that is a full scan
+        of the ledger index (SQLite hides this — it has a skip-scan).
+        """
+        def _collect(sql: str, cap: int) -> tuple[list[tuple[str, str]], bool]:
+            rows, truncated = self.db.query(sql, {}, max_rows=cap)
+            pairs: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                bu = str(row.get("business_unit") or "").strip()
+                ledger = str(row.get("ledger") or "").strip()
+                if bu and ledger and (bu, ledger) not in seen:
+                    pairs.append((bu, ledger))
+                    seen.add((bu, ledger))
+            return pairs, truncated
+
+        try:
+            pairs, truncated = _collect(q.scope_setup_pairs(self.db),
+                                        SCOPE_ROW_CAP)
+            if pairs:
+                return self._with_ledger_data(pairs), truncated
+        except DbError:
+            pass  # setup records not granted at this site — try the next source
+
+        # BU list from setup, then each BU's ledgers from PS_LEDGER filtered
+        # BY THAT BU — an index range scan on the leading column, not a scan
+        # of the whole table. A BU defined in setup but never posted to
+        # contributes no pairs, so it is not offered as an answerable scope.
+        try:
+            rows, truncated = self.db.query(q.scope_bu_list(self.db), {},
+                                            max_rows=SCOPE_ROW_CAP)
+            bus = [str(r.get("business_unit") or "").strip() for r in rows]
+            bus = [b for b in bus if b][:SCOPE_PROBE_CAP]
+            pairs = []
+            for bu in bus:
+                led_rows, _ = self.db.query(q.ledgers_for_bu(self.db),
+                                            {"bu": bu}, max_rows=200)
+                for lr in led_rows:
+                    led = str(lr.get("ledger") or lr.get("l") or "").strip()
+                    if led:
+                        pairs.append((bu, led))
+            if pairs:
+                return pairs, truncated
+        except DbError:
+            pass
+
+        # Last resort: the balance table itself. Capped, and slow by nature.
+        return _collect(q.financial_scope_pairs(self.db), SCOPE_ROW_CAP)
 
     def _effective_defaults_from_pairs(
         self, pairs: list[tuple[str, str]]
@@ -216,6 +281,29 @@ class TBEngine:
         return self._remember_effective_defaults(
             self._effective_defaults_from_pairs(pairs)
         )
+
+    def resolve_tree_ctl(self, setid: str, tree: str, business_unit: str) -> str:
+        """SETCNTRLVALUE for a tree: the business unit when the tree is
+        BU-controlled, otherwise the blank SetID-controlled value. Without it
+        a BU-controlled tree matches every unit's copy at once and node totals
+        come out multiplied — while still looking balanced."""
+        key = (setid, tree, business_unit)
+        if key in self._tree_ctl:
+            return self._tree_ctl[key]
+        try:
+            rows, _ = self.db.query(q.tree_ctl_values(self.db),
+                                    {"setid": setid, "tree": tree}, max_rows=50)
+        except DbError:
+            rows = []
+        values = [str(r.get("setcntrlvalue") or "") for r in rows]
+        chosen = ""
+        if business_unit in values:
+            chosen = business_unit
+        else:
+            blanks = [v for v in values if not v.strip()]
+            chosen = blanks[0] if blanks else (values[0] if values else "")
+        self._tree_ctl[key] = chosen
+        return chosen
 
     def resolve_ledger_for(self, business_unit: str, ledger: str = "") -> str:
         """Resolve an omitted ledger against the selected business unit.
@@ -301,8 +389,12 @@ class TBEngine:
     def _defaults(
         self, business_unit: str, fiscal_year: int, period: int, ledger: str
     ) -> tuple[str, int, int, str]:
-        eff = self.effective_defaults()
-        bu = (business_unit or "").strip() or eff["business_unit"]
+        # Only pay scope discovery when the caller actually omitted the scope.
+        # Calling it unconditionally put a catalog query in front of EVERY
+        # tool call, including the ones that named their business unit.
+        bu = (business_unit or "").strip()
+        if not bu:
+            bu = self.effective_defaults()["business_unit"]
         led = self.resolve_ledger_for(bu, ledger)
         fy, per = int(fiscal_year or 0), int(period or 0)
         if fy == 0 or per == 0:
@@ -1026,6 +1118,7 @@ class TBEngine:
         params = {
             "tsetid": setid,
             "tree": tree,
+            "tctl": self.resolve_tree_ctl(setid, tree, bu),
             "teffdt": str(effdt)[:10],
             "lvl": int(level or 2),
             "bu": bu,
@@ -1450,17 +1543,20 @@ class TBEngine:
 
     @staticmethod
     def _scrub_sql(s: str) -> str:
-        """Replace string literals with '' and comments with a space in ONE
-        character pass. Two regex passes desync on real input — an apostrophe
-        inside a comment ("-- don't") swallowed the FROM clause and let FOR
-        UPDATE past the deny list; '--' inside a literal would eat the rest of
-        the line. A literal-aware scanner has neither failure mode."""
+        """Blank out string literals and comments in ONE character pass,
+        PRESERVING LENGTH so offsets still map onto the original statement
+        (schema qualification splices at those offsets).
+
+        Two regex passes desync on real input — an apostrophe inside a comment
+        ("-- don't") swallowed the FROM clause and let FOR UPDATE past the
+        deny list; '--' inside a literal would eat the rest of the line. A
+        literal-aware scanner has neither failure mode."""
         out: list = []
         i, n = 0, len(s)
         while i < n:
             c = s[i]
             if c == "'":
-                out.append("''")
+                start = i
                 i += 1
                 while i < n:
                     if s[i] == "'":
@@ -1470,14 +1566,18 @@ class TBEngine:
                         i += 1
                         break
                     i += 1
+                out.append("'" + " " * (i - start - 2) + "'" if i - start >= 2
+                           else " " * (i - start))
             elif c == "-" and s[i:i + 2] == "--":
                 j = s.find("\n", i)
-                i = n if j < 0 else j  # newline kept
-                out.append(" ")
+                end = n if j < 0 else j  # newline preserved
+                out.append(" " * (end - i))
+                i = end
             elif c == "/" and s[i:i + 2] == "/*":
                 j = s.find("*/", i + 2)
-                i = n if j < 0 else j + 2
-                out.append(" ")
+                end = n if j < 0 else j + 2
+                out.append(" " * (end - i))
+                i = end
             else:
                 out.append(c)
                 i += 1
@@ -1589,7 +1689,7 @@ class TBEngine:
         # come back instantly with a correction, not as an opaque ORA-00942 —
         # or worse, burn the query timeout first.
         ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
-        problems = []
+        problems, unqualified = [], []
         for ref in self._table_refs(scrubbed):
             bare = ref.split(".")[-1]
             if bare.upper() in ctes or bare.upper() == "DUAL":
@@ -1600,14 +1700,48 @@ class TBEngine:
                     f"{bare} does not exist"
                     + (f" — did you mean: {', '.join(sugg)}?" if sugg else "")
                 )
+            elif "." not in ref:
+                unqualified.append(ref)
         if problems:
             raise EngineError(
                 "Rejected before execution: " + "; ".join(sorted(problems))
                 + ". Verify names with list_tables or describe_table."
             )
+        # Qualify bare names with the record owner. The validator resolves
+        # names against db.schema (e.g. SYSADM), so executing them unqualified
+        # would look them up in the LOGIN schema instead — the read-only
+        # account owns nothing, so every ad-hoc query died with ORA-00942
+        # right after the validator confirmed the table exists. An explicitly
+        # qualified name (OTHER_OWNER.CUSTOM_TBL) is left exactly as written.
+        s = self._qualify_tables(s, unqualified) if self.db.prefix else s
         cap = min(max(int(max_rows or 100), 1), 500)
         rows, truncated = self.db.query(s, {}, max_rows=cap)
-        return {"rows": rows, "row_count": len(rows), "truncated": truncated}
+        return {"rows": rows, "row_count": len(rows), "truncated": truncated,
+                "sql_executed": s}
+
+    def _qualify_tables(self, sql: str, names: list) -> str:
+        """Prefix the given bare FROM/JOIN targets with the schema owner.
+
+        Matching runs on a masked copy (literals/comments blanked, ANSI
+        function-FROM neutralized) that is the same length as the original, so
+        each match offset splices straight into the real statement. Matching
+        on the raw text would rewrite `EXTRACT(YEAR FROM INVOICE_DT)` into a
+        schema-qualified column.
+        """
+        if not names:
+            return sql
+        wanted = {n.upper() for n in names}
+        masked = self._neutralize_func_from(self._scrub_sql(sql))
+        edits = []
+        for m in self._TABLE_REF_RE.finditer(masked):
+            name = m.group(1)
+            if "." in name or name.upper() not in wanted:
+                continue
+            edits.append(m.start(1))
+        out = sql
+        for pos in sorted(edits, reverse=True):
+            out = out[:pos] + self.db.prefix + out[pos:]
+        return out
 
     def list_tables(self, pattern: str = "") -> dict:
         if not self.cfg.tools.allow_raw_sql:

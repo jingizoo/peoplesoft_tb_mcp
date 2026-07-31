@@ -161,17 +161,22 @@ class RequestScopeTests(unittest.TestCase):
             evidence_intent("Tell me the invoice amount and approval rule."),
             "mixed",
         )
+        # A domain noun inside a policy question does not make it a data
+        # question. Classifying these as "mixed" blocked wiki_lookup until a
+        # financial tool succeeded — and since no financial tool can answer
+        # "must invoices be approved", the user got a refusal with the wiki
+        # never called. The rule lives in the wiki; there is no figure to get.
         self.assertEqual(
             evidence_intent("Must invoices be approved?"),
-            "mixed",
+            "policy",
         )
         self.assertEqual(
             evidence_intent("Are journal approvals required?"),
-            "mixed",
+            "policy",
         )
         self.assertEqual(
             evidence_intent("Who is allowed to approve journals?"),
-            "mixed",
+            "policy",
         )
         self.assertEqual(evidence_intent("Who owes us?"), "data")
         self.assertEqual(

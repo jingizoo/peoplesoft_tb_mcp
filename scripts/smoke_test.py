@@ -641,6 +641,102 @@ DROP TABLE PS_INTFC_BI;
     check("leading comment does not defeat the SELECT-only check",
           ok_lead["rows"][0]["n"] > 0)
 
+    print("== port readiness: no full-ledger scans, concurrency, recovery ==")
+    import re as _re2
+    import threading as _th
+    _cap: list = []
+    _orig_q = engine.db.query
+
+    def _spy(sql, params=None, max_rows=None):
+        _cap.append((" ".join(str(sql).split()), dict(params or {})))
+        return _orig_q(sql, params, max_rows=max_rows)
+
+    engine.db.query = _spy
+    try:
+        engine.invalidate_scope_cache()
+        engine.effective_defaults()
+        disc = list(_cap)
+        _cap.clear()
+        engine.trial_balance(business_unit="US001", ledger="ACTUALS",
+                            fiscal_year=2026, period=6)
+        scoped = list(_cap)
+        _cap.clear()
+        # Every tool's SQL, audited for binds. A bind name supplied but not
+        # referenced is DPY-4008 on Oracle thin mode; SQLite ignores it.
+        for fn in (lambda: engine.rollup_trial_balance(fiscal_year=2026, period=6),
+                   lambda: engine.tb_integrity_check(fiscal_year=2026, period=6),
+                   lambda: engine.compare_trial_balance(fiscal_year=2026, period=6),
+                   lambda: arb.aging(as_of_date="2026-07-30", detail=True),
+                   lambda: arb.billing_workbench(as_of_date="2026-07-30")):
+            fn()
+        audited = list(_cap)
+    finally:
+        engine.db.query = _orig_q
+    check("scope discovery never scans the whole ledger",
+          not [s for s, _ in disc if "DISTINCT BUSINESS_UNIT" in s],
+          str([s[:60] for s, _ in disc if "DISTINCT BUSINESS_UNIT" in s]))
+    check("a fully-scoped call pays no catalog query",
+          not [s for s, _ in scoped
+               if "PS_BUS_UNIT_LED" in s or "DISTINCT BUSINESS_UNIT" in s])
+    strays = []
+    for sql, prm in audited + scoped + disc:
+        refs = set(_re2.findall(r"(?<![:\w]):(\w+)", sql))
+        if set(prm) - refs or refs - set(prm):
+            strays.append((sql[:60], sorted(set(prm) - refs), sorted(refs - set(prm))))
+    check("no bind mismatches in any audited statement (DPY-4008)",
+          not strays, str(strays[:2]))
+    # Concurrent chat channels must not serialize or collide
+    errs, vals = [], []
+
+    def _worker():
+        try:
+            vals.append(engine.trial_balance(business_unit="US001",
+                                             fiscal_year=2026,
+                                             period=6)["totals"]["ending_dr"])
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{type(e).__name__}: {e}")
+
+    threads = [_th.Thread(target=_worker) for _ in range(8)]
+    for _thread in threads:
+        _thread.start()
+    for _thread in threads:
+        _thread.join()
+    check("8 concurrent channels all succeed with identical totals",
+          not errs and len(vals) == 8 and len(set(vals)) == 1, str(errs[:1]))
+    # A reaped session must not break every later question
+    cfg_rec = Config.sample(ROOT)
+    db_rec = Database(cfg_rec)
+    eng_rec = TBEngine(db_rec, cfg_rec)
+    eng_rec.trial_balance(fiscal_year=2026, period=6)
+    db_rec._sqlite_conn().close()          # simulate an idle-timeout kill
+    check("query recovers after the session dies",
+          eng_rec.trial_balance(fiscal_year=2026,
+                                period=6)["totals"]["in_balance"] is True)
+    # Oracle-blank semantics: dispute predicate must not be `<> ''`
+    from pstb import ar as _armod
+    check("non-blank predicate is Oracle-safe (no `<> ''`)",
+          "<> ''" not in _armod._NONBLANK and "LENGTH" in _armod._NONBLANK,
+          _armod._NONBLANK)
+    check("disputes still detected on the sample book",
+          abs(ag["totals"]["disputed_amt"] - 42_000.00) < 0.01)
+    # Tree statements must be constrained to one control value
+    for _b in (q.tree_rollup(engine.db, {}), q.tree_node_span(engine.db),
+               q.tree_leaf_ranges(engine.db), q.tree_nodes_list(engine.db)):
+        if ":tctl" not in _b:
+            check("every tree statement filters SETCNTRLVALUE", False, _b[:70])
+            break
+    else:
+        check("every tree statement filters SETCNTRLVALUE", True)
+    # run_sql must qualify bare names with the record owner
+    cfg_sch = Config.sample(ROOT)
+    cfg_sch.db.schema = "SYSADM"
+    eng_sch = TBEngine(Database(cfg_sch), cfg_sch)
+    qualified = eng_sch._qualify_tables(
+        "SELECT EXTRACT(YEAR FROM INVOICE_DT) y FROM PS_BI_HDR", ["PS_BI_HDR"])
+    check("run_sql qualifies tables without touching function-FROM",
+          "FROM SYSADM.PS_BI_HDR" in qualified
+          and "SYSADM.INVOICE_DT" not in qualified, qualified)
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",

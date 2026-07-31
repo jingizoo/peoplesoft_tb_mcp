@@ -149,7 +149,7 @@ class ReportRunner:
     # ----------------------------------------------------------- tree lookups
     def _node_ranges(self, bu: str, tree: str, node: str) -> list:
         setid = self.e.resolve_setid(bu)
-        key = (setid, tree, node)
+        key = (setid, tree, node, bu)
         if key in self._range_cache:
             return self._range_cache[key]
         rows, _ = self.db.query(q.tree_effdt(self.db),
@@ -164,7 +164,8 @@ class ReportRunner:
         # Each statement gets exactly the binds it uses: python-oracledb (thin)
         # raises DPY-4008 on a bind name absent from the SQL, while sqlite3
         # silently ignores extras — a divergence tests on SQLite cannot catch.
-        base = {"tsetid": setid, "tree": tree, "teffdt": str(effdt)[:10]}
+        base = {"tsetid": setid, "tree": tree, "teffdt": str(effdt)[:10],
+                "tctl": self.e.resolve_tree_ctl(setid, tree, bu)}
         span, _ = self.db.query(q.tree_node_span(self.db),
                                 {**base, "node": node}, max_rows=1)
         if not span:

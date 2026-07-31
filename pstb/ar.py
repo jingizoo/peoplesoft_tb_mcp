@@ -46,8 +46,12 @@ LOAD_STATUS_DESCR = {"NEW": "Awaiting processing", "DON": "Processed", "ERR": "E
 NOT_FINAL = ("NEW", "PND", "HLD", "RDY", "TMP")
 DETAIL_ROW_CAP = 5_000
 
-# Oracle-safe "column has a non-blank value" ('' is NULL on Oracle, ' ' common)
-_NONBLANK = "COALESCE(TRIM({col}), '') <> ''"
+# "Column has a non-blank value", true on both dialects.
+# NOT `COALESCE(TRIM(x),'') <> ''`: on Oracle the literal '' IS NULL, so that
+# predicate is UNKNOWN for every row and disputed amounts silently read 0.00.
+# LENGTH(TRIM(x)) > 0 is UNKNOWN only for genuinely blank/NULL values, which
+# is the intended answer for them.
+_NONBLANK = "LENGTH(TRIM({col})) > 0"
 
 
 class ARError(RuntimeError):

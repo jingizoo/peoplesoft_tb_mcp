@@ -24,19 +24,34 @@ from pstb.db import Database, DbError  # noqa: E402
 from pstb.engine import TBEngine  # noqa: E402
 
 
-def timed(label: str, fn, show_sql: str = "") -> object:
+PROBLEMS: list = []
+
+
+def timed(label: str, fn, show_sql: str = "", expect_rows: bool = False,
+          remedy: str = "") -> object:
     t0 = time.perf_counter()
     try:
         out = fn()
     except Exception as e:
         ms = (time.perf_counter() - t0) * 1000
         print(f"  [FAIL {ms:8.0f} ms] {label}\n      {type(e).__name__}: {str(e)[:200]}")
+        if remedy:
+            print(f"      -> {remedy}")
+        PROBLEMS.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
         if show_sql:
             print("      SQL:\n" + "\n".join("        " + l for l in show_sql.splitlines()))
         return None
     ms = (time.perf_counter() - t0) * 1000
     n = len(out[0]) if isinstance(out, tuple) else (len(out) if hasattr(out, "__len__") else 1)
     flag = "  <-- SLOW" if ms > 5000 else ""
+    if expect_rows and not n:
+        # An empty discovery step is a misconfiguration, not a pass. Reporting
+        # [ok] here is how a completely wrong scope reached the chat UI.
+        print(f"  [EMPTY{ms:8.0f} ms] {label} — 0 rows")
+        if remedy:
+            print(f"      -> {remedy}")
+        PROBLEMS.append(f"{label}: returned no rows")
+        return out
     print(f"  [ok   {ms:8.0f} ms] {label} ({n} rows){flag}")
     if show_sql:
         print("      SQL:\n" + "\n".join("        " + l for l in show_sql.splitlines()))
@@ -71,7 +86,9 @@ def main() -> int:
         return 1
 
     print("\n2. Dimension tables (should be milliseconds)")
-    timed("PS_BUS_UNIT_TBL_GL", lambda: db.query(q.business_units(db), {}, max_rows=50))
+    timed("PS_BUS_UNIT_TBL_GL", lambda: db.query(q.business_units(db), {}, max_rows=50),
+          expect_rows=True,
+          remedy="No GL business units visible — check db.schema and SELECT grants.")
     timed("PS_SET_CNTRL_REC (setid)",
           lambda: db.query(q.setid_for(db), {"bu": bu, "recname": "GL_ACCOUNT_TBL"}, max_rows=1))
     timed("PS_CAL_DETP_TBL (calendar)",
@@ -86,11 +103,17 @@ def main() -> int:
     print("\n3. Ledger existence checks (must be fast — these run on 'no data')")
     timed("BU exists",
           lambda: db.query(db.exists_sql(f"SELECT 1 FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu"),
-                           {"bu": bu}, max_rows=1))
+                           {"bu": bu}, max_rows=1),
+          expect_rows=True,
+          remedy=f"business unit {bu!r} has no ledger rows — fix "
+                 "defaults.business_unit in config.yaml or pass --bu.")
     timed("BU+ledger exists",
           lambda: db.query(db.exists_sql(
               f"SELECT 1 FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu AND LEDGER = :led"),
-              {"bu": bu, "led": led}, max_rows=1))
+              {"bu": bu, "led": led}, max_rows=1),
+          expect_rows=True,
+          remedy=f"ledger {led!r} has no rows for {bu!r} — fix defaults.ledger "
+                 "in config.yaml or pass --ledger.")
 
     print("\n4. The trial-balance aggregate (the expensive one)")
     fy, per = args.fy, args.period
@@ -150,6 +173,12 @@ Reading this:
   - Anything fails with a timeout  -> raise db.query_timeout_seconds, or narrow.
 """)
     db.close()
+    if PROBLEMS:
+        print("\nPRE-FLIGHT FAILED — fix these before using the agent:")
+        for pb in PROBLEMS:
+            print(f"  - {pb}")
+        return 1
+    print("\nPre-flight OK: scope resolves, records readable, no empty discovery steps.")
     return 0
 
 
