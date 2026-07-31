@@ -6,6 +6,7 @@ Run after seeding:  python3 scripts/seed_sample_data.py && python3 scripts/smoke
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -949,6 +950,33 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           "General Ledger analyst" not in _p and "FINANCE analyst" in _p)
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
+
+    print("== number grounding ==")
+    from pstb.guards import ungrounded_figures, payload_numbers
+    _pay = [json.dumps({"totals": {"ending_dr": 6419357.27,
+                                   "ending_cr": 6419357.27},
+                        "rows": [{"account": "1000", "ending": 2108161.14}]})]
+    check("a figure copied from a tool result passes",
+          not ungrounded_figures("Debits equal credits at 6,419,357.27.", _pay))
+    check("a rounded restatement of a real figure passes",
+          not ungrounded_figures("About 6,419,357 in total.", _pay))
+    check("a FABRICATED figure is caught",
+          ungrounded_figures("The balance is 1,234,567.89.", _pay)
+          == ["1,234,567.89"])
+    check("years and periods are not treated as ledger figures",
+          not ungrounded_figures("For FY2026 period 6 across 23 accounts.", _pay))
+    check("percentages are exempt",
+          not ungrounded_figures("Margin improved 12.5%.", _pay))
+    check("no payloads means no false accusations",
+          not ungrounded_figures("Anything at all, 9,999,999.99.", []))
+    check("payload numbers are found at any nesting depth",
+          "2108161.14" in payload_numbers(_pay))
+    # Read the file rather than importing it: pstb.client.chat pulls in the
+    # mcp package, and this suite must run on the system interpreter with no
+    # virtualenv (that is how it verifies a box before install).
+    check("the guard is wired into the turn, not just available",
+          "ungrounded_figures(answer, turn_payloads)" in
+          (ROOT / "pstb" / "client" / "chat.py").read_text(encoding="utf-8"))
 
     print("== build identity ==")
     from pstb.version import build_info as _bi, label as _bl, source_fingerprint

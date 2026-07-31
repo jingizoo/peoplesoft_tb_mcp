@@ -437,3 +437,113 @@ def unevidenced_verdict(answer: str, tools_used: set) -> str:
     if had_policy and had_data:
         return ""
     return "the policy text" if not had_policy else "the actual figure from the ledger"
+
+# --------------------------------------------------------- number grounding
+# Money-shaped and other substantive figures the model states in prose. The
+# prompt already forbids inventing them and the verdict guard catches
+# unevidenced judgements, but neither MECHANICALLY prevents a fabricated
+# amount from reaching the user. This does: every figure in the answer must
+# appear in a tool payload from the same turn, or the answer is refused.
+_FIGURE = re.compile(r"(?<![\w.])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\w])"
+                     r"|(?<![\w.])-?\d+\.\d{2,}(?![\w])")
+
+# Values that are never "figures from the ledger": years, fiscal periods,
+# account numbers, percentages and small counts the model may legitimately
+# derive (how many rows it is describing).
+_FIGURE_EXEMPT = re.compile(
+    r"(?i)(?:FY\s*|fiscal year\s*|period\s*|P)\d{1,4}\b"
+    r"|\b(?:19|20)\d{2}\b"
+    r"|\d+(?:\.\d+)?\s*%"
+)
+
+
+def _numeric_key(text: str) -> str:
+    """Canonical form so 1,234.50 / 1234.5 / -1234.500 compare equal."""
+    cleaned = text.replace(",", "").lstrip("+")
+    negative = cleaned.startswith("-")
+    cleaned = cleaned.lstrip("-")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return text
+    if value == int(value):
+        body = str(int(value))
+    else:
+        body = ("%.6f" % value).rstrip("0").rstrip(".")
+    return ("-" if negative and value else "") + body
+
+
+def payload_numbers(payloads) -> set:
+    """Every number appearing anywhere in this turn's tool results."""
+    found: set = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+        elif isinstance(node, bool):
+            return
+        elif isinstance(node, (int, float)):
+            found.add(_numeric_key(str(node)))
+        elif isinstance(node, str):
+            for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", node):
+                found.add(_numeric_key(match))
+
+    for raw in payloads or []:
+        if isinstance(raw, str):
+            try:
+                walk(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", raw):
+                    found.add(_numeric_key(match))
+        else:
+            walk(raw)
+    return found
+
+
+def ungrounded_figures(answer: str, payloads) -> list:
+    """Figures stated in the answer that no tool result supports.
+
+    Rounding is tolerated in the direction a human would read it: a figure
+    matches if it appears exactly, or if a payload number rounds to it at the
+    stated precision (908,846.06 -> "908,846" or "908.85 thousand" style
+    restatements are NOT invented, they are the same fact).
+    """
+    grounded = payload_numbers(payloads)
+    if not grounded:
+        return []
+    exempt_spans = [m.span() for m in _FIGURE_EXEMPT.finditer(answer or "")]
+
+    def inside_exempt(span) -> bool:
+        return any(a <= span[0] and span[1] <= b for a, b in exempt_spans)
+
+    missing: list = []
+    for match in _FIGURE.finditer(answer or ""):
+        if inside_exempt(match.span()):
+            continue
+        text = match.group(0)
+        key = _numeric_key(text)
+        if key in grounded:
+            continue
+        # tolerate a rounded restatement of a grounded value
+        try:
+            stated = float(text.replace(",", ""))
+        except ValueError:
+            continue
+        decimals = len(text.split(".")[1]) if "." in text else 0
+        if any(round(float(g), decimals) == round(stated, decimals)
+               for g in grounded if _is_number(g)):
+            continue
+        missing.append(text)
+    return missing
+
+
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+        return True
+    except (TypeError, ValueError):
+        return False
