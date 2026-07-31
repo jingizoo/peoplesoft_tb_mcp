@@ -212,6 +212,10 @@ PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
 `search_records` / `describe_record` (find ANY record — including custom and
 site-specific ones — by searching PeopleTools record descriptions and field
 names, then list its fields) ·
+`profile_record` / `compare_records` (choose between candidate records on
+EVIDENCE — which columns this site actually populates, the real codes in its
+status columns, and masked sample rows — see
+[docs/RECORD_SELECTION.md](docs/RECORD_SELECTION.md)) ·
 `wiki_lookup` (searches, fetches and returns the actual passages — see
 [docs/RAG.md](docs/RAG.md)) · `wiki_search` · `wiki_get_page` · `wiki_health` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool

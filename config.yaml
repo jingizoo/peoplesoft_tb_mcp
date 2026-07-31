@@ -46,3 +46,11 @@ tools:
   txn_row_threshold: 1000 # a TRANSACTION table under this row count is flagged
                           # as probably-not-the-active-table; reference tables
                           # are never flagged (small is normal for them)
+  sample_rows: 3          # rows returned by profile_record / compare_records.
+                          # These reach the configured model, and on the Gemini
+                          # provider that means they leave your network.
+                          # Personal columns (names, addresses, tax and bank
+                          # identifiers) are MASKED first; identifiers, codes,
+                          # dates and amounts are not. Set to 0 to send no rows
+                          # at all — shape, fill rates and status-code counts
+                          # still come back, so record selection keeps working.

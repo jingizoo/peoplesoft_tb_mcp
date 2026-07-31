@@ -541,6 +541,39 @@ if cfg.tools.allow_raw_sql:
         return _safe(engine.describe_record, record=record)
 
     @mcp.tool()
+    def profile_record(table: str, sample_rows: int = -1, source: str = "") -> dict:
+        """See what a record actually CONTAINS before querying it: every
+        column, how many sampled rows populate each one, the real codes held
+        by its status/type columns, and a few sample rows.
+        Use this when more than one record could answer a question, when a
+        record is custom or unfamiliar, or when a query returned nothing and
+        you need to know whether the record is empty or your predicate was
+        wrong. value_counts is the strongest signal — seeing ITEM_STATUS holds
+        'O' and 'C' turns a guessed predicate into a correct one, and
+        always_null names columns this site never populates whatever the
+        catalog claims.
+        Personal columns (names, addresses, tax and bank identifiers) are
+        masked to a shape-preserving placeholder before they leave the
+        database; fill_percent and value_counts are measured over the rows
+        sampled, so never report them as totals."""
+        return _safe(engine.for_source(source).profile_record,
+                     table=table, sample_rows=sample_rows)
+
+    @mcp.tool()
+    def compare_records(tables: list, sample_rows: int = -1,
+                        source: str = "") -> dict:
+        """Profile up to 6 candidate records side by side and pick between
+        them on evidence instead of on their names. The intended sequence for
+        any unfamiliar question is search_records -> compare_records -> run_sql:
+        search_records proposes candidates by description, this shows which of
+        them are readable, populated, and carry the columns and status codes
+        the question implies. PeopleSoft ships many near-identically named
+        records and sites add more (live vs history vs staging vs custom);
+        names cannot separate those and contents can."""
+        return _safe(engine.for_source(source).compare_records,
+                     tables=tables, sample_rows=sample_rows)
+
+    @mcp.tool()
     def list_tables(pattern: str = "", source: str = "") -> dict:
         """List tables/views matching a pattern (e.g. 'JRNL' or 'PS_LEDGER%')."""
         return _safe(engine.for_source(source).list_tables, pattern=pattern)
