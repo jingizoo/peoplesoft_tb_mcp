@@ -47,8 +47,17 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
     headcount/area/units, not money.
     """
     if db.cfg.db.use_views:
-        # The XX_TB_* views encode the same contract; don't double-apply it.
+        # The view encodes the STATISTICS_CODE exclusion (it does not expose
+        # the column), but it keeps CURRENCY_CD as a dimension — so the
+        # base-currency contract must still be applied here. Dropping the
+        # whole clause silently mixed foreign-currency rows into every total.
         clause = ""
+        if (amount_basis or "base").lower() == "base" and not currency:
+            if base_currency:
+                params["base_curr"] = base_currency
+                clause += f" AND {alias}.CURRENCY_CD = :base_curr"
+            else:
+                clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
     else:
         # Oracle treats '' as NULL, so TRIM(' ') yields NULL and a plain
         # `TRIM(x) = ''` test is UNKNOWN — which would silently exclude every
@@ -302,6 +311,19 @@ def trees_list(db: Database) -> str:
   FROM {db.prefix}PSTREEDEFN GROUP BY SETID, TREE_NAME ORDER BY TREE_NAME"""
 
 
+def tree_ctl_values(db: Database) -> str:
+    """Control values a tree is defined under.
+
+    PSTREE* records are keyed by SETCNTRLVALUE as well as SETID/TREE_NAME.
+    A BU-controlled tree has one row per business unit; joining without it
+    matches every control value at once and multiplies node totals — while
+    still summing to a balanced-looking number.
+    """
+    p, today = db.prefix, db.today_expr()
+    return f"""SELECT DISTINCT SETCNTRLVALUE AS setcntrlvalue FROM {p}PSTREEDEFN
+ WHERE SETID = :setid AND TREE_NAME = :tree AND EFFDT <= {today}"""
+
+
 def tree_effdt(db: Database) -> str:
     p, today = db.prefix, db.today_expr()
     return f"""SELECT MAX(EFFDT) AS effdt FROM {p}PSTREEDEFN
@@ -324,10 +346,12 @@ def tree_rollup(db: Database, params: dict, amount_basis: str = "base",
   FROM {p}PS_LEDGER L
   JOIN {p}PSTREELEAF LF
     ON LF.SETID = :tsetid AND LF.TREE_NAME = :tree AND LF.EFFDT = {d}
+   AND LF.SETCNTRLVALUE = :tctl
    AND L.ACCOUNT BETWEEN LF.RANGE_FROM
                      AND COALESCE(NULLIF(NULLIF(LF.RANGE_TO, ''), ' '), LF.RANGE_FROM)
   JOIN {p}PSTREENODE N
     ON N.SETID = LF.SETID AND N.TREE_NAME = LF.TREE_NAME AND N.EFFDT = LF.EFFDT
+   AND N.SETCNTRLVALUE = LF.SETCNTRLVALUE
    AND LF.TREE_NODE_NUM BETWEEN N.TREE_NODE_NUM AND N.TREE_NODE_NUM_END
    AND N.TREE_LEVEL_NUM = :lvl
  WHERE L.BUSINESS_UNIT = :bu AND L.LEDGER = :ledger AND L.FISCAL_YEAR = :fy
@@ -341,7 +365,7 @@ def tree_node_span(db: Database) -> str:
     return f"""SELECT TREE_NODE_NUM AS a, TREE_NODE_NUM_END AS b
   FROM {p}PSTREENODE
  WHERE SETID = :tsetid AND TREE_NAME = :tree AND EFFDT = {d}
-   AND TREE_NODE = :node"""
+   AND SETCNTRLVALUE = :tctl AND TREE_NODE = :node"""
 
 
 def tree_leaf_ranges(db: Database) -> str:
@@ -352,6 +376,7 @@ def tree_leaf_ranges(db: Database) -> str:
        COALESCE(NULLIF(NULLIF(LF.RANGE_TO, ''), ' '), LF.RANGE_FROM) AS range_to
   FROM {p}PSTREELEAF LF
  WHERE LF.SETID = :tsetid AND LF.TREE_NAME = :tree AND LF.EFFDT = {d}
+   AND LF.SETCNTRLVALUE = :tctl
    AND LF.TREE_NODE_NUM BETWEEN :a AND :b"""
 
 
@@ -360,6 +385,7 @@ def tree_nodes_list(db: Database) -> str:
     return f"""SELECT TREE_NODE AS tree_node, TREE_LEVEL_NUM AS level_num
   FROM {p}PSTREENODE
  WHERE SETID = :tsetid AND TREE_NAME = :tree AND EFFDT = {d}
+   AND SETCNTRLVALUE = :tctl
  ORDER BY TREE_NODE_NUM"""
 
 
@@ -382,8 +408,36 @@ def ledger_business_units(db: Database) -> str:
  ORDER BY BUSINESS_UNIT"""
 
 
+def scope_setup_pairs(db: Database) -> str:
+    """BU/ledger catalog from SETUP tables, not from balance rows.
+
+    PS_BUS_UNIT_LED / PS_BUS_UNIT_TBL_GL hold one row per business unit (and
+    per ledger group), i.e. hundreds of rows. Deriving the catalog here costs
+    a small indexed read. Deriving it from PS_LEDGER instead means a DISTINCT
+    over tens of millions of balance rows: Oracle has no skip-scan for
+    DISTINCT, so the plan is a full scan of every leaf block of PSALEDGER.
+    That is what hung the first question on a real instance.
+    """
+    return f"""SELECT B.BUSINESS_UNIT AS business_unit, G.LEDGER AS ledger
+  FROM {db.prefix}PS_BUS_UNIT_LED B
+  JOIN {db.prefix}PS_LED_GRP_TBL G ON G.LEDGER_GROUP = B.LEDGER_GROUP
+ WHERE B.LEDGER_GROUP IS NOT NULL
+ ORDER BY B.BUSINESS_UNIT, G.LEDGER"""
+
+
+def scope_bu_list(db: Database) -> str:
+    """Fallback catalog: business units only, from the GL BU setup table."""
+    return f"""SELECT BUSINESS_UNIT AS business_unit
+  FROM {db.prefix}PS_BUS_UNIT_TBL_GL
+ ORDER BY BUSINESS_UNIT"""
+
+
 def financial_scope_pairs(db: Database) -> str:
-    """Accessible BU/ledger pairs from the leading PS_LEDGER index columns."""
+    """LAST-RESORT catalog straight from PS_LEDGER.
+
+    Only used when the setup tables are not granted. Callers MUST bound this
+    (row cap + a note), because on Oracle it scans the whole ledger index.
+    """
     return f"""SELECT DISTINCT BUSINESS_UNIT AS business_unit, LEDGER AS ledger
   FROM {db.prefix}PS_LEDGER
  WHERE BUSINESS_UNIT IS NOT NULL AND LEDGER IS NOT NULL

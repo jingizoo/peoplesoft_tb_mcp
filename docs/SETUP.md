@@ -40,7 +40,7 @@ python scripts/bootstrap.py
 ```
 
 Roughly two minutes. It creates `.venv/`, installs the package and both LLM
-clients, builds the sample ledger, and then verifies the engine (179 checks) and
+clients, builds the sample ledger, and then verifies the engine (188 checks) and
 the MCP server over real stdio. It is safe to re-run.
 
 Useful flags:

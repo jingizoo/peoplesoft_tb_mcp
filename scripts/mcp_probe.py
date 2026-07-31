@@ -23,6 +23,19 @@ from pstb.client.llm_base import clean_schema  # noqa: E402
 
 
 async def main() -> None:
+    # This probe asserts against the bundled sample ledger (US001 / FY2026 /
+    # known totals). Pointed at a real PeopleSoft database it would both fail
+    # spuriously AND fire COUNT(*)-style probes at production, so refuse.
+    from pstb.config import load_config
+
+    backend = load_config(str(ROOT / "config.yaml")).db.backend.lower()
+    if backend != "sqlite":
+        print(f"config.yaml uses db.backend={backend!r}; this probe is a "
+              "sample-data self-test and would query your real database.\n"
+              "Skipping. Verify a real connection with: "
+              "python scripts/diagnose_db.py")
+        return
+
     env = dict(os.environ)
     env["PSTB_CONFIG"] = str(ROOT / "config.yaml")
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")

@@ -37,8 +37,15 @@ class DbCfg:
     oracle_dsn: str = ""
     oracle_user: str = ""
     oracle_password: str = ""
+    # Thin-mode extras: a tnsnames/sqlnet directory and (optionally) a wallet,
+    # for sites that hand out a TNS alias or require mTLS.
+    oracle_config_dir: str = ""
+    oracle_wallet_dir: str = ""
+    oracle_wallet_password: str = ""
     mssql_conn_str: str = ""
     query_timeout_seconds: int = 120
+    # Concurrent chat channels each need their own session; this caps them.
+    pool_max: int = 8
 
 
 @dataclass
@@ -143,6 +150,10 @@ def load_config(path: Optional[str] = None) -> Config:
     d.oracle_dsn = _env("ORACLE_DSN", d.oracle_dsn)
     d.oracle_user = _env("ORACLE_USER", d.oracle_user)
     d.oracle_password = _env("ORACLE_PASSWORD", d.oracle_password)
+    d.oracle_config_dir = _env("TNS_ADMIN", d.oracle_config_dir)
+    d.oracle_wallet_dir = _env("ORACLE_WALLET_DIR", d.oracle_wallet_dir)
+    d.oracle_wallet_password = _env("ORACLE_WALLET_PASSWORD",
+                                    d.oracle_wallet_password)
     d.mssql_conn_str = _env("MSSQL_CONN_STR", d.mssql_conn_str)
     l.provider = _env("PSTB_LLM_PROVIDER", l.provider)
     l.ollama_host = _env("OLLAMA_HOST", l.ollama_host)

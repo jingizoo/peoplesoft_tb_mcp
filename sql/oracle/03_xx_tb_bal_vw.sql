@@ -31,6 +31,11 @@ SELECT L.BUSINESS_UNIT,
   LEFT JOIN XX_TB_ACCT_VW ACC
     ON ACC.SETID = S.SETID
    AND ACC.ACCOUNT = L.ACCOUNT
+ -- Statistical rows (headcount, area, units) are not money and must never
+ -- reach a trial balance. The agent relies on this view encoding the rule;
+ -- without it, use_views:true silently changes every reported total.
+ WHERE L.STATISTICS_CODE IS NULL
+    OR TRIM(L.STATISTICS_CODE) IS NULL
  GROUP BY L.BUSINESS_UNIT, L.LEDGER, L.FISCAL_YEAR, L.ACCOUNTING_PERIOD,
           L.ACCOUNT, ACC.DESCR, ACC.ACCOUNT_TYPE, ACC.EFF_STATUS,
           L.DEPTID, L.OPERATING_UNIT, L.PRODUCT, L.PROJECT_ID, L.CURRENCY_CD;
