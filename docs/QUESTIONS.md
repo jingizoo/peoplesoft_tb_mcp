@@ -114,6 +114,16 @@ absent or ungranted it names them so you can request exactly those grants.
 Ad-hoc results carry `scope_filtered`: when a business unit is selected and the
 query did not filter on it, the answer says the rows span business units.
 
+## Readiness reviews → `run_playbook`, `list_playbooks`
+51. Are we ready to close the period? *(close_readiness: balance, suspense,
+    unposted and unbalanced journals, RE roll, AR tie, billing pipeline,
+    period position — one verdict)*
+52. How healthy are receivables? *(receivables_health)*
+Verdicts: `passed` (every step ran, nothing found), `exceptions_found` (every
+step ran, some found something), `incomplete` (a step COULD NOT run — never a
+pass). Each step calls the same curated tool the individual question would, so
+a playbook can never disagree with the tool it wraps.
+
 ## Anything else → guarded `run_sql` (+ `list_tables`, `describe_table`)
 49. How many journals were posted in FY2026 by source?
 50. Which operator posted the most journal lines this year?

@@ -951,6 +951,45 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 
+    print("== playbooks: composed verdicts ==")
+    from pstb.playbooks import PlaybookRunner, PlaybookError
+    _pb = PlaybookRunner(engine)
+    _names = [p["playbook"] for p in _pb.list_playbooks()["playbooks"]]
+    check("playbooks are discoverable",
+          {"close_readiness", "receivables_health"} <= set(_names), str(_names))
+    _run = _pb.run("close_readiness", fiscal_year=2026, period=7)
+    check("close readiness runs every step",
+          len(_run["steps"]) == 8
+          and all(s["status"] in ("ok", "attention", "skipped")
+                  for s in _run["steps"]), str(len(_run["steps"])))
+    check("the sample's known exceptions are found, not hidden",
+          _run["verdict"] == "exceptions_found"
+          and _run["attention_count"] >= 3, str(_run["verdict"]))
+    _by = {s["step"]: s for s in _run["steps"]}
+    check("suspense and unposted journals surface as findings",
+          _by["suspense"]["status"] == "attention"
+          and _by["unposted"]["status"] == "attention")
+    check("a playbook figure matches the tool it wraps",
+          "6,419,357.27" in _by["balance"]["headline"],
+          _by["balance"]["headline"])
+    # A step that cannot run must NEVER read as a pass.
+    _bogus = _pb.run("close_readiness", business_unit="NOPE", fiscal_year=2026,
+                     period=6)
+    check("an unrunnable playbook is incomplete, never passed",
+          _bogus["verdict"] == "incomplete" and _bogus["skipped_count"] > 0,
+          str(_bogus["verdict"]))
+    check("incomplete says plainly it is not a pass",
+          "NOT a pass" in _bogus["summary"], _bogus["summary"])
+    try:
+        _pb.run("no_such_playbook")
+        check("an unknown playbook names the real ones", False)
+    except PlaybookError as e:
+        check("an unknown playbook names the real ones",
+              "close_readiness" in str(e), str(e)[:60])
+    check("playbook steps are wired to the model prompt",
+          "run_playbook (list_playbooks names them)" in
+          (ROOT / "pstb" / "client" / "prompt.py").read_text(encoding="utf-8"))
+
     print("== number grounding ==")
     from pstb.guards import ungrounded_figures, payload_numbers
     _pay = [json.dumps({"totals": {"ending_dr": 6419357.27,

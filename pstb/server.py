@@ -430,6 +430,42 @@ def list_ledgers(business_unit: str) -> dict:
     return _safe(engine.list_ledgers, business_unit=business_unit)
 
 
+@mcp.tool()
+def list_playbooks() -> dict:
+    """Named multi-step review workflows that run SERVER-SIDE and return one
+    verdict — close readiness, receivables health. Use for a broad readiness
+    question ("are we ready to close?", "how healthy is AR?") rather than one
+    specific figure. Never run the steps yourself: the sequence is fixed so it
+    cannot be reordered or forgotten."""
+    return _safe(playbooks.list_playbooks)
+
+
+@mcp.tool()
+def run_playbook(playbook: str = "", business_unit: str = "", ledger: str = "",
+                 fiscal_year: int = 0, period: int = 0) -> dict:
+    """Run a review workflow end to end and return a composed verdict.
+
+    playbook: close_readiness (default) or receivables_health — see
+    list_playbooks. Each step calls the same curated tool the individual
+    question would, so the numbers cannot disagree.
+    Read "verdict": passed = every step ran and found nothing;
+    exceptions_found = every step ran and some found something;
+    incomplete = a step COULD NOT RUN and must never be reported as a pass.
+    Report the verdict and the steps needing attention; the card beside your
+    reply already lists every step."""
+    return _safe(playbooks.run, playbook=playbook, business_unit=business_unit,
+                 ledger=ledger, fiscal_year=fiscal_year, period=period)
+
+
+@mcp.tool()
+def list_sources() -> dict:
+    """Databases this agent can query. 'default' is the PeopleSoft primary —
+    every curated tool answers from it. Extra sources are reachable from
+    run_sql / list_tables / describe_table / search_records via source=<name>;
+    use them when the user names a non-PeopleSoft system."""
+    return _safe(lambda: {"sources": engine.registry.describe()})
+
+
 if cfg.tools.allow_raw_sql:
 
     @mcp.tool()

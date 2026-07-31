@@ -56,6 +56,10 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   introspected at runtime (ACCTG_DT vs ASOF_DT dating, optional
   DISPUTE_STATUS/BAL_CURRENCY) and adaptations disclosed via record_notes —
   never assume the reference layout survives contact with a real site.
+- `pstb/playbooks.py` — accountant workflows (close readiness,
+  receivables health) composed from curated tools and run
+  server-side. The SEQUENCE lives in Python so the model cannot
+  reorder or forget a step; it triggers and narrates only.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
   PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
 - `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py` and

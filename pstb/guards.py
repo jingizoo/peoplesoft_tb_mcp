@@ -61,6 +61,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "get_billing_workbench",
     "run_report",
     "run_sql",
+    "run_playbook",
 }
 
 # Request-scope field -> tool argument. The right-hand value differs only where
@@ -101,6 +102,10 @@ _TOOL_SCOPE_ARGS = {
     "search_customers": {"business_unit": "business_unit"},
     "get_billing_workbench": {"business_unit": "business_unit"},
     "run_report": {
+        "business_unit": "business_unit", "ledger": "ledger",
+        "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "run_playbook": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
     },
@@ -214,6 +219,7 @@ _TOOL_DOMAINS = {
     "search_customers": {"balance", "customer"},
     "get_billing_workbench": {"billing"},
     "run_report": {"report", "balance", "variance"},
+    "run_playbook": {"balance", "journal", "ar", "billing", "report"},
 }
 
 
