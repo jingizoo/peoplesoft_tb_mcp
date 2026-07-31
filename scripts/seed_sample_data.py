@@ -286,6 +286,18 @@ CREATE TABLE PS_BUS_UNIT_LED (BUSINESS_UNIT TEXT, LEDGER_GROUP TEXT);
 -- searches RECDESCR so a question phrased functionally ("file interface")
 -- finds a record whose table name gives no clue. SQLTABLENAME is the site's
 -- physical-name override, blank when the name is just PS_ + RECNAME.
+-- A minimal Payables slice. AP has no curated tools by design: it is the
+-- worked example that "ask anything" reaches every module through
+-- search_records + run_sql, so it must be exercised like a real question.
+CREATE TABLE PS_VENDOR (SETID TEXT, VENDOR_ID TEXT, NAME1 TEXT, VENDOR_STATUS TEXT);
+CREATE TABLE PS_VOUCHER (
+  BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, VENDOR_ID TEXT, INVOICE_ID TEXT,
+  INVOICE_DT TEXT, GROSS_AMT REAL, ENTRY_STATUS TEXT, CURRENCY_CD TEXT);
+CREATE TABLE PS_PAYMENT_TBL (
+  BANK_SETID TEXT, PYMNT_ID TEXT, VENDOR_ID TEXT, PYMNT_DT TEXT,
+  PYMNT_AMT REAL, CURRENCY_CD TEXT, PYMNT_STATUS TEXT);
+CREATE TABLE PS_PYMNT_VCHR_XREF (
+  BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, PYMNT_ID TEXT, PAID_AMT REAL);
 CREATE TABLE PSRECDEFN (
   RECNAME TEXT, RECDESCR TEXT, RECTYPE INTEGER, SQLTABLENAME TEXT);
 CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
@@ -437,7 +449,32 @@ def main() -> None:
         ("CUSTOMER", "Customer Master", 0, ""),
         ("TU_FILE_INTFC", "File Interface Setup and Schedule", 0, ""),
     ]
+    _recs += [
+        ("VENDOR", "Supplier Master", 0, ""),
+        ("VOUCHER", "AP Voucher Header", 0, ""),
+        ("PAYMENT_TBL", "AP Payment Header", 0, ""),
+        ("PYMNT_VCHR_XREF", "Payment to Voucher Cross Reference", 0, ""),
+    ]
     con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
+    con.executemany(
+        "INSERT INTO PS_VENDOR VALUES (?,?,?,?)",
+        [(SETID, "V1001", "Ridgeline Supply Co", "A"),
+         (SETID, "V1002", "Cobalt IT Services", "A"),
+         (SETID, "V1003", "Harbor Freight Lines", "I")])
+    _vouchers, _payments, _xref = [], [], []
+    for i, (vend, amt, mon) in enumerate(
+            [("V1001", 12_500.00, 3), ("V1001", 8_200.00, 4),
+             ("V1001", 15_300.00, 5), ("V1002", 42_000.00, 4),
+             ("V1002", 9_900.00, 6), ("V1003", 3_400.00, 5)], start=1):
+        vid = f"VCHR{i:05d}"
+        pid = f"PAY{i:05d}"
+        _vouchers.append((BU, vid, vend, f"INV-{i:04d}",
+                          month_end(2026, mon), amt, "P", CURR))
+        _payments.append((SETID, pid, vend, month_end(2026, mon), amt, CURR, "P"))
+        _xref.append((BU, vid, pid, amt))
+    con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?)", _vouchers)
+    con.executemany("INSERT INTO PS_PAYMENT_TBL VALUES (?,?,?,?,?,?,?)", _payments)
+    con.executemany("INSERT INTO PS_PYMNT_VCHR_XREF VALUES (?,?,?,?)", _xref)
     con.executemany(
         "INSERT INTO PSRECFIELD VALUES (?,?,?)",
         [("LEDGER", "BUSINESS_UNIT", 1), ("LEDGER", "LEDGER", 2),

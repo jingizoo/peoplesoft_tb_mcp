@@ -913,6 +913,36 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           [x["source"] for x in eng_src.registry.describe()]
           == ["default", "mart"])
 
+    print("== modules beyond GL/AR/Billing are reachable ==")
+    # Reported live: "how many payments did we make to a vendor" was refused
+    # with "I don't have access to AP data, limited to GL and Billing". The
+    # data was reachable all along via search_records + run_sql; the agent
+    # had simply been told it was a General Ledger agent.
+    _ap = engine.search_records("payment")["records"]
+    check("AP records are discoverable by description",
+          any(r["table"] == "PS_PAYMENT_TBL" for r in _ap), str(_ap[:2]))
+    _rows = engine.run_sql(
+        "SELECT V.NAME1 AS vendor, COUNT(*) AS payments, "
+        "SUM(P.PYMNT_AMT) AS total FROM PS_PAYMENT_TBL P "
+        "JOIN PS_VENDOR V ON V.VENDOR_ID = P.VENDOR_ID "
+        "GROUP BY V.NAME1 ORDER BY payments DESC")["rows"]
+    check("the AP question actually answers",
+          _rows and _rows[0]["payments"] == 3
+          and abs(_rows[0]["total"] - 36_000.00) < 0.01, str(_rows[:1]))
+    _map = engine.get_record_map()["domains"]
+    check("record map covers AP, assets, commitment control and projects",
+          {"payables", "asset_management", "commitment_control",
+           "projects_expenses"} <= set(_map), str(sorted(_map)))
+    check("absent module records are marked, not errors",
+          any(r["present"] is False and "note" in r
+              for r in _map["asset_management"]))
+    from pstb.client.prompt import system_prompt as _sp
+    _p = _sp(cfg, surface="gui")
+    check("the agent is not framed as GL-only",
+          "General Ledger analyst" not in _p and "FINANCE analyst" in _p)
+    check("prompt forbids claiming module lockout before checking",
+          "NEVER tell the user you lack access to a module" in _p)
+
     print("== build identity ==")
     from pstb.version import build_info as _bi, label as _bl, source_fingerprint
     _info = _bi()

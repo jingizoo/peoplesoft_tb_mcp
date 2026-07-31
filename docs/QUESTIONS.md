@@ -93,6 +93,18 @@ See docs/NVISION.md for migrating existing nVision layouts.
      lists the conversions)*
 48s. Show the aging converted to INR. *(same — never per-row math in the model)*
 
+## Payables, Assets, and every other module → `search_records` + `run_sql`
+48w. How many payments did we make to each vendor? *(no curated AP tool —
+     search_records("payment") finds PS_PAYMENT_TBL / PS_PYMNT_VCHR_XREF,
+     then run_sql joins to PS_VENDOR)*
+48x. Which vouchers are posted but unpaid? *(PS_VOUCHER + PS_PYMNT_VCHR_XREF)*
+48y. What is our depreciation this period? *(PS_DEPRECIATION)*
+Curated tools cover GL, Receivables and Billing because those need exact
+semantics. Everything else — Payables, Asset Management, Commitment Control,
+Projects, Expenses, custom records — is reached this way. The agent must
+never claim a module is unavailable before checking; if records really are
+absent or ungranted it names them so you can request exactly those grants.
+
 ## Custom & site-specific records → `search_records`, `describe_record`
 48t. What files are configured in our file interface? *(no table name known —
      search_records("file interface") searches PeopleTools RECDESCR, finds
