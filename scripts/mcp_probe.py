@@ -57,7 +57,8 @@ async def main() -> None:
             NO_ARG_TOOLS = {"list_trees", "list_business_units",
                             "list_financial_scopes", "list_reports",
                             "get_record_map", "wiki_health",
-                            "list_playbooks", "list_sources"}
+                            "list_playbooks", "list_sources",
+                            "recall_site_facts"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"
@@ -113,6 +114,26 @@ async def main() -> None:
             assert ch["connected"] is False and ch["stage_failed"] == "connect", ch
             assert "SECRETTOKEN" not in str(ch), "token leaked into health output"
             print("Confluence health fails closed, no token leak ✔")
+
+            # CALL every zero-argument tool. Listing a tool proves it was
+            # registered; it does NOT prove the module it delegates to was
+            # imported. PR #34 shipped run_playbook whose module was never
+            # initialized — every call returned "NameError: name 'playbooks'
+            # is not defined" while the probe, the suites and CI stayed green
+            # because none of them invoked it.
+            for name in sorted(NO_ARG_TOOLS):
+                if name not in {t.name for t in listed.tools}:
+                    continue
+                out = await call(name)
+                assert "error" not in out, f"{name} failed: {out['error'][:120]}"
+            print(f"called {len(NO_ARG_TOOLS)} no-arg tools, none errored")
+
+            pb = await call("run_playbook", fiscal_year=2026, period=7)
+            assert "error" not in pb, f"run_playbook failed: {pb.get('error')}"
+            assert pb.get("verdict") in ("passed", "exceptions_found",
+                                         "incomplete"), pb
+            print(f"run_playbook close_readiness: {pb['verdict']} — "
+                  f"{pb['summary']}")
 
             print("\nMCP probe passed.")
 

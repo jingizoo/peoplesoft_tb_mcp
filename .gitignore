@@ -14,3 +14,4 @@ logs/
 config.yaml.bak-*
 .setup-probe-config.yaml
 BUILD_INFO.json
+site_memory.json

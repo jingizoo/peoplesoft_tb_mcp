@@ -56,6 +56,11 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   introspected at runtime (ACCTG_DT vs ASOF_DT dating, optional
   DISPUTE_STATUS/BAL_CURRENCY) and adaptations disclosed via record_notes —
   never assume the reference layout survives contact with a real site.
+- `pstb/memory.py` — site memory: facts about THIS installation (aliases,
+  calendar conventions, exclusions). Proposed by the model, ACTIVE ONLY
+  after a human approves — `python -m pstb.memory` reviews the queue.
+  Approved facts enter the prompt as context explicitly subordinate to
+  tool results, so a remembered alias can never outrank the database.
 - `pstb/playbooks.py` — accountant workflows (close readiness,
   receivables health) composed from curated tools and run
   server-side. The SEQUENCE lives in Python so the model cannot

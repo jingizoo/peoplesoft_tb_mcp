@@ -951,6 +951,47 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 
+    print("== site memory: nothing remembered without approval ==")
+    from pstb.memory import SiteMemory, MemoryError_, looks_like_a_lesson
+    from pstb.client.prompt import system_prompt as _sysprompt
+    _mdir = Path(_tf.mkdtemp(prefix="pstb_mem_"))
+    _mem = SiteMemory(_mdir / "mem.json")
+    _f = _mem.propose("ZZQX unique marker for this deployment", "alias")["fact"]
+    check("a proposed fact starts pending", _f["status"] == "pending")
+    check("a PENDING fact never reaches the prompt",
+          "ZZQX" not in _sysprompt(cfg, memory=_mem),
+          "pending memory leaked into the prompt")
+    _mem.decide(_f["id"], approve=True)
+    _p = _sysprompt(cfg, memory=_mem)
+    check("an APPROVED fact reaches the prompt", "ZZQX" in _p)
+    check("memory is framed as subordinate to tool results",
+          "the tool result is correct" in _p)
+    check("proposing the same fact twice does not duplicate it",
+          _mem.propose("ZZQX unique marker for this deployment",
+                       "alias")["already_known"] is True)
+    _rej = _mem.propose("A fact to reject", "context")["fact"]
+    _mem.decide(_rej["id"], approve=False)
+    check("a rejected fact stays out of the prompt",
+          "A fact to reject" not in _sysprompt(cfg, memory=_mem))
+    for _bad, _label in ((("", "context"), "empty text"),
+                         (("x" * 500, "context"), "an overlong fact"),
+                         (("ok", "nonsense_kind"), "an unknown kind")):
+        try:
+            _mem.propose(*_bad)
+            check(f"{_label} is rejected", False)
+        except MemoryError_:
+            check(f"{_label} is rejected", True)
+    check("a corrupt memory file degrades instead of crashing",
+          (lambda: ((_mdir / "bad.json").write_text("{not json"),
+                    SiteMemory(_mdir / "bad.json").list_facts()
+                    .get("load_error") is True)[1])())
+    check("teaching is detected, questions are not",
+          looks_like_a_lesson("Remember that the Denver books are US003")
+          and not looks_like_a_lesson("What is the trial balance?"))
+    check("the prompt tells the model approval is required",
+          "NOTED FOR REVIEW" in _sysprompt(cfg))
+    _sh.rmtree(_mdir)
+
     print("== playbooks: composed verdicts ==")
     from pstb.playbooks import PlaybookRunner, PlaybookError
     _pb = PlaybookRunner(engine)

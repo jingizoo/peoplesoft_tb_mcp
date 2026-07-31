@@ -265,6 +265,14 @@ def _int_scope_value(raw: object, field_name: str) -> int:
         ) from e
 
 
+def _site_memory():
+    """Site memory for prompt context. Read fresh each turn so an approval
+    takes effect on the next question rather than after a restart."""
+    from ..memory import SiteMemory
+    return SiteMemory(cfg.resolve_path(
+        getattr(cfg.tools, "site_memory", "site_memory.json")))
+
+
 def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
     """Resolve and validate a client scope exclusively from DB-discovered values."""
     raw = requested if isinstance(requested, dict) else {}
@@ -859,7 +867,7 @@ async def chat(payload: dict):
             tools = tool_specs(await session.list_tools())
 
         def make_provider():
-            prompt = system_prompt(cfg, surface="gui")
+            prompt = system_prompt(cfg, surface="gui", memory=_site_memory())
             if active_scope:
                 prompt += (
                     "\n\n## Active scope selected by the user and verified "
