@@ -1065,14 +1065,25 @@ def main():
             state.update(existing)
             info("existing configuration found; press Enter to keep each value")
 
-        backend = args.backend or state.get("backend")
+        backend = args.backend
         if backend is None:
-            backend = p.choose("What is this installation for?", [
+            # ALWAYS ask when interactive. Treating an existing value as the
+            # answer meant a fresh checkout - whose shipped config.yaml says
+            # sqlite - silently stayed on the sample ledger, with no prompt
+            # and no clue where to change it. The current value is only the
+            # default; --non-interactive keeps it without asking.
+            current = (state.get("backend") or "sqlite").lower()
+            options = [
                 ("oracle", "A real PeopleSoft database (Oracle)"),
-                ("sqlite", "Trying it out on the bundled sample ledger"),
-            ], 0)
-        elif args.backend is None and not p.interactive:
-            info("keeping the configured backend: {0}".format(backend))
+                ("sqlite", "The bundled sample ledger (no credentials needed)"),
+            ]
+            default_index = 0 if current == "oracle" else 1
+            if p.interactive and current:
+                info("currently configured: {0}".format(current))
+            backend = p.choose("What is this installation for?", options,
+                               default_index)
+            if not p.interactive:
+                info("keeping the configured backend: {0}".format(backend))
 
         step_venv(p, backend)
         if not existing:
