@@ -54,6 +54,20 @@ def _fmt(amount) -> str:
         return str(amount)
 
 
+def _incomplete(ic: dict, check: str) -> Optional[str]:
+    """Why this specific control probe could not run, or None if it ran.
+
+    Steps must consult this before reading a probe's result. Each probe
+    defaults to an empty list when it fails, and reading that empty list as
+    "nothing found" is the exact shape of a false pass: reporting "every
+    journal in scope is posted" when in truth no journal was ever read.
+    """
+    for row in (ic.get("checks_incomplete") or []):
+        if row.get("check") == check:
+            return row.get("reason") or "check did not run"
+    return None
+
+
 # --------------------------------------------------------------- close steps
 def _step_integrity(ctx: dict) -> tuple:
     ic = ctx["integrity"]
@@ -82,9 +96,13 @@ def _step_suspense(ctx: dict) -> tuple:
 
 
 def _step_unposted(ctx: dict) -> tuple:
-    rows = ctx["integrity"].get("unposted_journals") or []
-    if ctx["integrity"].get("balanced") is None:
+    ic = ctx["integrity"]
+    rows = ic.get("unposted_journals") or []
+    if ic.get("balanced") is None:
         return "skipped", "integrity check did not run", {}
+    why = _incomplete(ic, "unposted_journals")
+    if why:
+        return "skipped", f"unposted-journal check could not run: {why}", {}
     if not rows:
         return "ok", "every journal in scope is posted", {"unposted_journals": []}
     return ("attention", f"{len(rows)} unposted journal(s) — post or delete "
@@ -92,9 +110,13 @@ def _step_unposted(ctx: dict) -> tuple:
 
 
 def _step_out_of_balance_journals(ctx: dict) -> tuple:
-    rows = ctx["integrity"].get("out_of_balance_journals") or []
-    if ctx["integrity"].get("balanced") is None:
+    ic = ctx["integrity"]
+    rows = ic.get("out_of_balance_journals") or []
+    if ic.get("balanced") is None:
         return "skipped", "integrity check did not run", {}
+    why = _incomplete(ic, "out_of_balance_journals")
+    if why:
+        return "skipped", f"journal-balance check could not run: {why}", {}
     if not rows:
         return "ok", "all posted journals net to zero", {}
     return ("attention", f"{len(rows)} posted journal(s) do not net to zero",
@@ -102,9 +124,13 @@ def _step_out_of_balance_journals(ctx: dict) -> tuple:
 
 
 def _step_retained_earnings(ctx: dict) -> tuple:
-    roll = ctx["integrity"].get("retained_earnings_roll") or {}
+    ic = ctx["integrity"]
+    roll = ic.get("retained_earnings_roll") or {}
+    why = _incomplete(ic, "retained_earnings_roll")
+    if why:
+        return "skipped", f"retained-earnings roll could not run: {why}", roll
     status = roll.get("status")
-    if not status:
+    if not status or status == "not_evaluated":
         return "skipped", "retained-earnings roll not evaluated", roll
     if status == "ok":
         return "ok", "beginning balances roll from the prior-year close", roll
@@ -254,26 +280,37 @@ class PlaybookRunner:
 
     def _context(self, bu: str, ledger: str, fy: int, period: int) -> dict:
         """Gather every input once. Steps read this rather than querying, so
-        a playbook costs one pass over the tools it wraps."""
+        a playbook costs one pass over the tools it wraps.
+
+        Every input is caught broadly and on purpose. DbError and EngineError
+        are unrelated RuntimeError subclasses, so catching EngineError alone
+        let a record-shape failure — the single likeliest thing to go wrong on
+        a real instance — escape this method and abort the entire playbook
+        with a traceback. One unreadable input must cost the steps that need
+        it, not the seven checks that do not.
+        """
         ctx: dict = {"business_unit": bu, "ledger": ledger,
                      "fiscal_year": fy, "period": period}
-        try:
-            ctx["integrity"] = self.e.tb_integrity_check(
-                business_unit=bu, ledger=ledger, fiscal_year=fy, period=period)
-        except EngineError as e:
-            ctx["integrity"] = {"scope_status": "error", "detail": str(e)}
-        try:
-            ctx["aging"] = self.ar.aging(business_unit=bu)
-        except (ARError, EngineError) as e:
-            ctx["aging"] = str(e)
-        try:
-            ctx["workbench"] = self.ar.billing_workbench(business_unit=bu)
-        except (ARError, EngineError) as e:
-            ctx["workbench"] = str(e)
+
+        def gather(key: str, fn, on_error) -> None:
+            try:
+                ctx[key] = fn()
+            except Exception as e:                     # noqa: BLE001 — see above
+                ctx[key] = on_error(f"{type(e).__name__}: {e}")
+
+        gather("integrity",
+               lambda: self.e.tb_integrity_check(business_unit=bu,
+                                                 ledger=ledger,
+                                                 fiscal_year=fy,
+                                                 period=period),
+               lambda msg: {"scope_status": "error", "detail": msg})
+        gather("aging", lambda: self.ar.aging(business_unit=bu), str)
+        gather("workbench",
+               lambda: self.ar.billing_workbench(business_unit=bu), str)
         try:
             lfy, lper = self.e.last_posted_period(bu, ledger)
             ctx["latest_fy"], ctx["latest_period"] = lfy, lper
-        except EngineError:
+        except Exception:                              # noqa: BLE001
             ctx["latest_fy"] = ctx["latest_period"] = None
         return ctx
 
