@@ -16,6 +16,8 @@ try:  # mcp SDK >= 2.0
 except ImportError:  # mcp SDK 1.x
     from mcp.server.fastmcp import FastMCP
 
+from typing import Optional
+
 from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
@@ -41,6 +43,9 @@ try:
 except WikiError as e:
     print(f"[pstb] wiki disabled: {e}", file=sys.stderr)
     wiki = None
+# Let the engine resolve policy figures into query binds. Approved site memory
+# outranks the wiki, so both are handed over together.
+engine.attach_policy(wiki, memory)
 
 mcp = FastMCP("peoplesoft-tb")
 
@@ -501,7 +506,7 @@ if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
     def run_sql(sql: str, max_rows: int = 100, business_unit: str = "",
-                source: str = "") -> dict:
+                source: str = "", policy_binds: Optional[dict] = None) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
         CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
         only, DML/DDL rejected, rows capped at 500, every table validated against
@@ -515,9 +520,18 @@ if cfg.tools.allow_raw_sql:
         business_unit: the active scope, used only to report whether the query
         was actually restricted to it (scope_filtered / scope_note) — the SQL
         is never rewritten. Relay scope_note when it says NOT restricted.
-        PS_ tables use signed amounts (credits negative)."""
+        PS_ tables use signed amounts (credits negative).
+        policy_binds: when the question refers to a POLICY figure ("above the
+        capitalization threshold", "over the approval limit"), do NOT type the
+        number. Write the bind in the SQL and name the policy here — e.g.
+        sql="... WHERE COST >= :threshold", policy_binds={"threshold":
+        "capitalization_threshold"}. The value is looked up in the wiki and
+        bound server-side, and the result carries policy_basis with the exact
+        sentence and page it came from — quote that when you answer. Call
+        list_policy_terms for the available names."""
         return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
-                     business_unit=business_unit)
+                     business_unit=business_unit, policy_binds=policy_binds)
+
 
     @mcp.tool()
     def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
@@ -582,6 +596,33 @@ if cfg.tools.allow_raw_sql:
     def describe_table(table_name: str, source: str = "") -> dict:
         """Column names and types for one table/view (e.g. PS_JRNL_HEADER)."""
         return _safe(engine.for_source(source).describe_table, table_name=table_name)
+
+
+@mcp.tool()
+def list_policy_terms() -> dict:
+    """Which POLICY figures this agent can resolve from the wiki and bind into
+    a query (capitalization threshold, approval limit, write-off limit,
+    materiality, suspense clearing days, payment terms). Use with
+    resolve_policy_value, or pass policy_binds to run_sql."""
+    from .policy import list_terms
+
+    return _safe(list_terms)
+
+
+@mcp.tool()
+def resolve_policy_value(policy: str) -> dict:
+    """Look up a POLICY figure in the company wiki and return it with the exact
+    sentence and page it came from. USE THIS instead of recalling a threshold
+    from memory — a paraphrased figure silently changes which rows an answer
+    contains. Returns status: 'resolved' (one figure, cite the source),
+    'ambiguous' (the wiki disagrees with itself — quote every value and ask
+    which applies), 'not_found' (say so; do not supply one yourself), or
+    'demo_content' (bundled fictional pages — never filter real data with it).
+    To filter a query by the value, prefer run_sql's policy_binds so the number
+    is bound server-side rather than retyped."""
+    from .policy import PolicyResolver
+
+    return _safe(PolicyResolver(wiki, memory).resolve, policy=policy)
 
 
 if wiki is not None:

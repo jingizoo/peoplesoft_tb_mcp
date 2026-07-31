@@ -58,10 +58,30 @@ async def main() -> None:
                             "list_financial_scopes", "list_reports",
                             "get_record_map", "wiki_health",
                             "list_playbooks", "list_sources",
-                            "recall_site_facts"}
+                            "recall_site_facts", "list_policy_terms"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"
+
+            # Tools must still BE here. A module-level def written inside an
+            # indented suite ends that suite, and every decorated def after it
+            # becomes dead code in the new function's body — the file still
+            # parses, the server still starts, and six discovery tools simply
+            # stop existing. Naming them is the only way that shows up.
+            REQUIRED = {
+                "get_trial_balance", "get_account_balance", "drill_to_journals",
+                "tb_integrity_check", "search_accounts", "resolve_period",
+                "run_sql", "search_records", "describe_record", "list_tables",
+                "describe_table", "profile_record", "compare_records",
+                "run_playbook", "get_ar_aging", "resolve_policy_value",
+                "list_policy_terms",
+            }
+            names = {t.name for t in listed.tools}
+            gone = sorted(REQUIRED - names)
+            assert not gone, (
+                f"tools disappeared from the server: {gone} — check for a "
+                "def that dedented out of an if-block")
+            print(f"all {len(REQUIRED)} required tools present of {len(names)}")
             for s in specs:
                 clean_schema(s.schema)  # must not raise for either provider
             tb_spec = next(s for s in specs if s.name == "get_trial_balance")
@@ -127,6 +147,26 @@ async def main() -> None:
                 out = await call(name)
                 assert "error" not in out, f"{name} failed: {out['error'][:120]}"
             print(f"called {len(NO_ARG_TOOLS)} no-arg tools, none errored")
+
+            # Policy figures must arrive with provenance, and the bundled
+            # fictional pages must never be usable as a filter on real data.
+            pol = await call("resolve_policy_value",
+                             policy="capitalization_threshold")
+            assert pol.get("value") == 5000.0, pol
+            assert pol.get("quote"), "a policy value without its sentence is a guess"
+            if wh.get("is_bundled_demo_content"):
+                assert pol["status"] == "demo_content", pol
+                assert pol["usable_as_filter"] is False, \
+                    "demo policy figures must not be usable as filters"
+                blocked = await call(
+                    "run_sql",
+                    sql="SELECT 1 AS x FROM PS_JRNL_LN WHERE MONETARY_AMOUNT >= :t",
+                    policy_binds={"t": "capitalization_threshold"})
+                assert "error" in blocked and "NOT run" in blocked["error"], blocked
+                print("demo policy figure refused as a query filter ✔")
+            unknown = await call("resolve_policy_value", policy="bonus_accrual_rate")
+            assert "error" in unknown and "capitalization_threshold" in unknown["error"]
+            print("unknown policy names list the available ones ✔")
 
             pb = await call("run_playbook", fiscal_year=2026, period=7)
             assert "error" not in pb, f"run_playbook failed: {pb.get('error')}"

@@ -20,6 +20,10 @@ from .config import Config
 from .db import Database, DbError
 
 
+_PRIMARY_ALIASES = {"peoplesoft", "people soft", "ps", "psft", "primary",
+                    "main", "finance", "erp", "gl"}
+
+
 class SourceRegistry:
     def __init__(self, cfg: Config, primary: Database):
         self.cfg = cfg
@@ -39,6 +43,14 @@ class SourceRegistry:
         """
         name = (source or "").strip()
         if name in ("", "default"):
+            return self._primary
+        # The primary source IS the PeopleSoft database, so "peoplesoft" is
+        # the name anyone would reach for first. Refusing it on a technicality
+        # spends a whole turn on a correction that teaches nothing — accept
+        # the obvious aliases, unless the site has configured a real source
+        # under that name, which always wins.
+        if (name.lower() in _PRIMARY_ALIASES
+                and name not in (self.cfg.sources or {})):
             return self._primary
         if name not in self.cfg.sources:
             raise DbError(
