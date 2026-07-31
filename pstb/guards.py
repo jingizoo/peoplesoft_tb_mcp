@@ -111,6 +111,12 @@ _TOOL_SCOPE_ARGS = {
     "search_accounts": {"business_unit": "business_unit"},
 }
 
+# WHICH scope fields are governance and which are convenience.
+# business_unit/ledger are HARD: answering from the wrong company or ledger is
+# the failure the scope bar exists to prevent, so the model may never change
+# them. fiscal_year/period are SOFT defaults the user's question may override.
+_SOFT_SCOPE_FIELDS = {"fiscal_year", "period"}
+
 _SCOPE_ALIASES = {
     "business_unit": ("business_unit", "bu"),
     "ledger": ("ledger",),
@@ -367,6 +373,13 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
         if current_value is None:
             out[tool_arg] = requested
         elif not _same_scope_value(field, current_value, requested):
+            if field in _SOFT_SCOPE_FIELDS:
+                # Time is a DEFAULT, not a lock. "Show the trial balance for
+                # period 3" while the chip reads P6 is a legitimate question,
+                # and refusing it made the selected period a cage: no other
+                # period or year could be asked about without changing the
+                # scope first. The model's explicit value wins.
+                continue
             raise ScopeConflict(
                 f"{tool_name}.{tool_arg}={current!r} conflicts with the "
                 f"request scope {field}={requested!r}"

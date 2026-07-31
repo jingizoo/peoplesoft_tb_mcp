@@ -132,6 +132,29 @@ def _truncate_json(text: str, limit: int) -> str:
     return out if len(out) <= limit else out[:limit] + "\n...[truncated]"
 
 
+def _compact_args(args: dict, limit: int = 90) -> str:
+    """Readable one-line tool arguments for the trail.
+
+    Empty strings, zeros and False are the tool DEFAULTS — printing them
+    ("as_of_date":"", "customer_id":"", "detail":false ...) buried the two
+    values that actually mattered and wrapped the terminal. Show only what
+    was really set.
+    """
+    parts = []
+    for key, value in (args or {}).items():
+        if value in ("", 0, None, False, [], {}):
+            continue
+        text = value if isinstance(value, str) else json.dumps(
+            value, default=str)
+        if len(text) > 40:
+            text = text[:40] + "…"
+        parts.append(f"{key}={text}")
+    line = ", ".join(parts)
+    if len(line) > limit:
+        line = line[:limit] + "…"
+    return line
+
+
 async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     try:
         res = await session.call_tool(name, arguments=args)
@@ -336,9 +359,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 }
                 effective_args["question"] = user_text
 
-            arg_preview = json.dumps(effective_args, default=str)
-            if len(arg_preview) > 140:
-                arg_preview = arg_preview[:140] + "…"
+            arg_preview = _compact_args(effective_args)
             marker = "⊘" if blocked else "⚙"
             print(f"{DIM}  {marker} {call.name}({arg_preview}){RESET}")
 
