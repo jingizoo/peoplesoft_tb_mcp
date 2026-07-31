@@ -58,6 +58,9 @@ def _dr_cr(ending: float) -> tuple[float, float]:
 class TBEngine:
     def __init__(self, db: Database, cfg: Config):
         self.db = db
+        # Set by the server: named extra databases for ad-hoc questions.
+        self.registry = None
+        self._source_engines: dict = {}
         self.cfg = cfg
         self._setid_cache: dict[tuple[str, str], str] = {}
         self._eff_defaults: Optional[dict] = None
@@ -1793,6 +1796,26 @@ class TBEngine:
                 ranked.sort(key=lambda n: -counts.get(n, 0))
                 return ranked
         return []
+
+    def for_source(self, source: str = "") -> "TBEngine":
+        """Engine bound to a named source's Database (default: this one).
+
+        Only the ad-hoc tools route through this; curated PeopleSoft tools
+        always answer from the primary. A per-source engine is cheap (its
+        caches start empty and belong to that source's catalog) and reuses
+        the exact same guard pipeline — one code path, N databases.
+        """
+        name = (source or "").strip()
+        if name in ("", "default"):
+            return self
+        if self.registry is None:
+            from .db import DbError
+            raise DbError("No extra sources are configured; add them under "
+                          "'sources:' in config.yaml.")
+        if name not in self._source_engines:
+            eng = TBEngine(self.registry.get(name), self.cfg)
+            self._source_engines[name] = eng
+        return self._source_engines[name]
 
     def run_sql(self, sql: str, max_rows: int = 100,
                 business_unit: str = "") -> dict:

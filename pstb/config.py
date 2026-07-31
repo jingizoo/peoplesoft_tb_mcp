@@ -89,6 +89,11 @@ class Config:
     root: Path = field(default_factory=Path.cwd)
     defaults: Defaults = field(default_factory=Defaults)
     db: DbCfg = field(default_factory=DbCfg)
+    # Additional named databases for ask-anything beyond PeopleSoft.
+    # The db: block above is always the default source (the PeopleSoft one
+    # the curated tools use); entries here are reachable from run_sql /
+    # list_tables / describe_table / search_records via source=<name>.
+    sources: dict = field(default_factory=dict)
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
@@ -171,6 +176,18 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.llm, data.get("llm"))
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
+        for name, block in (data.get("sources") or {}).items():
+            src = DbCfg()
+            _apply_section(src, block)
+            # Per-source credentials come from env vars named after the
+            # source (PSTB_SRC_<NAME>_DSN/USER/PASSWORD), so secrets stay in
+            # .env with the same handling as the primary connection.
+            key = str(name).upper().replace("-", "_")
+            src.oracle_dsn = _env(f"PSTB_SRC_{key}_DSN", src.oracle_dsn)
+            src.oracle_user = _env(f"PSTB_SRC_{key}_USER", src.oracle_user)
+            src.oracle_password = _env(f"PSTB_SRC_{key}_PASSWORD",
+                                       src.oracle_password)
+            cfg.sources[str(name)] = src
 
     d, l, w = cfg.db, cfg.llm, cfg.wiki
     d.oracle_dsn = _env("ORACLE_DSN", d.oracle_dsn)

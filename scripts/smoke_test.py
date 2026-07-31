@@ -879,6 +879,40 @@ DROP TABLE OLD_BU;""")
           and _r.stdout.strip() == str(ROOT / "config.yaml"),
           _r.stdout.strip() or _r.stderr.strip()[:80])
 
+    print("== source registry: ask-anything on a second database ==")
+    from pstb.sources import SourceRegistry
+    from pstb.config import DbCfg
+    from pstb.db import DbError as _SrcErr
+    _mart = _tf.mkdtemp(prefix="pstb_mart_") + "/mart.db"
+    _mc = _sq.connect(_mart)
+    _mc.executescript("""
+CREATE TABLE BILLING_SUMMARY (REGION TEXT, TOTAL REAL);
+INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
+    _mc.commit(); _mc.close()
+    cfg_src = Config.sample(ROOT)
+    cfg_src.sources["mart"] = DbCfg(backend="sqlite", sqlite_path=_mart)
+    eng_src = TBEngine(Database(cfg_src), cfg_src)
+    eng_src.registry = SourceRegistry(cfg_src, eng_src.db)
+    rows = eng_src.for_source("mart").run_sql(
+        "SELECT REGION, TOTAL FROM BILLING_SUMMARY ORDER BY REGION")["rows"]
+    check("second source queryable through the same guard pipeline",
+          [r["region"] for r in rows] == ["EAST", "WEST"], str(rows))
+    check("default source unaffected",
+          eng_src.run_sql("SELECT COUNT(*) n FROM PS_LEDGER")["rows"][0]["n"] > 0)
+    check("per-source catalogs are isolated",
+          eng_src.for_source("mart").db.columns("BILLING_SUMMARY")
+          == {"REGION", "TOTAL"}
+          and not eng_src.db.columns("BILLING_SUMMARY"))
+    try:
+        eng_src.for_source("nope")
+        check("unknown source names the valid ones", False)
+    except _SrcErr as e:
+        check("unknown source names the valid ones",
+              "mart" in str(e) and "default" in str(e), str(e)[:70])
+    check("registry describes roles",
+          [x["source"] for x in eng_src.registry.describe()]
+          == ["default", "mart"])
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
