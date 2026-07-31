@@ -108,6 +108,25 @@ get_exchange_rate converts amounts server-side so the model never multiplies.
 A framework on top of MCP would add a dependency without fixing either
 failure mode.
 
+## Evals — pinning MODEL behavior
+
+```
+.venv/bin/python scripts/eval.py              # every case, exit 1 on failure
+.venv/bin/python scripts/eval.py --case ar-aging
+.venv/bin/python scripts/eval.py --from-qlog  # seed cases from real failures
+```
+
+The suites pin SQL and engine behavior; `evals/cases.json` pins what the
+MODEL does — which tool it picks, whether it refuses, whether it reaches for
+the wiki when it should query the ledger. Assertions are structural
+(`any_tool`, `not_tool`, `tool_args_contain`, `answer_lacks`, `not_refused`),
+never "does this read well", so a pass means the same thing every run. Run it
+after any change to prompts, tool docstrings, or the model — it caught a
+false positive in the number guard on its very first run.
+
+Real failures are the best eval material: `--from-qlog` turns flagged turns
+into pending cases for a human to grade.
+
 ## Testing
 
 `scripts/smoke_test.py` runs 202 checks on the stdlib alone (no venv required)

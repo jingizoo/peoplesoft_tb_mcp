@@ -969,6 +969,15 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           not ungrounded_figures("Margin improved 12.5%.", _pay))
     check("no payloads means no false accusations",
           not ungrounded_figures("Anything at all, 9,999,999.99.", []))
+    # Caught by the eval harness on its first run: ledger amounts are signed
+    # (credits negative) and the prompt instructs the model to present them
+    # positive with a DR/CR side, so a payload's -23,400.00 legitimately
+    # reads as "23,400.00 CR". Comparing signed values punished the model for
+    # following its instructions.
+    check("a sign-flipped credit is grounded, not fabricated",
+          not ungrounded_figures(
+              "Credits total 23,400.00 CR.",
+              [json.dumps({"totals": {"credit_amt": -23400.0}})]))
     check("payload numbers are found at any nesting depth",
           "2108161.14" in payload_numbers(_pay))
     # Read the file rather than importing it: pstb.client.chat pulls in the
