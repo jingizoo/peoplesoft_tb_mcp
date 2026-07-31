@@ -25,6 +25,20 @@ consumer, and any MCP-compatible host can connect to it instead (see below).
 Requires **Python 3.10+** and nothing else. Works on Windows, macOS, and Linux:
 
 ```bash
+python scripts/setup.py
+```
+
+That interactive wizard is the recommended path for a real deployment: it
+checks the Python version, builds the venv, verifies the sample, collects and
+**tests** your Oracle credentials, discovers business units / ledgers /
+calendar / SetID from the database itself, reports any missing SELECT grants
+as a ready-to-send GRANT statement, writes `.env` (mode 600) and
+`config.yaml`, and finishes with the pre-flight gate. It is safe to re-run —
+existing values become the defaults.
+
+For an unattended sample-only install:
+
+```bash
 python scripts/bootstrap.py
 ```
 

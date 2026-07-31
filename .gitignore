@@ -11,3 +11,5 @@ sample_data/*.db
 .idea/
 *.local.json
 logs/
+config.yaml.bak-*
+.setup-probe-config.yaml

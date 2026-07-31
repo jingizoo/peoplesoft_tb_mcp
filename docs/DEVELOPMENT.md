@@ -9,7 +9,8 @@ PeopleSoft Oracle database.
 Cross-platform (Windows, macOS, Linux):
 
 ```
-python scripts/bootstrap.py          # venv + install + seed + verify, one step
+python scripts/setup.py              # interactive: venv, credentials, discovery, pre-flight
+python scripts/bootstrap.py          # unattended: venv + install + seed + verify
 python scripts/seed_sample_data.py   # rebuild the sample ledger (stdlib only)
 python scripts/smoke_test.py         # engine tests, stdlib only, no install needed
 ```
