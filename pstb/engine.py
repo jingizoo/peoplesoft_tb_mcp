@@ -2006,8 +2006,36 @@ class TBEngine:
                                      "but narrow the query if it grows"}}
         return {}
 
+    def attach_policy(self, wiki=None, memory=None) -> None:
+        """Give the engine the wiki and site memory, so policy figures can be
+        resolved into binds. Optional: without it, policy_binds refuses rather
+        than guessing."""
+        from .policy import PolicyResolver
+
+        self._policy = PolicyResolver(wiki, memory)
+
+    def _policy_binds(self, policy_binds: Optional[dict]) -> tuple:
+        if not policy_binds:
+            return {}, [], []
+        resolver = getattr(self, "_policy", None)
+        if resolver is None:
+            from .policy import PolicyResolver
+
+            resolver = PolicyResolver(None, None)
+        return resolver.resolve_binds(policy_binds)
+
     def run_sql(self, sql: str, max_rows: int = 100,
-                business_unit: str = "") -> dict:
+                business_unit: str = "", policy_binds: Optional[dict] = None) -> dict:
+        """Run a guarded SELECT.
+
+        policy_binds maps a bind name to a policy figure the wiki defines, e.g.
+        {"threshold": "capitalization_threshold"} against SQL that says
+        `WHERE COST >= :threshold`. The value is looked up and bound HERE, so
+        the model never retypes it — a paraphrased threshold silently changes
+        which rows the user sees, and a wrong row set looks exactly as
+        confident as a right one. Anything that cannot be resolved refuses the
+        query rather than running it with a guess.
+        """
         if not self.cfg.tools.allow_raw_sql:
             raise EngineError("Raw SQL is disabled (tools.allow_raw_sql: false)")
         s = (sql or "").strip().rstrip(";").strip()
@@ -2056,11 +2084,37 @@ class TBEngine:
         # model wrote sargable SQL, and it costs nothing because EXPLAIN does
         # not execute. This is what lets allow_raw_sql stay on with
         # confidence against a real ledger.
+        binds, provenance, refusals = self._policy_binds(policy_binds)
+        if refusals:
+            raise EngineError(
+                "Policy-derived filter could not be resolved, so the query was "
+                "NOT run — running it without the filter would return a "
+                "different row set that looks just as authoritative. "
+                + " | ".join(refusals))
+        # A bind the SQL never references is a mis-wired filter: the model
+        # asked for a policy value and then wrote SQL that ignores it, which
+        # would silently return everything.
+        from .db import bind_names as _bind_names
+        referenced = _bind_names(scrubbed)
+        unused = sorted(b for b in binds if b.lower() not in referenced)
+        if unused:
+            raise EngineError(
+                "The SQL does not reference "
+                + ", ".join(f":{b}" for b in unused)
+                + ", so the policy filter would not have been applied. Add it "
+                  "to the WHERE clause or drop it from policy_binds.")
+
         plan_note = self._cost_gate(s, scrubbed)
         cap = min(max(int(max_rows or 100), 1), 500)
-        rows, truncated = self.db.query(s, {}, max_rows=cap)
+        rows, truncated = self.db.query(s, binds, max_rows=cap)
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}
+        if provenance:
+            out["policy_basis"] = provenance
+            out["policy_note"] = (
+                "These figures came from the wiki, not from the model. State "
+                "the value and cite its source page when reporting this "
+                "result — the row set depends on it.")
         if plan_note:
             out.update(plan_note)
         # Disclose, never rewrite. When a business unit is selected, say

@@ -31,6 +31,8 @@ Two contributing factors made it worse:
 | **`wiki_lookup`** | searches → **fetches** top pages → splits into heading-aware passages → BM25-ranks them → returns the passages | one call, grounded content; removes the skipped second step |
 | `pstb/retrieve.py` | passage splitting + BM25 (stdlib) | passage-level relevance, no infrastructure |
 | Answer guards | continue the loop on "I will call…"; flag a compliance verdict lacking either the rule or the figure | structure, not prompting |
+| **`resolve_policy_value`** | extracts a named policy FIGURE from the retrieved passages by regex, with the sentence and page it came from | the number must not be paraphrased |
+| **`run_sql(policy_binds=…)`** | binds that figure into the query server-side | the model writes `>= :threshold`, never the amount |
 
 Every passage carries page title, section heading, URL and version, so an
 answer can quote a sentence and name where it came from.
@@ -46,6 +48,56 @@ order rather than trusting the model to remember it:
 An error, invalid scope, or `NO DATA` result stops the chain. Wiki text is never
 used as a numerical fallback. Pure policy questions may still use the wiki
 directly, and data-only questions cannot call wiki tools.
+
+## Policy figures as query parameters
+
+Retrieval answers "what does the policy say". The harder half is "now apply
+it": *show me every asset above the capitalization threshold* needs the
+threshold to become a `WHERE` clause. Left to the model, that join happens in
+its head — and a paraphrased $10,000 where the policy says $5,000 returns a
+different row set that reads exactly as confidently as the right one. Nothing
+errors. Nothing is flagged.
+
+So the figure is extracted mechanically (`pstb/policy.py`) and bound
+server-side:
+
+```
+run_sql(
+  sql="SELECT ASSET_ID, COST FROM PS_COST WHERE COST >= :threshold",
+  policy_binds={"threshold": "capitalization_threshold"},
+)
+```
+
+The model supplies the SQL shape; the server supplies the value. The result
+carries `policy_basis` — value, unit, the verbatim sentence, and the page —
+so the answer can cite the rule it applied.
+
+Extraction is sentence-scoped: a figure counts only when it shares a sentence
+with the term's own vocabulary. A capitalization page also lists useful lives
+and approval chains, and taking the first number on the page is how you end up
+filtering assets at $3.
+
+Four outcomes refuse rather than guess:
+
+| status | when | why refusing is right |
+|---|---|---|
+| `ambiguous` | the corpus carries two different figures | a stale page nobody retired looks identical to a current one; quote both and ask |
+| `not_found` | no passage carries a figure | otherwise the model supplies one from training data — the exact failure this removes |
+| `demo_content` | the bundled sample policies | fictional rules must never filter a real ledger |
+| `no_wiki` | nothing configured to read | ask the user and say the value was supplied by hand |
+
+`run_sql` also refuses when the SQL never references a bind that was named:
+asking for a threshold and then forgetting the `WHERE` clause would silently
+report the unfiltered count as "assets above the threshold".
+
+Precedence: an **approved site-memory fact outranks a wiki scrape**, because a
+human confirmed it for this deployment. That is disclosed in the result, not
+applied silently. Add one with `remember_site_fact`, approve it with
+`python -m pstb.memory`.
+
+`list_policy_terms` reports the figures that can be resolved. For anything
+outside that list, read the page with `wiki_lookup` and apply it explicitly —
+stating the source, never as a silent filter.
 
 ## When a vector database *is* the right call
 

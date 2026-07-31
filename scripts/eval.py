@@ -67,13 +67,18 @@ def _grade(case: dict, answer: str, calls: list) -> list:
     # A tool that was CALLED but ERRORED is not evidence the feature works.
     # PR #34 shipped run_playbook whose module was never imported: the eval
     # saw the call, the model narrated the error, and the case passed.
+    #
+    # But the bar is "at least one call SUCCEEDED", not "no call failed".
+    # Recovering from a bad argument is the loop working as designed — a model
+    # that guessed source="PeopleSoft", read the error listing the real source
+    # names and immediately retried has demonstrated exactly the behaviour we
+    # want, and failing it here trains the harness to punish resilience.
     if want_any:
-        broken = [c for c in calls
-                  if c.get("tool") in want_any and c.get("ok") is False]
-        if broken:
+        attempts = [c for c in calls if c.get("tool") in want_any]
+        if attempts and not any(c.get("ok") for c in attempts):
             problems.append(
-                "expected tool(s) failed: "
-                + ", ".join(sorted({c["tool"] for c in broken})))
+                "every call to the expected tool(s) failed: "
+                + ", ".join(sorted({c["tool"] for c in attempts})))
 
     for banned in expect.get("not_tool") or []:
         if banned in called:
@@ -164,6 +169,17 @@ async def _main(args) -> int:
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    # Point the wiki at the eval fixture, not the bundled demo pages. The
+    # evidence gate correctly refuses demo content as support for a policy
+    # answer, which made every policy case unpassable here — a permanently
+    # red case teaches you to stop reading the eval. The fixture pages are
+    # ordinary policy documents, so these cases test the real path.
+    fixture = ROOT / "evals" / "wiki"
+    if fixture.is_dir():
+        env["PSTB_WIKI_PROVIDER"] = "localdocs"
+        env["PSTB_WIKI_LOCALDOCS_PATH"] = str(fixture)
+        cfg.wiki.provider = "localdocs"
+        cfg.wiki.localdocs_path = str(fixture)
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "pstb.server"], env=env)
 

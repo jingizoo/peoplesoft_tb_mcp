@@ -214,4 +214,9 @@ def load_config(path: Optional[str] = None) -> Config:
     w.confluence_labels = _env("CONFLUENCE_LABELS", w.confluence_labels)
     w.confluence_email = _env("CONFLUENCE_EMAIL", w.confluence_email)
     w.confluence_api_token = _env("CONFLUENCE_API_TOKEN", w.confluence_api_token)
+    # Lets a harness point the wiki somewhere else without editing config.yaml
+    # — the eval uses it to test policy answers against ordinary documents
+    # rather than the bundled demo pages, which the evidence gate refuses.
+    w.provider = _env("PSTB_WIKI_PROVIDER", w.provider)
+    w.localdocs_path = _env("PSTB_WIKI_LOCALDOCS_PATH", w.localdocs_path)
     return cfg
