@@ -528,13 +528,20 @@ def ungrounded_figures(answer: str, payloads) -> list:
         key = _numeric_key(text)
         if key in grounded:
             continue
+        # Ledger amounts are SIGNED (credits negative) and the prompt tells
+        # the model to present them the way accountants read them — positive
+        # with a DR/CR side. So a payload's -23,400.00 legitimately appears as
+        # "23,400.00 CR" in prose. Compare magnitudes too, or the guard
+        # punishes the model for following its instructions.
+        if key.lstrip("-") in {g.lstrip("-") for g in grounded}:
+            continue
         # tolerate a rounded restatement of a grounded value
         try:
             stated = float(text.replace(",", ""))
         except ValueError:
             continue
         decimals = len(text.split(".")[1]) if "." in text else 0
-        if any(round(float(g), decimals) == round(stated, decimals)
+        if any(round(abs(float(g)), decimals) == round(abs(stated), decimals)
                for g in grounded if _is_number(g)):
             continue
         missing.append(text)
