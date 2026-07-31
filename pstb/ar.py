@@ -157,6 +157,36 @@ class ARBilling:
         db-level catalog (one cache, one mechanism, for every module)."""
         return self.db.columns(table)
 
+    def _customer_shape(self) -> dict:
+        """Which optional PS_CUSTOMER columns exist here.
+
+        NAME1 is treated in two different ways on purpose. As a DISPLAY label
+        it degrades to NULL like any other decoration. As the SEARCH PREDICATE
+        in search_customers it must not: `UPPER(NULL) LIKE :q` matches nothing,
+        so a site without NAME1 would be told "no such customer" about
+        customers that plainly exist. Absent there, name search is withdrawn
+        and said so, and the ID search still runs.
+        """
+        if "PS_CUSTOMER" in self._shapes:
+            return self._shapes["PS_CUSTOMER"]
+        cols = self._cols("PS_CUSTOMER")
+        shape = {
+            "name": "NAME1" if (not cols or "NAME1" in cols) else "",
+            "status": "CUST_STATUS" if (not cols or "CUST_STATUS" in cols) else "",
+            "notes": [],
+        }
+        if cols and not shape["name"]:
+            shape["notes"].append(
+                "PS_CUSTOMER here has no NAME1; customers are identified by ID "
+                "only and searching by customer NAME is not available.")
+        if cols and not shape["status"]:
+            shape["notes"].append(
+                "PS_CUSTOMER here has no CUST_STATUS; active/inactive is not "
+                "reported.")
+        if cols:
+            self._shapes["PS_CUSTOMER"] = shape
+        return shape
+
     def _item_shape(self) -> dict:
         """Which optional PS_ITEM columns exist here, with fallbacks: item
         date ACCTG_DT -> ASOF_DT -> due-date-only aging; DISPUTE_STATUS and
@@ -330,8 +360,13 @@ class ARBilling:
         asof_cut = (f"\n   AND I.{shape['date']} <= {self.db.date_bind('asof')}"
                     if shape["date"] else "")
         cust_clause = " AND I.CUST_ID = :cust" if cust_filter else ""
-        return f"""SELECT I.CUST_ID AS cust_id, C.NAME1 AS name,
-       C.CUST_STATUS AS cust_status, {cur_sel},
+        cs = self._customer_shape()
+        c_name = f"C.{cs['name']} AS name" if cs["name"] else "NULL AS name"
+        c_stat = (f"C.{cs['status']} AS cust_status" if cs["status"]
+                  else "NULL AS cust_status")
+        c_group = "".join(f", C.{c}" for c in (cs["name"], cs["status"]) if c)
+        return f"""SELECT I.CUST_ID AS cust_id, {c_name},
+       {c_stat}, {cur_sel},
        {', '.join(cases)},
        SUM(I.BAL_AMT) AS total,
        SUM(CASE WHEN I.BAL_AMT < 0 THEN I.BAL_AMT ELSE 0 END) AS credit_amt,
@@ -342,7 +377,7 @@ class ARBilling:
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = I.CUST_ID
  WHERE I.BUSINESS_UNIT = :bu
    AND I.ITEM_STATUS = 'O'{asof_cut}{cust_clause}
- GROUP BY I.CUST_ID, C.NAME1, C.CUST_STATUS{group_cur}"""
+ GROUP BY I.CUST_ID{c_group}{group_cur}"""
 
     def _detail_sql(self, cust_filter: bool, shape: dict) -> str:
         p = self.db.prefix
@@ -590,20 +625,29 @@ class ARBilling:
             "q": f"%{(query or '').upper()}%",
             "qa": f"{(query or '').strip().upper()}%",
         }
-        sql = f"""SELECT C.CUST_ID AS cust_id, C.NAME1 AS name,
-       C.CUST_STATUS AS status, COALESCE(B.bal, 0) AS open_balance
+        cs = self._customer_shape()
+        c_name = f"C.{cs['name']} AS name" if cs["name"] else "NULL AS name"
+        c_stat = (f"C.{cs['status']} AS status" if cs["status"]
+                  else "NULL AS status")
+        # Withdraw the name predicate rather than let it match nothing.
+        name_pred = f"UPPER(C.{cs['name']}) LIKE :q OR " if cs["name"] else ""
+        sql = f"""SELECT C.CUST_ID AS cust_id, {c_name},
+       {c_stat}, COALESCE(B.bal, 0) AS open_balance
   FROM {p}PS_CUSTOMER C
   LEFT JOIN (SELECT CUST_ID, SUM(BAL_AMT) AS bal FROM {p}PS_ITEM
               WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'
               GROUP BY CUST_ID) B ON B.CUST_ID = C.CUST_ID
  WHERE C.SETID = :setid
-   AND (UPPER(C.NAME1) LIKE :q OR UPPER(C.CUST_ID) LIKE :qa)
+   AND ({name_pred}UPPER(C.CUST_ID) LIKE :qa)
  ORDER BY C.CUST_ID"""
         rows, truncated = self.db.query(sql, params, max_rows=max(int(limit or 25), 1))
         for r in rows:
             r["open_balance"] = r2(r["open_balance"])
-        return {"customers": rows, "count": len(rows), "truncated": truncated,
-                "note": "status A=active, I=inactive; open_balance sums open items"}
+        out = {"customers": rows, "count": len(rows), "truncated": truncated,
+               "note": "status A=active, I=inactive; open_balance sums open items"}
+        if cs["notes"]:
+            out["record_notes"] = cs["notes"]
+        return out
 
     def top_billing_customers(self, business_unit: str = "", n: int = 10,
                               months: int = 12, as_of_date: str = "",
@@ -636,15 +680,19 @@ class ARBilling:
             record_notes.append("PS_BI_HDR here has no BI_CURRENCY_CD; "
                                 "invoice amounts are assumed to be in the BU "
                                 "base currency.")
+        _cs = self._customer_shape()
+        tb_name = f"C.{_cs['name']} AS name" if _cs["name"] else "NULL AS name"
+        tb_group = f", C.{_cs['name']}" if _cs["name"] else ""
+        record_notes.extend(n for n in _cs["notes"] if n not in record_notes)
         rows, _ = self.db.query(
-            f"""SELECT H.BILL_TO_CUST_ID AS cust_id, C.NAME1 AS name,
+            f"""SELECT H.BILL_TO_CUST_ID AS cust_id, {tb_name},
        {cur_sel}, COUNT(*) AS invoices,
        SUM(H.INVOICE_AMOUNT) AS billed
   FROM {p}PS_BI_HDR H
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
  WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
- GROUP BY H.BILL_TO_CUST_ID, C.NAME1{group_cur}""",
+ GROUP BY H.BILL_TO_CUST_ID{tb_group}{group_cur}""",
             {"bu": bu, "setid": setid, "since": since}, max_rows=10_000,
         )
         base = self.e.base_currency_for(bu) or "USD"

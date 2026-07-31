@@ -41,9 +41,25 @@ class QueryCountRecorder:
     def __exit__(self, *exc) -> None:
         self.db.query = self._orig
 
+    _CATALOG = ("PRAGMA", "ALL_TAB_COLUMNS", "USER_TAB_COLUMNS",
+                "INFORMATION_SCHEMA.COLUMNS", "table_info")
+
     @property
     def count(self) -> int:
         return len(self.sql)
+
+    @property
+    def catalog(self) -> list:
+        """Column-shape probes. These are one-off per record per process and
+        cached in Database._catalog, so they belong in a different budget from
+        the queries that read facts — adapting one more record must not read
+        as a latency regression."""
+        return [s for s in self.sql if any(m in s.upper() for m in self._CATALOG)]
+
+    @property
+    def data(self) -> list:
+        cat = set(map(id, self.catalog))
+        return [s for s in self.sql if id(s) not in cat]
 
 
 class SetupLookupCacheTests(unittest.TestCase):
@@ -61,10 +77,16 @@ class SetupLookupCacheTests(unittest.TestCase):
             self.ar.aging()
         with QueryCountRecorder(self.db) as warm:
             self.ar.aging()
+        # Bound the queries that READ FACTS. Column-shape probes are counted
+        # separately below: they are cached per process, so adapting one more
+        # record to a site's real shape must not look like a slowdown here.
         self.assertLessEqual(
-            cold.count, 16,
-            f"first aging call issued {cold.count} statements:\n"
-            + "\n".join(s[:90] for s in cold.sql))
+            len(cold.data), 15,
+            f"first aging call issued {len(cold.data)} data statements:\n"
+            + "\n".join(s[:90] for s in cold.data))
+        self.assertEqual(
+            warm.catalog, [],
+            "column shapes are being re-probed on every call instead of cached")
         # The second call may only re-run the queries that read facts. If this
         # climbs back toward the cold count, a setup lookup has escaped its
         # cache again.

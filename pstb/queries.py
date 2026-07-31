@@ -60,6 +60,21 @@ def opt_expr(db: Database, table: str, column: str, present: str,
     return present if db.has_column(table, column) else absent
 
 
+def header_descr(db: Database, alias: str, qualifier: str = "") -> str:
+    """Journal-header description, whatever this release calls it.
+
+    PeopleSoft carries the header's free text as DESCR254_MIXED on some
+    releases and DESCR254 on others, and customised header records sometimes
+    have neither. One helper so the builders that need it cannot drift apart —
+    they already had, which is how drill_to_journals kept a hard reference
+    after unposted_journals was fixed.
+    """
+    for col in ("DESCR254_MIXED", "DESCR254", "DESCR"):
+        if db.has_column("PS_JRNL_HEADER", col):
+            return opt(db, "PS_JRNL_HEADER", col, alias, qualifier)
+    return "NULL AS {0}".format(alias)
+
+
 def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
                  alias: str = "L", base_currency: str = "") -> str:
     """Currency / amount-basis contract, applied identically by every tool.
@@ -84,11 +99,19 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
         # Oracle treats '' as NULL, so TRIM(' ') yields NULL and a plain
         # `TRIM(x) = ''` test is UNKNOWN — which would silently exclude every
         # monetary row on Oracle while passing on SQLite. Test both forms.
-        clause = (
+        # The predicate exists only to exclude statistical rows (headcount,
+        # square footage, units). A ledger record with no STATISTICS_CODE
+        # column cannot hold a statistical row, so dropping it is exactly
+        # right rather than merely tolerable — and this clause is shared by
+        # every ledger query in the product, so an ORA-00904 here would take
+        # out every GL number at once. has_column defaults to True when the
+        # catalog is unreadable, so the predicate survives wherever it should.
+        clause = opt_expr(
+            db, "PS_LEDGER", "STATISTICS_CODE",
             f" AND ({alias}.STATISTICS_CODE IS NULL"
             f" OR TRIM({alias}.STATISTICS_CODE) IS NULL"
-            f" OR TRIM({alias}.STATISTICS_CODE) = '')"
-        )
+            f" OR TRIM({alias}.STATISTICS_CODE) = '')",
+            "")
         # NO currency predicate on the base basis. CURRENCY_CD is the
         # TRANSACTION currency and POSTED_TOTAL_AMT is already the base
         # amount on every row — a journal entered in EUR posts only a
@@ -205,6 +228,28 @@ def tb_period_sums(
     extra_inner_sel = "".join(f", L.{c}" for c in extras)
     extra_outer_sel = "".join(f", T.{c} AS {c.lower()}" for c in extras)
     today = db.today_expr()
+    # The account table supplies DECORATION on top of an already-correct
+    # aggregate: the balances come from the subquery above and do not depend
+    # on it. A site whose PS_GL_ACCOUNT_TBL lacks DESCR or EFF_STATUS must
+    # still get its trial balance, so those are routed through opt(). Two
+    # deliberate exclusions:
+    #   ACCOUNT_TYPE stays required — a null account type silently misclassifies
+    #   an income statement, which is a wrong number, not a missing label.
+    #   SETID/EFFDT drop out together: without effective dating there is one
+    #   row per account and no snapshot to pick.
+    a_descr = opt(db, "PS_GL_ACCOUNT_TBL", "DESCR", "DESCR", "A2")
+    a_effst = opt(db, "PS_GL_ACCOUNT_TBL", "EFF_STATUS", "EFF_STATUS", "A2")
+    a_setid = opt_expr(db, "PS_GL_ACCOUNT_TBL", "SETID",
+                       "A2.SETID = :setid", "1 = 1")
+    if db.has_column("PS_GL_ACCOUNT_TBL", "EFFDT"):
+        setid_corr = opt_expr(db, "PS_GL_ACCOUNT_TBL", "SETID",
+                              "AX.SETID = A2.SETID AND ", "")
+        a_effdt = (f"""AND A2.EFFDT = (SELECT MAX(AX.EFFDT)
+                                 FROM {p}PS_GL_ACCOUNT_TBL AX
+                                WHERE {setid_corr}AX.ACCOUNT = A2.ACCOUNT
+                                  AND AX.EFFDT <= {today})""")
+    else:
+        a_effdt = ""
     return f"""SELECT T.account AS account, A.DESCR AS descr,
        A.ACCOUNT_TYPE AS acct_type, A.EFF_STATUS AS eff_status{extra_outer_sel},
        T.period AS period, T.amt AS amt
@@ -217,13 +262,10 @@ def tb_period_sums(
            AND {period_filter}
            {where_extra}
          GROUP BY L.ACCOUNT{extra_inner_sel}, L.ACCOUNTING_PERIOD) T
-  LEFT JOIN (SELECT A2.ACCOUNT, A2.DESCR, A2.ACCOUNT_TYPE, A2.EFF_STATUS
+  LEFT JOIN (SELECT A2.ACCOUNT, {a_descr}, A2.ACCOUNT_TYPE, {a_effst}
                FROM {p}PS_GL_ACCOUNT_TBL A2
-              WHERE A2.SETID = :setid
-                AND A2.EFFDT = (SELECT MAX(AX.EFFDT) FROM {p}PS_GL_ACCOUNT_TBL AX
-                                 WHERE AX.SETID = A2.SETID
-                                   AND AX.ACCOUNT = A2.ACCOUNT
-                                   AND AX.EFFDT <= {today})) A
+              WHERE {a_setid}
+                {a_effdt}) A
     ON A.ACCOUNT = T.account"""
 
 
@@ -231,12 +273,30 @@ def journal_lines(db: Database, dept: str, params: dict) -> str:
     p = db.prefix
     dept_clause = ""
     if dept:
+        # A department filter that cannot be applied must not return the
+        # unfiltered set — that is a wrong answer wearing a filter's label.
+        # This one refuses out loud, unlike the descriptive columns below.
+        if not db.has_column("PS_JRNL_LN", "DEPTID"):
+            raise ValueError(
+                "This site's PS_JRNL_LN has no DEPTID column, so journal "
+                "lines cannot be filtered by department. Re-run without the "
+                "department filter, or use describe_record PS_JRNL_LN to see "
+                "which chartfields this record does carry."
+            )
         params["dept"] = dept
         dept_clause = " AND J.DEPTID = :dept"
+    # Everything except the identity and the amount is a label here: the drill
+    # answers "which journals moved this account", and JOURNAL_ID plus
+    # MONETARY_AMOUNT answer it. The sibling builder unposted_journals already
+    # adapts the identical header columns; this one was left behind, so an
+    # absent OPRID took out the only tool that proves a balance.
+    j, h = "PS_JRNL_LN", "PS_JRNL_HEADER"
     return f"""SELECT H.JOURNAL_ID AS journal_id, H.JOURNAL_DATE AS journal_date,
-       H.SOURCE AS source, H.OPRID AS oprid, H.DESCR254_MIXED AS jrnl_descr,
-       J.JOURNAL_LINE AS line_nbr, J.DEPTID AS deptid, J.CURRENCY_CD AS currency_cd,
-       J.MONETARY_AMOUNT AS amount, J.LINE_DESCR AS line_descr
+       {opt(db, h, 'SOURCE', 'source', 'H')}, {opt(db, h, 'OPRID', 'oprid', 'H')},
+       {header_descr(db, 'jrnl_descr', 'H')},
+       J.JOURNAL_LINE AS line_nbr, {opt(db, j, 'DEPTID', 'deptid', 'J')},
+       {opt(db, j, 'CURRENCY_CD', 'currency_cd', 'J')},
+       J.MONETARY_AMOUNT AS amount, {opt(db, j, 'LINE_DESCR', 'line_descr', 'J')}
   FROM {p}PS_JRNL_LN J
   JOIN {p}PS_JRNL_HEADER H
     ON H.BUSINESS_UNIT = J.BUSINESS_UNIT
@@ -253,16 +313,31 @@ def journal_lines(db: Database, dept: str, params: dict) -> str:
 
 
 def unposted_journals(db: Database) -> str:
+    """Journals not yet posted. The finding is the journal itself; who entered
+    it, which subsystem it came from and its free-text description are labels
+    on that finding, so they degrade to NULL rather than taking the check
+    down. DESCR254_MIXED in particular is renamed or absent across releases.
+    """
     p = db.prefix
+    j = "PS_JRNL_HEADER"
+    descr = header_descr(db, "descr")
+    # No LEDGER_GROUP here means the record cannot be narrowed to one ledger
+    # group; listing every unposted journal for the unit is the safe side of
+    # that trade — a close check must not under-report.
+    led_clause = opt_expr(
+        db, j, "LEDGER_GROUP",
+        "AND (LEDGER_GROUP = :ledger OR :ledger IS NULL OR LEDGER_GROUP IS NULL)",
+        "")
     return f"""SELECT JOURNAL_ID AS journal_id, JOURNAL_DATE AS journal_date,
        ACCOUNTING_PERIOD AS period, JRNL_HDR_STATUS AS status,
-       SOURCE AS source, OPRID AS oprid, DESCR254_MIXED AS descr
-  FROM {p}PS_JRNL_HEADER
+       {opt(db, j, 'SOURCE', 'source')}, {opt(db, j, 'OPRID', 'oprid')},
+       {descr}
+  FROM {p}{j}
  WHERE BUSINESS_UNIT = :bu
    AND FISCAL_YEAR = :fy
    AND ACCOUNTING_PERIOD BETWEEN 1 AND :maxper
    AND JRNL_HDR_STATUS NOT IN ('P', 'D')
-   AND (LEDGER_GROUP = :ledger OR :ledger IS NULL OR LEDGER_GROUP IS NULL)
+   {led_clause}
  ORDER BY ACCOUNTING_PERIOD, JOURNAL_DATE, JOURNAL_ID"""
 
 

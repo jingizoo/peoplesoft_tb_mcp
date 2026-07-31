@@ -31,6 +31,60 @@ def _to_qmark(sql: str, params: dict) -> tuple[str, list]:
     return _BIND_RE.sub(sub, sql), ordered
 
 
+def _blank_literals(sql: str) -> str:
+    """Blank out quoted string literals, preserving length.
+
+    A :name inside a literal is text, not a bind. Length is preserved so
+    offsets into the result still line up with the original statement.
+    """
+    out = list(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch not in ("'", '"'):
+            i += 1
+            continue
+        out[i] = " "
+        j = i + 1
+        while j < n:
+            if sql[j] == ch:
+                if j + 1 < n and sql[j + 1] == ch:   # '' escapes a quote
+                    out[j] = out[j + 1] = " "
+                    j += 2
+                    continue
+                out[j] = " "
+                break
+            out[j] = " "
+            j += 1
+        i = j + 1
+    return "".join(out)
+
+
+def bind_names(sql: str) -> set:
+    """Lowercase bind names the statement actually references."""
+    return {m.lower() for m in _BIND_RE.findall(_blank_literals(sql))}
+
+
+def _bound_params(sql: str, params: dict) -> dict:
+    """Drop parameters the statement does not reference.
+
+    python-oracledb in thin mode raises DPY-4008 when handed a bind the
+    statement never uses. That now happens by design: opt_expr() replaces a
+    predicate like `A2.SETID = :setid` with `1 = 1` on a record that has no
+    SETID, while the caller still passes setid. Filtering at the point of
+    execution lets any builder drop a predicate without also having to reach
+    back and prune its caller's parameter dict — otherwise every optional
+    column carrying a bind would be a DPY-4008 waiting for the one site whose
+    record lacks it.
+    """
+    if not params:
+        return params
+    used = bind_names(sql)
+    if all(k.lower() in used for k in params):
+        return params
+    return {k: v for k, v in params.items() if k.lower() in used}
+
+
 def _jsonable(v: Any) -> Any:
     if hasattr(v, "isoformat"):  # datetime.date / datetime.datetime
         return v.isoformat()[:10] if getattr(v, "hour", None) in (None, 0) else v.isoformat()
@@ -396,7 +450,7 @@ class Database:
                         qsql, seq = _to_qmark(sql, params)
                         cur.execute(qsql, seq)
                     else:
-                        cur.execute(sql, params)
+                        cur.execute(sql, _bound_params(sql, params))
                     cols = [d[0].lower() for d in cur.description]
                     raw = cur.fetchmany(cap + 1)
                     truncated = len(raw) > cap

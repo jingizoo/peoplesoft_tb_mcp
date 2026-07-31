@@ -951,7 +951,13 @@ class TBEngine:
         params: dict = {
             "bu": bu, "ledger": led, "acct": account.strip(), "fy": fy, "per": per,
         }
-        sql = q.journal_lines(self.db, dept, params)
+        try:
+            sql = q.journal_lines(self.db, dept, params)
+        except ValueError as e:
+            # A department filter this record cannot support. Surface it as a
+            # tool error the model can relay, not a raw ValueError — and never
+            # by quietly returning the unfiltered set.
+            raise EngineError(str(e))
         cap = max(int(limit or 100), 1)
         lines, truncated = self.db.query(sql, params, max_rows=cap)
         jrnl_total = sum(float(l["amount"] or 0) for l in lines)
@@ -1082,21 +1088,47 @@ class TBEngine:
         if inactive:
             issues.append(f"{len(inactive)} inactive account(s) carry balances")
 
+        # Each control probe stands on its own. The balance verdict above is
+        # already computed and correct; an unreadable journal record must cost
+        # the journal checks only, not the answer to "do the books balance".
+        # Anything that could not run is named in checks_incomplete and forces
+        # control_status away from "passed" — a check that did not run is
+        # never a clean check.
+        incomplete: list = []
+
+        def probe(name: str, fn, default):
+            try:
+                return fn()
+            except Exception as e:                     # noqa: BLE001
+                incomplete.append({"check": name,
+                                   "reason": f"{type(e).__name__}: {e}"})
+                return default
+
         params = {"bu": bu, "fy": fy, "maxper": per, "ledger": led}
-        unposted, _ = self.db.query(q.unposted_journals(self.db), params, max_rows=50)
+        unposted = probe(
+            "unposted_journals",
+            lambda: self.db.query(q.unposted_journals(self.db), params,
+                                  max_rows=50)[0], [])
         for u in unposted:
             u["status_descr"] = JRNL_STATUS.get(u.get("status"), u.get("status"))
         if unposted:
             issues.append(f"{len(unposted)} journal(s) in periods 1-{per} are not posted")
 
         params = {"bu": bu, "ledger": led, "fy": fy, "maxper": per}
-        oob, _ = self.db.query(q.out_of_balance_journals(self.db), params, max_rows=50)
+        oob = probe(
+            "out_of_balance_journals",
+            lambda: self.db.query(q.out_of_balance_journals(self.db), params,
+                                  max_rows=50)[0], [])
         if oob:
             issues.append(f"{len(oob)} posted journal(s) do not net to zero")
 
-        re_roll = self._retained_earnings_roll(bu, led, fy)
+        re_roll = probe("retained_earnings_roll",
+                        lambda: self._retained_earnings_roll(bu, led, fy),
+                        {"status": "not_evaluated"})
         if re_roll.get("status") == "mismatch":
             issues.append("Beginning balances do not roll from prior-year close")
+        if incomplete:
+            issues.append(f"{len(incomplete)} control check(s) could not run")
 
         return {
             "business_unit": bu,
@@ -1115,10 +1147,15 @@ class TBEngine:
             "out_of_balance_journals": oob,
             "retained_earnings_roll": re_roll,
             "issues": issues,
+            "checks_incomplete": incomplete,
             # "control_status" describes the exception checks, NOT whether the
             # books balance — keep those two verdicts separately named so a
-            # reader (human or model) cannot conflate them.
-            "control_status": "passed" if not issues else "exceptions_found",
+            # reader (human or model) cannot conflate them. A probe that could
+            # not run outranks both: it is reported as checks_incomplete so it
+            # can never be read as a clean control environment.
+            "control_status": ("checks_incomplete" if incomplete
+                               else "passed" if not issues
+                               else "exceptions_found"),
             "clean": not issues,
             "scope_status": "ok",
             "summary": (
