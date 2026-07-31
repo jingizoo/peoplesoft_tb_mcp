@@ -64,6 +64,7 @@ class TBEngine:
         self._eff_defaults_expires_at = 0.0
         self._scope_cache_ttl_seconds = SCOPE_CACHE_TTL_SECONDS
         self._tree_ctl: dict = {}
+        self._record_cols: dict = {}
 
     # ------------------------------------------------------------------ utils
     def _adj_periods(self) -> list[int]:
@@ -1163,6 +1164,107 @@ class TBEngine:
     def list_trees(self) -> dict:
         rows, _ = self.db.query(q.trees_list(self.db), {}, max_rows=100)
         return {"trees": rows}
+
+    def record_columns(self, table: str) -> set:
+        """Columns a record actually has here — the shared db-level catalog."""
+        return self.db.columns(table)
+
+    # Every record the curated tools touch, with the columns they NEED versus
+    # the ones they merely PREFER. One manifest, checked in one pass, so a
+    # port reports every shape difference up front instead of leaking them
+    # one ORA-00904 at a time as questions happen to hit them.
+    RECORD_MANIFEST = {
+        "PS_LEDGER": {
+            "required": ["BUSINESS_UNIT", "LEDGER", "FISCAL_YEAR",
+                         "ACCOUNTING_PERIOD", "ACCOUNT", "POSTED_TOTAL_AMT"],
+            "optional": ["DEPTID", "CURRENCY_CD", "BASE_CURRENCY",
+                         "STATISTICS_CODE", "POSTED_TRAN_AMT"],
+        },
+        "PS_GL_ACCOUNT_TBL": {
+            "required": ["SETID", "ACCOUNT", "EFFDT"],
+            "optional": ["DESCR", "ACCOUNT_TYPE", "EFF_STATUS"],
+        },
+        "PS_BUS_UNIT_TBL_GL": {
+            "required": ["BUSINESS_UNIT"],
+            "optional": ["DESCR", "BASE_CURRENCY"],
+        },
+        "PS_SET_CNTRL_REC": {
+            "required": ["SETCNTRLVALUE", "RECNAME", "SETID"], "optional": [],
+        },
+        "PS_CAL_DETP_TBL": {
+            "required": ["SETID", "CALENDAR_ID", "FISCAL_YEAR",
+                         "ACCOUNTING_PERIOD"],
+            "optional": [],
+        },
+        "PS_JRNL_HEADER": {
+            "required": ["BUSINESS_UNIT", "JOURNAL_ID", "JOURNAL_DATE"],
+            "optional": ["SOURCE", "OPRID", "JRNL_HDR_STATUS", "POSTED_DATE"],
+        },
+        "PS_JRNL_LN": {
+            "required": ["BUSINESS_UNIT", "JOURNAL_ID", "ACCOUNT"],
+            "optional": ["LINE_DESCR", "DEPTID", "MONETARY_AMOUNT"],
+        },
+        "PS_ITEM": {
+            "required": ["BUSINESS_UNIT", "CUST_ID", "ITEM", "ITEM_STATUS",
+                         "BAL_AMT"],
+            "optional": ["ACCTG_DT", "ASOF_DT", "DUE_DT", "DISPUTE_STATUS",
+                         "BAL_CURRENCY"],
+        },
+        "PS_CUSTOMER": {
+            "required": ["SETID", "CUST_ID"],
+            "optional": ["NAME1", "CUST_STATUS"],
+        },
+        "PS_BI_HDR": {
+            "required": ["BUSINESS_UNIT", "INVOICE", "BILL_STATUS"],
+            "optional": ["BILL_TO_CUST_ID", "INVOICE_DT", "INVOICE_AMOUNT",
+                         "BILL_SOURCE_ID", "BI_CURRENCY_CD"],
+        },
+        "PS_INTFC_BI": {
+            "required": [],
+            "optional": ["INTFC_ID", "INTFC_LINE_NUM", "LOAD_STATUS_BI",
+                         "BILL_TO_CUST_ID", "BILL_SOURCE_ID"],
+        },
+        "PS_RT_RATE_TBL": {
+            "required": [],
+            "optional": ["FROM_CUR", "TO_CUR", "RT_TYPE", "EFFDT", "RATE_MULT",
+                         "RATE_DIV"],
+        },
+        "PSTREEDEFN": {
+            "required": [],
+            "optional": ["SETID", "SETCNTRLVALUE", "TREE_NAME", "EFFDT"],
+        },
+        "PSRECDEFN": {
+            "required": [],
+            "optional": ["RECNAME", "RECDESCR", "RECTYPE", "SQLTABLENAME"],
+        },
+    }
+
+    def audit_record_shapes(self) -> dict:
+        """Compare every record the tools touch against the live catalog.
+
+        One pass, run at port time (diagnose_db) or on demand: reports
+        missing REQUIRED columns (the tool cannot work), missing OPTIONAL
+        columns (a feature degrades, with disclosure), and unreadable
+        records (grants). This is the metadata-first contract: the shape is
+        read before any curated SQL assumes it.
+        """
+        report = {"unreadable": [], "missing_required": {},
+                  "missing_optional": {}, "clean": []}
+        for table, spec in self.RECORD_MANIFEST.items():
+            cols = self.db.columns(table)
+            if not cols:
+                report["unreadable"].append(table)
+                continue
+            need = [c for c in spec["required"] if c not in cols]
+            nice = [c for c in spec["optional"] if c not in cols]
+            if need:
+                report["missing_required"][table] = need
+            if nice:
+                report["missing_optional"][table] = nice
+            if not need and not nice:
+                report["clean"].append(table)
+        report["ok"] = not report["missing_required"]
+        return report
 
     def _business_unit_enrichment(self) -> dict[str, dict]:
         """Best-effort setup metadata, never the authority for valid scopes."""

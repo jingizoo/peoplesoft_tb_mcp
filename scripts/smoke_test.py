@@ -803,6 +803,34 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
           and degraded["notes"], str(degraded)[:120])
     _sh.rmtree(_tmpc)
 
+    # A site whose PS_BUS_UNIT_TBL_GL has no DESCR must not lose the whole
+    # business-unit list to ORA-00904 (seen on a real instance).
+    _tmpb = Path(_tf.mkdtemp(prefix="pstb_bu_"))
+    _bdb = _tmpb / "nodescr.db"
+    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _bdb)
+    _bc = _sq.connect(_bdb)
+    _bc.executescript("""
+ALTER TABLE PS_BUS_UNIT_TBL_GL RENAME TO OLD_BU;
+CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, BASE_CURRENCY TEXT);
+INSERT INTO PS_BUS_UNIT_TBL_GL SELECT BUSINESS_UNIT, BASE_CURRENCY FROM OLD_BU;
+DROP TABLE OLD_BU;""")
+    _bc.commit(); _bc.close()
+    cfg_b = Config.sample(ROOT)
+    cfg_b.db.sqlite_path = str(_bdb)
+    eng_b = TBEngine(Database(cfg_b), cfg_b)
+    check("record_columns reports the real shape",
+          eng_b.record_columns("PS_BUS_UNIT_TBL_GL")
+          == {"BUSINESS_UNIT", "BASE_CURRENCY"},
+          str(sorted(eng_b.record_columns("PS_BUS_UNIT_TBL_GL"))))
+    bus = eng_b.list_business_units()["business_units"]
+    check("business units survive a missing DESCR column",
+          [b["business_unit"] for b in bus] == ["US001"]
+          and bus[0]["descr"] is None and bus[0]["base_currency"] == "USD",
+          str(bus))
+    check("trial balance unaffected by the missing column",
+          eng_b.trial_balance(fiscal_year=2026, period=6)["totals"]["in_balance"])
+    _sh.rmtree(_tmpb)
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
