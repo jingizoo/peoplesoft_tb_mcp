@@ -93,6 +93,15 @@ See docs/NVISION.md for migrating existing nVision layouts.
      lists the conversions)*
 48s. Show the aging converted to INR. *(same — never per-row math in the model)*
 
+## Custom & site-specific records → `search_records`, `describe_record`
+48t. What files are configured in our file interface? *(no table name known —
+     search_records("file interface") searches PeopleTools RECDESCR, finds
+     TU_FILE_INTFC, then run_sql against PS_TU_FILE_INTFC)*
+48u. Which record holds FILE_ID? *(field-name search)*
+48v. What columns does PS_TU_FILE_INTFC have? *(describe_record)*
+Ad-hoc results carry `scope_filtered`: when a business unit is selected and the
+query did not filter on it, the answer says the rows span business units.
+
 ## Anything else → guarded `run_sql` (+ `list_tables`, `describe_table`)
 49. How many journals were posted in FY2026 by source?
 50. Which operator posted the most journal lines this year?

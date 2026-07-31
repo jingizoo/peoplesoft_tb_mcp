@@ -9,7 +9,7 @@ documentation from **Confluence** (or a local docs folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │ dynamic chat / REPL  │◄───────────────►│  MCP server (pstb.server) │
-│ GUI + client agent   │    30 tools     │  TB engine + guarded SQL  │
+│ GUI + client agent   │    32 tools     │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -29,7 +29,7 @@ python scripts/bootstrap.py
 ```
 
 That creates a virtualenv, installs the package, builds the sample ledger, and
-verifies both the engine (188 checks) and the MCP server end to end. Then install
+verifies both the engine (197 checks) and the MCP server end to end. Then install
 a local model and start asking questions:
 
 ```bash
@@ -152,7 +152,7 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 30 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 32 tools,
 no chat client needed.
 
 ## Tools exposed by the server
@@ -168,6 +168,9 @@ billing pipeline — see [docs/BILLING_AR.md](docs/BILLING_AR.md)) ·
 `get_top_billing_customers` · `get_exchange_rate` (effective-dated
 PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
 `get_record_map` (semantic record dictionary with live row counts) ·
+`search_records` / `describe_record` (find ANY record — including custom and
+site-specific ones — by searching PeopleTools record descriptions and field
+names, then list its fields) ·
 `wiki_lookup` (searches, fetches and returns the actual passages — see
 [docs/RAG.md](docs/RAG.md)) · `wiki_search` · `wiki_get_page` · `wiki_health` ·
 and (config-gated) `run_sql` / `list_tables` / `describe_table` — the SQL tool

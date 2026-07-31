@@ -1670,7 +1670,8 @@ class TBEngine:
                 return ranked
         return []
 
-    def run_sql(self, sql: str, max_rows: int = 100) -> dict:
+    def run_sql(self, sql: str, max_rows: int = 100,
+                business_unit: str = "") -> dict:
         if not self.cfg.tools.allow_raw_sql:
             raise EngineError("Raw SQL is disabled (tools.allow_raw_sql: false)")
         s = (sql or "").strip().rstrip(";").strip()
@@ -1716,8 +1717,33 @@ class TBEngine:
         s = self._qualify_tables(s, unqualified) if self.db.prefix else s
         cap = min(max(int(max_rows or 100), 1), 500)
         rows, truncated = self.db.query(s, {}, max_rows=cap)
-        return {"rows": rows, "row_count": len(rows), "truncated": truncated,
-                "sql_executed": s}
+        out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
+               "sql_executed": s}
+        # Disclose, never rewrite. When a business unit is selected, say
+        # plainly whether this query was restricted to it, so a cross-BU
+        # result is never mistaken for a scoped one.
+        bu = (business_unit or "").strip()
+        if bu:
+            # Match the executed text, NOT the scrubbed copy: the business
+            # unit appears inside a string literal ('US001'), and scrubbing
+            # blanks literals — which reported every correctly-filtered query
+            # as unfiltered. Comments are stripped so a mention in prose does
+            # not count as a filter.
+            probe = self._scrub_sql(s)
+            for lit in re.findall(r"'[^']*'", s):
+                probe += " " + lit
+            filtered = bool(re.search(rf"(?i)(?<![\w]){re.escape(bu)}(?![\w])",
+                                      probe))
+            out["scope_filtered"] = filtered
+            out["scope_note"] = (
+                f"Restricted to business unit {bu}."
+                if filtered else
+                f"NOT restricted to business unit {bu} — these rows may span "
+                "business units. Add a WHERE BUSINESS_UNIT = '"
+                f"{bu}' filter if the record has that column and you want "
+                "only the selected unit."
+            )
+        return out
 
     def _qualify_tables(self, sql: str, names: list) -> str:
         """Prefix the given bare FROM/JOIN targets with the schema owner.
@@ -1741,6 +1767,140 @@ class TBEngine:
         out = sql
         for pos in sorted(edits, reverse=True):
             out = out[:pos] + self.db.prefix + out[pos:]
+        return out
+
+    _RECTYPE = {0: "table", 1: "view", 7: "temp table"}
+
+    def _physical_name(self, recname: str, sqltablename: str) -> str:
+        """Physical object for a PeopleSoft record. A site can override the
+        name in PSRECDEFN.SQLTABLENAME; otherwise it is PS_ + RECNAME."""
+        override = (sqltablename or "").strip()
+        return override or f"PS_{(recname or '').strip()}"
+
+    def search_records(self, query: str = "", limit: int = 25) -> dict:
+        """Find the right PeopleSoft record for a question, using PeopleTools
+        metadata rather than guessing at table names.
+
+        Searches PSRECDEFN by record name AND description (so "file
+        interface" finds TU_FILE_INTFC even though the words are not in the
+        table name), then PSRECFIELD by field name. Falls back to the
+        database catalog when the PeopleTools tables are not granted, so this
+        still returns something useful on a locked-down account.
+        """
+        term = (query or "").strip()
+        if not term:
+            raise EngineError("search_records needs something to search for")
+        cap = min(max(int(limit or 25), 1), 100)
+        like = f"%{term.upper()}%"
+        out: list = []
+        seen: set = set()
+        source = "psrecdefn"
+        notes: list = []
+
+        def add(r: dict, matched_on: str) -> None:
+            rec = str(r.get("recname") or "").strip()
+            if not rec or rec in seen:
+                return
+            seen.add(rec)
+            phys = self._physical_name(rec, r.get("sqltablename"))
+            entry = {
+                "record": rec,
+                "table": phys,
+                "descr": (str(r.get("recdescr") or "").strip() or None),
+                "kind": self._RECTYPE.get(int(r.get("rectype") or 0), "table"),
+                "matched_on": matched_on,
+            }
+            if r.get("fieldname"):
+                entry["matched_field"] = r["fieldname"]
+            rows = self._approx_rows(phys)
+            if rows is not None:
+                entry["approx_rows"] = rows
+            out.append(entry)
+
+        try:
+            recs, _ = self.db.query(q.psrecdefn_search(self.db), {"q": like},
+                                    max_rows=cap * 4)
+            for r in recs:
+                add(r, "record name or description")
+            if len(out) < cap:
+                flds, _ = self.db.query(q.psrecfield_search(self.db),
+                                        {"q": like}, max_rows=cap * 4)
+                for r in flds:
+                    add(r, "field name")
+        except DbError as e:
+            # PeopleTools metadata not granted — degrade to the catalog.
+            source = "database catalog"
+            notes.append(
+                "PeopleTools metadata (PSRECDEFN/PSRECFIELD) is not readable "
+                f"by this account, so descriptions are unavailable: {e} "
+                "Ask your DBA for SELECT on PSRECDEFN and PSRECFIELD to get "
+                "description-based record search."
+            )
+            try:
+                tabs = self.list_tables(term)["tables"]
+            except EngineError:
+                tabs = []
+            for t in tabs:
+                name = str(t.get("table_name") or "")
+                if name and name not in seen:
+                    seen.add(name)
+                    entry = {"record": name, "table": name, "descr": None,
+                             "kind": str(t.get("object_type") or "table"),
+                             "matched_on": "table name"}
+                    rows = self._approx_rows(name)
+                    if rows is not None:
+                        entry["approx_rows"] = rows
+                    out.append(entry)
+
+        # Populated objects first: a record with rows is the likelier answer
+        # than an identically-named staging or history shell.
+        out.sort(key=lambda x: (-(x.get("approx_rows") or 0), x["record"]))
+        return {
+            "query": term,
+            "records": out[:cap],
+            "count": len(out[:cap]),
+            "source": source,
+            "notes": notes,
+            "note": (
+                "Query these with run_sql using the 'table' value (the "
+                "physical object). 'record' is the PeopleTools record name. "
+                "approx_rows comes from optimizer statistics and may be "
+                "stale or absent."
+            ),
+        }
+
+    def describe_record(self, record: str) -> dict:
+        """Fields of a PeopleSoft record from PeopleTools, with the physical
+        column list as a cross-check."""
+        rec = (record or "").strip().upper()
+        if not rec:
+            raise EngineError("describe_record needs a record name")
+        if rec.startswith("PS_"):
+            rec = rec[3:]
+        out: dict = {"record": rec}
+        try:
+            defn, _ = self.db.query(q.psrecdefn_search(self.db),
+                                    {"q": rec}, max_rows=50)
+            match = next((d for d in defn
+                          if str(d.get("recname") or "").upper() == rec), None)
+            if match:
+                out["descr"] = str(match.get("recdescr") or "").strip() or None
+                out["kind"] = self._RECTYPE.get(int(match.get("rectype") or 0),
+                                                "table")
+                out["table"] = self._physical_name(rec, match.get("sqltablename"))
+            flds, _ = self.db.query(q.psrecfield_for_record(self.db),
+                                    {"rec": rec}, max_rows=500)
+            if flds:
+                out["fields"] = [f["fieldname"] for f in flds]
+        except DbError:
+            pass
+        table = out.get("table") or f"PS_{rec}"
+        out["table"] = table
+        try:
+            out["columns"] = [c["column_name"]
+                              for c in self.describe_table(table)["columns"]]
+        except EngineError as e:
+            out["columns_error"] = str(e)
         return out
 
     def list_tables(self, pattern: str = "") -> dict:

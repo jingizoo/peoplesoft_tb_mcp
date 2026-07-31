@@ -737,6 +737,72 @@ DROP TABLE PS_INTFC_BI;
           "FROM SYSADM.PS_BI_HDR" in qualified
           and "SYSADM.INVOICE_DT" not in qualified, qualified)
 
+    print("== ask-anything: custom records, PeopleTools discovery, scope disclosure ==")
+    _tmpc = Path(_tf.mkdtemp(prefix="pstb_custom_"))
+    _cdb = _tmpc / "custom.db"
+    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _cdb)
+    _cc = _sq.connect(_cdb)
+    _cc.executescript("""
+CREATE TABLE PS_TU_FILE_INTFC (FILE_ID TEXT, DESCR TEXT, FILE_PATH TEXT,
+  FILE_TYPE TEXT, ACTIVE_FLG TEXT, BUSINESS_UNIT TEXT);
+INSERT INTO PS_TU_FILE_INTFC VALUES
+ ('AP_VCHR','AP voucher inbound','/in/ap','CSV','Y','US001'),
+ ('GL_JRNL','GL journal inbound','/in/gl','FLAT','Y','US001'),
+ ('BI_INV','Billing invoice out','/out/bi','XML','N','US002');
+INSERT INTO PSRECDEFN VALUES
+ ('TU_FILE_INTFC','File Interface Setup and Schedule',0,'');
+INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
+""")
+    _cc.commit(); _cc.close()
+    cfg_c = Config.sample(ROOT)
+    cfg_c.db.sqlite_path = str(_cdb)
+    eng_c = TBEngine(Database(cfg_c), cfg_c)
+    # A functional phrase must find a record whose TABLE NAME gives no clue.
+    found = eng_c.search_records("file interface")["records"]
+    check("PeopleTools description search finds a custom record",
+          any(r["record"] == "TU_FILE_INTFC"
+              and r["table"] == "PS_TU_FILE_INTFC" for r in found), str(found[:2]))
+    check("record search reports the physical table to query",
+          all("table" in r for r in found))
+    fld = eng_c.search_records("FILE_ID")["records"]
+    check("record search also matches on field name",
+          any(r["record"] == "TU_FILE_INTFC" for r in fld), str(fld[:2]))
+    desc = eng_c.describe_record("PS_TU_FILE_INTFC")
+    check("describe_record accepts a table name and returns real columns",
+          "FILE_ID" in (desc.get("columns") or [])
+          and desc["table"] == "PS_TU_FILE_INTFC", str(desc)[:90])
+    # A scope must not BLOCK ad-hoc SQL; it must disclose whether it applied.
+    from pstb.guards import apply_request_scope as _apply
+    _args = _apply("run_sql", {"sql": "SELECT FILE_ID FROM PS_TU_FILE_INTFC"},
+                   {"business_unit": "US001", "ledger": "ACTUALS", "period": 6})
+    check("an active scope no longer refuses ad-hoc SQL",
+          _args["business_unit"] == "US001" and "ledger" not in _args, str(_args))
+    _un = eng_c.run_sql(**_args)
+    _fi = eng_c.run_sql(
+        "SELECT FILE_ID FROM PS_TU_FILE_INTFC WHERE BUSINESS_UNIT = 'US001'",
+        business_unit="US001")
+    check("custom record is queryable under an active scope",
+          len(_un["rows"]) == 3 and len(_fi["rows"]) == 2)
+    check("cross-BU result is disclosed, filtered result is confirmed",
+          _un["scope_filtered"] is False and _fi["scope_filtered"] is True
+          and "NOT restricted" in _un["scope_note"])
+    _cm = eng_c.run_sql(
+        "SELECT FILE_ID FROM PS_TU_FILE_INTFC -- covers US001 too\n",
+        business_unit="US001")
+    check("a business unit named only in a comment is not a filter",
+          _cm["scope_filtered"] is False)
+    # No PeopleTools grant must degrade, not fail
+    _cc2 = _sq.connect(_cdb)
+    _cc2.executescript("DROP TABLE PSRECDEFN; DROP TABLE PSRECFIELD;")
+    _cc2.commit(); _cc2.close()
+    eng_c2 = TBEngine(Database(cfg_c), cfg_c)
+    degraded = eng_c2.search_records("TU_FILE")
+    check("record search degrades to the catalog without PeopleTools grants",
+          degraded["source"] == "database catalog"
+          and any(r["table"] == "PS_TU_FILE_INTFC" for r in degraded["records"])
+          and degraded["notes"], str(degraded)[:120])
+    _sh.rmtree(_tmpc)
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",

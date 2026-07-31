@@ -282,6 +282,13 @@ CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, DESCR TEXT, BASE_CURRENCY T
 -- unit / ledger group, so the lookup is a small indexed read instead of a
 -- DISTINCT over every balance row in PS_LEDGER.
 CREATE TABLE PS_BUS_UNIT_LED (BUSINESS_UNIT TEXT, LEDGER_GROUP TEXT);
+-- PeopleTools metadata. A real instance always has these; record discovery
+-- searches RECDESCR so a question phrased functionally ("file interface")
+-- finds a record whose table name gives no clue. SQLTABLENAME is the site's
+-- physical-name override, blank when the name is just PS_ + RECNAME.
+CREATE TABLE PSRECDEFN (
+  RECNAME TEXT, RECDESCR TEXT, RECTYPE INTEGER, SQLTABLENAME TEXT);
+CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
 CREATE TABLE PS_LED_GRP_TBL (LEDGER_GROUP TEXT, LEDGER TEXT, DESCR TEXT);
 CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
@@ -416,6 +423,28 @@ def main() -> None:
     )
     con.execute(
         "INSERT INTO PS_BUS_UNIT_TBL_GL VALUES (?,?,?)", (BU, "US Operations", CURR)
+    )
+    # PeopleTools catalog rows for the records this sample ships, plus a
+    # custom-looking one so description-based discovery is exercised.
+    _recs = [
+        ("LEDGER", "Ledger Balances", 0, ""),
+        ("JRNL_HEADER", "Journal Header", 0, ""),
+        ("JRNL_LN", "Journal Line", 0, ""),
+        ("GL_ACCOUNT_TBL", "GL Account Definition", 0, ""),
+        ("BI_HDR", "Billing Invoice Header", 0, ""),
+        ("INTFC_BI", "Billing Interface Staging", 0, ""),
+        ("ITEM", "AR Open Item", 0, ""),
+        ("CUSTOMER", "Customer Master", 0, ""),
+        ("TU_FILE_INTFC", "File Interface Setup and Schedule", 0, ""),
+    ]
+    con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
+    con.executemany(
+        "INSERT INTO PSRECFIELD VALUES (?,?,?)",
+        [("LEDGER", "BUSINESS_UNIT", 1), ("LEDGER", "LEDGER", 2),
+         ("LEDGER", "ACCOUNT", 3), ("BI_HDR", "INVOICE", 1),
+         ("BI_HDR", "BILL_STATUS", 2), ("ITEM", "CUST_ID", 1),
+         ("ITEM", "BAL_AMT", 2), ("TU_FILE_INTFC", "FILE_ID", 1),
+         ("TU_FILE_INTFC", "FILE_PATH", 2)],
     )
     con.executemany(
         "INSERT INTO PS_BUS_UNIT_LED VALUES (?,?)",

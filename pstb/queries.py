@@ -389,6 +389,46 @@ def tree_nodes_list(db: Database) -> str:
  ORDER BY TREE_NODE_NUM"""
 
 
+def psrecdefn_search(db: Database) -> str:
+    """Find PeopleSoft RECORDS by name or description from PeopleTools
+    metadata. PSRECDEFN is the definitive catalog: it carries the record
+    description a functional user would recognise ("File Interface Setup"),
+    and SQLTABLENAME when a site overrode the physical name, so the caller
+    never has to guess that PS_ + RECNAME is right.
+
+    RECTYPE: 0=SQL table, 1=SQL view, 2=derived/work, 3=subrecord,
+    5=dynamic view, 6=query view, 7=temporary table. Only 0/1/7 exist in the
+    database; the rest have no physical object to query.
+    """
+    p = db.prefix
+    return f"""SELECT RECNAME AS recname, RECDESCR AS recdescr,
+       RECTYPE AS rectype, SQLTABLENAME AS sqltablename
+  FROM {p}PSRECDEFN
+ WHERE RECTYPE IN (0, 1, 7)
+   AND (UPPER(RECNAME) LIKE :q OR UPPER(RECDESCR) LIKE :q)
+ ORDER BY RECNAME"""
+
+
+def psrecfield_search(db: Database) -> str:
+    """Records that contain a field whose name matches — how you find the
+    record behind "which table holds FILE_ID" without knowing its name."""
+    p = db.prefix
+    return f"""SELECT R.RECNAME AS recname, R.RECDESCR AS recdescr,
+       R.RECTYPE AS rectype, R.SQLTABLENAME AS sqltablename,
+       F.FIELDNAME AS fieldname
+  FROM {p}PSRECFIELD F
+  JOIN {p}PSRECDEFN R ON R.RECNAME = F.RECNAME
+ WHERE R.RECTYPE IN (0, 1, 7) AND UPPER(F.FIELDNAME) LIKE :q
+ ORDER BY R.RECNAME, F.FIELDNAME"""
+
+
+def psrecfield_for_record(db: Database) -> str:
+    """Field list of one record, in PeopleTools order."""
+    p = db.prefix
+    return f"""SELECT FIELDNAME AS fieldname, FIELDNUM AS fieldnum
+  FROM {p}PSRECFIELD WHERE RECNAME = :rec ORDER BY FIELDNUM"""
+
+
 def business_units(db: Database) -> str:
     return f"""SELECT BUSINESS_UNIT AS business_unit, DESCR AS descr,
        BASE_CURRENCY AS base_currency
