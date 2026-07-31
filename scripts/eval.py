@@ -64,6 +64,16 @@ def _grade(case: dict, answer: str, calls: list) -> list:
     want_any = expect.get("any_tool")
     if want_any and not any(t in called for t in want_any):
         problems.append(f"expected one of {want_any}, called {called or 'nothing'}")
+    # A tool that was CALLED but ERRORED is not evidence the feature works.
+    # PR #34 shipped run_playbook whose module was never imported: the eval
+    # saw the call, the model narrated the error, and the case passed.
+    if want_any:
+        broken = [c for c in calls
+                  if c.get("tool") in want_any and c.get("ok") is False]
+        if broken:
+            problems.append(
+                "expected tool(s) failed: "
+                + ", ".join(sorted({c["tool"] for c in broken})))
 
     for banned in expect.get("not_tool") or []:
         if banned in called:

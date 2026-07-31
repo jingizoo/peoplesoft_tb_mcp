@@ -20,6 +20,8 @@ from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
 from .ar import ARBilling, ARError
+from .memory import MemoryError_, SiteMemory
+from .playbooks import PlaybookError, PlaybookRunner
 from .report import ReportError, ReportRunner
 from . import wiki as wiki_mod
 from .wiki import WikiError, make_wiki
@@ -29,6 +31,9 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+playbooks = PlaybookRunner(engine, ar)
+memory = SiteMemory(cfg.resolve_path(
+    getattr(cfg.tools, 'site_memory', 'site_memory.json')))
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
 try:
@@ -43,7 +48,8 @@ mcp = FastMCP("peoplesoft-tb")
 def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
-    except (EngineError, DbError, WikiError, ReportError, ARError) as e:
+    except (EngineError, DbError, WikiError, ReportError, ARError,
+            PlaybookError, MemoryError_) as e:
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}
@@ -428,6 +434,31 @@ def list_ledgers(business_unit: str) -> dict:
     business_unit is required — prefer list_financial_scopes, which returns
     business units and ledgers together."""
     return _safe(engine.list_ledgers, business_unit=business_unit)
+
+
+@mcp.tool()
+def recall_site_facts() -> dict:
+    """Facts an operator approved about THIS installation — naming aliases,
+    calendar conventions, exclusions. They are already in your context; call
+    this only when the user asks what the agent has been told, or to check
+    whether something is remembered."""
+    return _safe(memory.list_facts, status="approved")
+
+
+@mcp.tool()
+def remember_site_fact(fact: str, kind: str = "context") -> dict:
+    """PROPOSE a durable fact about this installation for operator approval.
+
+    Use when the USER TEACHES you something that will still be true next
+    week — "in our system TU_FILE_INTFC is the file interface", "our fiscal
+    year runs July to June", "exclude intercompany from revenue totals".
+    Do NOT use it for the answer to a question, for anything you inferred
+    rather than were told, or for one-off context.
+    kind: alias | convention | exclusion | context.
+    The fact is stored as PENDING and does nothing until a human approves it,
+    so tell the user it was noted for review — never that you have learned
+    it."""
+    return _safe(memory.propose, text=fact, kind=kind, source="conversation")
 
 
 @mcp.tool()

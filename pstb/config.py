@@ -81,6 +81,9 @@ class ToolsCfg:
     max_rows: int = 200
     reports_path: str = "reports"
     question_log: str = "logs/questions.jsonl"
+    # Facts about THIS installation, approved by an operator. A plain
+    # reviewable file so a human can see exactly what the agent believes.
+    site_memory: str = "site_memory.json"
     txn_row_threshold: int = 1000
 
 
