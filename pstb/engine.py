@@ -68,6 +68,14 @@ class TBEngine:
         self._eff_defaults_expires_at = 0.0
         self._scope_cache_ttl_seconds = SCOPE_CACHE_TTL_SECONDS
         self._tree_ctl: dict = {}
+        # Setup lookups repeat many times per question and each is a WAN
+        # round trip on a real instance. They describe how the installation
+        # is CONFIGURED, not what was posted, so they hold for a session;
+        # the posted-period cache uses the scope TTL because journals move.
+        self._ledgers_cache: dict = {}
+        self._periods_cache: dict = {}
+        self._posted_cache: dict = {}
+        self._rate_cache: dict = {}
         self._record_cols: dict = {}
 
     # ------------------------------------------------------------------ utils
@@ -287,6 +295,10 @@ class TBEngine:
         """
         self._eff_defaults = None
         self._eff_defaults_expires_at = 0.0
+        self._posted_cache.clear()
+        self._rate_cache.clear()
+        self._ledgers_cache.clear()
+        self._periods_cache.clear()
 
     def effective_defaults(self) -> dict:
         """Config defaults validated against PS_LEDGER's accessible catalog.
@@ -339,9 +351,11 @@ class TBEngine:
         bu = (business_unit or "").strip()
         if not bu:
             return self.effective_defaults()["ledger"]
-        rows, _ = self.db.query(
-            q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=500
-        )
+        # Go through the cached accessor: this and list_ledgers were issuing
+        # the same statement separately, and on a WAN every duplicate is a
+        # full round trip the user waits on.
+        rows = [{"ledger": name}
+                for name in (self.list_ledgers(bu).get("ledgers") or [])]
         candidates: list[str] = []
         for row in rows:
             name = str(row.get("ledger") or "").strip()
@@ -375,6 +389,15 @@ class TBEngine:
             eff = self.effective_defaults()
             bu = eff["business_unit"]
         led = self.resolve_ledger_for(bu, led)
+        # These are MIN/MAX aggregates over the ledger. They are cheap per
+        # call but were re-issued several times per question — on a WAN each
+        # one is a full round trip, and AR aging alone triggered them twice.
+        # Journals do post during a session, so this uses the scope TTL
+        # rather than living forever.
+        cache_key = (bu, led)
+        cached = self._posted_cache.get(cache_key)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
         rows, _ = self.db.query(
             q.scope_year_bounds(self.db, self._adj_periods()),
             {"bu": bu, "led": led}, max_rows=1,
@@ -385,6 +408,8 @@ class TBEngine:
             else 0
         )
         if not fy:
+            self._posted_cache[cache_key] = (
+                time.monotonic() + self._scope_cache_ttl_seconds, (0, 0))
             return (0, 0)
         rows, _ = self.db.query(
             q.scope_last_regular_period(self.db, self._adj_periods()),
@@ -395,6 +420,8 @@ class TBEngine:
             if rows and rows[0].get("last_period") is not None
             else 0
         )
+        self._posted_cache[cache_key] = (
+            time.monotonic() + self._scope_cache_ttl_seconds, (fy, period))
         return (fy, period)
 
     def _current_fy_period(self) -> tuple[int, int]:
@@ -978,8 +1005,13 @@ class TBEngine:
             "cal": self.cfg.defaults.calendar_id,
             "fy": fy,
         }
+        key = (fy, params["setid"], params["cal"])
+        if key in self._periods_cache:
+            return self._periods_cache[key]
         rows, _ = self.db.query(q.cal_periods(self.db), params, max_rows=20)
-        return {"fiscal_year": fy, "periods": rows}
+        out = {"fiscal_year": fy, "periods": rows}
+        self._periods_cache[key] = out
+        return out
 
     def tb_integrity_check(
         self,
@@ -1476,11 +1508,15 @@ class TBEngine:
                 "business_unit is required. Call list_financial_scopes to get "
                 "business units and their ledgers together in one call."
             )
+        if bu in self._ledgers_cache:
+            return self._ledgers_cache[bu]
         rows, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=50)
         if not rows:
             return {"business_unit": bu, "ledgers": [],
                     **self._scope_diagnosis(bu, self.cfg.defaults.ledger, 0)}
-        return {"business_unit": bu, "ledgers": [r["ledger"] for r in rows]}
+        out = {"business_unit": bu, "ledgers": [r["ledger"] for r in rows]}
+        self._ledgers_cache[bu] = out
+        return out
 
     # ------------------------------------------------ semantic record map / FX
     # Curated concept -> record dictionary. kind='transaction' rows carry
@@ -1640,13 +1676,23 @@ class TBEngine:
                f"SELECT MAX(EFFDT) FROM {p}PS_RT_RATE_TBL "
                f"WHERE FROM_CUR = :f AND TO_CUR = :t AND RT_TYPE = :rt "
                f"AND EFFDT <= {self.db.date_bind('d')})")
-        rows, _ = self.db.query(sql, {"f": fc, "t": tc, "rt": rt, "d": d},
-                                max_rows=1)
+        # Rates are effective-dated setup data: for one (pair, type, date)
+        # the answer cannot change during a session. AR aging converts every
+        # currency group and the GL tie converts again, so the same pair was
+        # fetched repeatedly — each one a WAN round trip.
+        def _rate_rows(f_cur: str, t_cur: str) -> list:
+            key = (f_cur, t_cur, rt, d)
+            if key not in self._rate_cache:
+                found, _ = self.db.query(
+                    sql, {"f": f_cur, "t": t_cur, "rt": rt, "d": d}, max_rows=1)
+                self._rate_cache[key] = found
+            return self._rate_cache[key]
+
+        rows = _rate_rows(fc, tc)
         inverted = False
         cross_via = None
         if not rows:
-            rows, _ = self.db.query(sql, {"f": tc, "t": fc, "rt": rt, "d": d},
-                                    max_rows=1)
+            rows = _rate_rows(tc, fc)
             inverted = True
         if rows:
             m, dv = float(rows[0]["m"] or 0), float(rows[0]["dv"] or 1) or 1.0
