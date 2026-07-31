@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..config import load_config
+from ..version import build_info as _build_info
 from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
 from .. import queries as query_sql
@@ -380,6 +381,7 @@ def meta():
             "adjustment_periods": d.adjustment_periods,
             "account_tree": d.account_tree,
         },
+        "build": _build_info(),
         "backend": cfg.db.backend,
         "use_views": cfg.db.use_views,
         "wiki": getattr(wiki, "provider_name", None),

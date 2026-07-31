@@ -79,6 +79,8 @@ def main() -> int:
     led = args.ledger or cfg.defaults.ledger
     p = db.prefix
 
+    from pstb.version import label as _build_label
+    print(f"build: {_build_label()}")
     print(f"backend={cfg.db.backend} schema={cfg.db.schema or '(none)'} "
           f"views={cfg.db.use_views} timeout={cfg.db.query_timeout_seconds}s")
     print(f"scope: BU={bu} ledger={led} fy={args.fy or 'current'} period={args.period or 'current'}\n")

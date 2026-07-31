@@ -913,6 +913,20 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           [x["source"] for x in eng_src.registry.describe()]
           == ["default", "mart"])
 
+    print("== build identity ==")
+    from pstb.version import build_info as _bi, label as _bl, source_fingerprint
+    _info = _bi()
+    check("build reports a version and a fingerprint",
+          _info.get("version") and len(_info.get("fingerprint", "")) == 12,
+          str(_info.get("fingerprint")))
+    check("fingerprint is derived from source content",
+          source_fingerprint() == _info["fingerprint"])
+    check("label is a single human-readable line",
+          "\n" not in _bl() and _info["version"] in _bl(), _bl())
+    check("build identity is exposed to the GUI",
+          '"build": _build_info(),' in
+          (ROOT / "pstb" / "gui" / "app.py").read_text(encoding="utf-8"))
+
     print("== scope: time is a default, not a lock ==")
     from pstb.guards import apply_request_scope as _ars, ScopeConflict as _SC
     _scope = {"business_unit": "US001", "ledger": "ACTUALS",
