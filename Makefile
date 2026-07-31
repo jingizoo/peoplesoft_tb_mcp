@@ -1,11 +1,11 @@
 PY := .venv/bin/python
 
-.PHONY: venv seed smoke probe chat chat-gemini server clean
+.PHONY: venv seed unittest smoke probe qa chat chat-gemini server clean
 
-venv:            ## create venv and install package + LLM clients
+venv:            ## create venv and install package + LLM clients + web UI
 	python3 -m venv .venv
 	$(PY) -m pip install -q -U pip
-	$(PY) -m pip install -q -e ".[llm]"
+	$(PY) -m pip install -q -e ".[llm,gui]"
 
 seed:            ## build the SQLite sample GL (stdlib only)
 	python3 scripts/seed_sample_data.py
@@ -13,8 +13,13 @@ seed:            ## build the SQLite sample GL (stdlib only)
 smoke:           ## engine + wiki tests against the sample (stdlib only)
 	python3 scripts/smoke_test.py
 
+unittest:        ## focused scope, session, and evidence-gate regressions
+	$(PY) -m unittest discover -s tests -v
+
 probe:           ## end-to-end MCP server check without an LLM
 	$(PY) scripts/mcp_probe.py
+
+qa: seed unittest smoke probe  ## full local quality gate
 
 chat:            ## chat REPL (provider from config.yaml, default ollama)
 	$(PY) -m pstb.client.chat

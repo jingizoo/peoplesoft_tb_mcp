@@ -66,7 +66,9 @@ def get_trial_balance(
     fiscal year. Guessing a year (e.g. 2023) queries a year with no data and
     returns a false "nothing found" — never invent one.
     business_unit / ledger: leave empty unless the user named one.
-    period: 1-12 (0 = current; pass 998 for the post-adjustment year-end TB).
+    period: a regular fiscal period (commonly 1-12, sometimes 1-13); 0 means
+    current. Pass a configured adjustment period such as 998 for the
+    post-adjustment year-end TB.
     group_by: extra chartfields, comma-separated (e.g. "DEPTID" or "DEPTID,PROJECT_ID").
     account: exact "1000", range "6000-6999", list "1000,1100", or prefix "60%".
     currency: filter to one currency code, or "detail" to break out by currency.
@@ -303,10 +305,17 @@ def get_customer_ar(
 
 
 @mcp.tool()
-def search_customers(query: str = "", limit: int = 25) -> dict:
+def search_customers(
+    query: str = "", limit: int = 25, business_unit: str = ""
+) -> dict:
     """Find AR customers by name or ID; returns id, name, active/inactive status,
     and open balance. Empty query lists customers."""
-    return _safe(ar.search_customers, query=query, limit=limit)
+    return _safe(
+        ar.search_customers,
+        query=query,
+        limit=limit,
+        business_unit=business_unit,
+    )
 
 
 @mcp.tool()
@@ -390,12 +399,16 @@ def list_trees() -> dict:
 
 
 @mcp.tool()
-def list_financial_scopes() -> dict:
+def list_financial_scopes(include_activity: bool = False) -> dict:
     """Business units, their ledgers, base currency, and which fiscal years hold
     data — all in ONE call. Use this first when you don't know the scope.
+    The default is a fast BU/ledger inventory. Set include_activity=true only
+    when the user also asks for fiscal-year ranges or latest posted periods.
     Do not call list_business_units and list_ledgers together to work this out:
     both run in the same turn, so the second cannot use the first's result."""
-    return _safe(engine.list_financial_scopes)
+    return _safe(
+        engine.list_financial_scopes, include_activity=include_activity
+    )
 
 
 @mcp.tool()

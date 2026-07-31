@@ -3,14 +3,16 @@
 Conventions (PeopleSoft GL):
   - Amounts are signed: debits positive, credits negative.
   - Period 0 holds beginning balances written by year-end close.
-  - Periods 1..12 are fiscal months; adjustment periods (e.g. 998) hold
-    audit/adjusting entries and are included only on request.
+  - Regular periods follow the installation's fiscal calendar (often 12,
+    sometimes 13); configured adjustment periods hold audit/adjusting entries
+    and are included only on request.
   - Ending balance through period P = sum(periods 0..P) [+ adjustments].
 """
 from __future__ import annotations
 
 import datetime as dt
 import re
+import time
 from typing import Optional
 
 from . import queries as q
@@ -19,6 +21,7 @@ from .db import Database, DbError
 
 BALANCE_EPS = 0.005
 INTERNAL_ROW_CAP = 100_000
+SCOPE_CACHE_TTL_SECONDS = 60.0
 
 _SQL_DENY = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|"
@@ -55,6 +58,9 @@ class TBEngine:
         self.db = db
         self.cfg = cfg
         self._setid_cache: dict[tuple[str, str], str] = {}
+        self._eff_defaults: Optional[dict] = None
+        self._eff_defaults_expires_at = 0.0
+        self._scope_cache_ttl_seconds = SCOPE_CACHE_TTL_SECONDS
 
     # ------------------------------------------------------------------ utils
     def _adj_periods(self) -> list[int]:
@@ -114,67 +120,173 @@ class TBEngine:
         )
         return bool(rows)
 
-    def effective_defaults(self) -> dict:
-        """Config defaults validated against the connected database; when the
-        configured business unit or ledger has no data (typical right after
-        pointing at a real instance), discover real ones with bounded indexed
-        probes — never a full-ledger scan. Cached per process."""
-        if getattr(self, "_eff_defaults", None):
-            return self._eff_defaults
-        p = self.db.prefix
-        cfg_bu = self.cfg.defaults.business_unit
-        cfg_led = self.cfg.defaults.ledger
-        notes: list[str] = []
+    def _ledger_scope_pairs(self) -> tuple[list[tuple[str, str]], bool]:
+        """Return every accessible BU/ledger pair from PS_LEDGER.
 
-        bu = cfg_bu
-        if not self._bu_has_data(bu):
-            cands, _ = self.db.query(
-                f"SELECT BUSINESS_UNIT AS bu FROM {p}PS_BUS_UNIT_TBL_GL "
-                "ORDER BY BUSINESS_UNIT", {}, max_rows=50,
-            )
-            bu = next((c["bu"] for c in cands if self._bu_has_data(c["bu"])), cfg_bu)
-            if bu != cfg_bu:
-                notes.append(
-                    f"configured business_unit {cfg_bu!r} has no ledger data; "
-                    f"using {bu!r} discovered from the database"
-                )
-        leds, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=50)
-        led_names = [r["ledger"] for r in leds]
-        led = cfg_led
-        if led_names and cfg_led not in led_names:
-            led = next((l for l in led_names if l.upper() == "ACTUALS"), None)                 or next((l for l in led_names if "ACTUAL" in l.upper()), led_names[0])
+        The DISTINCT operates on the leading columns of the normal
+        (BUSINESS_UNIT, LEDGER, ...) ledger index and returns only the small
+        catalog, rather than aggregating/counting the underlying balance rows.
+        """
+        rows, truncated = self.db.query(
+            q.financial_scope_pairs(self.db), {}, max_rows=INTERNAL_ROW_CAP
+        )
+        pairs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            bu = str(row.get("business_unit") or "").strip()
+            ledger = str(row.get("ledger") or "").strip()
+            pair = (bu, ledger)
+            if bu and ledger and pair not in seen:
+                pairs.append(pair)
+                seen.add(pair)
+        return pairs, truncated
+
+    def _effective_defaults_from_pairs(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict:
+        cfg_bu = (self.cfg.defaults.business_unit or "").strip()
+        cfg_led = (self.cfg.defaults.ledger or "").strip()
+        by_bu: dict[str, list[str]] = {}
+        for bu, ledger in pairs:
+            by_bu.setdefault(bu, []).append(ledger)
+
+        notes: list[str] = []
+        if not by_bu:
+            return {
+                "business_unit": cfg_bu,
+                "ledger": cfg_led,
+                "ledgers": [],
+                "discovered": False,
+                "notes": ["No accessible business-unit/ledger scopes were found in PS_LEDGER."],
+            }
+
+        bu = cfg_bu if cfg_bu in by_bu else next(iter(by_bu))
+        if bu != cfg_bu:
             notes.append(
-                f"configured ledger {cfg_led!r} not found for {bu}; using {led!r}"
+                f"configured business_unit {cfg_bu!r} has no ledger data; "
+                f"using {bu!r} discovered from PS_LEDGER"
             )
-        self._eff_defaults = {
-            "business_unit": bu, "ledger": led, "ledgers": led_names,
-            "discovered": bool(notes), "notes": notes,
+
+        ledgers = by_bu[bu]
+        ledger = cfg_led
+        if cfg_led not in ledgers:
+            ledger = (
+                next((name for name in ledgers if name.upper() == "ACTUALS"), None)
+                or next((name for name in ledgers if "ACTUAL" in name.upper()), None)
+                or ledgers[0]
+            )
+            notes.append(
+                f"configured ledger {cfg_led!r} not found for {bu}; using {ledger!r}"
+            )
+        return {
+            "business_unit": bu,
+            "ledger": ledger,
+            "ledgers": list(ledgers),
+            "discovered": bool(notes),
+            "notes": notes,
         }
-        return self._eff_defaults
+
+    def _remember_effective_defaults(self, defaults: dict) -> dict:
+        self._eff_defaults = defaults
+        self._eff_defaults_expires_at = (
+            time.monotonic() + max(float(self._scope_cache_ttl_seconds), 0.0)
+        )
+        return defaults
+
+    def invalidate_scope_cache(self) -> None:
+        """Force scope/default discovery on the next request.
+
+        The normal cache is deliberately short-lived, and this explicit hook is
+        useful after a PeopleSoft grant or ledger onboarding change.
+        """
+        self._eff_defaults = None
+        self._eff_defaults_expires_at = 0.0
+
+    def effective_defaults(self) -> dict:
+        """Config defaults validated against PS_LEDGER's accessible catalog.
+
+        Discovery never depends on PS_BUS_UNIT_TBL_GL grants. The result has a
+        short TTL rather than living for the whole process, so a newly granted
+        or onboarded business unit becomes visible without a service restart.
+        """
+        now = time.monotonic()
+        if self._eff_defaults is not None and now < self._eff_defaults_expires_at:
+            return self._eff_defaults
+        pairs, _ = self._ledger_scope_pairs()
+        return self._remember_effective_defaults(
+            self._effective_defaults_from_pairs(pairs)
+        )
+
+    def resolve_ledger_for(self, business_unit: str, ledger: str = "") -> str:
+        """Resolve an omitted ledger against the selected business unit.
+
+        A configured/effective ledger belongs to its own default BU and cannot
+        safely be copied to another BU. Explicit ledger values are preserved so
+        the normal no-data diagnosis can explain an invalid user selection.
+        """
+        requested = (ledger or "").strip()
+        if requested:
+            return requested
+        bu = (business_unit or "").strip()
+        if not bu:
+            return self.effective_defaults()["ledger"]
+        rows, _ = self.db.query(
+            q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=500
+        )
+        candidates: list[str] = []
+        for row in rows:
+            name = str(row.get("ledger") or "").strip()
+            if name and name not in candidates:
+                candidates.append(name)
+        if candidates:
+            configured = (self.cfg.defaults.ledger or "").strip()
+            return (
+                configured if configured in candidates
+                else next(
+                    (name for name in candidates if name.upper() == "ACTUALS"),
+                    None,
+                )
+                or next(
+                    (name for name in candidates if "ACTUAL" in name.upper()),
+                    None,
+                )
+                or candidates[0]
+            )
+        eff = self.effective_defaults()
+        if bu == eff["business_unit"]:
+            return eff["ledger"]
+        return (self.cfg.defaults.ledger or "").strip()
 
     def last_posted_period(self, bu: str = "", ledger: str = "") -> tuple[int, int]:
         """Newest regular period with posted rows for the scope — targeted MAX
         queries on the indexed (BU, LEDGER, FY, PERIOD) path."""
-        eff = self.effective_defaults()
-        bu = (bu or "").strip() or eff["business_unit"]
-        led = (ledger or "").strip() or eff["ledger"]
-        p = self.db.prefix
+        bu = (bu or "").strip()
+        led = (ledger or "").strip()
+        if not bu:
+            eff = self.effective_defaults()
+            bu = eff["business_unit"]
+        led = self.resolve_ledger_for(bu, led)
         rows, _ = self.db.query(
-            f"SELECT MAX(FISCAL_YEAR) AS fy FROM {p}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led "
-            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
+            q.scope_year_bounds(self.db, self._adj_periods()),
             {"bu": bu, "led": led}, max_rows=1,
         )
-        fy = int(rows[0]["fy"]) if rows and rows[0]["fy"] is not None else 0
+        fy = (
+            int(rows[0]["last_regular_fy"])
+            if rows and rows[0].get("last_regular_fy") is not None
+            else 0
+        )
         if not fy:
             return (0, 0)
         rows, _ = self.db.query(
-            f"SELECT MAX(ACCOUNTING_PERIOD) AS p FROM {p}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led AND FISCAL_YEAR = :fy "
-            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
+            q.scope_last_regular_period(self.db, self._adj_periods()),
             {"bu": bu, "led": led, "fy": fy}, max_rows=1,
         )
-        return (fy, int(rows[0]["p"]) if rows and rows[0]["p"] is not None else 12)
+        period = (
+            int(rows[0]["last_period"])
+            if rows and rows[0].get("last_period") is not None
+            else 0
+        )
+        return (fy, period)
 
     def _current_fy_period(self) -> tuple[int, int]:
         try:
@@ -191,7 +303,7 @@ class TBEngine:
     ) -> tuple[str, int, int, str]:
         eff = self.effective_defaults()
         bu = (business_unit or "").strip() or eff["business_unit"]
-        led = (ledger or "").strip() or eff["ledger"]
+        led = self.resolve_ledger_for(bu, ledger)
         fy, per = int(fiscal_year or 0), int(period or 0)
         if fy == 0 or per == 0:
             cur_fy, cur_per = self._current_fy_period()
@@ -215,13 +327,12 @@ class TBEngine:
         )
         if not rows:
             known, _ = self.db.query(
-                f"SELECT BUSINESS_UNIT AS bu FROM {p}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT",
-                {}, max_rows=25,
+                q.ledger_business_units(self.db), {}, max_rows=25,
             )
             return {
                 "scope_status": "business_unit_not_found",
                 "detail": f"No ledger data exists for business unit {bu!r}.",
-                "known_business_units": [r["bu"] for r in known],
+                "known_business_units": [r["business_unit"] for r in known],
             }
         rows, _ = self.db.query(
             self.db.exists_sql(
@@ -258,24 +369,40 @@ class TBEngine:
     def base_currency_for(self, business_unit: str) -> str:
         """Base currency of a GL business unit, cached. Used to bind a literal
         currency into ledger queries instead of a column-to-column predicate."""
-        key = ("__basecur__", business_unit)
+        bu = (business_unit or "").strip()
+        key = ("__basecur__", bu)
         if key not in self._setid_cache:
             cur = ""
             try:
                 rows, _ = self.db.query(
                     f"SELECT BASE_CURRENCY AS c FROM {self.db.prefix}PS_BUS_UNIT_TBL_GL "
                     "WHERE BUSINESS_UNIT = :bu",
-                    {"bu": business_unit}, max_rows=1,
+                    {"bu": bu}, max_rows=1,
                 )
                 cur = (rows[0]["c"] or "").strip() if rows else ""
             except Exception:
                 cur = ""
+            if not cur:
+                try:
+                    rows, _ = self.db.query(
+                        q.business_unit_base_currency(self.db),
+                        {"bu": bu},
+                        max_rows=1,
+                    )
+                    cur = (
+                        str(rows[0].get("base_currency") or "").strip()
+                        if rows else ""
+                    )
+                except Exception:
+                    cur = ""
             self._setid_cache[key] = cur or (self.cfg.defaults.base_currency or "")
         return self._setid_cache[key]
 
-    def _max_regular_period(self, fy: int) -> int:
+    def _max_regular_period(
+        self, fy: int, business_unit: str = "", ledger: str = ""
+    ) -> int:
         """Highest non-adjustment period in the calendar for this year (supports
-        13-period calendars); falls back to 12."""
+        13-period calendars); falls back to scoped ledger activity, then 12."""
         adj = set(self._adj_periods())
         try:
             rows, _ = self.db.query(
@@ -287,11 +414,30 @@ class TBEngine:
                 },
                 max_rows=999,
             )
-            regular = [int(r["period"]) for r in rows if int(r["period"]) not in adj]
+            regular = [
+                int(r["period"])
+                for r in rows
+                if int(r["period"]) > 0
+                and int(r["period"]) != 999
+                and int(r["period"]) not in adj
+            ]
             if regular:
                 return max(regular)
         except Exception:
             pass
+        bu = (business_unit or "").strip()
+        led = (ledger or "").strip()
+        if bu and led:
+            try:
+                rows, _ = self.db.query(
+                    q.scope_last_regular_period(self.db, self._adj_periods()),
+                    {"bu": bu, "led": led, "fy": int(fy)},
+                    max_rows=1,
+                )
+                if rows and rows[0].get("last_period") is not None:
+                    return int(rows[0]["last_period"])
+            except Exception:
+                pass
         return 12
 
     def _parse_group_by(self, group_by: str) -> list[str]:
@@ -504,7 +650,7 @@ class TBEngine:
         # trend: "through 998" means through the last regular period, adjustments
         # included. Walking 1..998 would both fabricate periods and double-count.
         requested_adjustment_basis = per in adj
-        max_regular = self._max_regular_period(fy)
+        max_regular = self._max_regular_period(fy, bu, led)
         regular_through = max_regular if (requested_adjustment_basis or per > max_regular) else per
 
         rows = self._period_sums(
@@ -925,57 +1071,165 @@ class TBEngine:
         rows, _ = self.db.query(q.trees_list(self.db), {}, max_rows=100)
         return {"trees": rows}
 
-    def list_business_units(self) -> dict:
-        rows, _ = self.db.query(q.business_units(self.db), {}, max_rows=200)
-        return {"business_units": rows}
+    def _business_unit_enrichment(self) -> dict[str, dict]:
+        """Best-effort setup metadata, never the authority for valid scopes."""
+        try:
+            rows, _ = self.db.query(
+                q.business_units(self.db), {}, max_rows=INTERNAL_ROW_CAP
+            )
+        except Exception:
+            return {}
+        enriched: dict[str, dict] = {}
+        for row in rows:
+            bu = str(row.get("business_unit") or "").strip()
+            if not bu:
+                continue
+            enriched[bu] = {
+                "descr": str(row.get("descr") or "").strip() or None,
+                "base_currency": (
+                    str(row.get("base_currency") or "").strip() or None
+                ),
+            }
+        return enriched
 
-    def list_financial_scopes(self) -> dict:
+    def _ledger_scope_currency(self, bu: str, ledger: str) -> Optional[str]:
+        try:
+            rows, _ = self.db.query(
+                q.scope_base_currency(self.db),
+                {"bu": bu, "led": ledger},
+                max_rows=1,
+            )
+        except Exception:
+            return None
+        if not rows:
+            return None
+        return str(rows[0].get("base_currency") or "").strip() or None
+
+    def _scope_period_details(
+        self, bu: str, ledger: str
+    ) -> tuple[list[int], Optional[dict]]:
+        rows, _ = self.db.query(
+            q.scope_year_bounds(self.db, self._adj_periods()),
+            {"bu": bu, "led": ledger},
+            max_rows=1,
+        )
+        if not rows:
+            return [], None
+        first = rows[0].get("first_fy")
+        last = rows[0].get("last_fy")
+        regular = rows[0].get("last_regular_fy")
+        fiscal_years = (
+            [int(first), int(last)]
+            if first is not None and last is not None
+            else []
+        )
+        if regular is None:
+            return fiscal_years, None
+        fy = int(regular)
+        rows, _ = self.db.query(
+            q.scope_last_regular_period(self.db, self._adj_periods()),
+            {"bu": bu, "led": ledger, "fy": fy},
+            max_rows=1,
+        )
+        if not rows or rows[0].get("last_period") is None:
+            return fiscal_years, None
+        return fiscal_years, {
+            "fiscal_year": fy,
+            "period": int(rows[0]["last_period"]),
+        }
+
+    def list_business_units(self) -> dict:
+        pairs, truncated = self._ledger_scope_pairs()
+        enriched = self._business_unit_enrichment()
+        first_ledger: dict[str, str] = {}
+        for bu, ledger in pairs:
+            first_ledger.setdefault(bu, ledger)
+        rows = []
+        for bu, ledger in first_ledger.items():
+            meta = enriched.get(bu, {})
+            rows.append({
+                "business_unit": bu,
+                "descr": meta.get("descr"),
+                "base_currency": (
+                    meta.get("base_currency")
+                    or self._ledger_scope_currency(bu, ledger)
+                ),
+            })
+        return {"business_units": rows, "truncated": truncated}
+
+    def list_financial_scopes(self, include_activity: bool = True) -> dict:
         """Business units with base currency, their ledgers, and the fiscal
-        years/periods that hold data — in one round trip.
+        years/periods that hold data — in one deterministic catalog response.
 
         Two separate calls (list_business_units then list_ledgers) cannot be
         chained reliably by a model: both are emitted in the same turn, so the
         second runs before the first returns and silently falls back to the
         configured default.
+
+        Valid BU/ledger pairs always come from PS_LEDGER. PS_BUS_UNIT_TBL_GL is
+        optional enrichment only, because read-only production users often do
+        not have grants to that setup record. The default inventory is fast:
+        it does not probe every scope's history. Set ``include_activity`` only
+        when fiscal-year ranges and latest periods are actually required.
         """
-        p = self.db.prefix
-        rows, _ = self.db.query(
-            f"""SELECT L.BUSINESS_UNIT AS business_unit, L.LEDGER AS ledger,
-       MIN(L.FISCAL_YEAR) AS first_fy, MAX(L.FISCAL_YEAR) AS last_fy,
-       MAX(CASE WHEN L.ACCOUNTING_PERIOD BETWEEN 1 AND 12
-                THEN L.FISCAL_YEAR * 100 + L.ACCOUNTING_PERIOD END) AS last_yp,
-       MAX(L.BASE_CURRENCY) AS base_currency, COUNT(*) AS row_count
-  FROM {p}PS_LEDGER L
- GROUP BY L.BUSINESS_UNIT, L.LEDGER
- ORDER BY L.BUSINESS_UNIT, L.LEDGER""",
-            {}, max_rows=500,
+        pairs, truncated = self._ledger_scope_pairs()
+        enriched = self._business_unit_enrichment()
+        scopes: dict[str, dict] = {}
+        for bu, ledger in pairs:
+            meta = enriched.get(bu, {})
+            currency = (
+                meta.get("base_currency")
+                or (self._ledger_scope_currency(bu, ledger)
+                    if include_activity else None)
+            )
+            scope = scopes.setdefault(bu, {
+                "business_unit": bu,
+                "descr": meta.get("descr"),
+                "base_currency": currency,
+                "ledgers": [],
+            })
+            if not scope.get("base_currency") and currency:
+                scope["base_currency"] = currency
+            if include_activity:
+                fiscal_years, last_posted = self._scope_period_details(
+                    bu, ledger
+                )
+            else:
+                fiscal_years, last_posted = [], None
+            scope["ledgers"].append({
+                "ledger": ledger,
+                "fiscal_years": fiscal_years,
+                "last_posted": last_posted,
+                # Preserve the public key while avoiding the production-scale
+                # full COUNT(*) that previously made discovery appear stuck.
+                "row_count": None,
+            })
+
+        effective = self._remember_effective_defaults(
+            self._effective_defaults_from_pairs(pairs)
         )
-        descr = {}
-        try:
-            for b in self.list_business_units()["business_units"]:
-                descr[b["business_unit"]] = b.get("descr")
-        except Exception:
-            pass
-        scopes: dict = {}
-        for r in rows:
-            bu = r["business_unit"]
-            s = scopes.setdefault(bu, {
-                "business_unit": bu, "descr": descr.get(bu),
-                "base_currency": r.get("base_currency"), "ledgers": [],
-            })
-            yp = int(r.get("last_yp") or 0)
-            s["ledgers"].append({
-                "ledger": r["ledger"],
-                "fiscal_years": [int(r["first_fy"]), int(r["last_fy"])],
-                "last_posted": ({"fiscal_year": yp // 100, "period": yp % 100}
-                                if yp else None),
-                "row_count": int(r["row_count"]),
-            })
+        note = (
+            "Use these exact values; do not invent a business unit, ledger, or year. "
+            "row_count is intentionally not calculated during scope discovery. "
+            + (
+                "Fiscal-year and latest-period activity was included."
+                if include_activity
+                else "Activity detail is deferred until a scope is selected."
+            )
+        )
+        if truncated:
+            note += (
+                f" The catalog exceeded the safety cap of {INTERNAL_ROW_CAP} "
+                "BU/ledger pairs and is truncated."
+            )
         return {
             "scopes": list(scopes.values()),
-            "default": {"business_unit": self.cfg.defaults.business_unit,
-                        "ledger": self.cfg.defaults.ledger},
-            "note": "Use these exact values; do not invent a business unit, ledger, or year.",
+            "default": {
+                "business_unit": effective["business_unit"],
+                "ledger": effective["ledger"],
+            },
+            "note": note,
+            "truncated": truncated,
         }
 
     def list_ledgers(self, business_unit: str = "") -> dict:

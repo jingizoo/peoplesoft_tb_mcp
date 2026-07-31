@@ -121,29 +121,19 @@ class ARBilling:
 
     def _latest_posted_period(self, bu: str) -> tuple[int, int, Optional[str]]:
         """(fy, period, period_end_date) of the newest regular period with
-        posted rows in the default ledger — the only boundary a current-state
-        subledger can honestly be reconciled at."""
+        posted rows in the BU's resolved ledger — the only boundary a
+        current-state subledger can honestly be reconciled at."""
         if bu in self._latest_posted:
             return self._latest_posted[bu]
-        p = self.db.prefix
-        led = self.cfg.defaults.ledger
-        rows, _ = self.db.query(
-            f"SELECT MAX(FISCAL_YEAR) AS fy FROM {p}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led "
-            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
-            {"bu": bu, "led": led}, max_rows=1,
-        )
-        fy = int(rows[0]["fy"]) if rows and rows[0]["fy"] is not None else 0
+        # Resolve the ledger for this BU rather than copying the configured
+        # default BU's ledger. TBEngine also applies the site's configured
+        # adjustment-period exclusions, so legitimate period 13 remains a
+        # regular period and the AR-to-GL comparison uses the correct cutoff.
+        led = self.e.resolve_ledger_for(bu)
+        fy, per = self.e.last_posted_period(bu, led)
         if not fy:
             self._latest_posted[bu] = (0, 0, None)
             return self._latest_posted[bu]
-        rows, _ = self.db.query(
-            f"SELECT MAX(ACCOUNTING_PERIOD) AS p FROM {p}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led AND FISCAL_YEAR = :fy "
-            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
-            {"bu": bu, "led": led, "fy": fy}, max_rows=1,
-        )
-        per = int(rows[0]["p"]) if rows and rows[0]["p"] is not None else 0
         end_dt = None
         try:
             cal = self.e.list_periods(fy)["periods"]
@@ -566,7 +556,9 @@ class ARBilling:
         if not c:
             raise ARError("customer is required (an ID like C1001, or a name)")
         bu = self._bu(business_unit)
-        matches = self.search_customers(c, limit=5)["customers"]
+        matches = self.search_customers(
+            c, limit=5, business_unit=bu
+        )["customers"]
         exact = [m for m in matches if m["cust_id"].upper() == c.upper()]
         if exact:
             cust_id = exact[0]["cust_id"]
@@ -600,8 +592,10 @@ class ARBilling:
                 out[k] = result[k]
         return out
 
-    def search_customers(self, query: str = "", limit: int = 25) -> dict:
-        bu = self._bu("")
+    def search_customers(
+        self, query: str = "", limit: int = 25, business_unit: str = ""
+    ) -> dict:
+        bu = self._bu(business_unit)
         setid = self.e.resolve_setid(bu, "CUSTOMER")
         p = self.db.prefix
         params = {

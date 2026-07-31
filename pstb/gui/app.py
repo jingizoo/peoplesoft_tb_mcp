@@ -8,14 +8,20 @@ Run:  python -m pstb.gui            (then open http://127.0.0.1:8000)
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import re
 import sys
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from ..config import load_config
 from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
+from .. import queries as query_sql
 from ..ar import ARBilling, ARError
 from ..qlog import QuestionLog
 from ..report import ReportError, ReportRunner
@@ -46,8 +52,290 @@ except WikiError:
 
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None, redoc_url=None)
 
-# Conversation state for the chat panel, kept per process.
-_chat_state: dict = {"provider": None, "name": None}
+
+@dataclass
+class _ProviderSession:
+    """One provider history, scoped to one browser session and DB scope."""
+
+    provider: object
+    touched: float
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class _ProviderSessionStore:
+    """Small, bounded in-process provider registry.
+
+    Provider SDK objects contain mutable conversation history and are not safe
+    to share.  The key includes the validated financial scope, so changing BU,
+    ledger, year, or period always starts a separate context.  Expiry and a
+    hard bound prevent abandoned browser tabs from growing memory forever.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: int = 30 * 60,
+        max_entries: int = 100,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.ttl_seconds = max(60, int(ttl_seconds))
+        self.max_entries = max(1, int(max_entries))
+        self.clock = clock
+        self._entries: dict[tuple, _ProviderSession] = {}
+        self._lock = threading.RLock()
+
+    def _purge(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._entries.items()
+            if now - entry.touched > self.ttl_seconds and not entry.lock.locked()
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+
+    def get_or_create(self, key: tuple, factory: Callable[[], object]) -> _ProviderSession:
+        now = self.clock()
+        with self._lock:
+            self._purge(now)
+            entry = self._entries.get(key)
+            if entry is None:
+                while len(self._entries) >= self.max_entries:
+                    candidates = [
+                        (candidate.touched, candidate_key)
+                        for candidate_key, candidate in self._entries.items()
+                        if not candidate.lock.locked()
+                    ]
+                    if not candidates:
+                        break
+                    self._entries.pop(min(candidates)[1], None)
+                entry = _ProviderSession(provider=factory(), touched=now)
+                self._entries[key] = entry
+            entry.touched = now
+            return entry
+
+    async def reset_session(self, session_id: str) -> int:
+        """Remove only one browser session; never clear another user's history."""
+        with self._lock:
+            keys = [key for key in self._entries if key[0] == session_id]
+            entries = [self._entries.pop(key) for key in keys]
+        for entry in entries:
+            # A reset can arrive while a provider call is running in a worker
+            # thread. Wait for that scoped turn before mutating its history.
+            async with entry.lock:
+                try:
+                    await asyncio.to_thread(entry.provider.reset)
+                except Exception:
+                    pass
+        return len(entries)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_provider_sessions = _ProviderSessionStore(
+    ttl_seconds=int(os.environ.get("PSTB_CHAT_SESSION_TTL_SECONDS", "1800")),
+    max_entries=int(os.environ.get("PSTB_CHAT_MAX_SESSIONS", "100")),
+)
+
+_scope_cache: dict = {"expires": 0.0, "value": None}
+_scope_cache_lock = threading.RLock()
+_SCOPE_CACHE_SECONDS = 60
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
+_SCOPE_DISCOVERY_RE = re.compile(
+    r"\b(list|what|which|available|all|exist)\b.*"
+    r"\b(business\s+units|bus|bu'?s|ledgers|financial\s+scopes?|entities)\b",
+    re.IGNORECASE,
+)
+
+
+class _ScopeRequired(ValueError):
+    def __init__(self, detail: str, options: list[dict]):
+        super().__init__(detail)
+        self.detail = detail
+        self.options = options
+
+
+def _financial_scope_catalog(force: bool = False) -> dict:
+    """Return the authoritative PS_LEDGER scope catalog with a short TTL."""
+    now = time.monotonic()
+    with _scope_cache_lock:
+        if (
+            not force
+            and _scope_cache["value"] is not None
+            and now < _scope_cache["expires"]
+        ):
+            return _scope_cache["value"]
+        value = engine.list_financial_scopes(include_activity=False)
+        _scope_cache.update(
+            {"value": value, "expires": now + _SCOPE_CACHE_SECONDS}
+        )
+        return value
+
+
+def _scope_options(catalog: dict, business_unit: str = "") -> list[dict]:
+    options: list[dict] = []
+    for bu_scope in catalog.get("scopes") or []:
+        bu = str(bu_scope.get("business_unit") or "").strip()
+        if business_unit and bu != business_unit:
+            continue
+        for ledger_scope in bu_scope.get("ledgers") or []:
+            last = ledger_scope.get("last_posted") or {}
+            options.append(
+                {
+                    "business_unit": bu,
+                    "descr": bu_scope.get("descr"),
+                    "base_currency": bu_scope.get("base_currency"),
+                    "ledger": str(ledger_scope.get("ledger") or "").strip(),
+                    "fiscal_year": int(last.get("fiscal_year") or 0),
+                    "period": int(last.get("period") or 0),
+                    "fiscal_years": ledger_scope.get("fiscal_years") or [],
+                }
+            )
+    return options
+
+
+def _int_scope_value(raw: object, field_name: str) -> int:
+    if raw in (None, ""):
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400, detail=f"{field_name} must be an integer"
+        ) from e
+
+
+def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
+    """Resolve and validate a client scope exclusively from DB-discovered values."""
+    raw = requested if isinstance(requested, dict) else {}
+    catalog = catalog or _financial_scope_catalog()
+    all_options = _scope_options(catalog)
+    if not all_options:
+        raise HTTPException(
+            status_code=503,
+            detail="No business-unit and ledger combinations were found in PS_LEDGER.",
+        )
+
+    bu = str(raw.get("business_unit") or raw.get("bu") or "").strip()
+    if not bu:
+        business_units = sorted({o["business_unit"] for o in all_options})
+        if len(business_units) != 1:
+            raise _ScopeRequired(
+                "Choose a business unit before asking a financial-data question.",
+                all_options,
+            )
+        bu = business_units[0]
+
+    bu_options = [o for o in all_options if o["business_unit"] == bu]
+    if not bu_options:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Business unit {bu!r} is not present in the connected PS_LEDGER.",
+        )
+
+    ledger = str(raw.get("ledger") or "").strip()
+    if not ledger:
+        if len(bu_options) != 1:
+            raise _ScopeRequired(
+                f"Choose a ledger for business unit {bu}.", bu_options
+            )
+        ledger = bu_options[0]["ledger"]
+
+    matches = [o for o in bu_options if o["ledger"] == ledger]
+    if not matches:
+        known = ", ".join(sorted({o["ledger"] for o in bu_options}))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ledger {ledger!r} is not valid for {bu}. Available: {known}.",
+        )
+    discovered = matches[0]
+
+    if not discovered["fiscal_year"] or not discovered["period"]:
+        latest_fy, latest_period = engine.last_posted_period(bu, ledger)
+        discovered = {
+            **discovered,
+            "fiscal_year": latest_fy,
+            "period": latest_period,
+        }
+
+    fiscal_year = _int_scope_value(
+        raw.get("fiscal_year", raw.get("fy")), "fiscal_year"
+    ) or discovered["fiscal_year"]
+    period = _int_scope_value(raw.get("period", raw.get("per")), "period")
+    if not period:
+        period = discovered["period"]
+    years = discovered.get("fiscal_years") or []
+    if fiscal_year and len(years) >= 2:
+        first, last = int(years[0]), int(years[-1])
+        if fiscal_year < first or fiscal_year > last:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Fiscal year {fiscal_year} is outside the data range "
+                    f"{first}-{last} for {bu}/{ledger}."
+                ),
+            )
+    if fiscal_year < 1 or fiscal_year > 9999:
+        raise HTTPException(
+            status_code=400,
+            detail="fiscal_year must be between 1 and 9999",
+        )
+    # PeopleSoft calendars can have 13 regular periods and site-specific
+    # adjustment/closing periods. Do not impose a 12-period calendar in the
+    # chat boundary; the financial tool remains the source of truth.
+    if period < 1 or period > 999:
+        raise HTTPException(
+            status_code=400,
+            detail="period must be between 1 and 999",
+        )
+    return {
+        "business_unit": bu,
+        "ledger": ledger,
+        "fiscal_year": fiscal_year,
+        "period": period,
+    }
+
+
+def _question_requires_scope(message: str) -> bool:
+    from ..guards import evidence_intent
+
+    return evidence_intent(message) in {"data", "mixed"}
+
+
+def _is_scope_catalog_question(message: str) -> bool:
+    from ..guards import requires_financial_evidence
+
+    return bool(
+        _SCOPE_DISCOVERY_RE.search(message)
+        and not requires_financial_evidence(message)
+    )
+
+
+def _provider_key(
+    session_id: str, provider_name: str, scope: Optional[dict]
+) -> tuple:
+    if not scope:
+        return (session_id, provider_name, "__KNOWLEDGE_ONLY__", "", 0, 0)
+    return (
+        session_id,
+        provider_name,
+        scope["business_unit"],
+        scope["ledger"],
+        scope["fiscal_year"],
+        scope["period"],
+    )
+
+
+def _session_id(payload: dict) -> str:
+    session_id = str((payload or {}).get("session_id") or "").strip()
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "session_id is required and must be 8-128 letters, numbers, "
+                "dots, colons, underscores, or hyphens"
+            ),
+        )
+    return session_id
 
 
 def _guard(fn, **kw):
@@ -88,10 +376,25 @@ def meta():
                 else cfg.llm.gemini_model},
         "raw_sql": cfg.tools.allow_raw_sql,
     }
+    # PS_LEDGER is the authority for selectable financial scopes.  The GL
+    # business-unit setup table is useful metadata, but it must not collapse the
+    # UI to a configured sample BU when that table is unavailable to a read-only
+    # service account.
     try:
-        out["business_units"] = engine.list_business_units()["business_units"]
-    except Exception:
+        catalog = _financial_scope_catalog()
+        out["financial_scopes"] = catalog.get("scopes") or []
+        out["business_units"] = [
+            {
+                "business_unit": item.get("business_unit"),
+                "descr": item.get("descr"),
+                "base_currency": item.get("base_currency"),
+            }
+            for item in out["financial_scopes"]
+        ]
+    except Exception as e:
+        out["financial_scopes"] = []
         out["business_units"] = []
+        out["scope_catalog_error"] = str(e)
     # Scope comes from the DATABASE, validated against config — not raw config.
     # On a real instance the config defaults are often the sample values.
     try:
@@ -103,6 +406,7 @@ def meta():
             "ledgers": eff["ledgers"] or [eff["ledger"]],
             "fiscal_year": fy0,
             "period": per0,
+            "max_regular_period": engine._max_regular_period(fy0),
             "discovered": eff["discovered"],
             "notes": eff["notes"],
         }
@@ -114,6 +418,7 @@ def meta():
     except Exception as e:
         out["scope"] = {"business_unit": d.business_unit, "ledger": d.ledger,
                         "ledgers": [d.ledger], "fiscal_year": 0, "period": 0,
+                        "max_regular_period": 12,
                         "discovered": False, "notes": [f"scope discovery failed: {e}"]}
         out["ledgers"] = [d.ledger]
     try:
@@ -128,14 +433,12 @@ def meta():
     # the UI the newest period that actually has activity.
     try:
         rows, _ = db.query(
-            f"SELECT MAX(ACCOUNTING_PERIOD) AS p FROM {db.prefix}PS_LEDGER "
-            "WHERE BUSINESS_UNIT = :bu AND LEDGER = :led AND FISCAL_YEAR = :fy "
-            "AND ACCOUNTING_PERIOD BETWEEN 1 AND 12",
-            {"bu": cfg.defaults.business_unit, "led": cfg.defaults.ledger,
+            query_sql.scope_last_regular_period(db, engine._adj_periods()),
+            {"bu": out["scope"]["business_unit"], "led": out["scope"]["ledger"],
              "fy": out["current"]["fiscal_year"]},
             max_rows=1,
         )
-        p = rows[0]["p"] if rows else None
+        p = rows[0]["last_period"] if rows else None
         out["last_period_with_data"] = int(p) if p is not None else out["current"]["period"]
     except Exception:
         out["last_period_with_data"] = out["current"]["period"]
@@ -224,6 +527,7 @@ def scope_for(business_unit: str = "", ledger: str = ""):
         fy, per = engine.last_posted_period(bu, led)
         return {"business_unit": bu, "ledger": led, "ledgers": ledgers,
                 "fiscal_year": fy, "period": per,
+                "max_regular_period": engine._max_regular_period(fy),
                 **({"scope_status": leds["scope_status"], "detail": leds.get("detail")}
                    if "scope_status" in leds else {})}
     return _guard(_scope, business_unit=business_unit, ledger=ledger)
@@ -260,8 +564,15 @@ def ar_customer(customer: str, business_unit: str = "", as_of_date: str = ""):
 
 
 @app.get("/api/ar/customers")
-def ar_customers(query: str = "", limit: int = 25):
-    return _guard(ar.search_customers, query=query, limit=limit)
+def ar_customers(
+    query: str = "", limit: int = 25, business_unit: str = ""
+):
+    return _guard(
+        ar.search_customers,
+        query=query,
+        limit=limit,
+        business_unit=business_unit,
+    )
 
 
 @app.get("/api/billing")
@@ -321,12 +632,79 @@ def wiki_page(page_id: str):
 
 @app.post("/api/chat")
 async def chat(payload: dict):
-    """Run one agent turn over a fresh MCP session, keeping conversation history
-    in the provider between requests."""
+    """Run one governed chat turn in a browser-session + DB-scope context."""
     message = (payload or {}).get("message", "").strip()
-    provider_name = (payload or {}).get("provider") or cfg.llm.provider
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
+    session_id = _session_id(payload)
+    if "scope" not in payload:
+        raise HTTPException(status_code=400, detail="scope is required")
+    provider_name = str(
+        (payload or {}).get("provider") or cfg.llm.provider
+    ).strip().lower()
+    if provider_name not in {"gemini", "ollama"}:
+        raise HTTPException(status_code=400, detail="provider must be gemini or ollama")
+
+    try:
+        # This async route must not perform synchronous Oracle/SQL Server I/O
+        # on FastAPI's event loop.
+        catalog = await asyncio.to_thread(_financial_scope_catalog)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Financial scope discovery failed: {e}"
+        ) from e
+
+    # Scope discovery is deterministic and does not need an LLM round trip.
+    # It also works before the user has chosen a BU, which is the key escape
+    # hatch from a bad configured default.
+    if _is_scope_catalog_question(message):
+        options = _scope_options(catalog)
+        return {
+            "answer": (
+                "These business-unit and ledger combinations come directly "
+                "from PS_LEDGER. Select one to make it the active chat scope."
+            ),
+            "tool_calls": [
+                {
+                    "tool": "list_financial_scopes",
+                    "args": {},
+                    "ms": 0,
+                    "ok": True,
+                    "result": catalog,
+                }
+            ],
+            "scope_options": options,
+            "provider": provider_name,
+            "turn_id": None,
+        }
+
+    requested_scope = payload.get("scope")
+    has_requested_scope = bool(
+        isinstance(requested_scope, dict)
+        and any(
+            requested_scope.get(name) not in (None, "", 0, "0")
+            for name in ("business_unit", "bu", "ledger", "fiscal_year", "fy",
+                         "period", "per")
+        )
+    )
+    active_scope: Optional[dict] = None
+    if has_requested_scope or _question_requires_scope(message):
+        try:
+            # Validation can fall back to a latest-posted-period lookup when a
+            # catalog record has no activity metadata, so it is also offloaded.
+            active_scope = await asyncio.to_thread(
+                _validated_scope, requested_scope, catalog
+            )
+        except _ScopeRequired as e:
+            return {
+                "scope_required": True,
+                "error": e.detail,
+                "answer": e.detail,
+                "scope_options": e.options,
+                "tool_calls": [],
+                "provider": provider_name,
+                "turn_id": None,
+            }
 
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -344,63 +722,71 @@ async def chat(payload: dict):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = tool_specs(await session.list_tools())
-                set_tool_result_limit(cfg, provider_name)
-                if _chat_state["provider"] is None or _chat_state["name"] != provider_name:
+
+                def make_provider():
                     prompt = system_prompt(cfg, surface="gui")
-                    try:
-                        eff = engine.effective_defaults()
-                        fy0, per0 = engine.last_posted_period(
-                            eff["business_unit"], eff["ledger"])
+                    if active_scope:
                         prompt += (
-                            "\n\n## Live scope in THIS database (verified)\n"
-                            f"- Business unit: {eff['business_unit']} | Ledger: "
-                            f"{eff['ledger']} (available: {', '.join(eff['ledgers'])})\n"
-                            f"- Latest posted period: FY{fy0} P{per0}\n"
-                            "Use these when the user doesn't specify — they come "
-                            "from the database, not config."
+                            "\n\n## Active scope selected by the user and verified "
+                            "against PS_LEDGER\n"
+                            f"- Business unit: {active_scope['business_unit']}\n"
+                            f"- Ledger: {active_scope['ledger']}\n"
+                            f"- Fiscal year: {active_scope['fiscal_year']}\n"
+                            f"- Period: {active_scope['period']}\n"
+                            "Use this exact scope for every financial-data tool. "
+                            "The server enforces it. If the question combines a "
+                            "financial fact with a policy, retrieve the database "
+                            "fact first and then retrieve the wiki passage; never "
+                            "let wiki text replace database evidence."
                         )
-                    except Exception:
-                        pass
+                    else:
+                        prompt += (
+                            "\n\n## Knowledge-only conversation\n"
+                            "No financial database scope is selected. You may "
+                            "answer general questions and retrieve approved wiki "
+                            "passages, but do not call a financial-data tool. If "
+                            "the user asks for a balance, transaction, customer, "
+                            "invoice, report, or other financial fact, ask them "
+                            "to select a database scope."
+                        )
                     if provider_name == "gemini":
                         from ..client.llm_gemini import GeminiVertexProvider as P
                     else:
                         from ..client.llm_ollama import OllamaProvider as P
-                    _chat_state["provider"] = P(cfg, prompt, tools)
-                    _chat_state["name"] = provider_name
-                provider = _chat_state["provider"]
+                    return P(cfg, prompt, tools)
 
-                # Record which tools ran so the UI can show the evidence trail.
-                import pstb.client.chat as chat_mod
+                key = _provider_key(session_id, provider_name, active_scope)
+                provider_entry = _provider_sessions.get_or_create(
+                    key, make_provider
+                )
+                provider = provider_entry.provider
 
-                original = chat_mod.call_mcp_tool
-
-                async def traced(sess, name, args):
-                    import json as _json
-                    import time as _time
-
-                    t0 = _time.perf_counter()
-                    out = await original(sess, name, args)
-                    ms = int((_time.perf_counter() - t0) * 1000)
+                def observe_tool(name, args, out, ms, ok):
                     # Hand the browser the actual payload so it can render the
                     # result inline — the model's prose never carries a figure
                     # that the UI then re-displays.
+                    import json as _json
+
                     try:
                         data = _json.loads(out)
                     except (ValueError, TypeError):
                         data = None
                     calls.append({
-                        "tool": name, "args": args, "ms": ms,
-                        "ok": not str(out).startswith("TOOL ERROR"),
+                        "tool": name, "args": args, "ms": ms, "ok": ok,
                         "result": data,
                     })
-                    return out
 
-                chat_mod.call_mcp_tool = traced
-                try:
-                    answer = await agent_turn(provider, session, message,
-                                              qlog=qlog, surface="gui")
-                finally:
-                    chat_mod.call_mcp_tool = original
+                async with provider_entry.lock:
+                    set_tool_result_limit(cfg, provider_name)
+                    answer = await agent_turn(
+                        provider,
+                        session,
+                        message,
+                        qlog=qlog,
+                        surface="gui",
+                        scope=active_scope,
+                        tool_observer=observe_tool,
+                    )
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup
@@ -420,6 +806,7 @@ async def chat(payload: dict):
             content={"error": f"{type(root).__name__}: {root}", "tool_calls": calls},
         )
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
+            "scope": active_scope,
             "turn_id": getattr(agent_turn, "last_turn_id", None)}
 
 
@@ -434,10 +821,10 @@ def feedback(payload: dict):
 
 
 @app.post("/api/chat/reset")
-def chat_reset():
-    if _chat_state["provider"] is not None:
-        _chat_state["provider"].reset()
-    return {"ok": True}
+async def chat_reset(payload: dict):
+    session_id = _session_id(payload or {})
+    cleared = await _provider_sessions.reset_session(session_id)
+    return {"ok": True, "histories_cleared": cleared}
 
 
 def main() -> None:

@@ -14,13 +14,28 @@ import json
 import os
 import re
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from ..config import Config, load_config
-from ..guards import promises_tool_call, unevidenced_verdict
+from ..guards import (
+    FINANCIAL_EVIDENCE_TOOLS,
+    POLICY_EVIDENCE_TOOLS,
+    ScopeConflict,
+    apply_request_scope,
+    evidence_intent,
+    financial_tool_domains,
+    is_policy_tool,
+    normalize_request_scope,
+    promises_tool_call,
+    question_financial_domains,
+    tool_result_status,
+    unevidenced_verdict,
+)
 from ..qlog import QuestionLog
 from .llm_base import LLMProvider, LLMResponse, ToolResult, ToolSpec
 from .prompt import system_prompt
@@ -121,50 +136,282 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     return _truncate_json(text, MAX_TOOL_RESULT_CHARS)
 
 
+def _blocked_result(reason: str, next_step: str) -> str:
+    """Provider-neutral function response for a call stopped by a guard."""
+    return json.dumps({
+        "error": reason,
+        "evidence_gate": "blocked",
+        "next_step": next_step,
+    })
+
+
+def _evidence_nudge(intent: str, db_ok: bool, relevant_financial_db_ok: bool,
+                    policy_ok: bool, policy_attempted: bool = False,
+                    db_problem: str = "", user_question: str = "") -> str:
+    """Return the next required evidence phase, or an empty string."""
+    if intent == "data" and not db_ok:
+        detail = f" The previous database result failed: {db_problem}" if db_problem else ""
+        return (
+            "Evidence gate: answer this data question from PeopleSoft, not the "
+            f"wiki. Call the most specific database tool now.{detail}"
+        )
+    if intent == "mixed" and not relevant_financial_db_ok:
+        detail = f" The previous database result failed: {db_problem}" if db_problem else ""
+        return (
+            "Evidence gate: this question combines a financial fact with a "
+            "policy decision. Call the relevant PeopleSoft financial tool now. "
+            f"Do not call the wiki until that result succeeds.{detail}"
+        )
+    if intent in ("policy", "mixed") and not policy_ok and not policy_attempted:
+        return (
+            "Evidence gate: retrieve the actual policy passage with wiki_lookup "
+            f"now using the user's exact question: {user_question!r}. "
+            "Do not search for generic phrases such as 'evidence gate policy', "
+            "and do not answer from memory, wiki titles, or links."
+        )
+    return ""
+
+
 async def agent_turn(provider: LLMProvider, session: ClientSession,
-                     user_text: str, qlog=None, surface: str = "terminal") -> str:
-    resp: LLMResponse = provider.send_user(user_text)
+                     user_text: str, qlog=None, surface: str = "terminal",
+                     scope: dict | None = None,
+                     tool_observer: Callable | None = None) -> str:
+    """Run one model turn with deterministic source ordering.
+
+    ``scope`` is an optional, user-validated request scope. Concrete values are
+    injected into financial tools that support them; a model attempt to change
+    one is rejected before reaching MCP. Scope discovery itself is never
+    constrained, so ``list_financial_scopes`` can still answer "all BUs".
+    """
+    request_scope = normalize_request_scope(scope)
+    intent = evidence_intent(user_text)
+    required_financial_domains = question_financial_domains(user_text)
+    financial_fact_required = (
+        intent == "data" and bool(required_financial_domains)
+    )
+    resp: LLMResponse = await asyncio.to_thread(provider.send_user, user_text)
     logged_calls: list[dict] = []
     rounds = 0
     hit_limit = False
     nudges = 0
+    db_ok = False
+    covered_financial_domains: set[str] = set()
+    policy_ok = False
+    policy_attempted = False
+    scope_blocked = False
+    last_db_problem = ""
+
+    def has_relevant_financial_evidence() -> bool:
+        if required_financial_domains:
+            return required_financial_domains.issubset(
+                covered_financial_domains
+            )
+        # An anaphoric mixed question ("Is that within policy?") must re-query
+        # at least one curated financial source. Do not rely on stale model
+        # history to supply the data side of a verdict.
+        return bool(covered_financial_domains)
+
     for _ in range(MAX_TOOL_ROUNDS):
         if not resp.tool_calls:
+            relevant_financial_db_ok = has_relevant_financial_evidence()
+            data_ok = (
+                relevant_financial_db_ok if financial_fact_required else db_ok
+            )
+            needed = _evidence_nudge(
+                intent,
+                data_ok,
+                relevant_financial_db_ok,
+                policy_ok,
+                policy_attempted,
+                last_db_problem,
+                user_text,
+            )
+            if nudges < MAX_NUDGES and needed:
+                nudges += 1
+                resp = await asyncio.to_thread(provider.send_user, needed)
+                continue
             # Promised a tool call but made none — continue rather than
             # handing the user an unfulfilled intention.
             if nudges < MAX_NUDGES and promises_tool_call(resp.text):
                 nudges += 1
-                resp = provider.send_user(
+                resp = await asyncio.to_thread(
+                    provider.send_user,
                     "You stated you would call a tool but did not. Issue that "
                     "tool call now, then answer. Do not describe what you will "
-                    "do — do it."
+                    "do — do it.",
                 )
                 continue
             break
         rounds += 1
         if resp.text.strip():
             print(f"{DIM}{resp.text.strip()}{RESET}")
-        results = []
-        for call in resp.tool_calls:
-            arg_preview = json.dumps(call.args, default=str)
+
+        # A model may emit DB and wiki calls in one parallel batch. Execute all
+        # non-wiki calls first; only a successful financial result opens the
+        # wiki phase for a mixed question. Return results in the model's
+        # original call order so Gemini/Ollama transcripts remain valid.
+        indexed_calls = list(enumerate(resp.tool_calls))
+        execution_order = (
+            sorted(indexed_calls, key=lambda item: is_policy_tool(item[1].name))
+            if intent == "mixed" else indexed_calls
+        )
+        results_by_index: dict[int, ToolResult] = {}
+        for index, call in execution_order:
+            effective_args = dict(call.args or {})
+            blocked = ""
+            next_step = ""
+            relevant_financial_db_ok = has_relevant_financial_evidence()
+            if (
+                surface == "gui"
+                and not request_scope
+                and not is_policy_tool(call.name)
+                and call.name != "list_financial_scopes"
+            ):
+                blocked = (
+                    f"{call.name} requires a user-selected PeopleSoft scope "
+                    "in the GUI"
+                )
+                next_step = (
+                    "Ask the user to choose a business unit and ledger before "
+                    "calling a financial or database tool."
+                )
+                scope_blocked = True
+            elif intent == "data" and is_policy_tool(call.name):
+                blocked = (
+                    f"{call.name} is not allowed for a data-only question; "
+                    "wiki text cannot substitute for PeopleSoft data"
+                )
+                next_step = "Call the relevant PeopleSoft database tool."
+            elif (
+                intent == "mixed"
+                and is_policy_tool(call.name)
+                and not relevant_financial_db_ok
+            ):
+                blocked = (
+                    f"{call.name} is blocked until a PeopleSoft financial tool "
+                    "returns successful evidence"
+                )
+                next_step = (
+                    "Call the relevant PeopleSoft financial tool; retry the "
+                    "wiki only after it succeeds."
+                )
+            if not blocked:
+                try:
+                    effective_args = apply_request_scope(
+                        call.name, effective_args, request_scope
+                    )
+                except ScopeConflict as e:
+                    blocked = f"REQUEST_SCOPE_CONFLICT: {e}"
+                    next_step = (
+                        "Use the request scope exactly, or ask the user to "
+                        "change the scope before retrying."
+                    )
+            # RAG relevance is a server-side invariant, not a model preference.
+            # The model may paraphrase a nudge as a useless query such as
+            # "evidence gate policy"; always retrieve passages for what the
+            # user actually asked. Other lookup controls (page/passages limits)
+            # remain intact.
+            if (
+                not blocked
+                and call.name == "wiki_lookup"
+                and intent in {"policy", "mixed"}
+            ):
+                effective_args = {
+                    key: value
+                    for key, value in effective_args.items()
+                    if key in {"question", "max_pages", "max_passages"}
+                }
+                effective_args["question"] = user_text
+
+            arg_preview = json.dumps(effective_args, default=str)
             if len(arg_preview) > 140:
                 arg_preview = arg_preview[:140] + "…"
-            print(f"{DIM}  ⚙ {call.name}({arg_preview}){RESET}")
-            out = await call_mcp_tool(session, call.name, call.args)
-            err = out.startswith("TOOL ERROR") or '"error":' in out[:200]
-            logged_calls.append({"tool": call.name, "ok": not err,
-                                 **({"error": out[:200]} if err else {})})
-            results.append(ToolResult(call_id=call.id, name=call.name, content=out))
-        resp = provider.send_tool_results(results)
+            marker = "⊘" if blocked else "⚙"
+            print(f"{DIM}  {marker} {call.name}({arg_preview}){RESET}")
+
+            started = time.perf_counter()
+            out = (
+                _blocked_result(blocked, next_step)
+                if blocked
+                else await call_mcp_tool(session, call.name, effective_args)
+            )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            ok, problem = tool_result_status(call.name, out)
+            if tool_observer is not None:
+                tool_observer(
+                    call.name, dict(effective_args), out, elapsed_ms, ok
+                )
+            if is_policy_tool(call.name):
+                if call.name in POLICY_EVIDENCE_TOOLS:
+                    policy_attempted = True
+                    if ok:
+                        policy_ok = True
+            else:
+                if ok:
+                    db_ok = True
+                    if call.name in FINANCIAL_EVIDENCE_TOOLS:
+                        covered_financial_domains.update(
+                            financial_tool_domains(call.name)
+                        )
+                else:
+                    last_db_problem = problem or blocked or "database tool failed"
+            logged_calls.append({
+                "tool": call.name,
+                "ok": ok,
+                **({"error": (problem or blocked or out)[:240]} if not ok else {}),
+            })
+            results_by_index[index] = ToolResult(
+                call_id=call.id, name=call.name, content=out
+            )
+        results = [results_by_index[i] for i in range(len(resp.tool_calls))]
+        resp = await asyncio.to_thread(provider.send_tool_results, results)
     else:
         hit_limit = True
     answer = resp.text or ("(stopped: too many tool rounds)" if hit_limit
                            else "(no response)")
 
+    relevant_financial_db_ok = has_relevant_financial_evidence()
+    gate_replaced_answer = False
+    if scope_blocked:
+        answer = (
+            "Choose a PeopleSoft business unit and ledger before I query "
+            "financial data. No configured default scope was used."
+        )
+        gate_replaced_answer = True
+    elif intent == "mixed" and not relevant_financial_db_ok:
+        answer = (
+            "I could not obtain successful PeopleSoft financial evidence, so "
+            "I cannot decide this question. The wiki was not used as a "
+            "substitute for the missing financial result."
+            + (f" Database detail: {last_db_problem}" if last_db_problem else "")
+        )
+        gate_replaced_answer = True
+    elif intent == "mixed" and not policy_ok:
+        answer = (
+            "The PeopleSoft data was retrieved, but no verified wiki passage "
+            "was available, so I cannot decide whether the result satisfies "
+            "the requested rule."
+        )
+        gate_replaced_answer = True
+    elif intent == "data" and not (
+        relevant_financial_db_ok if financial_fact_required else db_ok
+    ):
+        answer = (
+            "I could not obtain a successful PeopleSoft result for this "
+            "question. No wiki content was used in its place."
+        )
+        gate_replaced_answer = True
+    elif intent == "policy" and not policy_ok:
+        answer = (
+            "I could not retrieve a verified policy passage from the wiki, so "
+            "I cannot answer this policy question from memory."
+        )
+        gate_replaced_answer = True
+
     # A compliance verdict needs a rule AND a figure. If one side is missing,
     # say so rather than letting a half-grounded judgement stand.
-    used = {c["tool"] for c in logged_calls}
-    missing = unevidenced_verdict(answer, used)
+    used = {c["tool"] for c in logged_calls if c["ok"]}
+    missing = "" if gate_replaced_answer else unevidenced_verdict(answer, used)
     if missing:
         if True:
             answer += (
