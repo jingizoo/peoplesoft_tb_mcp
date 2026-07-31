@@ -233,6 +233,7 @@ const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(und
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[];
 let PENDING_TIME={}, SYNC_TIME_SELECTS=null;
+let SCOPE_DISCOVERING=false, SCOPE_LOAD_ERROR='';
 const makeSessionId=()=>{
   if(globalThis.crypto&&crypto.randomUUID) return crypto.randomUUID();
   return 'chat-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
@@ -332,9 +333,43 @@ function renderBuildTag(node){
   tag.textContent='v'+(b.version||'?')+' · '+short;
   tag.title=Object.entries(b).map(([k,v])=>k+': '+v).join('\n');
 }
+function applyScopeCatalog(){
+  // Auto-select only when the database is unambiguous. With multiple choices
+  // the conversation asks, rather than inheriting a sample BU.
+  const opts=flattenScopes(META.financial_scopes||[]);
+  if(opts.length===1&&!CHAT_SCOPE) setChatScope(opts[0],false);
+  if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
+  return opts;
+}
+async function loadScopesInBackground(){
+  // The page is already usable: policy questions, the wiki and general chat
+  // work with no scope at all. Discovery fills the bar in when it lands
+  // instead of holding the first paint hostage to a WAN round trip.
+  setScopeDiscovering(true);
+  try{
+    const d=await api('/api/scopes');
+    META.financial_scopes=d.scopes||[];
+    META.business_units=d.business_units||[];
+    META.scopes_ready=true;
+    const opts=applyScopeCatalog();
+    // A chooser already on screen was rendered empty — refresh it in place.
+    if(!CHAT_SCOPE&&document.querySelector('#msgs .scope-chooser')&&opts.length)
+      showScopeChooser();
+  }catch(e){
+    SCOPE_LOAD_ERROR=e.message||String(e);
+  }finally{
+    setScopeDiscovering(false);
+  }
+}
+function setScopeDiscovering(active){
+  SCOPE_DISCOVERING=active; updateScopeChip();
+}
 function updateScopeChip(){
   const chip=$('#active-scope');
-  if(chip) chip.textContent=scopeLabel(CHAT_SCOPE);
+  if(!chip) return;
+  if(!CHAT_SCOPE&&SCOPE_DISCOVERING){ chip.textContent='Finding business units…'; return; }
+  if(!CHAT_SCOPE&&SCOPE_LOAD_ERROR){ chip.textContent='Scope unavailable — retry'; return; }
+  chip.textContent=scopeLabel(CHAT_SCOPE);
 }
 function setChatScope(value,announce){
   let next=canonicalScope(value);
@@ -1061,10 +1096,8 @@ async function viewAR(){
     sc0.period||META.last_period_with_data||META.current.period);
   $('#f-fy').value=sc0.fiscal_year||META.current.fiscal_year;
   per.value=sc0.period||META.last_period_with_data||META.current.period;
-  const chatOptions=flattenScopes(META.financial_scopes||[]);
-  // Auto-select only when the database is unambiguous. With multiple choices,
-  // the conversation itself asks the user instead of inheriting a sample BU.
-  if(chatOptions.length===1) setChatScope(chatOptions[0],false);
+  applyScopeCatalog();          // instant when the server cache was warm
+  if(!META.scopes_ready) loadScopesInBackground();
   async function rescope(keepLedger){
     try{
       const d=await api('/api/scope?'+qs({business_unit:bu.value,
@@ -1232,7 +1265,11 @@ function viewChat(){
   });
   const context=el('div','chat-context','<span>Active data context</span>');
   const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
-  contextButton.id='active-scope';contextButton.onclick=showScopeChooser;context.append(contextButton);
+  contextButton.id='active-scope';
+  contextButton.onclick=()=>{
+    if(SCOPE_LOAD_ERROR){SCOPE_LOAD_ERROR='';loadScopesInBackground();return;}
+    showScopeChooser();
+  };context.append(contextButton);
   buildTimeSelects().forEach(sel=>context.append(sel));
   const build=el('span','build-tag');
   build.id='build-tag';

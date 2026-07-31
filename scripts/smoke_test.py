@@ -706,9 +706,16 @@ DROP TABLE PS_INTFC_BI;
         audited = list(_cap)
     finally:
         engine.db.query = _orig_q
+    # The hazard is an UNBOUNDED DISTINCT over PS_LEDGER (full index scan on
+    # Oracle). A DISTINCT with equality predicates on (BUSINESS_UNIT, LEDGER)
+    # is the batched existence probe and is index-friendly — the point of
+    # batching was to replace one round trip per pair with one per 50.
+    _unbounded = [s for s, _ in disc
+                  if "DISTINCT BUSINESS_UNIT" in s and " WHERE " not in s]
     check("scope discovery never scans the whole ledger",
-          not [s for s, _ in disc if "DISTINCT BUSINESS_UNIT" in s],
-          str([s[:60] for s, _ in disc if "DISTINCT BUSINESS_UNIT" in s]))
+          not _unbounded, str([s[:60] for s in _unbounded]))
+    check("discovery stays within a handful of round trips",
+          len(disc) <= 6, f"{len(disc)} queries")
     check("a fully-scoped call pays no catalog query",
           not [s for s, _ in scoped
                if "PS_BUS_UNIT_LED" in s or "DISTINCT BUSINESS_UNIT" in s])
