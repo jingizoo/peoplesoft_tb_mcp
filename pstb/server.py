@@ -29,6 +29,8 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+from .sources import SourceRegistry
+engine.registry = SourceRegistry(cfg, db)
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:
@@ -151,6 +153,7 @@ def drill_to_journals(
 def search_accounts(query: str = "", account_type: str = "", limit: int = 50,
                     business_unit: str = "") -> dict:
     """Find GL accounts by description text or account-number prefix.
+    Uses the business unit's own SetID, so pass the active scope's BU.
     account_type filter: A=Asset, L=Liability, Q=Equity, R=Revenue, E=Expense.
     Empty query lists accounts (up to limit)."""
     return _safe(engine.search_accounts, query=query, account_type=account_type,
@@ -430,7 +433,8 @@ def list_ledgers(business_unit: str) -> dict:
 if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
-    def run_sql(sql: str, max_rows: int = 100, business_unit: str = "") -> dict:
+    def run_sql(sql: str, max_rows: int = 100, business_unit: str = "",
+                source: str = "") -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
         CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
         only, DML/DDL rejected, rows capped at 500, every table validated against
@@ -445,11 +449,11 @@ if cfg.tools.allow_raw_sql:
         was actually restricted to it (scope_filtered / scope_note) — the SQL
         is never rewritten. Relay scope_note when it says NOT restricted.
         PS_ tables use signed amounts (credits negative)."""
-        return _safe(engine.run_sql, sql=sql, max_rows=max_rows,
+        return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
                      business_unit=business_unit)
 
     @mcp.tool()
-    def search_records(query: str = "", limit: int = 25) -> dict:
+    def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
         """Find the right PeopleSoft record for a question by searching
         PeopleTools metadata — record DESCRIPTIONS and field names, not just
         table names. Use this whenever the question names a module, a document,
@@ -459,7 +463,7 @@ if cfg.tools.allow_raw_sql:
         physical table to query (honoring a site's SQLTABLENAME override),
         the description, and approximate row counts, most-populated first.
         Follow with describe_record then run_sql."""
-        return _safe(engine.search_records, query=query, limit=limit)
+        return _safe(engine.for_source(source).search_records, query=query, limit=limit)
 
     @mcp.tool()
     def describe_record(record: str) -> dict:
@@ -470,14 +474,14 @@ if cfg.tools.allow_raw_sql:
         return _safe(engine.describe_record, record=record)
 
     @mcp.tool()
-    def list_tables(pattern: str = "") -> dict:
+    def list_tables(pattern: str = "", source: str = "") -> dict:
         """List tables/views matching a pattern (e.g. 'JRNL' or 'PS_LEDGER%')."""
-        return _safe(engine.list_tables, pattern=pattern)
+        return _safe(engine.for_source(source).list_tables, pattern=pattern)
 
     @mcp.tool()
-    def describe_table(table_name: str) -> dict:
+    def describe_table(table_name: str, source: str = "") -> dict:
         """Column names and types for one table/view (e.g. PS_JRNL_HEADER)."""
-        return _safe(engine.describe_table, table_name=table_name)
+        return _safe(engine.for_source(source).describe_table, table_name=table_name)
 
 
 if wiki is not None:
