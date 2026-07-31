@@ -1493,6 +1493,33 @@ class TBEngine:
             ("PS_ITEM_ACTIVITY", "transaction", "AR item activity", ""),
             ("PS_CUSTOMER", "reference", "customers", "search_customers"),
         ],
+        "payables": [
+            ("PS_VOUCHER", "transaction",
+             "AP voucher headers (supplier invoices); ENTRY_STATUS P=posted",
+             ""),
+            ("PS_VOUCHER_LINE", "transaction", "voucher lines", ""),
+            ("PS_DISTRIB_LINE", "transaction",
+             "voucher accounting distribution — ties AP to the GL", ""),
+            ("PS_PYMNT_VCHR_XREF", "transaction",
+             "payment-to-voucher cross reference: how a payment maps to the "
+             "vouchers it paid", ""),
+            ("PS_PAYMENT_TBL", "transaction",
+             "payment headers (PYMNT_ID, PYMNT_AMT, PYMNT_DT, bank)", ""),
+            ("PS_VENDOR", "reference", "suppliers/vendors", ""),
+        ],
+        "asset_management": [
+            ("PS_ASSET", "reference", "asset master", ""),
+            ("PS_COST", "transaction", "asset cost rows", ""),
+            ("PS_DEPRECIATION", "transaction", "depreciation by period", ""),
+        ],
+        "commitment_control": [
+            ("PS_KK_ACTIVITY_LOG", "transaction",
+             "budget-check activity (encumbrance/pre-encumbrance)", ""),
+        ],
+        "projects_expenses": [
+            ("PS_PROJECT", "reference", "projects", ""),
+            ("PS_EX_SHEET_HDR", "transaction", "expense report headers", ""),
+        ],
         "chartfields_setup": [
             ("PS_GL_ACCOUNT_TBL", "reference", "accounts (effective-dated)",
              "search_accounts"),
