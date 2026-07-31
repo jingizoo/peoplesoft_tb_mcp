@@ -148,11 +148,13 @@ def drill_to_journals(
 
 
 @mcp.tool()
-def search_accounts(query: str = "", account_type: str = "", limit: int = 50) -> dict:
+def search_accounts(query: str = "", account_type: str = "", limit: int = 50,
+                    business_unit: str = "") -> dict:
     """Find GL accounts by description text or account-number prefix.
     account_type filter: A=Asset, L=Liability, Q=Equity, R=Revenue, E=Expense.
     Empty query lists accounts (up to limit)."""
-    return _safe(engine.search_accounts, query=query, account_type=account_type, limit=limit)
+    return _safe(engine.search_accounts, query=query, account_type=account_type,
+                 limit=limit, business_unit=business_unit)
 
 
 @mcp.tool()
