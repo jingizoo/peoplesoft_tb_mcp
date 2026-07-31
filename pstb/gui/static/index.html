@@ -1175,6 +1175,7 @@ function viewChat(){
   $('#q').focus();
 }
 async function send(messageOverride,appendUser){
+  const sendSession=CHAT_SESSION_ID; // stale-answer guard after Clear
   if(CHAT_RESETTING) return;
   const i=$('#q');
   const supplied=typeof messageOverride==='string';
