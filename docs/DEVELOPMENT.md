@@ -117,6 +117,30 @@ get_exchange_rate converts amounts server-side so the model never multiplies.
 A framework on top of MCP would add a dependency without fixing either
 failure mode.
 
+## Monitoring — from answering to noticing
+
+```
+.venv/bin/python scripts/monitor.py                 # run + diff + report
+.venv/bin/python scripts/monitor.py --quiet         # silent unless something changed
+.venv/bin/python scripts/monitor.py --history       # what has been recorded
+```
+
+Runs a playbook, compares it to the previous run, and reports what CHANGED —
+new findings, findings that moved (suspense grew from 15,000 to 40,000),
+findings that cleared, and checks that STOPPED RUNNING, which is the loudest
+signal because the verdict is no longer comparable. No language model is
+involved: the diff is deterministic, so it cannot drift or hallucinate and it
+runs on a box with no LLM configured.
+
+Exit codes are for schedulers: `0` nothing changed, `1` something changed,
+`2` the run failed. A nightly cron that mails only on change:
+
+```
+30 6 * * * cd /opt/peoplesoft_tb_mcp && .venv/bin/python scripts/monitor.py --quiet | mail -E -s "PeopleSoft close readiness" finance-team@yourco.com
+```
+
+Snapshots and an append-only history live in `logs/monitor/`.
+
 ## Evals — pinning MODEL behavior
 
 ```

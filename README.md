@@ -103,6 +103,18 @@ after the database result succeeds. More in
 
 One-shot mode: `.venv/bin/python -m pstb.client.chat --ask "total assets as of period 6?"`
 
+## Monitoring
+
+Playbooks can run on a schedule and report only what changed:
+
+```bash
+.venv/bin/python scripts/monitor.py --quiet
+```
+
+Exit code 1 means something moved since the last run — new findings, cleared
+findings, or a check that stopped running. See docs/DEVELOPMENT.md for a cron
+example.
+
 ## LLM providers
 
 | | Ollama | Gemini on Vertex AI |

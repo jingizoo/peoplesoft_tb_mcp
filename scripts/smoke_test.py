@@ -951,6 +951,58 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 
+    print("== monitoring: what changed since last time ==")
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_mon", ROOT / "scripts" / "monitor.py")
+    _mon = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mon)
+
+    def _run(steps, verdict="exceptions_found"):
+        return {"verdict": verdict, "summary": "x", "title": "T",
+                "business_unit": "US001", "ledger": "ACTUALS",
+                "fiscal_year": 2026, "period": 7,
+                "attention_count": sum(1 for s in steps
+                                       if s["status"] == "attention"),
+                "skipped_count": sum(1 for s in steps
+                                     if s["status"] == "skipped"),
+                "steps": steps}
+
+    def _step(sid, status, headline="h"):
+        return {"step": sid, "title": sid, "why": "", "status": status,
+                "headline": headline, "detail": {}}
+
+    _first = _mon.diff_runs({}, _run([_step("a", "attention")]))
+    check("a first run is a baseline, not a change report",
+          _first["first_run"] is True)
+    _same = _mon.diff_runs(_run([_step("a", "attention")]),
+                           _run([_step("a", "attention")]))
+    check("an unchanged run reports no change", _same["changed"] is False)
+    _new = _mon.diff_runs(_run([_step("a", "ok")]),
+                          _run([_step("a", "attention")]))
+    check("a new finding is reported",
+          _new["changed"] and len(_new["new_findings"]) == 1)
+    _fixed = _mon.diff_runs(_run([_step("a", "attention")]),
+                            _run([_step("a", "ok")]))
+    check("a resolved finding is reported too",
+          _fixed["changed"] and len(_fixed["resolved"]) == 1)
+    _moved = _mon.diff_runs(_run([_step("a", "attention", "15,000.00")]),
+                            _run([_step("a", "attention", "40,000.00")]))
+    check("a finding that MOVED is reported with its previous value",
+          _moved["changed"] and _moved["moved"]
+          and _moved["moved"][0]["previous_headline"] == "15,000.00")
+    # The loudest signal: a check that stopped running means the verdict is
+    # no longer comparable to yesterday's.
+    _stopped = _mon.diff_runs(_run([_step("a", "ok")]),
+                              _run([_step("a", "skipped")]))
+    check("a check that STOPPED RUNNING is surfaced",
+          _stopped["changed"] and len(_stopped["stopped_running"]) == 1)
+    check("stopped checks are called out as not comparable",
+          "not comparable" in _mon.render(_run([_step("a", "skipped")]),
+                                          _stopped))
+    _vc = _mon.diff_runs(_run([_step("a", "ok")], verdict="passed"),
+                         _run([_step("a", "attention")]))
+    check("a verdict change is reported", _vc["verdict_changed"] is True)
+
     print("== site memory: nothing remembered without approval ==")
     from pstb.memory import SiteMemory, MemoryError_, looks_like_a_lesson
     from pstb.client.prompt import system_prompt as _sysprompt
