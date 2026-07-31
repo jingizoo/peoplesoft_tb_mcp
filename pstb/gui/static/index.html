@@ -370,11 +370,17 @@ function renderScopeChooser(options,onChoose,title){
   });
   c.append(body); return c;
 }
+function dismissScopeChoosers(){
+  document.querySelectorAll('#msgs .scope-chooser').forEach(h=>h.remove());
+}
 function showScopeChooser(){
   const msgs=$('#msgs'); if(!msgs) return;
+  // At most ONE chooser card: clicking the chip repeatedly was stacking
+  // identical cards, and a card picked in one copy left the others live.
+  dismissScopeChoosers();
   const options=flattenScopes(META.financial_scopes||[]);
-  const holder=el('div','inline');
-  const chooser=renderScopeChooser(options,()=>holder.remove(),'Choose active scope');
+  const holder=el('div','inline scope-chooser');
+  const chooser=renderScopeChooser(options,()=>dismissScopeChoosers(),'Choose active scope');
   holder.append(chooser);msgs.append(holder);msgs.scrollTop=msgs.scrollHeight;
 }
 
@@ -1117,9 +1123,9 @@ function viewChat(){
     'tables, controls, statements, customer views, and approved wiki evidence inside this conversation.</p>';
   msgs.append(hero);
   if(!CHAT_SCOPE){
-    const holder=el('div','inline');
+    const holder=el('div','inline scope-chooser');
     holder.append(renderScopeChooser(
-      flattenScopes(META.financial_scopes||[]),()=>holder.remove(),
+      flattenScopes(META.financial_scopes||[]),()=>dismissScopeChoosers(),
       'Choose a scope for financial questions'
     ));
     msgs.append(holder);
@@ -1191,10 +1197,11 @@ async function send(messageOverride,appendUser){
     } finally { clearTimeout(timer); }
     const j=await r.json();
     think.remove();
+    if(sendSession!==CHAT_SESSION_ID) return; // cleared mid-flight — stale answer
     if(j.scope_required){
-      const holder=el('div','inline');
+      const holder=el('div','inline scope-chooser');
       holder.append(renderScopeChooser(j.scope_options||[],()=>{
-        holder.remove();send(m,false);
+        dismissScopeChoosers();send(m,false);
       },j.answer||'Choose a scope'));
       msgs.append(holder);msgs.scrollTop=msgs.scrollHeight;
       return;

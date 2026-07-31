@@ -108,6 +108,7 @@ _TOOL_SCOPE_ARGS = {
         "fiscal_year": "fiscal_year", "period": "period",
     },
     "list_ledgers": {"business_unit": "business_unit"},
+    "search_accounts": {"business_unit": "business_unit"},
 }
 
 _SCOPE_ALIASES = {

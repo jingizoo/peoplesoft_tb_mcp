@@ -69,7 +69,7 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
     and non-monetary statistical rows into the total, which is the usual reason
     a generated trial balance does not tie to PeopleSoft.
 
-      base        -> POSTED_TOTAL_AMT where CURRENCY_CD = BASE_CURRENCY
+      base        -> SUM(POSTED_TOTAL_AMT) across ALL currency rows\n                     (POSTED_TOTAL_AMT is already the base amount)
       transaction -> POSTED_TRAN_AMT, caller groups by CURRENCY_CD
     Statistical rows (STATISTICS_CODE populated) are always excluded; they are
     headcount/area/units, not money.
@@ -80,12 +80,6 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
         # base-currency contract must still be applied here. Dropping the
         # whole clause silently mixed foreign-currency rows into every total.
         clause = ""
-        if (amount_basis or "base").lower() == "base" and not currency:
-            if base_currency:
-                params["base_curr"] = base_currency
-                clause += f" AND {alias}.CURRENCY_CD = :base_curr"
-            else:
-                clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
     else:
         # Oracle treats '' as NULL, so TRIM(' ') yields NULL and a plain
         # `TRIM(x) = ''` test is UNKNOWN — which would silently exclude every
@@ -95,17 +89,14 @@ def basis_clause(db: Database, amount_basis: str, currency: str, params: dict,
             f" OR TRIM({alias}.STATISTICS_CODE) IS NULL"
             f" OR TRIM({alias}.STATISTICS_CODE) = '')"
         )
-        if (amount_basis or "base").lower() == "base" and not currency:
-            if base_currency:
-                # Bind the resolved currency rather than comparing
-                # CURRENCY_CD to BASE_CURRENCY column-to-column: Oracle cannot
-                # use the PS_LEDGER index for a column-to-column predicate and
-                # may switch to a full scan, which on a real ledger reads as a
-                # hang.
-                params["base_curr"] = base_currency
-                clause += f" AND {alias}.CURRENCY_CD = :base_curr"
-            else:
-                clause += f" AND {alias}.CURRENCY_CD = {alias}.BASE_CURRENCY"
+        # NO currency predicate on the base basis. CURRENCY_CD is the
+        # TRANSACTION currency and POSTED_TOTAL_AMT is already the base
+        # amount on every row — a journal entered in EUR posts only a
+        # CURRENCY_CD='EUR' row, so filtering to the base currency silently
+        # dropped all foreign-entered activity while the TB still balanced
+        # (both sides of the FX journal excluded). Base total = SUM of
+        # POSTED_TOTAL_AMT across ALL currency rows. An explicit currency=
+        # filter and the transaction basis keep their predicates below.
     if currency and currency.lower() != "detail":
         params["curr"] = currency.upper()
         clause += f" AND {alias}.CURRENCY_CD = :curr"

@@ -645,6 +645,17 @@ class TBEngine:
         max_rows: int = 0,
     ) -> dict:
         bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        basis = "regular"
+        if per in self._adj_periods():
+            # Asking for "period 998" means the post-adjustment year-end
+            # basis, not a monthly bucket: clamp to the last regular period
+            # and fold the adjustments in, exactly as account_balance does.
+            # Passing 998 through as :maxper swept the adjustments in even
+            # with include_adjustments=False and then labeled them as
+            # activity of a nonexistent period.
+            per = self._max_regular_period(fy, bu, led)
+            include_adjustments = True
+            basis = "post_adjustment"
         extras = self._parse_group_by(group_by)
         if currency.lower() == "detail" and "CURRENCY_CD" not in extras:
             extras.append("CURRENCY_CD")
@@ -695,6 +706,7 @@ class TBEngine:
             "ledger": led,
             "fiscal_year": fy,
             "period": per,
+            "basis": basis,
             "include_adjustments": include_adjustments,
             "group_by": ["ACCOUNT"] + extras,
             "rows": out_rows[:cap],
@@ -822,9 +834,16 @@ class TBEngine:
             self._period_sums(bu, led, fy, per, dept=dept, account=account),
             ["account"], per, False,
         )
+        # A prior-YEAR ending must be the POST-adjustment basis: the current
+        # year's period-0 opening was written by year-end close and therefore
+        # includes 998 adjustments. Comparing it against a pre-adjustment
+        # prior ending fabricates a "mover" for every adjusted account.
+        prior_year = vfy < fy
+        prior_adj = prior_year and vper >= self._max_regular_period(vfy, bu, led)
         base = self._pivot(
-            self._period_sums(bu, led, vfy, vper, dept=dept, account=account),
-            ["account"], vper, False,
+            self._period_sums(bu, led, vfy, vper, dept=dept, account=account,
+                              include_adj=prior_adj),
+            ["account"], vper, prior_adj,
         )
         keys = set(cur) | set(base)
         rows = []
@@ -918,8 +937,11 @@ class TBEngine:
             ),
         }
 
-    def search_accounts(self, query: str = "", account_type: str = "", limit: int = 50) -> dict:
-        setid = self.resolve_setid(self.cfg.defaults.business_unit)
+    def search_accounts(self, query: str = "", account_type: str = "",
+                    limit: int = 50, business_unit: str = "") -> dict:
+        setid = self.resolve_setid(
+            (business_unit or "").strip()
+            or self.cfg.defaults.business_unit)
         params: dict = {
             "setid": setid,
             "qd": f"%{(query or '').upper()}%",

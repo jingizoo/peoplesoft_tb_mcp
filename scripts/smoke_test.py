@@ -177,7 +177,41 @@ def main() -> None:
     _sql = q.tb_period_sums(Database(cfg), extras=[], include_adj=False,
                             adj_periods=[998], dept="", currency="", account="", params=_p)
     check("statistical rows excluded", "STATISTICS_CODE" in _sql)
-    check("base-currency rows only", "CURRENCY_CD = L.BASE_CURRENCY" in _sql)
+    # POSTED_TOTAL_AMT is the BASE amount on EVERY currency row; a journal
+    # entered in EUR posts only a CURRENCY_CD='EUR' row. Filtering base-basis
+    # queries to the base currency silently dropped all foreign-entered
+    # activity — while the TB still balanced. The base basis must therefore
+    # carry NO currency predicate.
+    check("base basis sums all currency rows (no CURRENCY_CD filter)",
+          "CURRENCY_CD = L.BASE_CURRENCY" not in _sql
+          and ":base_curr" not in _sql, _sql[:80])
+    import sqlite3 as _sqfx
+    _fxc = _sqfx.connect(str(ROOT / "sample_data" / "ps_sample.db"))
+    _fxc.execute(
+        "INSERT INTO PS_LEDGER SELECT BUSINESS_UNIT, LEDGER, ACCOUNT, ALTACCT, "
+        "DEPTID, OPERATING_UNIT, PRODUCT, FUND_CODE, CLASS_FLD, PROGRAM_CODE, "
+        "BUDGET_REF, AFFILIATE, PROJECT_ID, 'EUR', STATISTICS_CODE, "
+        "FISCAL_YEAR, ACCOUNTING_PERIOD, 9200.0, 9200.0, 8464.0, "
+        "BASE_CURRENCY FROM PS_LEDGER WHERE ACCOUNT='1000' "
+        "AND FISCAL_YEAR=2026 AND ACCOUNTING_PERIOD=6 LIMIT 1")
+    _fxc.execute(
+        "INSERT INTO PS_LEDGER SELECT BUSINESS_UNIT, LEDGER, ACCOUNT, ALTACCT, "
+        "DEPTID, OPERATING_UNIT, PRODUCT, FUND_CODE, CLASS_FLD, PROGRAM_CODE, "
+        "BUDGET_REF, AFFILIATE, PROJECT_ID, 'EUR', STATISTICS_CODE, "
+        "FISCAL_YEAR, ACCOUNTING_PERIOD, -9200.0, -9200.0, -8464.0, "
+        "BASE_CURRENCY FROM PS_LEDGER WHERE ACCOUNT='4000' "
+        "AND FISCAL_YEAR=2026 AND ACCOUNTING_PERIOD=6 LIMIT 1")
+    _fxc.commit(); _fxc.close()
+    eng_fx = TBEngine(Database(Config.sample(ROOT)), Config.sample(ROOT))
+    tb_fx = eng_fx.trial_balance(fiscal_year=2026, period=6)
+    r1000fx = {r["account"]: r for r in tb_fx["rows"]}["1000"]
+    check("foreign-entered journal included in base TB",
+          abs(r1000fx["ending"] - (r1000["ending"] + 9200.0)) < 0.01
+          and tb_fx["totals"]["in_balance"],
+          f"{r1000fx['ending']:,.2f}")
+    _fxc = _sqfx.connect(str(ROOT / "sample_data" / "ps_sample.db"))
+    _fxc.execute("DELETE FROM PS_LEDGER WHERE CURRENCY_CD='EUR'")
+    _fxc.commit(); _fxc.close()
     check("basis declared on result", tb.get("amount_basis") == "base", str(tb.get("amount_basis")))
     _txn = q.tb_period_sums(Database(cfg), extras=[], include_adj=False, adj_periods=[998],
                             dept="", currency="", account="", params={}, amount_basis="transaction")

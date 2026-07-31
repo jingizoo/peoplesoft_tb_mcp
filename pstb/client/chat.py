@@ -102,18 +102,30 @@ def _truncate_json(text: str, limit: int) -> str:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return text[:limit] + "\n...[truncated]"
-    rows = payload.get("rows") if isinstance(payload, dict) else None
+    # Trim whichever top-level list dominates the payload ('rows' for
+    # run_sql, 'customers'/'items' for aging, 'stuck_invoices' for billing...).
+    # Trimming only 'rows' meant AR payloads fell through to a raw character
+    # cut that produced invalid JSON and severed totals/gl_tie — the model
+    # then summed visible customers itself and fabricated a total.
+    list_key, rows = None, None
+    if isinstance(payload, dict):
+        best = 0
+        for k, v in payload.items():
+            if isinstance(v, list) and v:
+                size = len(json.dumps(v, default=str))
+                if size > best:
+                    best, list_key, rows = size, k, v
     if not isinstance(rows, list) or not rows:
         return text[:limit] + "\n...[truncated]"
     kept = rows
-    while kept and len(json.dumps({**payload, "rows": kept}, default=str)) > limit:
+    while kept and len(json.dumps({**payload, list_key: kept}, default=str)) > limit:
         kept = kept[: max(1, len(kept) * 3 // 4)]
         if len(kept) == 1:
             break
-    payload["rows"] = kept
+    payload[list_key] = kept
     payload["rows_omitted_for_context"] = len(rows) - len(kept)
     payload["note_truncation"] = (
-        f"{len(rows) - len(kept)} detail row(s) withheld to fit context; "
+        f"{len(rows) - len(kept)} '{list_key}' entr(ies) withheld to fit context; "
         "totals above cover the full result set."
     )
     out = json.dumps(payload, default=str)
@@ -200,6 +212,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     policy_attempted = False
     scope_blocked = False
     last_db_problem = ""
+    last_policy_problem = ""
 
     def has_relevant_financial_evidence() -> bool:
         if required_financial_domains:
@@ -346,13 +359,22 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                     policy_attempted = True
                     if ok:
                         policy_ok = True
+                    else:
+                        last_policy_problem = (problem or blocked
+                                               or "wiki lookup failed")
             else:
                 if ok:
                     db_ok = True
                     if call.name in FINANCIAL_EVIDENCE_TOOLS:
-                        covered_financial_domains.update(
-                            financial_tool_domains(call.name)
-                        )
+                        covered = financial_tool_domains(call.name)
+                        if call.name == "run_sql":
+                            # Ad-hoc SQL has no fixed domain: a successful
+                            # SELECT the user's question routed to IS the
+                            # financial evidence for that question. Without
+                            # this, correct run_sql answers were replaced by
+                            # a false "could not obtain a PeopleSoft result".
+                            covered = required_financial_domains or {"adhoc"}
+                        covered_financial_domains.update(covered)
                 else:
                     last_db_problem = problem or blocked or "database tool failed"
             logged_calls.append({
@@ -391,6 +413,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             "The PeopleSoft data was retrieved, but no verified wiki passage "
             "was available, so I cannot decide whether the result satisfies "
             "the requested rule."
+            + (f" Wiki detail: {last_policy_problem}"
+               if last_policy_problem else "")
         )
         gate_replaced_answer = True
     elif intent == "data" and not (
@@ -405,6 +429,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
         answer = (
             "I could not retrieve a verified policy passage from the wiki, so "
             "I cannot answer this policy question from memory."
+            + (f" Wiki detail: {last_policy_problem}"
+               if last_policy_problem else "")
         )
         gate_replaced_answer = True
 
@@ -514,6 +540,11 @@ async def run(args: argparse.Namespace) -> int:
                     if len(parts) == 2 and parts[1] in ("ollama", "gemini"):
                         try:
                             provider = build_provider(parts[1], cfg, tools)
+                            # Re-size tool results for the NEW provider: an 8B
+                            # local model drowns past ~24k chars, and Gemini
+                            # can take 120k — keeping the old limit gives the
+                            # wrong behavior in both directions.
+                            set_tool_result_limit(cfg, parts[1])
                             print(f"(switched to {provider.name}:{provider.model} — history reset)")
                         except (RuntimeError, SystemExit) as e:
                             print(f"(cannot switch: {e})")
