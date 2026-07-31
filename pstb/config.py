@@ -117,12 +117,38 @@ def _env(name: str, current: str) -> str:
     return v or current
 
 
+# The directory that contains the pstb package — i.e. the repo/deployment
+# root, wherever it was unpacked.
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_config_path(path: Optional[str] = None) -> Path:
+    """Where the config lives: path arg > $PSTB_CONFIG > ./config.yaml >
+    <package root>/config.yaml. Pure path logic (no yaml import), so tests
+    can verify it under a bare interpreter."""
+    explicit = path or os.environ.get("PSTB_CONFIG")
+    if explicit:
+        cfg_path = Path(explicit)
+        return cfg_path if cfg_path.is_absolute() else Path.cwd() / cfg_path
+    cfg_path = Path.cwd() / "config.yaml"
+    if not cfg_path.exists() and (_PACKAGE_ROOT / "config.yaml").exists():
+        return _PACKAGE_ROOT / "config.yaml"
+    return cfg_path
+
+
 def load_config(path: Optional[str] = None) -> Config:
-    """Load config.yaml (path arg > $PSTB_CONFIG > ./config.yaml) then overlay env vars."""
-    cfg_path = Path(path or os.environ.get("PSTB_CONFIG") or "config.yaml")
-    if not cfg_path.is_absolute():
-        cfg_path = Path.cwd() / cfg_path
-    cfg = Config(root=cfg_path.parent if cfg_path.exists() else Path.cwd())
+    """Load config.yaml, searched as: path arg > $PSTB_CONFIG > ./config.yaml
+    > <package root>/config.yaml. Then overlay env vars.
+
+    The package-root fallback is what makes every entry point safe to launch
+    from ANY working directory. Without it, `cd scripts && python -m pstb.gui`
+    found no config in the cwd and silently served the built-in sqlite
+    defaults — on a real deployment that surfaced as every API call failing
+    with "SQLite sample database not found" while a correct config.yaml sat
+    one directory up.
+    """
+    cfg_path = resolve_config_path(path)
+    cfg = Config(root=cfg_path.parent if cfg_path.exists() else _PACKAGE_ROOT)
 
     # .env sits next to the config file (or cwd); load before reading env overlays.
     try:
