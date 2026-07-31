@@ -23,6 +23,7 @@ BALANCE_EPS = 0.005
 INTERNAL_ROW_CAP = 100_000
 SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
 SCOPE_PROBE_CAP = 250          # max existence probes when filtering the catalog
+SCOPE_BATCH = 50               # pairs verified per round trip
 SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balances
 
 _SQL_DENY = re.compile(
@@ -148,13 +149,29 @@ class TBEngine:
         round-trips on a very large installation."""
         if len(pairs) > SCOPE_PROBE_CAP:
             return pairs
-        kept = []
-        for bu, ledger in pairs:
+        # ONE query per batch, not one per pair. Each probe is milliseconds of
+        # database work but a full network round trip; on a WAN with a few
+        # hundred BU/ledger pairs the serial loop was the minute-long first
+        # page load reported from the work box. A grouped query costs the
+        # same index work and 2-3 round trips total.
+        kept: list = []
+        p = self.db.prefix
+        for start in range(0, len(pairs), SCOPE_BATCH):
+            chunk = pairs[start:start + SCOPE_BATCH]
+            params: dict = {}
+            clauses = []
+            for i, (bu, ledger) in enumerate(chunk):
+                params[f"b{i}"], params[f"l{i}"] = bu, ledger
+                clauses.append(f"(BUSINESS_UNIT = :b{i} AND LEDGER = :l{i})")
+            sql = (f"SELECT DISTINCT BUSINESS_UNIT AS bu, LEDGER AS led "
+                   f"FROM {p}PS_LEDGER WHERE " + " OR ".join(clauses))
             try:
-                if self._pair_has_data(bu, ledger):
-                    kept.append((bu, ledger))
+                rows, _ = self.db.query(sql, params, max_rows=SCOPE_BATCH)
+                found = {(str(r["bu"]).strip(), str(r["led"]).strip())
+                         for r in rows}
+                kept.extend(pair for pair in chunk if pair in found)
             except DbError:
-                kept.append((bu, ledger))  # can't prove empty — keep it
+                kept.extend(chunk)      # cannot prove empty — keep them
         return kept or pairs
 
     def _ledger_scope_pairs(self) -> tuple[list[tuple[str, str]], bool]:

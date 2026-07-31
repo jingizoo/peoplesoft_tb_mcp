@@ -9,6 +9,7 @@ Run:  python -m pstb.gui            (then open http://127.0.0.1:8000)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import sys
@@ -51,7 +52,56 @@ try:
 except WikiError:
     wiki = None
 
-app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None, redoc_url=None)
+# ---------------------------------------------------------------- MCP session
+# One server subprocess for the LIFETIME OF THE PROCESS, not one per chat turn.
+# Spawning per turn cost a fresh Python start, MCP handshake, Oracle logon and
+# cold caches on every question (~390ms of pure overhead locally, worse over a
+# corporate network) with zero cache reuse between questions.
+#
+# The session is owned by the app LIFESPAN, not by a request. MCP's stdio
+# client uses anyio cancel scopes, and a cancel scope must be exited by the
+# same task that entered it — holding the stack inside a request handler and
+# closing it from another raises "attempted to exit cancel scope in a
+# different task". Entering at startup and exiting at shutdown keeps both ends
+# in the lifespan task; individual tool calls are safe from request tasks
+# because they only move messages over memory streams.
+_MCP: dict = {"session": None, "tools": None, "error": None}
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    stack = contextlib.AsyncExitStack()
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        from ..client.chat import tool_specs
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
+                             + os.pathsep + env.get("PYTHONPATH", ""))
+        params = StdioServerParameters(
+            command=sys.executable, args=["-m", "pstb.server"], env=env)
+        read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        _MCP["session"] = session
+        _MCP["tools"] = tool_specs(await session.list_tools())
+    except Exception as e:                      # degrade, never fail to boot
+        _MCP["error"] = str(e)
+        print(f"[pstb] shared MCP session unavailable ({e}); "
+              "falling back to one server per turn", file=sys.stderr)
+    try:
+        yield
+    finally:
+        try:
+            await stack.aclose()
+        except Exception:
+            pass
+        _MCP.update({"session": None, "tools": None})
+
+
+app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
+              redoc_url=None, lifespan=_lifespan)
 
 
 @dataclass
@@ -170,6 +220,16 @@ def _financial_scope_catalog(force: bool = False) -> dict:
             {"value": value, "expires": now + _SCOPE_CACHE_SECONDS}
         )
         return value
+
+
+def _warm_scope_catalog():
+    """The cached catalog, or None when discovery has not run yet. Never
+    triggers discovery — that is the whole point of the async split."""
+    now = time.monotonic()
+    with _scope_cache_lock:
+        if _scope_cache["value"] is not None and now < _scope_cache["expires"]:
+            return _scope_cache["value"]
+    return None
 
 
 def _scope_options(catalog: dict, business_unit: str = "") -> list[dict]:
@@ -399,9 +459,14 @@ def meta():
     # business-unit setup table is useful metadata, but it must not collapse the
     # UI to a configured sample BU when that table is unavailable to a read-only
     # service account.
-    try:
-        catalog = _financial_scope_catalog()
-        out["financial_scopes"] = catalog.get("scopes") or []
+    # /api/meta must return INSTANTLY. Building the catalog here meant the
+    # page sat on its first paint for as long as discovery took — a minute on
+    # a real WAN — with nothing on screen to explain it. The catalog is served
+    # only when a previous request already warmed the cache; otherwise the
+    # client fetches /api/scopes in the background and fills the bar in.
+    warm = _warm_scope_catalog()
+    if warm is not None:
+        out["financial_scopes"] = warm.get("scopes") or []
         out["business_units"] = [
             {
                 "business_unit": item.get("business_unit"),
@@ -410,10 +475,11 @@ def meta():
             }
             for item in out["financial_scopes"]
         ]
-    except Exception as e:
+        out["scopes_ready"] = True
+    else:
         out["financial_scopes"] = []
         out["business_units"] = []
-        out["scope_catalog_error"] = str(e)
+        out["scopes_ready"] = False
     # Scope comes from the DATABASE, validated against config — not raw config.
     # On a real instance the config defaults are often the sample values.
     try:
@@ -529,6 +595,29 @@ def compare(
         fiscal_year=fiscal_year, period=period, vs_fiscal_year=vs_fiscal_year,
         vs_period=vs_period, top=top, min_abs_change=min_abs_change,
     )
+
+
+@app.get("/api/scopes")
+def scopes_catalog(force: bool = False):
+    """Business-unit / ledger catalog, built on demand.
+
+    Split out of /api/meta so the page can paint immediately and fill this in
+    when it arrives. Safe to call repeatedly: it is cached.
+    """
+    def _build() -> dict:
+        catalog = _financial_scope_catalog(force=force)
+        scopes = catalog.get("scopes") or []
+        return {
+            "scopes": scopes,
+            "business_units": [
+                {"business_unit": s.get("business_unit"),
+                 "descr": s.get("descr"),
+                 "base_currency": s.get("base_currency")}
+                for s in scopes
+            ],
+            "ready": True,
+        }
+    return _guard(_build)
 
 
 @app.get("/api/scope")
@@ -741,93 +830,105 @@ async def chat(payload: dict):
                 "turn_id": None,
             }
 
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-
-    from ..client.chat import agent_turn, set_tool_result_limit, tool_specs
+    from ..client.chat import agent_turn, set_tool_result_limit
     from ..client.prompt import system_prompt
-
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
-    params = StdioServerParameters(command=sys.executable, args=["-m", "pstb.server"], env=env)
 
     calls: list = []
     try:
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = tool_specs(await session.list_tools())
+        # Use the shared, lifespan-owned server when it is up; otherwise fall
+        # back to a per-turn subprocess so a chat never fails outright.
+        shared = _MCP.get("session") is not None
+        if shared:
+            session, tools = _MCP["session"], _MCP["tools"]
+            per_turn = contextlib.AsyncExitStack()
+        else:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+            from ..client.chat import tool_specs
+            env = dict(os.environ)
+            env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
+                                 + os.pathsep + env.get("PYTHONPATH", ""))
+            params = StdioServerParameters(
+                command=sys.executable, args=["-m", "pstb.server"], env=env)
+            per_turn = contextlib.AsyncExitStack()
+            read, write = await per_turn.enter_async_context(
+                stdio_client(params))
+            session = await per_turn.enter_async_context(
+                ClientSession(read, write))
+            await session.initialize()
+            tools = tool_specs(await session.list_tools())
 
-                def make_provider():
-                    prompt = system_prompt(cfg, surface="gui")
-                    if active_scope:
-                        prompt += (
-                            "\n\n## Active scope selected by the user and verified "
-                            "against PS_LEDGER\n"
-                            f"- Business unit: {active_scope['business_unit']}\n"
-                            f"- Ledger: {active_scope['ledger']}\n"
-                            f"- Fiscal year: "
-                            f"{active_scope.get('fiscal_year') or 'any (the question decides)'}\n"
-                            f"- Period: "
-                            f"{active_scope.get('period') or 'any (the question decides)'}\n"
-                            "Business unit and ledger are FIXED — never change "
-                            "them. Fiscal year and period are defaults: use "
-                            "them when the question does not name its own, and "
-                            "pass the period the user actually asked for when "
-                            "they do. "
-                            "If the question combines a "
-                            "financial fact with a policy, retrieve the database "
-                            "fact first and then retrieve the wiki passage; never "
-                            "let wiki text replace database evidence."
-                        )
-                    else:
-                        prompt += (
-                            "\n\n## Knowledge-only conversation\n"
-                            "No financial database scope is selected. You may "
-                            "answer general questions and retrieve approved wiki "
-                            "passages, but do not call a financial-data tool. If "
-                            "the user asks for a balance, transaction, customer, "
-                            "invoice, report, or other financial fact, ask them "
-                            "to select a database scope."
-                        )
-                    if provider_name == "gemini":
-                        from ..client.llm_gemini import GeminiVertexProvider as P
-                    else:
-                        from ..client.llm_ollama import OllamaProvider as P
-                    return P(cfg, prompt, tools)
-
-                key = _provider_key(session_id, provider_name, active_scope)
-                provider_entry = _provider_sessions.get_or_create(
-                    key, make_provider
+        def make_provider():
+            prompt = system_prompt(cfg, surface="gui")
+            if active_scope:
+                prompt += (
+                    "\n\n## Active scope selected by the user and verified "
+                    "against PS_LEDGER\n"
+                    f"- Business unit: {active_scope['business_unit']}\n"
+                    f"- Ledger: {active_scope['ledger']}\n"
+                    f"- Fiscal year: "
+                    f"{active_scope.get('fiscal_year') or 'any (the question decides)'}\n"
+                    f"- Period: "
+                    f"{active_scope.get('period') or 'any (the question decides)'}\n"
+                    "Business unit and ledger are FIXED — never change "
+                    "them. Fiscal year and period are defaults: use "
+                    "them when the question does not name its own, and "
+                    "pass the period the user actually asked for when "
+                    "they do. "
+                    "If the question combines a "
+                    "financial fact with a policy, retrieve the database "
+                    "fact first and then retrieve the wiki passage; never "
+                    "let wiki text replace database evidence."
                 )
-                provider = provider_entry.provider
+            else:
+                prompt += (
+                    "\n\n## Knowledge-only conversation\n"
+                    "No financial database scope is selected. You may "
+                    "answer general questions and retrieve approved wiki "
+                    "passages, but do not call a financial-data tool. If "
+                    "the user asks for a balance, transaction, customer, "
+                    "invoice, report, or other financial fact, ask them "
+                    "to select a database scope."
+                )
+            if provider_name == "gemini":
+                from ..client.llm_gemini import GeminiVertexProvider as P
+            else:
+                from ..client.llm_ollama import OllamaProvider as P
+            return P(cfg, prompt, tools)
 
-                def observe_tool(name, args, out, ms, ok):
-                    # Hand the browser the actual payload so it can render the
-                    # result inline — the model's prose never carries a figure
-                    # that the UI then re-displays.
-                    import json as _json
+        key = _provider_key(session_id, provider_name, active_scope)
+        provider_entry = _provider_sessions.get_or_create(
+            key, make_provider
+        )
+        provider = provider_entry.provider
 
-                    try:
-                        data = _json.loads(out)
-                    except (ValueError, TypeError):
-                        data = None
-                    calls.append({
-                        "tool": name, "args": args, "ms": ms, "ok": ok,
-                        "result": data,
-                    })
+        def observe_tool(name, args, out, ms, ok):
+            # Hand the browser the actual payload so it can render the
+            # result inline — the model's prose never carries a figure
+            # that the UI then re-displays.
+            import json as _json
 
-                async with provider_entry.lock:
-                    set_tool_result_limit(cfg, provider_name)
-                    answer = await agent_turn(
-                        provider,
-                        session,
-                        message,
-                        qlog=qlog,
-                        surface="gui",
-                        scope=active_scope,
-                        tool_observer=observe_tool,
-                    )
+            try:
+                data = _json.loads(out)
+            except (ValueError, TypeError):
+                data = None
+            calls.append({
+                "tool": name, "args": args, "ms": ms, "ok": ok,
+                "result": data,
+            })
+
+        async with provider_entry.lock:
+            set_tool_result_limit(cfg, provider_name)
+            answer = await agent_turn(
+                provider,
+                session,
+                message,
+                qlog=qlog,
+                surface="gui",
+                scope=active_scope,
+                tool_observer=observe_tool,
+            )
+        await per_turn.aclose()
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup
