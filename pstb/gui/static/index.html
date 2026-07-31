@@ -130,6 +130,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .composer input:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .chat-context{display:flex;align-items:center;gap:8px;padding:8px 18px 0;background:var(--panel);
   color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+.scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .scope-chip{border:1px solid var(--line);background:var(--bg);border-radius:20px;padding:5px 10px;
   cursor:pointer;color:var(--ink);font-weight:600}
 .scope-chip:hover{border-color:var(--accent);color:var(--accent)}
@@ -229,7 +230,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!==undefined)n.innerHTML=h;return n;};
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null;
+let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[];
 const makeSessionId=()=>{
   if(globalThis.crypto&&crypto.randomUUID) return crypto.randomUUID();
   return 'chat-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
@@ -288,15 +289,20 @@ function flattenScopes(scopes){
 }
 function canonicalScope(value){
   if(!value||!value.business_unit||!value.ledger) return null;
+  // null fiscal_year/period mean ANY — the question decides and each tool
+  // uses its own current-period default. Business unit and ledger are the
+  // only fields that must always be pinned.
+  const num=v=>(v===null||v===undefined||v===''||v==='any')?null:(Number(v)||null);
   return {
     business_unit:String(value.business_unit),ledger:String(value.ledger),
-    fiscal_year:Number(value.fiscal_year||0),period:Number(value.period||0)
+    fiscal_year:num(value.fiscal_year),period:num(value.period)
   };
 }
 function scopeLabel(value){
-  return value
-    ? value.business_unit+' · '+value.ledger+' · FY'+value.fiscal_year+' P'+value.period
-    : 'Choose financial scope';
+  if(!value) return 'Choose financial scope';
+  const fy=value.fiscal_year?('FY'+value.fiscal_year):'any year';
+  const per=value.period?('P'+value.period):'any period';
+  return value.business_unit+' · '+value.ledger+' · '+fy+' · '+per;
 }
 function syncScopeControls(value){
   if(!value) return;
@@ -307,8 +313,10 @@ function syncScopeControls(value){
   if(![...lg.options].some(o=>o.value===value.ledger))
     lg.append(new Option(value.ledger,value.ledger));
   if(![...per.options].some(o=>Number(o.value)===Number(value.period)))
-    per.append(new Option('Period '+value.period,value.period));
-  lg.value=value.ledger; fy.value=value.fiscal_year; per.value=value.period;
+    if(value.period) per.append(new Option('Period '+value.period,value.period));
+  lg.value=value.ledger;
+  if(fy) fy.value=value.fiscal_year||'';
+  if(per) per.value=value.period||'';
 }
 function updateScopeChip(){
   const chip=$('#active-scope');
@@ -319,12 +327,49 @@ function setChatScope(value,announce){
   if(!next) return;
   const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
   CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
+  // Refresh the selectable fiscal years for this BU/ledger in the background;
+  // the editor uses them next time it opens.
+  api('/api/scope?'+qs({business_unit:next.business_unit,ledger:next.ledger}))
+    .then(d=>{if(d&&d.fiscal_years&&d.fiscal_years.length) SCOPE_YEARS=d.fiscal_years;})
+    .catch(()=>{});
   if(announce&&changed&&$('#msgs')){
     $('#msgs').append(el('div','msg bot',
       '<div class="who">New database context</div>'+esc(scopeLabel(next))+
       '<br><span style="color:var(--muted)">Conversation history is isolated from every other scope.</span>'));
     $('#msgs').scrollTop=$('#msgs').scrollHeight;
   }
+}
+function renderTimeControls(){
+  // Fiscal year and period are DEFAULTS, not locks: set them to steer
+  // unqualified questions, or choose Any to let each question decide.
+  const box=el('div','pad');
+  box.style.borderTop='1px solid var(--line)';
+  const cur=CHAT_SCOPE||{};
+  const years=(()=>{
+    const found=(SCOPE_YEARS||[]).slice();
+    (META.financial_scopes||[]).forEach(s=>(s.ledgers||[]).forEach(l=>
+      (l.fiscal_years||[]).forEach(y=>{if(found.indexOf(y)<0)found.push(y);})));
+    if(cur.fiscal_year&&found.indexOf(cur.fiscal_year)<0) found.push(cur.fiscal_year);
+    return found.sort((a,b)=>b-a);
+  })();
+  const fySel=el('select','scope-time');
+  fySel.append(new Option('Any year',''));
+  years.forEach(y=>fySel.append(new Option('FY'+y,y)));
+  fySel.value=cur.fiscal_year||'';
+  const perSel=el('select','scope-time');
+  perSel.append(new Option('Any period',''));
+  for(let i=1;i<=13;i++) perSel.append(new Option('Period '+i,i));
+  perSel.append(new Option('998 (adjustments)',998));
+  perSel.value=cur.period||'';
+  const apply=()=>{
+    if(!CHAT_SCOPE) return;
+    setChatScope({...CHAT_SCOPE,fiscal_year:fySel.value||null,
+                  period:perSel.value||null},true);
+  };
+  fySel.onchange=apply; perSel.onchange=apply;
+  const lbl=el('span','scope-meta','Applies to questions that do not name their own period:&nbsp;');
+  box.append(lbl,fySel,document.createTextNode(' '),perSel);
+  return box;
 }
 function renderScopeChooser(options,onChoose,title){
   const choices=(options||[]).map(o=>canonicalScope(o)?o:null).filter(Boolean);
@@ -368,7 +413,9 @@ function renderScopeChooser(options,onChoose,title){
     };
     row.append(use); body.append(row);
   });
-  c.append(body); return c;
+  c.append(body);
+  c.append(renderTimeControls());
+  return c;
 }
 function dismissScopeChoosers(){
   document.querySelectorAll('#msgs .scope-chooser').forEach(h=>h.remove());
@@ -655,6 +702,21 @@ function renderGeneric(name,d){
     c.append(pre);
   }
   return c;
+}
+function compactArgs(args){
+  // Only arguments that were actually set: empty strings, zeros and false are
+  // tool DEFAULTS, and printing them buried the values that mattered while
+  // wrapping the trail. Full JSON remains on hover (title attribute).
+  const parts=[];
+  Object.entries(args||{}).forEach(([k,v])=>{
+    if(v===''||v===0||v===false||v===null||v===undefined) return;
+    let t=(typeof v==='string')?v:JSON.stringify(v);
+    if(t.length>32) t=t.slice(0,32)+'\u2026';
+    parts.push(k+'='+t);
+  });
+  let line=parts.join(', ');
+  if(line.length>80) line=line.slice(0,80)+'\u2026';
+  return line;
 }
 function renderToolResult(name,data,args){
   if(!data||typeof data!=='object') return null;
@@ -1211,7 +1273,7 @@ async function send(messageOverride,appendUser){
     (j.tool_calls||[]).forEach(c=>{
       const step=el('div','step');
       step.innerHTML='<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
-        '<span class="args">'+esc(JSON.stringify(c.args||{}).slice(0,120))+'</span>'+
+        '<span class="args" title="'+esc(JSON.stringify(c.args||{}))+'">'+esc(compactArgs(c.args))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       msgs.append(step);
       const node=renderToolResult(c.tool,c.result,c.args||{});

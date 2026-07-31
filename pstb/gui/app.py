@@ -257,14 +257,27 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
             "period": latest_period,
         }
 
+    # An explicitly CLEARED time field (key present, value null/"any") means
+    # "no time constraint" — the tools then use their own current-period
+    # defaults and the question itself decides. An ABSENT key still falls
+    # back to the discovered latest posted period.
+    def _cleared(*keys) -> bool:
+        for k in keys:
+            if k in raw:
+                return str(raw.get(k) or "").strip().lower() in ("", "any", "none")
+        return False
+
+    fy_cleared = _cleared("fiscal_year", "fy")
+    period_cleared = _cleared("period", "per")
+
     fiscal_year = _int_scope_value(
         raw.get("fiscal_year", raw.get("fy")), "fiscal_year"
-    ) or discovered["fiscal_year"]
+    ) or (None if fy_cleared else discovered["fiscal_year"])
     period = _int_scope_value(raw.get("period", raw.get("per")), "period")
     if not period:
-        period = discovered["period"]
+        period = None if period_cleared else discovered["period"]
     years = discovered.get("fiscal_years") or []
-    if fiscal_year and len(years) >= 2:
+    if fiscal_year is not None and len(years) >= 2:
         first, last = int(years[0]), int(years[-1])
         if fiscal_year < first or fiscal_year > last:
             raise HTTPException(
@@ -274,7 +287,7 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
                     f"{first}-{last} for {bu}/{ledger}."
                 ),
             )
-    if fiscal_year < 1 or fiscal_year > 9999:
+    if fiscal_year is not None and (fiscal_year < 1 or fiscal_year > 9999):
         raise HTTPException(
             status_code=400,
             detail="fiscal_year must be between 1 and 9999",
@@ -282,17 +295,19 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
     # PeopleSoft calendars can have 13 regular periods and site-specific
     # adjustment/closing periods. Do not impose a 12-period calendar in the
     # chat boundary; the financial tool remains the source of truth.
-    if period < 1 or period > 999:
+    if period is not None and (period < 1 or period > 999):
         raise HTTPException(
             status_code=400,
             detail="period must be between 1 and 999",
         )
-    return {
-        "business_unit": bu,
-        "ledger": ledger,
-        "fiscal_year": fiscal_year,
-        "period": period,
-    }
+    scope = {"business_unit": bu, "ledger": ledger}
+    # Omit a cleared field entirely: apply_request_scope only injects what is
+    # present, so an omitted period leaves each tool on its own default.
+    if fiscal_year is not None:
+        scope["fiscal_year"] = fiscal_year
+    if period is not None:
+        scope["period"] = period
+    return scope
 
 
 def _question_requires_scope(message: str) -> bool:
@@ -320,8 +335,10 @@ def _provider_key(
         provider_name,
         scope["business_unit"],
         scope["ledger"],
-        scope["fiscal_year"],
-        scope["period"],
+        # Time fields are optional: a cleared year/period means "any", and
+        # the session key must stay stable rather than raising KeyError.
+        scope.get("fiscal_year") or 0,
+        scope.get("period") or 0,
     )
 
 
@@ -525,8 +542,24 @@ def scope_for(business_unit: str = "", ledger: str = ""):
             led = next((l for l in ledgers if l.upper() == "ACTUALS"),
                        ledgers[0] if ledgers else engine.effective_defaults()["ledger"])
         fy, per = engine.last_posted_period(bu, led)
+        # Fiscal years that actually hold data, so the scope editor offers
+        # real choices instead of only the latest one.
+        try:
+            years = []
+            for sc in engine.list_financial_scopes(
+                    include_activity=True).get("scopes") or []:
+                if sc.get("business_unit") != bu:
+                    continue
+                for lg in sc.get("ledgers") or []:
+                    if lg.get("ledger") == led:
+                        years = [int(y) for y in (lg.get("fiscal_years") or [])]
+        except Exception:
+            years = []
+        if fy and fy not in years:
+            years.append(fy)
         return {"business_unit": bu, "ledger": led, "ledgers": ledgers,
                 "fiscal_year": fy, "period": per,
+                "fiscal_years": sorted(years, reverse=True),
                 "max_regular_period": engine._max_regular_period(fy),
                 **({"scope_status": leds["scope_status"], "detail": leds.get("detail")}
                    if "scope_status" in leds else {})}
@@ -731,10 +764,16 @@ async def chat(payload: dict):
                             "against PS_LEDGER\n"
                             f"- Business unit: {active_scope['business_unit']}\n"
                             f"- Ledger: {active_scope['ledger']}\n"
-                            f"- Fiscal year: {active_scope['fiscal_year']}\n"
-                            f"- Period: {active_scope['period']}\n"
-                            "Use this exact scope for every financial-data tool. "
-                            "The server enforces it. If the question combines a "
+                            f"- Fiscal year: "
+                            f"{active_scope.get('fiscal_year') or 'any (the question decides)'}\n"
+                            f"- Period: "
+                            f"{active_scope.get('period') or 'any (the question decides)'}\n"
+                            "Business unit and ledger are FIXED — never change "
+                            "them. Fiscal year and period are defaults: use "
+                            "them when the question does not name its own, and "
+                            "pass the period the user actually asked for when "
+                            "they do. "
+                            "If the question combines a "
                             "financial fact with a policy, retrieve the database "
                             "fact first and then retrieve the wiki passage; never "
                             "let wiki text replace database evidence."

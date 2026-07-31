@@ -913,6 +913,58 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           [x["source"] for x in eng_src.registry.describe()]
           == ["default", "mart"])
 
+    print("== scope: time is a default, not a lock ==")
+    from pstb.guards import apply_request_scope as _ars, ScopeConflict as _SC
+    _scope = {"business_unit": "US001", "ledger": "ACTUALS",
+              "fiscal_year": 2026, "period": 6}
+    # Asking about another period must NOT be refused: pinning the period
+    # made the chip a cage — no other period or year could be asked about.
+    check("a different period is allowed and wins",
+          _ars("get_trial_balance", {"period": 3}, _scope)["period"] == 3)
+    check("a different fiscal year is allowed and wins",
+          _ars("get_trial_balance", {"fiscal_year": 2025},
+               _scope)["fiscal_year"] == 2025)
+    check("an unstated period still inherits the scope default",
+          _ars("get_trial_balance", {}, _scope)["period"] == 6)
+    try:
+        _ars("get_trial_balance", {"business_unit": "US002"}, _scope)
+        check("business unit remains a hard lock", False)
+    except _SC:
+        check("business unit remains a hard lock", True)
+    try:
+        _ars("get_trial_balance", {"ledger": "BUDGET"}, _scope)
+        check("ledger remains a hard lock", False)
+    except _SC:
+        check("ledger remains a hard lock", True)
+    # A cleared period is simply absent from the scope, so nothing is injected
+    check("a cleared period injects no period",
+          "period" not in _ars("get_trial_balance", {},
+                               {"business_unit": "US001", "ledger": "ACTUALS"}))
+
+    print("== GUI script: no undeclared globals ==")
+    # The chat JS has no test suite, and its two live outages this project
+    # were both the same shape: an edit added a USE of a module global while
+    # the companion edit adding its DECLARATION silently failed to match, so
+    # every turn threw ReferenceError. Strings and comments are stripped so
+    # ordinary words never count.
+    import re as _rejs
+    _html = (ROOT / "pstb" / "gui" / "static" / "index.html").read_text(
+        encoding="utf-8")
+    _script = _rejs.search(r"<script>([\s\S]*)</script>", _html).group(1)
+    _clean = _rejs.sub(r"'[^'\n]*'|\"[^\"\n]*\"|`[^`]*`", "''", _script)
+    _clean = _rejs.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", _clean)
+    _declared = set(_rejs.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", _clean))
+    for _m in _rejs.finditer(
+            r"\b(?:let|const|var)\s+([^;\n=]+(?:=[^;\n]*)?"
+            r"(?:,\s*[^;\n=]+(?:=[^;\n]*)?)*)", _clean):
+        _declared |= set(_rejs.findall(r"\b([A-Za-z_$][\w$]*)\s*(?:=|,|$)",
+                                       _m.group(1)))
+    _assigned = set(_rejs.findall(r"(?<![.\w$])([A-Z][A-Z0-9_]{2,})\s*=(?!=)",
+                                  _clean))
+    _undeclared = sorted(_assigned - _declared)
+    check("every GUI module global is declared", not _undeclared,
+          str(_undeclared))
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
