@@ -188,6 +188,14 @@ journal descriptions — are sent to Google Cloud. Ollama keeps everything local
 Confirm this against your data-handling policy before pointing Gemini at
 production financials.
 
+`profile_record` and `compare_records` add row-level samples to that path.
+Personal columns (names, contacts, addresses, tax and bank identifiers) are
+masked to a shape-preserving placeholder before they leave the database, and
+identifiers, codes, dates and amounts are not — see
+[RECORD_SELECTION.md](RECORD_SELECTION.md). Set `tools.sample_rows: 0` in
+`config.yaml` to send no rows at all; record selection still works from shape,
+fill rates and status-code counts.
+
 ## 5. Verify it works
 
 ```bash
