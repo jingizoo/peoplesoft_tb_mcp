@@ -1017,14 +1017,22 @@ def step_preflight(state):
 
 def step_summary(state, preflight_ok):
     step("Ready")
-    try:
-        from pstb.version import label, write_build_info
-        write_build_info()
-        ok("running build: {0}".format(label()))
+    # Run this INSIDE the venv: this script runs on the system interpreter,
+    # where pstb is not importable, so importing it here silently skipped the
+    # build record on every install — precisely the ZIP deployment the record
+    # exists for.
+    snippet = ("import json\n"
+               "from pstb.version import label, write_build_info\n"
+               "write_build_info()\n"
+               "print(json.dumps({'ok': True, 'label': label()}))\n")
+    res = run_in_venv(snippet, timeout=60)
+    if res.get("ok"):
+        ok("running build: {0}".format(res.get("label", "?")))
         info("recorded in BUILD_INFO.json so a ZIP deployment still reports "
              "its origin")
-    except Exception as e:
-        warn("could not record build identity: {0}".format(e))
+    else:
+        warn("could not record build identity: {0}".format(
+            str(res.get("error", ""))[:120]))
     py = ".venv\\Scripts\\python" if platform.system() == "Windows" \
         else ".venv/bin/python"
     print("  Start the web UI:")

@@ -951,6 +951,16 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 
+    print("== setup wizard: build identity is recorded ==")
+    # The wizard runs on the SYSTEM interpreter, where pstb is not
+    # importable. Importing pstb.version directly there meant the build
+    # record was silently skipped on every install — precisely the ZIP
+    # deployment it exists for. It must run inside the venv.
+    _setup_src = (ROOT / "scripts" / "setup.py").read_text(encoding="utf-8")
+    check("the wizard records build identity via the venv, not by import",
+          "from pstb.version import label, write_build_info\n" not in _setup_src
+          and "run_in_venv(snippet" in _setup_src)
+
     print("== cost gate: the optimizer decides, not hope ==")
     _cg = Path(_tf.mkdtemp(prefix="pstb_cost_"))
     _cdbf = _cg / "big.db"
