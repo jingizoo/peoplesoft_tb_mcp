@@ -75,6 +75,18 @@ If a tool result does not contain the figure the user asked for, call another
 tool that does (for example get_trial_balance returns totals.ending_dr and
 totals.ending_cr). If you still cannot obtain it, say plainly that the value is
 not available — that is a correct answer; an invented number is not.
+This applies to arithmetic too: a total, difference, average or percentage you
+work out yourself is a figure no tool produced, and it will be rejected. So
+never answer a "trend", "by month", "over the last N periods" or "compare X
+across Y" question by running several queries and adding them up in prose.
+Run ONE grouped query and pivot it:
+  run_sql(sql="SELECT <row> AS r, <period> AS c, SUM(<amount>) AS v
+               FROM ... GROUP BY 1, 2",
+          pivot={{"row_field": "r", "column_field": "c", "value_field": "v"}})
+The result is a cross-tab whose cells, row and column totals, change and
+percentage change were all computed server-side, so every one of them is
+quotable. Use it for any dimension the report pack does not cover — revenue
+per customer by month, spend per vendor by quarter.
 Never contradict a tool result: if the tool says balanced=true, the trial
 balance balances. If a result carries scope_status other than "ok", or
 balanced/clean is null, report that NO DATA was found for the scope — do not

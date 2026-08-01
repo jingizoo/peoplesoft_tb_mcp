@@ -2039,7 +2039,8 @@ class TBEngine:
         return resolver.resolve_binds(policy_binds)
 
     def run_sql(self, sql: str, max_rows: int = 100,
-                business_unit: str = "", policy_binds: Optional[dict] = None) -> dict:
+                business_unit: str = "", policy_binds: Optional[dict] = None,
+                pivot: Optional[dict] = None) -> dict:
         """Run a guarded SELECT.
 
         policy_binds maps a bind name to a policy figure the wiki defines, e.g.
@@ -2123,6 +2124,26 @@ class TBEngine:
         rows, truncated = self.db.query(s, binds, max_rows=cap)
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}
+        if pivot:
+            # Consolidate HERE. Every total, change and percentage in the
+            # result is then a figure a tool produced, which is both what the
+            # number guard requires and what stops the model doing arithmetic
+            # in prose where nobody can check it.
+            from .pivot import PivotError, pivot_rows
+
+            try:
+                out["pivot"] = pivot_rows(
+                    rows,
+                    row_field=str(pivot.get("row_field") or ""),
+                    column_field=str(pivot.get("column_field") or ""),
+                    value_field=str(pivot.get("value_field") or ""),
+                    totals=pivot.get("totals", True) is not False,
+                    movement=pivot.get("movement", True) is not False,
+                )
+            except PivotError as e:
+                raise EngineError(str(e))
+            if out["pivot"].get("truncated") and not truncated:
+                out["truncated"] = True
         if provenance:
             out["policy_basis"] = provenance
             out["policy_note"] = (

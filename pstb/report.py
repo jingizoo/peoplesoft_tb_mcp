@@ -245,9 +245,20 @@ class ReportRunner:
         if report.strip():
             defs = self._definitions()
             if report.strip() not in defs:
+                # The report pack is GL-shaped: rows are accounts or tree
+                # nodes. A model reaching for an invented name like
+                # "revenue_by_customer" is asking a cross-tab question about a
+                # dimension no report carries, so point it at the tool that
+                # does rather than leaving it to guess a second wrong name.
                 raise ReportError(
                     f"Unknown report {report!r}. Available: {sorted(defs)} "
-                    "(or pass ad-hoc rows=...)"
+                    "(or pass ad-hoc rows=...). These report on GL ACCOUNTS. "
+                    "For any other dimension across periods — revenue per "
+                    "CUSTOMER by month, spend per VENDOR by quarter — use "
+                    "run_sql with one grouped query and pivot={'row_field': "
+                    "..., 'column_field': ..., 'value_field': ...}, which "
+                    "returns the cross-tab with totals and change already "
+                    "computed."
                 )
             spec = defs[report.strip()]
         elif rows.strip():

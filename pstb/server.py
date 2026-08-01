@@ -508,7 +508,8 @@ if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
     def run_sql(sql: str, max_rows: int = 100, business_unit: str = "",
-                source: str = "", policy_binds: Optional[dict] = None) -> dict:
+                source: str = "", policy_binds: Optional[dict] = None,
+                pivot: Optional[dict] = None) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
         CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
         only, DML/DDL rejected, rows capped at 500, every table validated against
@@ -530,9 +531,23 @@ if cfg.tools.allow_raw_sql:
         "capitalization_threshold"}. The value is looked up in the wiki and
         bound server-side, and the result carries policy_basis with the exact
         sentence and page it came from — quote that when you answer. Call
-        list_policy_terms for the available names."""
+        list_policy_terms for the available names.
+        pivot: USE THIS for any "trend", "by month", "over the last N periods",
+        "compare X across Y" question. Write ONE query returning three columns
+        — the row label, the column label and the numeric value, grouped by the
+        first two — then name them here:
+          sql="SELECT C.NAME1 AS customer, H.INVOICE_PERIOD AS period,
+               SUM(H.INVOICE_AMOUNT) AS amt FROM ... GROUP BY 1, 2"
+          pivot={"row_field":"customer","column_field":"period","value_field":"amt"}
+        You get back a cross-tab with the totals, the change and the percentage
+        change already computed. Quote those figures directly and NEVER
+        recompute or add them up yourself — arithmetic done in prose cannot be
+        checked, and the answer guard will reject figures no tool produced.
+        Do not run one query per month and add them up; one grouped query is
+        both faster and correct."""
         return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
-                     business_unit=business_unit, policy_binds=policy_binds)
+                     business_unit=business_unit, policy_binds=policy_binds,
+                     pivot=pivot)
 
 
     @mcp.tool()

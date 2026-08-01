@@ -767,8 +767,54 @@ function renderPlaybook(d){
   frag.append(c);
   return frag;
 }
+function renderPivot(p){
+  // The consolidated view is the answer to a trend question; the flat rows
+  // underneath it are the working. Lead with the cross-tab.
+  const c=el('div','card');
+  c.append(el('h2',null,esc(String(p.value_field||'value').replace(/_/g,' '))+
+    ' by '+esc(String(p.column_field||'').replace(/_/g,' '))+
+    ' <span class="sub">'+p.row_count+' '+
+    esc(String(p.row_field||'row').replace(/_/g,' '))+(p.row_count===1?'':'s')+
+    (p.truncated?', truncated':'')+'</span>'));
+  const cols=p.columns||[], rows=p.rows||[];
+  const n=v=>(v===null||v===undefined)?'—'
+    :Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const sc=el('div'); sc.style.maxHeight='420px'; sc.style.overflow='auto';
+  const t=el('table');
+  let head='<thead><tr><th>'+esc(String(p.row_field||''))+'</th>'+
+    cols.map(x=>'<th class="num">'+esc(String(x))+'</th>').join('')+
+    '<th class="num">Total</th><th class="num">Change</th><th class="num">%</th></tr></thead>';
+  let body='<tbody>'+rows.map(r=>{
+    const span=r.activity_span;
+    const label=esc(String(r.row))+(span
+      ? ' <span class="sub" title="no activity at one or both ends of the range">'+
+        'active '+esc(String(span.first_active_column))+'–'+
+        esc(String(span.last_active_column))+'</span>' : '');
+    return '<tr><td>'+label+'</td>'+
+      (r.values||[]).map(v=>'<td class="num">'+(v?n(v):'—')+'</td>').join('')+
+      '<td class="num"><b>'+n(r.total)+'</b></td>'+
+      '<td class="num">'+n(r.change)+'</td>'+
+      '<td class="num">'+(r.change_pct===null||r.change_pct===undefined
+        ? '—' : Number(r.change_pct).toFixed(1)+'%')+'</td></tr>';
+  }).join('')+'</tbody>';
+  let foot='';
+  if(p.column_totals){
+    foot='<tfoot><tr><th>Total</th>'+
+      p.column_totals.map(v=>'<th class="num">'+n(v)+'</th>').join('')+
+      '<th class="num">'+n(p.grand_total)+'</th><th></th><th></th></tr></tfoot>';
+  }
+  t.innerHTML=head+body+foot;
+  sc.append(t); c.append(sc);
+  const notes=[];
+  if(p.change_basis) notes.push('Change = '+esc(p.change_basis)+'.');
+  notes.push('Blank cells are zero activity, not missing data.');
+  if(p.truncation_note) notes.push(esc(p.truncation_note));
+  c.append(el('div','pad sub',notes.join(' ')));
+  return c;
+}
 function renderSql(d){
   const c=el('div','card');
+  if(d.pivot&&(d.pivot.rows||[]).length) return renderPivot(d.pivot);
   c.append(el('h2',null,'Query result <span class="sub">'+d.row_count+' row'+
     (d.row_count===1?'':'s')+(d.truncated?' (truncated)':'')+'</span>'));
   // A cross-BU result must never be mistaken for a scoped one.
