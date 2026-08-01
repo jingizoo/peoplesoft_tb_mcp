@@ -46,6 +46,8 @@ except WikiError as e:
 # Let the engine resolve policy figures into query binds. Approved site memory
 # outranks the wiki, so both are handed over together.
 engine.attach_policy(wiki, memory)
+# Record discovery uses what people here have taught about their own tables.
+engine.attach_memory(memory)
 
 mcp = FastMCP("peoplesoft-tb")
 
@@ -599,6 +601,41 @@ if cfg.tools.allow_raw_sql:
 
 
 @mcp.tool()
+def remember_record_fact(table: str, fact: str) -> dict:
+    """REMEMBER what the user tells you about a table, so it is found next
+    time. Use this the moment someone explains what a record holds — "the
+    interface file info is in TU_FILE_INTFC", "PS_XX_REBATE is our custom
+    rebate accrual table". A client-specific record has no PeopleTools
+    description and a name that gives nothing away, so no metadata search will
+    ever surface it; being told once is the only way it becomes findable.
+    Afterwards search_records('interface file') returns it, ranked first.
+    table: the record or table name exactly as it exists (TU_FILE_INTFC).
+    fact: what it holds, in one sentence, in the user's own words.
+    Confirm to the user that you have noted it. Do NOT use this for figures,
+    policies or rules — those belong in the wiki, via resolve_policy_value."""
+    name = (table or "").strip().upper()
+    body = (fact or "").strip()
+    if not name or not body:
+        return {"error": "remember_record_fact needs both a table and a fact"}
+    return _safe(memory.propose, text=f"{name}: {body}", kind="record",
+                 source="taught in conversation")
+
+
+@mcp.tool()
+def what_do_we_know_about(table: str) -> dict:
+    """What this site has TAUGHT the agent about a record, if anything. Use
+    alongside describe_record and profile_record when a table is unfamiliar:
+    the catalog says what columns exist, this says what the record is FOR."""
+    return _safe(lambda: {
+        "table": (table or "").strip().upper(),
+        "taught": memory.record_facts(table),
+        "note": ("Taught facts are pointers, not authority. Verify the shape "
+                 "with describe_record and the contents with profile_record; "
+                 "the live catalog wins any disagreement."),
+    })
+
+
+@mcp.tool()
 def list_policy_terms() -> dict:
     """Which POLICY figures this agent can resolve from the wiki and bind into
     a query (capitalization threshold, approval limit, write-off limit,
@@ -620,9 +657,10 @@ def resolve_policy_value(policy: str) -> dict:
     'demo_content' (bundled fictional pages — never filter real data with it).
     To filter a query by the value, prefer run_sql's policy_binds so the number
     is bound server-side rather than retyped."""
-    from .policy import PolicyResolver
-
-    return _safe(PolicyResolver(wiki, memory).resolve, policy=policy)
+    # Reuse the engine's resolver rather than building one per call — a
+    # fresh instance starts with an empty cache, so every ask would pay the
+    # full wiki cost again.
+    return _safe(engine._policy.resolve, policy=policy)
 
 
 if wiki is not None:

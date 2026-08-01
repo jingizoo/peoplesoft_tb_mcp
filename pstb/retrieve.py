@@ -116,7 +116,13 @@ def rank_passages(question: str, passages: list[dict], top: int = 6,
             score += idf * (tf[w] * (k1 + 1)) / (denom or 1)
             matched.append(w)
         if score > 0:
+            # Coverage, not the raw BM25 score, is what a reader can act on.
+            # A score of 4.1 means nothing on its own — it is not comparable
+            # between questions — whereas "matched 2 of the 5 words you asked
+            # about" says plainly how much of the question this passage speaks
+            # to, and lets a weak match be recognised as weak.
             scored.append({**passages[i], "score": round(score, 3),
-                           "matched_terms": sorted(matched)[:8]})
+                           "matched_terms": sorted(matched)[:8],
+                           "term_coverage": round(len(set(matched)) / len(set(q)), 2)})
     scored.sort(key=lambda x: -x["score"])
     return scored[: max(int(top or 6), 1)]

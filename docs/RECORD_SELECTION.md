@@ -78,3 +78,40 @@ Profiling reads at most 50 rows per record, always with `ROWNUM` / `LIMIT` /
 scans a record, so it is safe to point at a table with a hundred million rows.
 `fill_percent` and `value_counts` are measured over the rows sampled — they are
 evidence about shape, and must never be reported as totals.
+
+
+## Records nobody could have guessed
+
+Profiling answers "which of these candidate tables fits". It cannot answer
+"which table is it" when the table is client-specific: no PeopleTools
+description, a name that encodes nothing, no wiki page. `search_records("interface
+file")` returns nothing, and no improvement to retrieval changes that — the
+information was never written anywhere the agent can read.
+
+What exists instead is somebody saying it out loud, once:
+
+> "the interface file info is in TU_FILE_INTFC"
+
+`remember_record_fact(table="TU_FILE_INTFC", fact="holds inbound interface
+file headers and load status")` keeps it. Afterwards:
+
+- `search_records("interface file")` returns it, **ranked first** — a human
+  naming a table for this purpose outranks a substring match on a name
+- so does `search_records("load status")` — matching is on the explanation, not
+  on the words the question happened to use
+- `describe_record` carries a `taught_here` block
+- `what_do_we_know_about(table)` reports it directly
+
+### Why these are usable before approval
+
+Site memory normally requires human approval before a fact enters prompt
+context, because an unreviewed claim must not silently shape a conclusion.
+Record facts do a different job and get a different rule: they help *find* a
+record, and whatever is found is then read from the live catalog anyway. A
+wrong one makes discovery worse; it cannot make a number wrong. Requiring a CLI
+round trip before the agent can act on something the user just said is friction
+with nothing on the other side of it.
+
+The boundary that does hold: a taught fact is a **pointer, never authority**.
+Every surface that shows one says so, and the columns always come from the
+catalog. Reject one with `python -m pstb.memory` and it stops being used.

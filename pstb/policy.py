@@ -34,7 +34,9 @@ the result rather than silently applied.
 """
 from __future__ import annotations
 
+import copy as _copy
 import re
+import time as _time
 from typing import Optional
 
 
@@ -169,9 +171,25 @@ def extract_candidates(text: str, term: PolicyTerm) -> list:
 class PolicyResolver:
     """Resolve a named policy figure to a value plus its receipt."""
 
+    TTL = 300.0        # seconds
+
     def __init__(self, wiki=None, memory=None):
         self.wiki = wiki
         self.memory = memory
+        self._cache: dict = {}
+
+    def _cached(self, key: str):
+        hit = self._cache.get(key)
+        if hit and hit[0] > _time.monotonic():
+            return _copy.deepcopy(hit[1])
+        return None
+
+    def _store(self, key: str, value: dict) -> dict:
+        self._cache[key] = (_time.monotonic() + self.TTL, _copy.deepcopy(value))
+        return value
+
+    def invalidate(self) -> None:
+        self._cache.clear()
 
     # -- site memory takes precedence over anything scraped -----------------
     def _from_memory(self, term: PolicyTerm) -> Optional[dict]:
@@ -215,9 +233,13 @@ class PolicyResolver:
                 "list, read the page with wiki_lookup and apply it yourself — "
                 "but state the source and do not use it as a silent filter.")
 
+        cached = self._cached(key)
+        if cached is not None:
+            return cached
+
         from_mem = self._from_memory(term)
         if from_mem:
-            return from_mem
+            return self._store(key, from_mem)
 
         base = {"status": "not_found", "policy": term.key, "label": term.label,
                 "unit": term.unit, "meaning": term.meaning,
@@ -228,7 +250,7 @@ class PolicyResolver:
             base["note"] = ("No wiki is configured, so policy figures cannot "
                             "be looked up. Ask the user for the value and say "
                             "that it was supplied by hand.")
-            return base
+            return self._store(key, base)
 
         # Is this the bundled fiction? Decide BEFORE reading, so a demo page
         # can never reach a filter on a real ledger.
@@ -259,6 +281,8 @@ class PolicyResolver:
                         "url": passage.get("url"),
                         "kind": "wiki",
                     }
+                    cand["term_coverage"] = passage.get("term_coverage")
+                    cand["passage"] = text[:600]
                     if not any(c["value"] == cand["value"]
                                and c["quote"] == cand["quote"]
                                for c in candidates):
@@ -273,7 +297,7 @@ class PolicyResolver:
                 f"No figure for the {term.label} was found in the wiki. Do NOT "
                 "supply one from memory — ask the user for it, or run the "
                 "query without that filter and say it is unfiltered.")
-            return base
+            return self._store(key, base)
 
         distinct = sorted({c["value"] for c in candidates})
         if len(distinct) > 1:
@@ -284,18 +308,39 @@ class PolicyResolver:
                 f"{term.label} ({', '.join(f'{v:,.2f}' for v in distinct)}). "
                 "Quote all of them with their sources and ask the user which "
                 "applies — one of these pages is likely out of date.")
-            return base
+            return self._store(key, base)
 
         winner = candidates[0]
+        # A figure of the right SHAPE is not a figure on the right SUBJECT.
+        # The sentence scoping in extract_candidates keeps out most of it, but
+        # a page about a neighbouring topic can still carry a sentence with
+        # both the vocabulary and a number. When the retrieved passage barely
+        # matched the question, hand the model the evidence and let it judge
+        # instead of quietly binding the number into a WHERE clause.
+        coverage = winner.get("term_coverage")
+        weak = coverage is not None and coverage < 0.5
         base.update({
-            "status": "demo_content" if demo else "resolved",
+            "status": ("demo_content" if demo
+                       else "needs_review" if weak else "resolved"),
             "value": winner["value"],
             "unit": winner["unit"],
             "quote": winner["quote"],
             "source": winner["source"],
+            "passage": winner.get("passage"),
+            "term_coverage": coverage,
             "corroborating_passages": len(candidates),
-            "usable_as_filter": not demo,
+            "usable_as_filter": not demo and not weak,
         })
+        if weak and not demo:
+            base["note"] = (
+                f"A figure was found, but the passage matched only "
+                f"{coverage:.0%} of the search terms — it may be about a "
+                f"different rule. READ the passage below and decide whether it "
+                f"really states the {term.label}. If it does, apply the value "
+                "and cite the page; if it does not, say the wiki does not "
+                "record this figure. It is deliberately not usable as a "
+                "silent filter.")
+            return self._store(key, base)
         if demo:
             base["note"] = (
                 "This value came from the BUNDLED DEMO policy pages shipped "
@@ -306,7 +351,7 @@ class PolicyResolver:
             base["note"] = (
                 f"{term.meaning} Value taken verbatim from the wiki, not from "
                 "the model. Cite the source page when you use it.")
-        return base
+        return self._store(key, base)
 
     def resolve_binds(self, policy_binds: dict) -> tuple:
         """Resolve {bind_name: policy_key} into (binds, provenance, refusals).

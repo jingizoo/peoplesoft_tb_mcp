@@ -2006,6 +2006,20 @@ class TBEngine:
                                      "but narrow the query if it grows"}}
         return {}
 
+    def attach_memory(self, memory) -> None:
+        """Give the engine site memory, so record discovery can use what
+        people here have taught it about their own tables."""
+        self._memory = memory
+
+    def _taught(self, table: str = "") -> list:
+        mem = getattr(self, "_memory", None)
+        if mem is None:
+            return []
+        try:
+            return mem.record_facts(table)
+        except Exception:
+            return []
+
     def attach_policy(self, wiki=None, memory=None) -> None:
         """Give the engine the wiki and site memory, so policy figures can be
         resolved into binds. Optional: without it, policy_binds refuses rather
@@ -2250,9 +2264,48 @@ class TBEngine:
                         entry["approx_rows"] = rows
                     out.append(entry)
 
+        # Records someone here has TAUGHT us about. A client-specific table
+        # has no description in PSRECDEFN and a name that gives nothing away,
+        # so no amount of metadata search will surface it — but "that one
+        # holds the interface files" was said out loud once, and this is where
+        # that pays off. Taught matches lead, because a human naming a table
+        # for this purpose beats a substring match on its name.
+        mem = getattr(self, "_memory", None)
+        taught_hits = []
+        if mem is not None:
+            try:
+                taught_hits = mem.search_record_facts(term)
+            except Exception:
+                taught_hits = []
+        for fact in taught_hits:
+            rec = str(fact.get("record") or "").upper()
+            if not rec:
+                continue
+            phys = rec if rec.startswith("PS_") else f"PS_{rec}"
+            existing = next((e for e in out
+                             if e["table"].upper() == phys
+                             or e["record"].upper() == rec), None)
+            entry = existing or {"record": rec, "table": phys, "descr": None,
+                                 "kind": "table"}
+            entry["matched_on"] = "taught here"
+            entry["taught"] = fact.get("detail") or fact.get("text")
+            entry["taught_status"] = fact.get("status")
+            if existing is None:
+                # Row counts cost a query each. Taught records lead the list
+                # anyway, so only the ones a reader will actually see are
+                # worth probing.
+                if len(out) < 5:
+                    rows = self._approx_rows(phys)
+                    if rows is not None:
+                        entry["approx_rows"] = rows
+                out.append(entry)
+            seen.add(rec)
+
         # Populated objects first: a record with rows is the likelier answer
-        # than an identically-named staging or history shell.
-        out.sort(key=lambda x: (-(x.get("approx_rows") or 0), x["record"]))
+        # than an identically-named staging or history shell. Taught records
+        # outrank everything — that is the whole point of having been told.
+        out.sort(key=lambda x: (0 if x.get("taught") else 1,
+                                -(x.get("approx_rows") or 0), x["record"]))
         return {
             "query": term,
             "records": out[:cap],
@@ -2327,6 +2380,17 @@ class TBEngine:
             pass
         table = out.get("table") or f"PS_{rec}"
         out["table"] = table
+        taught = self._taught(rec)
+        if taught:
+            out["taught_here"] = [
+                {"fact": t.get("detail") or t.get("text"),
+                 "status": t.get("status"), "source": t.get("source")}
+                for t in taught
+            ]
+            out["taught_note"] = (
+                "Someone at this site described this record. Treat it as a "
+                "pointer, not as authority: the columns above come from the "
+                "live catalog and win any disagreement.")
         try:
             out["columns"] = [c["column_name"]
                               for c in self.describe_table(table)["columns"]]

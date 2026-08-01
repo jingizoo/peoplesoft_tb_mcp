@@ -198,6 +198,154 @@ class BoundQueryTests(_WikiCase):
         self.assertTrue(out["rows"])
 
 
+class LookupCacheTests(unittest.TestCase):
+    """The lookup cache must key on the CORPUS, not the provider type."""
+
+    def test_two_corpora_do_not_share_cached_answers(self) -> None:
+        from pstb import wiki as wiki_mod
+
+        wiki_mod.clear_lookup_cache()
+        made = []
+        for body in (CURRENT, STALE):
+            d = Path(tempfile.mkdtemp(prefix="pstb-corpus-"))
+            (d / "policy.md").write_text(body)
+            cfg = Config.sample(ROOT)
+            cfg.wiki.provider = "localdocs"
+            cfg.wiki.localdocs_path = str(d)
+            made.append((d, make_wiki(cfg)))
+        try:
+            q = "What is our capitalization threshold?"
+            first = wiki_mod.lookup(made[0][1], q)
+            second = wiki_mod.lookup(made[1][1], q)
+            t1 = {s.get("title") for s in first.get("sources") or []}
+            t2 = {s.get("title") for s in second.get("sources") or []}
+            self.assertTrue(first.get("passages") and second.get("passages"))
+            # Both corpora answer the same question from DIFFERENT pages, so a
+            # shared cache entry shows up as identical passage text.
+            self.assertNotEqual(
+                first["passages"][0]["text"], second["passages"][0]["text"],
+                f"one corpus was served the other's cached passages "
+                f"({t1} vs {t2})")
+        finally:
+            for d, _ in made:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_repeat_lookups_do_not_re_search(self) -> None:
+        from pstb import wiki as wiki_mod
+
+        wiki_mod.clear_lookup_cache()
+        d = Path(tempfile.mkdtemp(prefix="pstb-cache-"))
+        (d / "policy.md").write_text(CURRENT)
+        cfg = Config.sample(ROOT)
+        cfg.wiki.provider = "localdocs"
+        cfg.wiki.localdocs_path = str(d)
+        w = make_wiki(cfg)
+        hits = {"n": 0}
+        original = w.search
+
+        def counted(query, limit=8):
+            hits["n"] += 1
+            return original(query, limit)
+
+        w.search = counted
+        try:
+            for _ in range(4):
+                wiki_mod.lookup(w, "What is our capitalization threshold?")
+            self.assertEqual(hits["n"], 1,
+                             "each repeat lookup hit the wiki again — over "
+                             "Confluence that is an HTTP round trip per call")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class RelevanceTests(_WikiCase):
+    """Retrieval finding something is not retrieval finding the answer."""
+
+    PAGES = {"fixed-asset-policy.md": CURRENT}
+
+    def test_an_uncovered_subject_is_marked_weak(self) -> None:
+        from pstb import wiki as wiki_mod
+
+        out = wiki_mod.lookup(
+            self.wiki, "What is our cryptocurrency treasury holding policy?")
+        self.assertEqual(out["relevance"], "weak")
+        self.assertIn("relevance_note", out)
+        self.assertIn("does not cover", out["relevance_note"])
+
+    def test_a_covered_subject_is_marked_strong(self) -> None:
+        from pstb import wiki as wiki_mod
+
+        out = wiki_mod.lookup(self.wiki, "capitalization threshold")
+        self.assertEqual(out["relevance"], "strong")
+        self.assertNotIn("relevance_note", out)
+
+
+class ResolutionCacheTests(_WikiCase):
+    """Resolution is cached, INCLUDING the negative answers.
+
+    A policy the wiki does not carry is the most expensive lookup there is —
+    it exhausts every search phrasing and fetches every candidate page before
+    concluding nothing. Repeating that on each ask is the worst case, not an
+    edge case: "we do not have that figure" is exactly the answer a user
+    probes at at few times in a row.
+    """
+
+    PAGES = {"fixed-asset-policy.md": CURRENT}
+
+    def _counted(self):
+        from pstb import wiki as wiki_mod
+
+        wiki_mod.clear_lookup_cache()
+        hits = {"n": 0}
+        s, g = self.wiki.search, self.wiki.get_page
+        self.wiki.search = lambda q, limit=8: (
+            hits.__setitem__("n", hits["n"] + 1) or s(q, limit))
+        self.wiki.get_page = lambda i: (
+            hits.__setitem__("n", hits["n"] + 1) or g(i))
+        return PolicyResolver(self.wiki, None), hits
+
+    def test_a_resolved_policy_is_not_looked_up_twice(self) -> None:
+        r, hits = self._counted()
+        r.resolve("capitalization_threshold")
+        cold = hits["n"]
+        self.assertGreater(cold, 0)
+        hits["n"] = 0
+        for _ in range(5):
+            r.resolve("capitalization_threshold")
+        self.assertEqual(hits["n"], 0,
+                         "each repeat re-read the wiki; over Confluence that "
+                         "is an HTTP round trip per call")
+
+    def test_a_missing_policy_is_not_re_searched(self) -> None:
+        r, hits = self._counted()
+        r.resolve("materiality_threshold")
+        hits["n"] = 0
+        for _ in range(5):
+            got = r.resolve("materiality_threshold")
+        self.assertEqual(hits["n"], 0)
+        self.assertEqual(got["status"], "not_found")
+
+    def test_the_cached_answer_is_a_copy(self) -> None:
+        # A caller mutating a result must not corrupt what the next one gets.
+        r, _ = self._counted()
+        first = r.resolve("capitalization_threshold")
+        first["value"] = 999999.0
+        first["candidates"].clear()
+        second = r.resolve("capitalization_threshold")
+        self.assertEqual(second["value"], 10000.0)
+
+    def test_invalidate_forces_a_fresh_read(self) -> None:
+        from pstb import wiki as wiki_mod
+
+        r, hits = self._counted()
+        r.resolve("capitalization_threshold")
+        r.invalidate()
+        wiki_mod.clear_lookup_cache()
+        hits["n"] = 0
+        r.resolve("capitalization_threshold")
+        self.assertGreater(hits["n"], 0)
+
+
 class DemoContentTests(unittest.TestCase):
     """The bundled sample policies are fictional. They must never filter a
     real ledger — that pairs a live balance with an invented rule."""
