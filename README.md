@@ -227,6 +227,25 @@ Key semantics baked in: signed amounts (credits negative), period 0 beginning
 balances, adjustment period 998, ending(P) = Σ periods 0..P, effective-dated
 chartfields, tree rollups, journal drill-down with ledger tie-out.
 
+## Porting a 9.1 instance's custom records into 9.2
+
+`pstb.migrate` reuses the guarded connection stack to port **custom records
+and their data** from an old 9.1 database into an existing 9.2 instance:
+discovery (naming prefixes / `LASTUPDOPRID`), dependency closure (subrecords,
+audit + related-language records, prompt tables, view references),
+classification against 9.2, emitted App Designer / Data Mover artifacts, and
+read-only build verification + count/sum reconciliation. It never writes to
+either database — the delivered tools apply, the pipeline proves.
+
+```bash
+python -m pstb.migrate discover        # or: plan / emit / verify-build / reconcile
+python -m pstb.migrate.server          # same steps as MCP tools for the chat client
+```
+
+Configuration lives in the commented `migrate:` block of `config.yaml`;
+design, runbook, and limits in
+[docs/MIGRATION_PIPELINE.md](docs/MIGRATION_PIPELINE.md).
+
 ## Roadmap: from TB to all of PeopleSoft Finance
 
 - **nVision replacement:** report definitions in [reports/](reports/) replicate
@@ -251,7 +270,8 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 
 ```
 pstb/            server.py (MCP) · engine.py (TB math) · queries.py · db.py ·
-                 wiki.py · client/ (chat REPL + providers) · gui/ (web UI)
+                 wiki.py · client/ (chat REPL + providers) · gui/ (web UI) ·
+                 migrate/ (9.1 -> 9.2 record port: CLI + MCP server)
 scripts/         seed_sample_data.py · smoke_test.py · mcp_probe.py
 sql/oracle/      XX_TB_* view DDL for the real database
 docs/            SETUP.md (install) · QUESTIONS.md (catalog) · VIEWS.md ·

@@ -76,6 +76,29 @@ class WikiCfg:
 
 
 @dataclass
+class MigrateCfg:
+    """9.1 -> 9.2 record-porting pipeline (pstb.migrate).
+
+    source/target name entries under `sources:` — the pipeline never gets its
+    own credential plumbing, it borrows the guarded connections. target ""
+    means the primary `db:` block (the usual case: this deployment already
+    points at the 9.2 instance).
+    """
+    source: str = ""          # sources: entry for the OLD (9.1) database
+    target: str = ""          # sources: entry for the NEW (9.2); "" = primary db
+    # How custom records are recognized. Site naming standards first
+    # (prefixes), LASTUPDOPRID <> 'PPLSOFT' as a second signal — both are
+    # heuristics, which is why the plan is reviewed, not auto-applied.
+    custom_prefixes: list = field(default_factory=lambda: ["Z_", "ZZ_"])
+    discovery: str = "both"   # prefix | oprid | both
+    out_dir: str = "migrate_out"
+    state_path: str = "migrate_state.db"
+    # Closure safety valve: stop expanding dependencies past this many records
+    # rather than walking half the delivered system through a generic prompt.
+    max_records: int = 2000
+
+
+@dataclass
 class ToolsCfg:
     allow_raw_sql: bool = True
     max_rows: int = 200
@@ -105,6 +128,7 @@ class Config:
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
+    migrate: MigrateCfg = field(default_factory=MigrateCfg)
 
     @classmethod
     def sample(cls, root: Path | str) -> "Config":
@@ -184,6 +208,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.llm, data.get("llm"))
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
+        _apply_section(cfg.migrate, data.get("migrate"))
         for name, block in (data.get("sources") or {}).items():
             src = DbCfg()
             _apply_section(src, block)

@@ -38,6 +38,27 @@ wiki:
   confluence_space: ""    # optional space key filter, e.g. FIN
   confluence_labels: ""   # optional label filter, e.g. "gl-policy,gl-close,gl-coa"
 
+# 9.1 -> 9.2 record-porting pipeline (python -m pstb.migrate, or the
+# pstb.migrate.server MCP server). Uncomment and point source at a `sources:`
+# entry for the 9.1 database; target defaults to the primary db: block above
+# (this deployment's 9.2 instance). Credentials for named sources come from
+# .env as PSTB_SRC_<NAME>_DSN / _USER / _PASSWORD. Runbook and design:
+# docs/MIGRATION_PIPELINE.md.
+#
+# sources:
+#   fscm91:
+#     backend: oracle
+#     schema: SYSADM
+#
+# migrate:
+#   source: fscm91          # the OLD (9.1) database, read-only
+#   target: ""              # "" = the primary db: block (the 9.2 instance)
+#   custom_prefixes: [Z_, ZZ_]   # your site's custom-record naming standard
+#   discovery: both         # prefix | oprid | both (LASTUPDOPRID <> PPLSOFT)
+#   out_dir: migrate_out    # where emitted App Designer / Data Mover artifacts land
+#   state_path: migrate_state.db  # per-record progress, survives restarts
+#   max_records: 2000       # closure safety valve
+
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
   max_rows: 200           # cap on rows returned to the LLM

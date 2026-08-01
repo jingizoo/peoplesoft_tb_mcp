@@ -35,6 +35,7 @@ sqlserver = ["pyodbc>=5.1,<6.0"]
 pstb-server = "pstb.server:main"
 pstb-chat = "pstb.client.chat:main"
 pstb-gui = "pstb.gui.app:main"
+pstb-migrate-server = "pstb.migrate.server:main"
 
 [tool.setuptools.packages.find]
 include = ["pstb*"]
