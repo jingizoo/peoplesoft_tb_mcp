@@ -229,16 +229,24 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 
 ## Porting a 9.1 instance's custom records into 9.2
 
-`pstb.migrate` reuses the guarded connection stack to port **custom records
-and their data** from an old 9.1 database into an existing 9.2 instance:
+`pstb.migrate` reuses the guarded connection stack to port **records and
+their data** from an old 9.1 database into an existing 9.2 instance:
 discovery (naming prefixes / `LASTUPDOPRID`), dependency closure (subrecords,
 audit + related-language records, prompt tables, view references),
 classification against 9.2, emitted App Designer / Data Mover artifacts, and
 read-only build verification + count/sum reconciliation. It never writes to
 either database — the delivered tools apply, the pipeline proves.
 
+Tables that **changed shape between releases** — custom drift, and delivered
+tables when `delivered_data: convert` is enabled for a reimplementation — go
+through a column mapping engine: renames, expressions, PeopleSoft type
+defaults for new 9.2 columns, and row filters. Before anything moves,
+`preflight` counts on the real 9.1 data how many rows each mapping would
+truncate, round, overflow, or collide on the 9.2 key.
+
 ```bash
-python -m pstb.migrate discover        # or: plan / emit / verify-build / reconcile
+python -m pstb.migrate discover        # or: plan / mapping / preflight / emit
+python -m pstb.migrate preflight       # read-only: rows at risk, per probe
 python -m pstb.migrate.server          # same steps as MCP tools for the chat client
 ```
 

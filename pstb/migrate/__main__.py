@@ -3,8 +3,12 @@ exposes, for operators who prefer a terminal (or a cron job re-running
 reconcile overnight).
 
     python -m pstb.migrate discover [--mode prefix|oprid|both] [--limit N]
+                                    [--delivered-like 'JRNL%']
     python -m pstb.migrate plan [REC ...] [--mode ...]
     python -m pstb.migrate show REC
+    python -m pstb.migrate mapping [REC]
+    python -m pstb.migrate mapping-template [REC] [--overwrite]
+    python -m pstb.migrate preflight [REC ...]
     python -m pstb.migrate emit [--out DIR]
     python -m pstb.migrate verify-build
     python -m pstb.migrate reconcile [REC ...]
@@ -36,9 +40,23 @@ def main(argv: list | None = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("discover", help="list candidate custom records on 9.1")
+    d = sub.add_parser("discover", help="list candidate records on 9.1")
     d.add_argument("--mode", default="", choices=["", "prefix", "oprid", "both"])
     d.add_argument("--limit", type=int, default=0)
+    d.add_argument("--delivered-like", default="", dest="delivered_like",
+                   help="list DELIVERED records matching a LIKE pattern")
+
+    mp = sub.add_parser("mapping", help="column mapping + risks for reshaped records")
+    mp.add_argument("recname", nargs="?", default="")
+
+    mt = sub.add_parser("mapping-template",
+                        help="write a starter mapping-overrides file")
+    mt.add_argument("recname", nargs="?", default="")
+    mt.add_argument("--overwrite", action="store_true")
+
+    pf = sub.add_parser("preflight",
+                        help="count rows each mapping would damage (read-only)")
+    pf.add_argument("recnames", nargs="*")
 
     pl = sub.add_parser("plan", help="closure + classification against 9.2")
     pl.add_argument("seeds", nargs="*", help="seed records (default: discovery)")
@@ -66,11 +84,19 @@ def main(argv: list | None = None) -> int:
     try:
         pipe = _build()
         if a.cmd == "discover":
-            out = pipe.discover(mode=a.mode, limit=a.limit)
+            out = pipe.discover(mode=a.mode, limit=a.limit,
+                                delivered_like=a.delivered_like)
         elif a.cmd == "plan":
             out = pipe.plan(seed_records=a.seeds or None, mode=a.mode)
         elif a.cmd == "show":
             out = pipe.show_record(a.recname)
+        elif a.cmd == "mapping":
+            out = pipe.mapping(recname=a.recname)
+        elif a.cmd == "mapping-template":
+            out = pipe.mapping_template(recname=a.recname,
+                                        overwrite=a.overwrite)
+        elif a.cmd == "preflight":
+            out = pipe.preflight(recnames=a.recnames or None)
         elif a.cmd == "emit":
             out = pipe.emit(out_dir=a.out)
         elif a.cmd == "verify-build":

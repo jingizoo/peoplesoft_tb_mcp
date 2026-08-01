@@ -51,15 +51,51 @@ LOAD_ONLY = "load_only"                    # custom table already in 9.2, same s
 ALREADY_PRESENT = "already_present"        # custom non-table already in 9.2, same shape
 DRIFT_REVIEW = "drift_review"              # custom, in both, shapes differ: human/LLM merge
 DELIVERED_OK = "delivered_ok"              # delivered dependency, present in 9.2: nothing to do
+DELIVERED_CONVERT = "delivered_convert"    # delivered, in both: reshape and move data (opt-in)
 DELIVERED_MISSING = "delivered_missing"    # delivered dependency ABSENT in 9.2: resolve first
 UNKNOWN_SOURCE = "unknown_source"          # referenced but not found in 9.1 metadata
 
-# Data movement per record: straight Data Mover copy, a reviewed mapping
-# script, or nothing (views/subrecords/work records carry no data; delivered
-# records must NEVER have data copied across releases).
+# Data movement per record: straight Data Mover copy, a reviewed column
+# mapping, or nothing (views/subrecords/work records carry no data).
+#
+# Delivered records default to DATA_NONE: 9.2 ships its own delivered content
+# and Oracle's upgrade path converts history through delivered App Engine
+# programs. Sites reimplementing on a standing 9.2 instance need the data
+# anyway — migrate.delivered_data = "convert" opts in, and every such record
+# then goes through the mapping engine and the pre-flight probes rather than
+# a straight copy.
 DATA_DMS = "dms"
 DATA_MAPPED_SQL = "mapped_sql"
 DATA_NONE = "none"
+
+# Risk severity from the mapping engine and the pre-flight probes.
+BLOCKER = "blocker"    # will fail or silently corrupt: resolve before moving
+WARNING = "warning"    # may lose information: confirm it is acceptable
+INFO = "info"          # worth knowing, no action implied
+
+# PeopleSoft's own NOT NULL defaults, used when 9.2 added a column that 9.1
+# cannot source. Matches what App Designer Build writes, so a synthesized row
+# looks like one the application would have created.
+PS_TYPE_DEFAULT = {
+    0: "' '",     # Character
+    1: "' '",     # Long Character
+    2: "0",       # Number
+    3: "0",       # Signed Number
+    4: "NULL",    # Date
+    5: "NULL",    # Time
+    6: "NULL",    # DateTime
+    8: "NULL",    # Image
+    9: "NULL",    # Image Reference
+}
+
+# Type families — a mapping within a family may lose precision, a mapping
+# across families needs an explicit conversion expression.
+_FAMILIES = {0: "char", 1: "char", 2: "num", 3: "num", 4: "date",
+             5: "time", 6: "datetime", 8: "image", 9: "image"}
+
+
+def type_family(fieldtype: int | None) -> str:
+    return _FAMILIES.get(fieldtype, "unknown")
 
 # Record lifecycle in the state db.
 STATUSES = (

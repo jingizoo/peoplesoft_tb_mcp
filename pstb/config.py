@@ -96,6 +96,20 @@ class MigrateCfg:
     # Closure safety valve: stop expanding dependencies past this many records
     # rather than walking half the delivered system through a generic prompt.
     max_records: int = 2000
+    # Delivered-table DATA. "skip" (default) leaves delivered content to the
+    # 9.2 instance and Oracle's conversion path. "convert" opts a
+    # reimplementation into moving it: every delivered record seeded into the
+    # plan then goes through the column mapping engine and the pre-flight
+    # probes instead of a straight copy.
+    delivered_data: str = "skip"      # skip | convert
+    # How a converted record reaches 9.2: across a database link, or from a
+    # staging table the 9.1 extract was landed into on the 9.2 side.
+    convert_via: str = "dblink"       # dblink | staging
+    dblink_name: str = "SOURCE91"
+    staging_prefix: str = "STG_"
+    # Operator-authored column mappings (renames, expressions, defaults, row
+    # filters). Reviewed config, not generated — see docs/MIGRATION_PIPELINE.md.
+    mapping_overrides: str = "migrate_mappings.json"
 
 
 @dataclass

@@ -184,15 +184,46 @@ class RecordCatalog:
     def physical_columns(self, table_name: str) -> set:
         return self.db.columns(table_name)
 
-    def table_row_count(self, table_name: str) -> int:
-        rows, _ = self.db.query(
-            f"SELECT COUNT(*) AS N FROM {self.prefix}{table_name}", {},
-            max_rows=1)
+    def table_row_count(self, table_name: str, where: str = "") -> int:
+        sql = f"SELECT COUNT(*) AS N FROM {self.prefix}{table_name}"
+        if where:
+            sql += f" WHERE {where}"
+        rows, _ = self.db.query(sql, {}, max_rows=1)
         return int(rows[0]["n"]) if rows else 0
 
-    def column_sum(self, table_name: str, column: str) -> float:
-        rows, _ = self.db.query(
-            f"SELECT SUM({column}) AS S FROM {self.prefix}{table_name}", {},
-            max_rows=1)
+    def column_sum(self, table_name: str, column: str, where: str = "") -> float:
+        sql = f"SELECT SUM({column}) AS S FROM {self.prefix}{table_name}"
+        if where:
+            sql += f" WHERE {where}"
+        rows, _ = self.db.query(sql, {}, max_rows=1)
         v = rows[0].get("s") if rows else None
         return float(v) if v is not None else 0.0
+
+    def discover_delivered(self, like: str, limit: int = 0) -> list:
+        """Delivered (non-custom) records matching a name pattern — how an
+        operator names the delivered tables a reimplementation has to carry,
+        e.g. like='LEDGER%' or like='%JRNL%'. Custom records are excluded so
+        this never overlaps discover_custom()."""
+        pattern = (like or "").strip().upper()
+        if not pattern:
+            raise MigrateError("discover_delivered needs a LIKE pattern, "
+                               "e.g. 'JRNL%' or '%VOUCHER%'.")
+        rows, truncated = self.db.query(
+            f"SELECT RECNAME, RECTYPE, SQLTABLENAME, LASTUPDOPRID, RECDESCR "
+            f"FROM {self.prefix}PSRECDEFN WHERE RECNAME LIKE :p "
+            f"ORDER BY RECNAME",
+            {"p": pattern}, max_rows=limit or _MAX_DISCOVER)
+        out = []
+        for r in rows:
+            name = str(r.get("recname") or "").upper()
+            if self.is_custom(name):
+                continue
+            out.append({
+                "recname": name,
+                "rectype": int(r.get("rectype") or 0),
+                "sqltablename": str(r.get("sqltablename") or "").strip(),
+                "descr": str(r.get("recdescr") or "").strip(),
+            })
+        if truncated:
+            out.append({"recname": "", "truncated": True})
+        return out

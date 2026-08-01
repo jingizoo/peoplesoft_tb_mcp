@@ -253,9 +253,13 @@ class MigratePipelineTests(unittest.TestCase):
         # Drifted and delivered records never ride the straight copy.
         self.assertNotIn("Z_DRIFT_TBL", exp)
         self.assertNotIn("BUS_UNIT_TBL_GL", exp)
-        drift = (out / "drift" / "Z_DRIFT_TBL.sql").read_text()
-        self.assertIn("NEW_ATTR", drift)
-        self.assertIn("OLD_FLAG", drift)
+        # Custom drift and delivered conversion share one mapping engine, so
+        # a drifted custom record gets the same INSERT-SELECT treatment.
+        drift = (out / "convert" / "Z_DRIFT_TBL.sql").read_text()
+        self.assertIn("INSERT INTO PS_Z_DRIFT_TBL (", drift)
+        self.assertIn("NEW_ATTR", drift)     # 9.2-only column, defaulted
+        self.assertIn("OLD_FLAG", drift)     # 9.1-only column, reported dropped
+        self.assertIn("[warning:unsourced_column]", drift)
         self.assertEqual([b["recname"] for b in result["blockers"]],
                          ["OLD_DLV_VW"])
         self.assertTrue((out / "plan.json").exists())

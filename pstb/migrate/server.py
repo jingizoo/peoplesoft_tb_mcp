@@ -6,7 +6,8 @@ Same contract as pstb.server: stdio carries the protocol, diagnostics go to
 stderr, every tool returns a dict and never raises into the agent loop. The
 chat client (Gemini or Ollama) — or any MCP host — drives the cycle:
 
-    migrate_discover -> migrate_plan -> [review, migrate_show_record ...]
+    migrate_discover -> migrate_plan -> [review: migrate_show_record,
+    migrate_mapping, migrate_mapping_template, migrate_preflight]
     -> migrate_emit -> operator applies in App Designer / Data Mover
     -> migrate_verify_build -> migrate_reconcile -> migrate_status
 
@@ -60,12 +61,17 @@ def _safe(fn_name: str, /, **kw) -> dict:
 
 
 @mcp.tool()
-def migrate_discover(mode: str = "", limit: int = 0) -> dict:
-    """List candidate custom records on the 9.1 source. mode: 'prefix' (site
-    naming standard), 'oprid' (LASTUPDOPRID <> PPLSOFT), or 'both' (default
-    from config). Both signals are heuristics — treat the result as a review
-    list, and re-run with different modes to see what each signal adds."""
-    return _safe("discover", mode=mode, limit=limit)
+def migrate_discover(mode: str = "", limit: int = 0,
+                     delivered_like: str = "") -> dict:
+    """List candidate records on the 9.1 source. mode: 'prefix' (site naming
+    standard), 'oprid' (LASTUPDOPRID <> PPLSOFT), or 'both' (default from
+    config) — both signals are heuristics, so treat the result as a review
+    list. delivered_like: instead list DELIVERED records matching a name
+    pattern (e.g. 'JRNL%', '%VOUCHER%'), which is how you find the delivered
+    tables a reimplementation has to carry; seed those into migrate_plan with
+    migrate.delivered_data = convert."""
+    return _safe("discover", mode=mode, limit=limit,
+                 delivered_like=delivered_like)
 
 
 @mcp.tool()
@@ -91,11 +97,47 @@ def migrate_show_record(recname: str) -> dict:
 
 
 @mcp.tool()
+def migrate_mapping(recname: str = "") -> dict:
+    """Column-by-column data conversion for records whose shape differs
+    between 9.1 and 9.2 (custom drift and delivered_convert). For every 9.2
+    column: where its value comes from (same-name column, an operator rename,
+    an expression, or a synthesized PeopleSoft default) and what that costs —
+    truncation, rounding, overflow, type-family change, key-set change.
+    Also lists 9.1 columns with no home in 9.2 and ranked rename candidates.
+    Empty recname returns every mapped record. Read this before proposing
+    mapping overrides."""
+    return _safe("mapping", recname=recname)
+
+
+@mcp.tool()
+def migrate_mapping_template(recname: str = "", overwrite: bool = False) -> dict:
+    """Write a starter mapping-overrides file listing every unresolved column
+    with its rename candidates, ready to edit. Entries take {"from":
+    "SRC_COL"} for a rename, {"expr": "SQL"} for a conversion, {"default":
+    "value"} for a constant, plus a record-level "where" to filter which rows
+    migrate. Refuses to clobber an existing file unless overwrite is true."""
+    return _safe("mapping_template", recname=recname, overwrite=overwrite)
+
+
+@mcp.tool()
+def migrate_preflight(recnames: str = "") -> dict:
+    """Count, on the REAL 9.1 data, the rows each mapping would damage:
+    values too long for the 9.2 column (truncation), values with too many
+    decimals (rounding), values exceeding the new precision (overflow), and
+    rows that would collide on the 9.2 key. Read-only. Run this before
+    executing any conversion script — a zero-risk record is safe to load, and
+    anything blocking is marked blocked in the state db."""
+    names = [s.strip() for s in (recnames or "").split(",") if s.strip()]
+    return _safe("preflight", recnames=names or None)
+
+
+@mcp.tool()
 def migrate_emit(out_dir: str = "") -> dict:
     """Write the apply artifacts from the current plan: App Designer project
-    record list, Data Mover export/import scripts, per-record drift mapping
-    SQL, reconcile probes, plan.json/plan.md and a runbook README. Files only
-    — nothing executes against either database."""
+    record list, Data Mover export/import scripts, mapping-driven
+    INSERT-SELECT conversion SQL per reshaped record, staging DDL (staging
+    mode), resolved_mappings.json, reconcile probes, plan.json/plan.md and a
+    runbook README. Files only — nothing executes against either database."""
     return _safe("emit", out_dir=out_dir)
 
 
@@ -137,7 +179,10 @@ def main() -> None:
     print(
         f"[pstb.migrate] MCP server starting — source={cfg.migrate.source or '(unset)'}, "
         f"target={cfg.migrate.target or 'primary db'}, "
-        f"prefixes={','.join(cfg.migrate.custom_prefixes)}",
+        f"prefixes={','.join(cfg.migrate.custom_prefixes)}, "
+        f"delivered_data={cfg.migrate.delivered_data}"
+        + (f" via {cfg.migrate.convert_via}"
+           if cfg.migrate.delivered_data == "convert" else ""),
         file=sys.stderr,
     )
     mcp.run()

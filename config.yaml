@@ -58,6 +58,16 @@ wiki:
 #   out_dir: migrate_out    # where emitted App Designer / Data Mover artifacts land
 #   state_path: migrate_state.db  # per-record progress, survives restarts
 #   max_records: 2000       # closure safety valve
+#   # DELIVERED-table data. "skip" (default) leaves delivered content to 9.2
+#   # and Oracle's conversion path. "convert" moves it: needed when
+#   # reimplementing onto a standing 9.2 instance, and it bypasses both 9.2's
+#   # delivered content and Oracle's conversion programs — read the
+#   # "Delivered data" section of docs/MIGRATION_PIPELINE.md before enabling.
+#   delivered_data: skip    # skip | convert
+#   convert_via: dblink     # dblink | staging (staging lands the 9.1 extract first)
+#   dblink_name: SOURCE91   # the 9.1 database link, when convert_via=dblink
+#   staging_prefix: STG_    # landing-table prefix, when convert_via=staging
+#   mapping_overrides: migrate_mappings.json  # operator column mappings + row filters
 
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools

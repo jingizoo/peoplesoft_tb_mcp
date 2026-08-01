@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from .catalog import RecordCatalog
 from .spec import (ALREADY_PRESENT, BUILD_AND_LOAD, BUILD_DEFINITION,
-                   DATA_DMS, DATA_MAPPED_SQL, DATA_NONE, DELIVERED_MISSING,
-                   DELIVERED_OK, DRIFT_REVIEW, LOAD_ONLY, PlanItem, RecordDef,
-                   ShapeDiff, UNKNOWN_SOURCE)
+                   DATA_DMS, DATA_MAPPED_SQL, DATA_NONE, DELIVERED_CONVERT,
+                   DELIVERED_MISSING, DELIVERED_OK, DRIFT_REVIEW, LOAD_ONLY,
+                   PlanItem, RecordDef, ShapeDiff, UNKNOWN_SOURCE)
 
 
 def shape_diff(src: RecordDef, tgt: RecordDef) -> ShapeDiff:
@@ -46,7 +46,7 @@ def shape_diff(src: RecordDef, tgt: RecordDef) -> ShapeDiff:
 
 
 def classify(source: RecordCatalog, target: RecordCatalog, recname: str,
-             via: list) -> PlanItem:
+             via: list, delivered_data: str = "skip") -> PlanItem:
     src = source.record(recname)
     if src is None:
         return PlanItem(recname=recname, rectype=-1,
@@ -60,6 +60,26 @@ def classify(source: RecordCatalog, target: RecordCatalog, recname: str,
 
     if not custom:
         if tgt is not None:
+            if delivered_data == "convert" and src.has_table and tgt.has_table:
+                diff = shape_diff(src, tgt)
+                item = PlanItem(
+                    recname=recname, rectype=src.rectype,
+                    classification=DELIVERED_CONVERT,
+                    data_plan=DATA_DMS if diff.empty() else DATA_MAPPED_SQL,
+                    via=via, shape_diff={} if diff.empty() else diff.to_dict())
+                item.notes.append(
+                    "Delivered record with migrate.delivered_data=convert: "
+                    "data moves 9.1 -> 9.2"
+                    + (" through the column mapping (shapes differ) — run "
+                       "preflight before loading."
+                       if not diff.empty() else
+                       " by straight copy (shapes match)."))
+                item.notes.append(
+                    "Delivered content in 9.2 and Oracle's delivered "
+                    "conversion programs are bypassed on this path. Confirm "
+                    "this record is not one 9.2 already populates, or the "
+                    "load will duplicate or contradict it.")
+                return item
             return PlanItem(recname=recname, rectype=src.rectype,
                             classification=DELIVERED_OK, data_plan=DATA_NONE,
                             via=via)

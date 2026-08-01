@@ -51,32 +51,46 @@ def verify_build(items: list, source: RecordCatalog,
 
 
 def reconcile(items: list, source: RecordCatalog, target: RecordCatalog,
-              recnames: list | None = None) -> list:
+              recnames: list | None = None, mappings: dict | None = None) -> list:
     wanted = {r.upper() for r in recnames} if recnames else None
+    mappings = mappings or {}
     out = []
     for it in items:
         if it.data_plan not in (DATA_DMS, DATA_MAPPED_SQL):
             continue
         if wanted is not None and it.recname not in wanted:
             continue
-        out.append(_reconcile_one(it, source, target))
+        out.append(_reconcile_one(it, source, target,
+                                  mappings.get(it.recname)))
     return out
 
 
 def _reconcile_one(it: PlanItem, source: RecordCatalog,
-                   target: RecordCatalog) -> dict:
+                   target: RecordCatalog, mapping=None) -> dict:
+    """Counts and sums on both sides.
+
+    With a mapping in play the two sides are NOT symmetric: the target column
+    may be renamed, and the load may have carried only the rows the mapping's
+    filter selects. Comparing raw table totals in that case reports a failure
+    for a correct migration, so the source side is filtered and the columns
+    are paired through the mapping.
+    """
     rec = source.record(it.recname)
     if rec is None or not rec.has_table:
         return {"recname": it.recname, "ok": False,
                 "problem": "no source table to reconcile"}
-    t = rec.table_name
-    result: dict = {"recname": it.recname, "table": t}
+    src_t = rec.table_name
+    tgt_t = mapping.target_table if mapping else src_t
+    where = mapping.where if mapping else ""
+    result: dict = {"recname": it.recname, "table": src_t}
+    if where:
+        result["source_filter"] = where
     try:
-        src_n = source.table_row_count(t)
+        src_n = source.table_row_count(src_t, where)
     except Exception as e:
         return {**result, "ok": False, "problem": f"source count failed: {e}"}
     try:
-        tgt_n = target.table_row_count(t)
+        tgt_n = target.table_row_count(tgt_t)
     except Exception as e:
         return {**result, "ok": False, "source_rows": src_n,
                 "problem": f"target count failed (table missing or no grant): {e}"}
@@ -84,19 +98,35 @@ def _reconcile_one(it: PlanItem, source: RecordCatalog,
     mismatches = []
     if src_n != tgt_n:
         mismatches.append(f"row count {src_n} -> {tgt_n}")
-    # Numeric sums only when both sides have the column — a drift merge can
-    # legitimately drop one; the shape diff already documents that.
-    tgt_cols = target.physical_columns(t)
-    for col in rec.numeric_fields():
-        if tgt_cols and col.upper() not in tgt_cols:
+
+    numeric = set(rec.numeric_fields())
+    if mapping is not None:
+        pairs = [(t, s) for t, s in mapping.sourced_pairs() if s in numeric]
+        # Unverifiable columns are numeric on the TARGET side — a 9.2-only
+        # column is absent from the source's numeric list by definition, so
+        # checking against it would report nothing and quietly imply the
+        # column had been verified.
+        tgt_rec = target.record(it.recname)
+        tgt_numeric = set(tgt_rec.numeric_fields()) if tgt_rec else set()
+        unverifiable = [c.target_column for c in mapping.columns
+                        if not c.sourced and c.target_column in tgt_numeric]
+        if unverifiable:
+            result["unverifiable_columns"] = sorted(unverifiable)
+    else:
+        pairs = [(c, c) for c in sorted(numeric)]
+    tgt_cols = target.physical_columns(tgt_t)
+    for tcol, scol in pairs:
+        if tgt_cols and tcol.upper() not in tgt_cols:
             continue
         try:
-            s, g = source.column_sum(t, col), target.column_sum(t, col)
+            s = source.column_sum(src_t, scol, where)
+            g = target.column_sum(tgt_t, tcol)
         except Exception as e:
-            mismatches.append(f"{col}: sum probe failed: {e}")
+            mismatches.append(f"{tcol}: sum probe failed: {e}")
             continue
         if abs(s - g) > 1e-6:
-            mismatches.append(f"{col}: sum {s} -> {g}")
+            label = tcol if tcol == scol else f"{scol} -> {tcol}"
+            mismatches.append(f"{label}: sum {s} -> {g}")
     result["ok"] = not mismatches
     if mismatches:
         result["mismatches"] = mismatches
