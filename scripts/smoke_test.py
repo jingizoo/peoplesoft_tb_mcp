@@ -1236,6 +1236,24 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("every GUI module global is declared", not _undeclared,
           str(_undeclared))
 
+    # The scope bar shows the business unit's NAME beside its code. Two values
+    # look like names but are not: "(discovered)" is the placeholder /api/meta
+    # returns when it knows a unit but has no description, and some sites'
+    # PS_BUS_UNIT_TBL_GL has no DESCR column at all, so the code comes back
+    # echoed as its own description. Rendering either produces "US001
+    # (discovered)" or "US001 US001", both worse than the bare code. There is
+    # no JS test runner here, so assert the guards are still in the source.
+    check("scope bar filters the (discovered) name placeholder",
+          "(discovered)" in _script and "learnBuNames" in _script,
+          "the placeholder guard in learnBuNames is gone")
+    check("scope bar does not echo the unit code as its own name",
+          _rejs.search(r"name\s*===\s*bu", _clean) is not None,
+          "the descr-equals-code guard is gone")
+    check("scope label reads the business-unit name",
+          _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
+                       _clean) is not None,
+          "scopeLabel no longer looks up the unit name")
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",

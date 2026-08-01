@@ -232,6 +232,7 @@ const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElemen
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[];
+let BU_NAMES={};
 let PENDING_TIME={}, SYNC_TIME_SELECTS=null;
 let SCOPE_DISCOVERING=false, SCOPE_LOAD_ERROR='';
 const makeSessionId=()=>{
@@ -280,6 +281,29 @@ function rebuildPeriodOptions(maxRegular,selected){
   if(wanted) per.value=String(wanted);
 }
 
+// A business unit code says nothing to a reader who does not already know the
+// installation. The name is in the scope catalog, which lands after first
+// paint, so it is recorded whenever a payload carries one and the chip is
+// redrawn when it arrives.
+function learnBuNames(list){
+  let gained=false;
+  (list||[]).forEach(o=>{
+    const bu=o&&o.business_unit, name=(o&&o.descr||'').trim();
+    // "(discovered)" is the placeholder /api/meta uses when it has a unit but
+    // no description for it, and some sites' PS_BUS_UNIT_TBL_GL has no DESCR
+    // column at all. Neither is a name — showing either is worse than the
+    // bare code.
+    if(!bu||!name||name==='(discovered)'||name===bu) return;
+    if(BU_NAMES[bu]!==name){ BU_NAMES[bu]=name; gained=true; }
+  });
+  return gained;
+}
+function buName(bu){
+  const n=BU_NAMES[bu];
+  if(!n) return '';
+  return n.length>28?(n.slice(0,27)+'…'):n;
+}
+
 function flattenScopes(scopes){
   return (scopes||[]).flatMap(s=>(s.ledgers||[]).map(l=>{
     const last=l.last_posted||{};
@@ -305,7 +329,9 @@ function scopeLabel(value){
   if(!value) return 'Choose financial scope';
   const fy=value.fiscal_year?('FY'+value.fiscal_year):'any year';
   const per=value.period?('P'+value.period):'any period';
-  return value.business_unit+' · '+value.ledger+' · '+fy+' · '+per;
+  const name=buName(value.business_unit);
+  const unit=value.business_unit+(name?(' '+name):'');
+  return unit+' · '+value.ledger+' · '+fy+' · '+per;
 }
 function syncScopeControls(value){
   if(!value) return;
@@ -351,6 +377,7 @@ async function loadScopesInBackground(){
     META.financial_scopes=d.scopes||[];
     META.business_units=d.business_units||[];
     META.scopes_ready=true;
+    if(learnBuNames(d.scopes)|learnBuNames(d.business_units)) updateScopeChip();
     const opts=applyScopeCatalog();
     // A chooser already on screen was rendered empty — refresh it in place.
     if(!CHAT_SCOPE&&document.querySelector('#msgs .scope-chooser')&&opts.length)
