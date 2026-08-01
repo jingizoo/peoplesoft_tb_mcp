@@ -117,3 +117,47 @@ class BatchedProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BusinessUnitNameTests(unittest.TestCase):
+    """The scope bar shows the unit's NAME, not only its code.
+
+    "US001" identifies nothing to a reader who does not already know the
+    installation, and on a multi-unit instance it is the difference between
+    reading a number for the right company and the wrong one. The name only
+    exists in the scope catalog — /api/meta carries a "(discovered)"
+    placeholder, not a description — so if this payload ever stops carrying
+    descr the chip silently reverts to bare codes with nothing failing.
+    """
+
+    def setUp(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from pstb.gui import app as gapp
+
+        gapp._scope_cache.update({"value": None, "expires": 0.0})
+        self.client = TestClient(gapp.app)
+
+    def test_the_scope_catalog_carries_a_real_description(self) -> None:
+        scopes = self.client.get("/api/scopes").json().get("scopes") or []
+        self.assertTrue(scopes, "no scopes to check")
+        named = [s for s in scopes
+                 if (s.get("descr") or "").strip()
+                 and s["descr"] != "(discovered)"
+                 and s["descr"] != s["business_unit"]]
+        self.assertTrue(
+            named,
+            "no scope carried a usable business-unit description, so the "
+            f"scope bar can only show codes: {[s.get('descr') for s in scopes]}")
+
+    def test_the_description_is_absent_rather_than_faked(self) -> None:
+        # A site whose PS_BUS_UNIT_TBL_GL has no DESCR column must yield a
+        # missing description, never the business unit code echoed back as if
+        # it were a name — the UI treats those differently on purpose.
+        for scope in self.client.get("/api/scopes").json().get("scopes") or []:
+            descr = scope.get("descr")
+            if descr is None:
+                continue
+            self.assertNotEqual(
+                descr.strip(), scope["business_unit"],
+                "descr echoed the code; the UI would render 'US001 US001'")
