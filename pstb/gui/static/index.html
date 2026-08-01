@@ -360,6 +360,13 @@ function renderBuildTag(node){
   tag.title=Object.entries(b).map(([k,v])=>k+': '+v).join('\n');
 }
 function applyScopeCatalog(){
+  // Learn unit names HERE, because this is the one function both routes into
+  // the catalog call. The background loader is skipped entirely when the
+  // server's scope cache is already warm — /api/meta then carries the whole
+  // catalog inline — so learning names only in that loader meant the very
+  // situation a running server is normally in showed codes with no name.
+  if(learnBuNames(META.financial_scopes)|learnBuNames(META.business_units))
+    updateScopeChip();
   // Auto-select only when the database is unambiguous. With multiple choices
   // the conversation asks, rather than inheriting a sample BU.
   const opts=flattenScopes(META.financial_scopes||[]);
@@ -377,8 +384,7 @@ async function loadScopesInBackground(){
     META.financial_scopes=d.scopes||[];
     META.business_units=d.business_units||[];
     META.scopes_ready=true;
-    if(learnBuNames(d.scopes)|learnBuNames(d.business_units)) updateScopeChip();
-    const opts=applyScopeCatalog();
+    const opts=applyScopeCatalog();   // learns the unit names on the way
     // A chooser already on screen was rendered empty — refresh it in place.
     if(!CHAT_SCOPE&&document.querySelector('#msgs .scope-chooser')&&opts.length)
       showScopeChooser();

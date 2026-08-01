@@ -1254,6 +1254,20 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
                        _clean) is not None,
           "scopeLabel no longer looks up the unit name")
 
+    # Names must be learned in applyScopeCatalog, which BOTH routes into the
+    # catalog run. Learning them only inside loadScopesInBackground shipped
+    # broken: that loader is skipped entirely when the server's scope cache is
+    # warm — /api/meta then carries the catalog inline — so every page load
+    # against an already-running server showed codes with no name, which is
+    # the normal state of a deployed server rather than an edge case.
+    _apply = _rejs.search(
+        r"function\s+applyScopeCatalog\s*\([^)]*\)\s*\{([\s\S]*?)\n\}",
+        _clean)
+    check("business-unit names are learned on the warm-cache path too",
+          _apply is not None and "learnBuNames" in _apply.group(1),
+          "applyScopeCatalog does not call learnBuNames, so a warm server "
+          "shows business unit codes with no name")
+
     print("== DB-derived scope discovery ==")
     eff = engine.effective_defaults()
     check("healthy config validates without discovery",
