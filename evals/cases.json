@@ -163,6 +163,23 @@
         "not_refused": true,
         "_why": "a broad readiness question runs the playbook, not ad-hoc steps"
       }
+    },
+    {
+      "id": "trend-consolidated",
+      "question": "Show me billed revenue per customer by month as one table with months across the top",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "run_sql"
+        ],
+        "tool_args_contain": {
+          "pivot": "row_field"
+        },
+        "_why": "Per-CUSTOMER by month is not a report the pack covers \u2014 the income statement gives periods across the top but only for GL accounts. So this must go through one grouped query pivoted server-side. Answering it by running a query per month and adding them up in prose cannot work: the number guard rejects figures no tool produced."
+      }
     }
   ]
 }

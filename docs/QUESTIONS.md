@@ -140,3 +140,56 @@ a playbook can never disagree with the tool it wraps.
 - Commitment control: encumbrance vs budget (PS_KK_ACTIVITY_LOG).
 - Consolidations: intercompany/affiliate elimination checks (AFFILIATE chartfield).
 - Allocation results tracing (PS_ALLOC_*).
+
+## Trend and cross-tab questions
+
+"How has this customer's revenue moved over the last six months" wants one
+table: the customer down the side, months across the top, totals and movement
+at the edges.
+
+Three things made that hard, and only one of them was obvious.
+
+**It was never a SQL problem.** One `GROUP BY` returns every period at once —
+there was no need to chain a query per month, and doing so is both slower and
+wrong.
+
+**The report pack does not cover it.** Reports are GL-shaped: rows are accounts
+or tree nodes. Revenue per *customer* by month is a dimension they have no
+answer for, and a model asked for one will invent a report name that does not
+exist.
+
+**The number guard blocked the arithmetic.** This is the real reason. A
+consolidated table is made almost entirely of derived figures — row totals,
+column totals, change, percentage change — and none of them appear in any tool
+result, because nothing computed them. The guard rejects figures no tool
+produced, correctly. The effect was that consolidating was penalised: it
+required arithmetic, and arithmetic got blocked.
+
+So the arithmetic moved server-side, the same way policy figures moved out of
+the model's head and into a bind:
+
+```
+run_sql(
+  sql="SELECT C.NAME1 AS customer, <period> AS month, SUM(H.INVOICE_AMOUNT) AS revenue
+         FROM PS_BI_HDR H JOIN PS_CUSTOMER C ON C.CUST_ID = H.BILL_TO_CUST_ID
+        WHERE H.BUSINESS_UNIT = 'US001' AND H.BILL_STATUS = 'INV'
+        GROUP BY 1, 2",
+  pivot={"row_field": "customer", "column_field": "month", "value_field": "revenue"},
+)
+```
+
+Every cell, total, change and percentage comes back computed, so every one is
+quotable. The UI renders it as a cross-tab with both total edges.
+
+### What it refuses to pretend
+
+| case | behaviour |
+|---|---|
+| a cell with no row | true zero — the row exists, that column had no activity |
+| percentage from a zero base | `null`, not 0% or 100% — it has no percentage |
+| a row empty at both ends | `change` is 0 and arithmetically true, so the row also carries `activity_span` and must not be narrated as flat |
+| more than 60 columns | refuses, and says to put the wider dimension down the side |
+| a misnamed field | names the columns the query actually returned |
+
+`change` is always the last column minus the first, and `change_basis` says so
+in the payload — on sparse data that comparison is easy to misread.
