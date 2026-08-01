@@ -38,7 +38,11 @@ KINDS = {
     "convention": "how this installation is set up (calendar, periods, codes)",
     "exclusion": "something to leave out of a particular kind of answer",
     "context": "background a newcomer would need to read an answer correctly",
+    "record": "what a specific table or record holds, taught by someone here",
 }
+
+# Record facts are attached to a table name so record discovery can find them.
+_RECORD_RE = re.compile(r"^\s*([A-Za-z_][\w$#]{0,29})\s*:\s*(.+)$", re.S)
 
 MAX_FACTS = 500          # a memory file, not a database
 MAX_TEXT = 400           # a fact, not an essay
@@ -99,6 +103,14 @@ class SiteMemory:
                 return {"fact": existing, "already_known": True}
         fact = {"id": fact_id, "text": body, "kind": kind,
                 "status": "pending", "source": source, "proposed": _now()}
+        if kind == "record":
+            m = _RECORD_RE.match(body)
+            if not m:
+                raise MemoryError_(
+                    "a record fact must start with the table name, e.g. "
+                    "'PS_TU_FILE_INTFC: holds inbound interface file headers'")
+            fact["record"] = m.group(1).upper()
+            fact["detail"] = m.group(2).strip()
         data["facts"].append(fact)
         self._save(data)
         return {"fact": fact, "already_known": False}
@@ -143,6 +155,47 @@ class SiteMemory:
     def approved(self) -> list:
         return [f for f in self._load()["facts"]
                 if f.get("status") == "approved"]
+
+    def record_facts(self, table: str = "") -> list:
+        """What someone here has taught about a record.
+
+        Both approved and pending facts are returned, each carrying its own
+        status. Approval still governs whether a fact enters PROMPT CONTEXT —
+        an unreviewed claim must not silently shape a conclusion. But record
+        facts do a different job: they help FIND a table, and whatever is
+        found is then read from the live catalog anyway. Making someone run a
+        CLI before the agent can act on "that table holds interface files" is
+        friction with nothing on the other side of it, so discovery uses them
+        immediately and labels where they came from.
+        """
+        want = (table or "").strip().upper()
+        if want.startswith("PS_"):
+            want = want[3:]
+        out = []
+        for f in self._load()["facts"]:
+            if f.get("kind") != "record" or f.get("status") == "rejected":
+                continue
+            rec = str(f.get("record") or "")
+            if want and rec != want and rec != f"PS_{want}" \
+                    and rec.removeprefix("PS_") != want:
+                continue
+            out.append(f)
+        return out
+
+    def search_record_facts(self, query: str) -> list:
+        """Record facts whose text matches a query — this is what makes
+        'interface file' find a custom table nobody could have guessed."""
+        terms = [t for t in re.split(r"\W+", (query or "").lower()) if len(t) > 2]
+        if not terms:
+            return []
+        hits = []
+        for f in self.record_facts():
+            hay = f"{f.get('record','')} {f.get('detail') or f.get('text','')}".lower()
+            score = sum(1 for t in terms if t in hay)
+            if score:
+                hits.append((score, f))
+        hits.sort(key=lambda x: -x[0])
+        return [f for _, f in hits]
 
     def prompt_block(self) -> str:
         """Approved facts as prompt context, or '' when there are none.

@@ -49,6 +49,55 @@ An error, invalid scope, or `NO DATA` result stops the chain. Wiki text is never
 used as a numerical fallback. Pure policy questions may still use the wiki
 directly, and data-only questions cannot call wiki tools.
 
+## Deciding whether retrieval actually helped
+
+BM25 always returns its best candidates. Ask about a subject the wiki has no
+page on and it still answers — confidently, with prose about a neighbouring
+topic. Nothing in the result says "this is the closest I had, and it is not
+close".
+
+So every `wiki_lookup` now reports how much of the question each passage
+actually speaks to:
+
+| field | meaning |
+|---|---|
+| `term_coverage` (per passage) | fraction of the question's meaningful terms the passage matched |
+| `best_term_coverage` | the best of those |
+| `relevance` | `strong` (≥0.6), `partial` (≥0.3), `weak` |
+| `relevance_note` | present unless `strong`; instructs the reader to check before using |
+
+Coverage rather than the raw BM25 score, because a score of 4.1 means nothing
+on its own — it is not comparable between questions — while "matched 2 of your
+5 terms" is directly readable.
+
+The judgement itself belongs to the model, and this is deliberate: **the MCP
+server has no LLM**. The model is the client driving these tools, so it already
+reads every passage. What was missing was not a screening step — that would
+cost an extra round trip per lookup — but the evidence needed to screen well,
+and a refusal to auto-apply a weak match. `resolve_policy_value` now returns
+`needs_review` instead of `resolved` when the passage carrying the figure
+matched under half the query terms, and `needs_review` is not usable as a
+filter.
+
+## Caching
+
+A policy page does not change hourly, and the same question recurs constantly
+— the model asks, a figure is resolved from the same page, a follow-up asks
+again. Two caches, both 5-minute TTL:
+
+- `wiki.lookup` results, keyed on **corpus identity** plus question and shape.
+  Keyed on the provider *type* alone, two localdocs roots shared entries and
+  one corpus was served the other's passages.
+- `PolicyResolver.resolve` results, including the negative ones. `not_found`
+  is the most expensive answer there is — it exhausts every search phrasing and
+  fetches every candidate before concluding nothing — and "we don't have that
+  figure" is exactly what a user probes at a few times in a row.
+
+Measured on the bundled corpus: a resolved policy costs 3 wiki round trips
+cold and **0** warm; a missing one costs 7 cold and **0** warm. Over Confluence
+at ~200 ms per call that is the difference between 1.4 s and nothing on every
+repeat. The cold cost is unchanged — this removes repetition, not first reads.
+
 ## Policy figures as query parameters
 
 Retrieval answers "what does the policy say". The harder half is "now apply

@@ -6,9 +6,12 @@ any wiki credentials exist.
 """
 from __future__ import annotations
 
+import copy as _copy
 import datetime as dt
 import hashlib
 import re
+import threading as _threading
+import time as _time
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
@@ -350,12 +353,54 @@ class ConfluenceWiki:
         }
 
 
+def _cache_identity(wiki) -> str:
+    """Stable identity for the CORPUS behind a provider, for cache keys."""
+    name = getattr(wiki, "provider_name", "?")
+    root = getattr(wiki, "root", None)
+    if root is not None:
+        try:
+            return f"{name}:{Path(root).resolve()}"
+        except Exception:
+            return f"{name}:{root}"
+    base = getattr(wiki, "base_url", "") or ""
+    space = getattr(wiki, "space", "") or ""
+    labels = getattr(wiki, "labels", "") or ""
+    return f"{name}:{base}:{space}:{labels}"
+
+
+_LOOKUP_TTL = 300.0            # seconds; a policy page does not change hourly
+_LOOKUP_CACHE: dict = {}
+_LOOKUP_LOCK = _threading.Lock()
+
+
+def clear_lookup_cache() -> None:
+    with _LOOKUP_LOCK:
+        _LOOKUP_CACHE.clear()
+
+
 def lookup(wiki, question: str, max_pages: int = 3, max_passages: int = 6,
            limit: int = 8) -> dict:
     """Search, FETCH the top pages, and return the passages that answer the
     question — with provenance. One call replaces search-then-read, which is
-    the step models skip (leaving the user with a list of hyperlinks)."""
+    the step models skip (leaving the user with a list of hyperlinks).
+
+    Cached for a few minutes per (question, shape). On local files a lookup is
+    a millisecond, but against Confluence it is a search plus one HTTP fetch
+    per page — and the same question recurs constantly: the model asks, a
+    policy figure is resolved from the same page, then a follow-up asks again.
+    """
     from .retrieve import rank_passages, split_passages
+
+    # The corpus must be part of the key, not just the provider TYPE. Two
+    # localdocs roots are both "localdocs"; keying on the type alone served
+    # one corpus's passages for another's question — which the test fixtures
+    # caught here and a second configured wiki would have hit in production.
+    key = (_cache_identity(wiki), question, max_pages, max_passages, limit)
+    now = _time.monotonic()
+    with _LOOKUP_LOCK:
+        hit = _LOOKUP_CACHE.get(key)
+        if hit and hit[0] > now:
+            return _copy.deepcopy(hit[1])
 
     hits = wiki.search(question, limit=max(int(limit or 8), 1))
     if not hits:
@@ -404,6 +449,23 @@ def lookup(wiki, question: str, max_pages: int = 3, max_passages: int = 6,
             "not contain the answer, say so — do not infer policy from a title."
         ),
     }
+    # Retrieval finding SOMETHING is not retrieval finding the ANSWER. BM25
+    # always returns its best candidates, so a question the wiki has no page
+    # about still comes back with confident-looking prose about a neighbouring
+    # topic. Say how much of the question each passage actually speaks to, and
+    # make the judgement an explicit step rather than an assumption.
+    best = max((p.get("term_coverage") or 0.0) for p in top) if top else 0.0
+    out["best_term_coverage"] = best
+    out["relevance"] = ("strong" if best >= 0.6
+                        else "partial" if best >= 0.3 else "weak")
+    if out["relevance"] != "strong":
+        out["relevance_note"] = (
+            f"These passages match only {best:.0%} of the question's terms. "
+            "READ THEM BEFORE USING THEM: retrieval returns its closest "
+            "candidates even when the wiki has no page on this subject. If "
+            "they do not actually answer what was asked, say the wiki does "
+            "not cover it rather than reporting the nearest topic instead."
+        )
     try:
         h = wiki.health()
         if h.get("is_bundled_demo_content"):
@@ -413,6 +475,8 @@ def lookup(wiki, question: str, max_pages: int = 3, max_passages: int = 6,
             )
     except Exception:
         pass
+    with _LOOKUP_LOCK:
+        _LOOKUP_CACHE[key] = (now + _LOOKUP_TTL, _copy.deepcopy(out))
     return out
 
 
