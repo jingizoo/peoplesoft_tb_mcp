@@ -524,10 +524,35 @@ def psrecfield_for_record(db: Database) -> str:
 
 
 def business_units(db: Database) -> str:
-    return f"""SELECT BUSINESS_UNIT AS business_unit,
-       {opt(db, 'PS_BUS_UNIT_TBL_GL', 'DESCR', 'descr')},
-       {opt(db, 'PS_BUS_UNIT_TBL_GL', 'BASE_CURRENCY', 'base_currency')}
-  FROM {db.prefix}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT"""
+    """Business units with their names and base currency.
+
+    The NAME lives on PS_BUS_UNIT_TBL_FS, the Financials business-unit
+    definition. PS_BUS_UNIT_TBL_GL holds the GL-specific attributes — ledger
+    group, base currency — and in delivered PeopleSoft carries no DESCR at
+    all. Reading the description from the GL record therefore did not fail
+    loudly; opt() simply emitted NULL on every real instance, and the scope
+    bar showed a bare code with nothing indicating why.
+
+    The join is conditional rather than unconditional: reporting roles are
+    often granted one of these records and not the other, and an outer join
+    to a table the account cannot read fails the whole query. When FS is not
+    readable this falls back to a DESCR on the GL record, which is where a
+    site that customised one would have put it.
+    """
+    p = db.prefix
+    gl, fs = "PS_BUS_UNIT_TBL_GL", "PS_BUS_UNIT_TBL_FS"
+    base = opt(db, gl, "BASE_CURRENCY", "base_currency", "G")
+    # columns() is empty for BOTH "no such table" and "catalog unreadable";
+    # either way the join is unsafe, so both take the fallback.
+    if db.columns(fs) and db.has_column(fs, "DESCR"):
+        return f"""SELECT G.BUSINESS_UNIT AS business_unit,
+       F.DESCR AS descr, {base}
+  FROM {p}{gl} G
+  LEFT JOIN {p}{fs} F ON F.BUSINESS_UNIT = G.BUSINESS_UNIT
+ ORDER BY G.BUSINESS_UNIT"""
+    return f"""SELECT G.BUSINESS_UNIT AS business_unit,
+       {opt(db, gl, 'DESCR', 'descr', 'G')}, {base}
+  FROM {p}{gl} G ORDER BY G.BUSINESS_UNIT"""
 
 
 def ledger_business_units(db: Database) -> str:

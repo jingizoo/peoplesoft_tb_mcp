@@ -276,7 +276,14 @@ CREATE TABLE PS_GL_ACCOUNT_TBL (
   ACCOUNT_TYPE TEXT);
 CREATE TABLE PS_DEPT_TBL (
   SETID TEXT, DEPTID TEXT, EFFDT TEXT, EFF_STATUS TEXT, DESCR TEXT);
-CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, DESCR TEXT, BASE_CURRENCY TEXT);
+-- Delivered PeopleSoft splits these deliberately, and the sample now matches
+-- it: the NAME of a business unit is on the Financials record, while the GL
+-- record carries only GL attributes and has NO DESCR. Shipping a DESCR on
+-- PS_BUS_UNIT_TBL_GL modelled a shape no real instance has, so a query
+-- reading the name from the wrong record passed here and returned NULL on
+-- every real one.
+CREATE TABLE PS_BUS_UNIT_TBL_FS (BUSINESS_UNIT TEXT, DESCR TEXT);
+CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, BASE_CURRENCY TEXT);
 -- Ledger setup records. A real instance always has these, and the agent
 -- discovers its BU/ledger catalog from them: they hold one row per business
 -- unit / ledger group, so the lookup is a small indexed read instead of a
@@ -434,7 +441,10 @@ def main() -> None:
         [(SETID, d, "1900-01-01", "A", n) for d, n in DEPTS],
     )
     con.execute(
-        "INSERT INTO PS_BUS_UNIT_TBL_GL VALUES (?,?,?)", (BU, "US Operations", CURR)
+        "INSERT INTO PS_BUS_UNIT_TBL_GL VALUES (?,?)", (BU, CURR)
+    )
+    con.execute(
+        "INSERT INTO PS_BUS_UNIT_TBL_FS VALUES (?,?)", (BU, "US Operations")
     )
     # PeopleTools catalog rows for the records this sample ships, plus a
     # custom-looking one so description-based discovery is exercised.

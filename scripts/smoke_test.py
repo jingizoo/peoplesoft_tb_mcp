@@ -845,33 +845,62 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
           and degraded["notes"], str(degraded)[:120])
     _sh.rmtree(_tmpc)
 
-    # A site whose PS_BUS_UNIT_TBL_GL has no DESCR must not lose the whole
-    # business-unit list to ORA-00904 (seen on a real instance).
-    _tmpb = Path(_tf.mkdtemp(prefix="pstb_bu_"))
-    _bdb = _tmpb / "nodescr.db"
-    _sh.copy(ROOT / "sample_data" / "ps_sample.db", _bdb)
-    _bc = _sq.connect(_bdb)
-    _bc.executescript("""
-ALTER TABLE PS_BUS_UNIT_TBL_GL RENAME TO OLD_BU;
-CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, BASE_CURRENCY TEXT);
-INSERT INTO PS_BUS_UNIT_TBL_GL SELECT BUSINESS_UNIT, BASE_CURRENCY FROM OLD_BU;
-DROP TABLE OLD_BU;""")
-    _bc.commit(); _bc.close()
-    cfg_b = Config.sample(ROOT)
-    cfg_b.db.sqlite_path = str(_bdb)
-    eng_b = TBEngine(Database(cfg_b), cfg_b)
-    check("record_columns reports the real shape",
-          eng_b.record_columns("PS_BUS_UNIT_TBL_GL")
-          == {"BUSINESS_UNIT", "BASE_CURRENCY"},
-          str(sorted(eng_b.record_columns("PS_BUS_UNIT_TBL_GL"))))
-    bus = eng_b.list_business_units()["business_units"]
-    check("business units survive a missing DESCR column",
-          [b["business_unit"] for b in bus] == ["US001"]
-          and bus[0]["descr"] is None and bus[0]["base_currency"] == "USD",
-          str(bus))
-    check("trial balance unaffected by the missing column",
-          eng_b.trial_balance(fiscal_year=2026, period=6)["totals"]["in_balance"])
-    _sh.rmtree(_tmpb)
+    # The business unit's NAME lives on PS_BUS_UNIT_TBL_FS; delivered
+    # PS_BUS_UNIT_TBL_GL has no DESCR at all. Reading it from the GL record
+    # did not fail loudly — it returned NULL on every real instance while the
+    # sample, which wrongly carried a DESCR there, showed a name. So both
+    # records are exercised here, and the base currency must keep coming from
+    # GL in every case.
+    _bu_shapes = [
+        ("delivered: name on FS, none on GL", "", "US Operations"),
+        ("FS record not granted or absent",
+         "DROP TABLE PS_BUS_UNIT_TBL_FS;", None),
+        ("FS present but carrying no DESCR",
+         "ALTER TABLE PS_BUS_UNIT_TBL_FS DROP COLUMN DESCR;", None),
+        ("no FS, site customised a DESCR onto GL",
+         "DROP TABLE PS_BUS_UNIT_TBL_FS;"
+         "ALTER TABLE PS_BUS_UNIT_TBL_GL ADD COLUMN DESCR TEXT;"
+         "UPDATE PS_BUS_UNIT_TBL_GL SET DESCR='Customised GL name';",
+         "Customised GL name"),
+    ]
+    for _label, _ddl, _want in _bu_shapes:
+        _tmpb = Path(_tf.mkdtemp(prefix="pstb_bu_"))
+        _bdb = _tmpb / "bu.db"
+        _sh.copy(ROOT / "sample_data" / "ps_sample.db", _bdb)
+        _bc = _sq.connect(_bdb)
+        for (_v,) in _bc.execute(
+                "SELECT name FROM sqlite_master WHERE type='view'").fetchall():
+            _bc.execute(f"DROP VIEW {_v}")
+        if _ddl:
+            _bc.executescript(_ddl)
+        _bc.commit(); _bc.close()
+        cfg_b = Config.sample(ROOT)
+        cfg_b.db.sqlite_path = str(_bdb)
+        cfg_b.db.use_views = False
+        eng_b = TBEngine(Database(cfg_b), cfg_b)
+        bus = eng_b.list_business_units()["business_units"]
+        check(f"business-unit name — {_label}",
+              [b["business_unit"] for b in bus] == ["US001"]
+              and bus[0]["descr"] == _want
+              and bus[0]["base_currency"] == "USD",
+              f"wanted descr={_want!r}, got {bus}")
+        check(f"trial balance unaffected — {_label}",
+              eng_b.trial_balance(fiscal_year=2026,
+                                  period=6)["totals"]["in_balance"])
+        eng_b.db.close()
+        _sh.rmtree(_tmpb)
+
+    # The sample must MODEL the delivered split, or a query reading the name
+    # from the wrong record passes here and returns NULL on every real
+    # instance — which is exactly what shipped.
+    _cfg_s = Config.sample(ROOT)
+    _db_s = Database(_cfg_s)
+    check("sample models delivered PeopleSoft: name on FS, not on GL",
+          "DESCR" in _db_s.columns("PS_BUS_UNIT_TBL_FS")
+          and "DESCR" not in _db_s.columns("PS_BUS_UNIT_TBL_GL"),
+          f"FS={sorted(_db_s.columns('PS_BUS_UNIT_TBL_FS'))} "
+          f"GL={sorted(_db_s.columns('PS_BUS_UNIT_TBL_GL'))}")
+    _db_s.close()
 
     # Launching any entry point from a subdirectory must still find the
     # deployment's config.yaml — `cd scripts && python -m pstb.gui` silently
