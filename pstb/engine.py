@@ -1029,9 +1029,11 @@ class TBEngine:
         bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
         issues: list[str] = []
 
+        _t0 = time.perf_counter()
         piv = self._pivot(
             self._period_sums(bu, led, fy, per, include_adj=True), ["account"], per, True
         )
+        _tb_ms = int((time.perf_counter() - _t0) * 1000)
         if not piv:
             diag = self._scope_diagnosis(bu, led, fy)
             return {
@@ -1096,13 +1098,20 @@ class TBEngine:
         # never a clean check.
         incomplete: list = []
 
+        probe_ms: dict = {}
+
         def probe(name: str, fn, default):
+            started = time.perf_counter()
             try:
                 return fn()
             except Exception as e:                     # noqa: BLE001
                 incomplete.append({"check": name,
                                    "reason": f"{type(e).__name__}: {e}"})
                 return default
+            finally:
+                # "The integrity check is slow" names a bundle of four very
+                # different queries; the timing has to say WHICH ONE.
+                probe_ms[name] = int((time.perf_counter() - started) * 1000)
 
         params = {"bu": bu, "fy": fy, "maxper": per, "ledger": led}
         unposted = probe(
@@ -1148,6 +1157,7 @@ class TBEngine:
             "retained_earnings_roll": re_roll,
             "issues": issues,
             "checks_incomplete": incomplete,
+            "probe_timings_ms": {"tb_aggregate": _tb_ms, **probe_ms},
             # "control_status" describes the exception checks, NOT whether the
             # books balance — keep those two verdicts separately named so a
             # reader (human or model) cannot conflate them. A probe that could

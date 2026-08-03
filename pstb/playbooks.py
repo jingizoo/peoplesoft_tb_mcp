@@ -22,6 +22,7 @@ must never read as "the AR tie is fine".
 from __future__ import annotations
 
 import datetime as dt
+import time
 from typing import Callable, Optional
 
 from .ar import ARBilling, ARError
@@ -292,26 +293,60 @@ class PlaybookRunner:
         ctx: dict = {"business_unit": bu, "ledger": ledger,
                      "fiscal_year": fy, "period": period}
 
-        def gather(key: str, fn, on_error) -> None:
+        def gather(key: str, fn, on_error) -> tuple:
+            """(key, value, elapsed_ms) — run in a worker thread below."""
+            started = time.perf_counter()
             try:
-                ctx[key] = fn()
+                value = fn()
             except Exception as e:                     # noqa: BLE001 — see above
-                ctx[key] = on_error(f"{type(e).__name__}: {e}")
+                value = on_error(f"{type(e).__name__}: {e}")
+            return key, value, int((time.perf_counter() - started) * 1000)
 
-        gather("integrity",
-               lambda: self.e.tb_integrity_check(business_unit=bu,
-                                                 ledger=ledger,
-                                                 fiscal_year=fy,
-                                                 period=period),
-               lambda msg: {"scope_status": "error", "detail": msg})
-        gather("aging", lambda: self.ar.aging(business_unit=bu), str)
-        gather("workbench",
-               lambda: self.ar.billing_workbench(business_unit=bu), str)
-        try:
-            lfy, lper = self.e.last_posted_period(bu, ledger)
-            ctx["latest_fy"], ctx["latest_period"] = lfy, lper
-        except Exception:                              # noqa: BLE001
-            ctx["latest_fy"] = ctx["latest_period"] = None
+        def latest() -> tuple:
+            try:
+                return self.e.last_posted_period(bu, ledger)
+            except Exception:                          # noqa: BLE001
+                return None, None
+
+        # The four inputs are INDEPENDENT — integrity reads the ledger, aging
+        # reads AR, the workbench reads billing — yet they ran in sequence,
+        # so the playbook's wall time was the SUM of the site's slowest
+        # queries. On the bundled sample that sum is milliseconds; on a real
+        # instance it is what made close readiness time out. The database
+        # layer is built for this (Oracle session pool, per-thread SQLite),
+        # so they now run together and the playbook costs the slowest input,
+        # not the total. Each input's elapsed time is kept: when a run IS
+        # slow, the result names the culprit instead of leaving "timed out"
+        # as the whole diagnosis.
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(gather, "integrity",
+                            lambda: self.e.tb_integrity_check(
+                                business_unit=bu, ledger=ledger,
+                                fiscal_year=fy, period=period),
+                            lambda msg: {"scope_status": "error",
+                                         "detail": msg}),
+                pool.submit(gather, "aging",
+                            lambda: self.ar.aging(business_unit=bu), str),
+                pool.submit(gather, "workbench",
+                            lambda: self.ar.billing_workbench(
+                                business_unit=bu), str),
+                pool.submit(gather, "latest_posted", latest,
+                            lambda msg: (None, None)),
+            ]
+            timings: dict = {}
+            for future in futures:
+                key, value, elapsed_ms = future.result()
+                timings[key] = elapsed_ms
+                if key == "latest_posted":
+                    lfy, lper = (value if isinstance(value, tuple)
+                                 else (None, None))
+                    ctx["latest_fy"], ctx["latest_period"] = lfy, lper
+                else:
+                    ctx[key] = value
+        ctx["_input_timings_ms"] = timings
         return ctx
 
     def run(self, playbook: str = "", business_unit: str = "",
@@ -351,6 +386,15 @@ class PlaybookRunner:
             verdict = "passed"
             summary = f"all {len(results)} checks passed"
 
+        timings = ctx.get("_input_timings_ms") or {}
+        slowest = max(timings.values(), default=0)
+        out_timing: dict = {"input_timings_ms": timings}
+        if slowest >= 30_000:
+            worst = max(timings, key=timings.get)
+            out_timing["performance_note"] = (
+                f"the {worst} input took {slowest / 1000:.0f}s — that is the "
+                "query to tune, not the playbook. Run "
+                "scripts/diagnose_db.py to see its individual statements.")
         return {
             "playbook": name,
             "title": spec["title"],
@@ -359,6 +403,7 @@ class PlaybookRunner:
             "as_of": dt.date.today().isoformat(),
             "verdict": verdict,
             "summary": summary,
+            **out_timing,
             "attention_count": len(attention),
             "skipped_count": len(skipped),
             "steps": results,

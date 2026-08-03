@@ -259,3 +259,98 @@ class ParallelPageFetchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConcurrentPlaybookContextTests(unittest.TestCase):
+    """close_readiness gathers its four inputs together, not in sequence.
+
+    The inputs are independent — integrity reads the ledger, aging reads AR,
+    the workbench reads billing — and running them serially made the playbook
+    cost the SUM of the site's slowest queries, which is what a close-
+    readiness timeout on a real instance is made of.
+    """
+
+    def _runner_with_slow_inputs(self, delay=0.15):
+        from pstb.config import load_config
+        from pstb.db import Database
+        from pstb.engine import TBEngine
+        from pstb.ar import ARBilling
+        from pstb.playbooks import PlaybookRunner
+
+        cfg = load_config(str(ROOT / "config.yaml"))
+        db = Database(cfg)
+        engine = TBEngine(db, cfg)
+        ar = ARBilling(engine)
+        intervals = {}
+
+        def slow(name, fn):
+            def wrapper(*a, **k):
+                start = time.perf_counter()
+                time.sleep(delay)
+                out = fn(*a, **k)
+                intervals[name] = (start, time.perf_counter())
+                return out
+            return wrapper
+
+        engine.tb_integrity_check = slow("integrity", engine.tb_integrity_check)
+        ar.aging = slow("aging", ar.aging)
+        ar.billing_workbench = slow("workbench", ar.billing_workbench)
+        return PlaybookRunner(engine, ar), intervals, db
+
+    def test_the_inputs_overlap(self):
+        runner, intervals, db = self._runner_with_slow_inputs()
+        try:
+            result = runner.run("close_readiness")
+        finally:
+            db.close()
+        self.assertEqual(len(intervals), 3)
+        spans = list(intervals.values())
+        joint = max(e for _, e in spans) - min(s for s, _ in spans)
+        total = sum(e - s for s, e in spans)
+        self.assertLess(joint, total * 0.8,
+                        f"inputs spanned {joint:.2f}s against {total:.2f}s of "
+                        "work — the context gather is serial again")
+        self.assertEqual(result["verdict"], "exceptions_found")
+
+    def test_concurrency_changes_no_step_outcome(self):
+        # The whole point of a deterministic playbook is that HOW it runs
+        # never changes WHAT it reports.
+        from pstb.config import load_config
+        from pstb.db import Database
+        from pstb.engine import TBEngine
+        from pstb.ar import ARBilling
+        from pstb.playbooks import PlaybookRunner
+
+        cfg = load_config(str(ROOT / "config.yaml"))
+        db = Database(cfg)
+        try:
+            engine = TBEngine(db, cfg)
+            plain = PlaybookRunner(engine, ARBilling(engine)).run(
+                "close_readiness")
+        finally:
+            db.close()
+        runner, _, db2 = self._runner_with_slow_inputs(delay=0.05)
+        try:
+            slowed = runner.run("close_readiness")
+        finally:
+            db2.close()
+        self.assertEqual(
+            [(s["step"], s["status"]) for s in plain["steps"]],
+            [(s["step"], s["status"]) for s in slowed["steps"]])
+
+    def test_a_slow_run_names_its_culprit(self):
+        runner, _, db = self._runner_with_slow_inputs(delay=0.05)
+        try:
+            result = runner.run("close_readiness")
+        finally:
+            db.close()
+        timings = result["input_timings_ms"]
+        self.assertEqual(
+            set(timings), {"integrity", "aging", "workbench", "latest_posted"})
+        # The stubs slept, so their inputs must report measurable time.
+        self.assertGreaterEqual(timings["integrity"], 50)
+        # Integrity itself itemises: the aggregate and each control probe.
+        balance = next(s for s in result["steps"] if s["step"] == "balance")
+        probes = balance["detail"]["probe_timings_ms"]
+        self.assertIn("tb_aggregate", probes)
+        self.assertIn("out_of_balance_journals", probes)
