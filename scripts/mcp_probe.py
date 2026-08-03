@@ -150,6 +150,23 @@ async def main() -> None:
 
             # Policy figures must arrive with provenance, and the bundled
             # fictional pages must never be usable as a filter on real data.
+            # The chat client now issues a batch's tool calls CONCURRENTLY
+            # over this same stdio session. FakeSession tests prove the loop;
+            # only a real session proves the SDK multiplexes request ids
+            # rather than interleaving corrupt frames — which is exactly the
+            # kind of failure that would pass every unit test and break the
+            # first real conversation.
+            import asyncio as _aio
+            g_tb, g_per, g_ws = await _aio.gather(
+                call("get_trial_balance", fiscal_year=2026, period=6),
+                call("list_periods", fiscal_year=2026),
+                call("wiki_search", query="suspense"),
+            )
+            assert g_tb["totals"]["in_balance"], "concurrent TB wrong"
+            assert g_per.get("periods"), "concurrent list_periods wrong"
+            assert g_ws.get("results"), "concurrent wiki_search wrong"
+            print("3 concurrent tool calls over one stdio session ✔")
+
             # Technical research path: find a KB page by the system's NAME,
             # then read it whole through pagination. This is the flow a
             # "how does the <integration> work" question depends on; the
