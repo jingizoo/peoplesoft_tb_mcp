@@ -1099,6 +1099,50 @@ class TBEngine:
         incomplete: list = []
 
         probe_ms: dict = {}
+        narrowed: list = []
+
+        def plan_cost_reason(sql: str, params: dict) -> str:
+            """Non-empty reason when the optimizer plans a big full scan."""
+            plan = self.db.explain_plan(sql, params)
+            aliases = self._alias_map(self._scrub_sql(sql))
+            for step in (plan.get("steps") or []):
+                options = str(step.get("options") or "").upper()
+                if "FULL" not in options and step.get("operation") != "SCAN":
+                    continue
+                obj = str(step.get("object") or "").split(".")[-1].upper()
+                obj = aliases.get(obj, obj)
+                rows = self._approx_rows(obj) if obj else None
+                if rows and rows >= self._SCAN_ROW_FLOOR:
+                    idx = self.db.indexes(obj)
+                    leads = ("; ".join(
+                        f"{i['name']}({', '.join(i['columns'][:3])})"
+                        for i in idx[:2]) or "none")
+                    return (f"full scan of {obj} (~{rows:,} rows) — "
+                            f"available indexes: {leads}")
+            return ""
+
+        def journal_probe(name: str, sql: str, params: dict):
+            """Ask the optimizer BEFORE running; adapt when the answer is
+            "that will scan everything". First fallback narrows the check to
+            the CURRENT period, which is what a close actually needs tonight;
+            if even that plans a huge scan, refuse in milliseconds with the
+            index that would fix it — an instant, named incomplete beats a
+            two-minute timeout that takes the whole playbook with it."""
+            reason = plan_cost_reason(sql, params)
+            if not reason:
+                rows, _ = self.db.query(sql, params, max_rows=50)
+                return rows
+            narrow = dict(params, minper=per)
+            if not plan_cost_reason(sql, narrow):
+                rows, _ = self.db.query(sql, narrow, max_rows=50)
+                narrowed.append({
+                    "check": name,
+                    "scope": f"period {per} only",
+                    "reason": f"full-range plan too expensive: {reason}"})
+                return rows
+            raise EngineError(
+                f"skipped before running: {reason}. Even the single-period "
+                "plan scans everything; ask a DBA to add that index.")
 
         def probe(name: str, fn, default):
             started = time.perf_counter()
@@ -1113,21 +1157,24 @@ class TBEngine:
                 # different queries; the timing has to say WHICH ONE.
                 probe_ms[name] = int((time.perf_counter() - started) * 1000)
 
-        params = {"bu": bu, "fy": fy, "maxper": per, "ledger": led}
+        params = {"bu": bu, "fy": fy, "minper": 1, "maxper": per,
+                  "ledger": led}
         unposted = probe(
             "unposted_journals",
-            lambda: self.db.query(q.unposted_journals(self.db), params,
-                                  max_rows=50)[0], [])
+            lambda: journal_probe("unposted_journals",
+                                  q.unposted_journals(self.db), params), [])
         for u in unposted:
             u["status_descr"] = JRNL_STATUS.get(u.get("status"), u.get("status"))
         if unposted:
             issues.append(f"{len(unposted)} journal(s) in periods 1-{per} are not posted")
 
-        params = {"bu": bu, "ledger": led, "fy": fy, "maxper": per}
+        params = {"bu": bu, "ledger": led, "fy": fy, "minper": 0,
+                  "maxper": per}
         oob = probe(
             "out_of_balance_journals",
-            lambda: self.db.query(q.out_of_balance_journals(self.db), params,
-                                  max_rows=50)[0], [])
+            lambda: journal_probe("out_of_balance_journals",
+                                  q.out_of_balance_journals(self.db), params),
+            [])
         if oob:
             issues.append(f"{len(oob)} posted journal(s) do not net to zero")
 
@@ -1157,6 +1204,7 @@ class TBEngine:
             "retained_earnings_roll": re_roll,
             "issues": issues,
             "checks_incomplete": incomplete,
+            "checks_narrowed": narrowed,
             "probe_timings_ms": {"tb_aggregate": _tb_ms, **probe_ms},
             # "control_status" describes the exception checks, NOT whether the
             # books balance — keep those two verdicts separately named so a
@@ -1874,6 +1922,28 @@ class TBEngine:
                 i += 1
         return "".join(out)
 
+    def _alias_map(self, scrubbed: str) -> dict:
+        """ALIAS -> TABLE for every FROM/JOIN target, plus identity entries.
+
+        Plans name what they scanned, and SQLite names the ALIAS ("H"), not
+        the table. Index advice keyed on an alias reports "no index" for a
+        table that has three, which is worse than no advice at all.
+        """
+        alias_map: dict = {}
+        for m in re.finditer(
+                r"(?is)\b(?:FROM|JOIN)\s+([A-Za-z_][\w$#.]*)"
+                r"(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?",
+                self._neutralize_func_from(scrubbed)):
+            table, alias = m.group(1), m.group(2)
+            base = table.split(".")[-1].upper()
+            alias_map[base] = base
+            if alias and alias.upper() not in {"ON", "WHERE", "JOIN", "LEFT",
+                                               "RIGHT", "INNER", "OUTER",
+                                               "CROSS", "GROUP", "ORDER",
+                                               "USING"}:
+                alias_map[alias.upper()] = base
+        return alias_map
+
     def _table_refs(self, scrubbed: str) -> set:
         """Names referenced as tables by FROM/JOIN (input must already be
         comment- and literal-scrubbed via _scrub_sql)."""
@@ -1958,6 +2028,79 @@ class TBEngine:
     # reference tables are read end-to-end all the time and that is correct.
     _SCAN_ROW_FLOOR = 50_000
 
+    def explain_query(self, sql: str) -> dict:
+        """Ask the optimizer how it WOULD run a query — before running it.
+
+        The answer to "how do I best perform this join" belongs to the
+        database, not to intuition: the plan says what will be scanned, and
+        the index catalog says what COULD be used instead. This never
+        executes the statement, so it is free to call on any candidate query
+        — including one that just timed out — to see why and what to change.
+        """
+        s = (sql or "").strip().rstrip(";").strip()
+        if not s:
+            raise EngineError("explain_query needs a SELECT statement")
+        scrubbed = self._scrub_sql(s)
+        if not re.match(r"(?is)^\s*(SELECT|WITH)\b", scrubbed):
+            raise EngineError("Only SELECT/WITH statements can be explained")
+        m = _SQL_DENY.search(scrubbed)
+        if m:
+            raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
+        refs = sorted(self._table_refs(scrubbed))
+        unqualified = [r for r in refs if "." not in r]
+        if self.db.prefix:
+            s = self._qualify_tables(s, unqualified)
+        plan = self.db.explain_plan(s)
+        tables = [r.split(".")[-1] for r in refs]
+        alias_map = self._alias_map(scrubbed)
+
+        def _resolve(obj: str) -> str:
+            return alias_map.get(obj.split(".")[-1].upper(),
+                                 obj.split(".")[-1].upper())
+        table_info = []
+        for t in tables:
+            info = {"table": t, "approx_rows": self._approx_rows(t),
+                    "indexes": self.db.indexes(t)}
+            table_info.append(info)
+        out: dict = {"sql": s, "plan": plan, "tables": table_info}
+        advice: list = []
+        for step in (plan.get("steps") or []):
+            options = str(step.get("options") or "").upper()
+            operation = str(step.get("operation") or "").upper()
+            obj = str(step.get("object") or "").strip()
+            is_full = ("FULL" in options
+                       or (operation == "SCAN" and "INDEX" not in
+                           str(step.get("detail") or "").upper()))
+            if not is_full or not obj:
+                continue
+            obj = _resolve(obj)
+            rows = self._approx_rows(obj)
+            idx = self.db.indexes(obj)
+            if idx:
+                leads = "; ".join(
+                    f"{i['name']} leads with {', '.join(i['columns'][:3])}"
+                    for i in idx[:3])
+                advice.append(
+                    f"FULL SCAN of {obj}"
+                    + (f" (~{rows:,} rows)" if rows else "")
+                    + f". Available indexes: {leads}. Add the leading "
+                    "column(s) of one of these to your WHERE/JOIN to avoid "
+                    "the scan.")
+            else:
+                advice.append(
+                    f"FULL SCAN of {obj}"
+                    + (f" (~{rows:,} rows)" if rows else "")
+                    + ". No readable index exists — no rewrite avoids this "
+                    "scan; narrow the rows another way (period range, "
+                    "business unit) or ask a DBA for an index.")
+        if not advice and plan.get("available"):
+            advice.append("No large full scans planned — run it.")
+        out["advice"] = advice
+        out["note"] = (
+            "This did NOT execute the query. Rewrite using the advice, "
+            "re-explain if unsure, then run_sql.")
+        return out
+
     def _cost_gate(self, sql: str, scrubbed: str = "") -> dict:
         """Refuse or flag a plan that scans a large table.
 
@@ -1997,19 +2140,31 @@ class TBEngine:
             # it would make every unindexed custom record unqueryable. Warn
             # loudly instead, so the cost is visible but the work is possible.
             filtered = " WHERE " in (scrubbed or sql).upper()
+            hints = []
+            for x in big[:3]:
+                idx = self.db.indexes(x["object"])
+                if idx:
+                    hints.append(
+                        f"{x['object']} indexes: " + "; ".join(
+                            f"{i['name']}({', '.join(i['columns'][:3])})"
+                            for i in idx[:3]))
+            hint_text = (" " + " | ".join(hints)) if hints else ""
             if not filtered:
                 raise EngineError(
                     f"Refused: the optimizer plans a FULL SCAN of {names} with "
                     "no filter at all. Add a WHERE clause — business unit, "
                     "ledger, fiscal year, period, or a key column — and try "
                     "again. The query was not executed."
+                    + hint_text
+                    + " Use explain_query to check the rewrite before running."
                 )
             return {"plan": {"available": True, "full_scans": big,
                              "warning": (
                                  f"This filtered query still scans {names} — "
                                  "no usable index for those predicates. It "
-                                 "ran, but ask a DBA about an index if you "
-                                 "will repeat it.")}}
+                                 "ran, but rewrite to lead with an indexed "
+                                 "column, or ask a DBA about an index if you "
+                                 "will repeat it." + hint_text)}}
         if scans:
             return {"plan": {"available": True, "full_scans": scans,
                              "note": "full scan of small table(s); acceptable "
@@ -2463,4 +2618,23 @@ class TBEngine:
                 + (f". Close matches: {', '.join(sugg)}" if sugg else "")
                 + ". Use list_tables to browse."
             )
-        return {"table": table_name.strip(), "columns": rows}
+        out = {"table": table_name.strip(), "columns": rows}
+        # Indexes travel with the shape, because a query writer needs both at
+        # the same moment: which columns exist, and which of them a predicate
+        # can be SERVED by. The optimizer only uses an index whose LEADING
+        # columns appear in the WHERE/JOIN, so the order shown here is the
+        # order that matters.
+        idx = self.db.indexes(out["table"])
+        if idx:
+            out["indexes"] = idx
+            out["index_note"] = (
+                "An index helps only when its LEADING column(s) appear in "
+                "your WHERE or JOIN. Filter by these to stay fast on a large "
+                "table.")
+        else:
+            out["indexes"] = []
+            out["index_note"] = (
+                "No readable index on this table — every query is a full "
+                "scan here. Keep filters tight and expect large tables to "
+                "be slow.")
+        return out

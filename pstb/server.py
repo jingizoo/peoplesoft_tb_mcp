@@ -551,6 +551,19 @@ if cfg.tools.allow_raw_sql:
 
 
     @mcp.tool()
+    def explain_query(sql: str, source: str = "") -> dict:
+        """Ask the optimizer how it WOULD run a SELECT — WITHOUT running it.
+        USE THIS BEFORE any join or aggregate over large tables (PS_LEDGER,
+        PS_JRNL_LN, PS_ITEM, custom transaction tables), and IMMEDIATELY
+        after any query times out. Returns the plan, each referenced table's
+        approximate row count and its INDEXES with their column order, plus
+        concrete advice: which full scans are planned and which index's
+        leading columns your WHERE/JOIN must include to avoid them. Rewrite,
+        re-explain if unsure, then run_sql. An index helps only when its
+        LEADING columns appear in your predicates."""
+        return _safe(engine.for_source(source).explain_query, sql=sql)
+
+    @mcp.tool()
     def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
         """Find the right PeopleSoft record for a question by searching
         PeopleTools metadata — record DESCRIPTIONS and field names, not just

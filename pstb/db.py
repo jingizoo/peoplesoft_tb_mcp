@@ -182,6 +182,68 @@ class Database:
         cols = self.columns(table)
         return (not cols) or column.upper() in cols
 
+    def indexes(self, table: str) -> list:
+        """Indexes on a table, with their column lists in order (cached).
+
+        This is what lets a join be REASONED ABOUT before it is run: the
+        optimizer can only use an index whose LEADING columns appear in the
+        predicates, so "which indexes exist and what do they lead with" is
+        exactly the information a query writer needs and never had. Returns
+        [] when unreadable — callers treat that as "unknown", never "none".
+        """
+        key = ("IDX", table.upper())
+        with self._catalog_lock:
+            if key in self._catalog:
+                return self._catalog[key]
+        out: list = []
+        try:
+            if self.dialect == "oracle":
+                owner = self.cfg.db.schema.strip().rstrip(".").upper()
+                where = "C.TABLE_NAME = :t"
+                params: dict = {"t": table.upper()}
+                if owner:
+                    where += " AND C.TABLE_OWNER = :o"
+                    params["o"] = owner
+                rows, _ = self.query(
+                    f"SELECT C.INDEX_NAME AS name, C.COLUMN_NAME AS col, "
+                    f"C.COLUMN_POSITION AS pos, I.UNIQUENESS AS uniq "
+                    f"FROM ALL_IND_COLUMNS C JOIN ALL_INDEXES I "
+                    f"ON I.INDEX_NAME = C.INDEX_NAME "
+                    f"AND I.TABLE_NAME = C.TABLE_NAME "
+                    f"AND I.OWNER = C.INDEX_OWNER "
+                    f"WHERE {where} ORDER BY C.INDEX_NAME, C.COLUMN_POSITION",
+                    params, max_rows=500)
+                by_name: dict = {}
+                for r in rows:
+                    entry = by_name.setdefault(
+                        str(r["name"]),
+                        {"name": str(r["name"]),
+                         "unique": str(r.get("uniq") or "") == "UNIQUE",
+                         "columns": []})
+                    entry["columns"].append(str(r["col"]))
+                out = list(by_name.values())
+            elif self.dialect == "sqlite":
+                if not self.columns(table):
+                    return []
+                rows, _ = self.query(f"PRAGMA index_list({table})",
+                                     {}, max_rows=100)
+                for r in rows:
+                    name = str(r.get("name") or "")
+                    cols, _ = self.query(f"PRAGMA index_info({name})",
+                                         {}, max_rows=50)
+                    out.append({
+                        "name": name,
+                        "unique": bool(r.get("unique")),
+                        "columns": [str(c.get("name") or "")
+                                    for c in sorted(
+                                        cols, key=lambda x: x.get("seqno", 0))],
+                    })
+        except Exception:
+            return []
+        with self._catalog_lock:
+            self._catalog[key] = out
+        return out
+
     def clear_catalog(self) -> None:
         with self._catalog_lock:
             self._catalog.clear()
@@ -354,7 +416,7 @@ class Database:
             return conn
 
 
-    def explain_plan(self, sql: str) -> dict:
+    def explain_plan(self, sql: str, params: Optional[dict] = None) -> dict:
         """Optimizer plan for a SELECT, WITHOUT executing it.
 
         On Oracle this is EXPLAIN PLAN + a read of PLAN_TABLE: the database
@@ -399,7 +461,9 @@ class Database:
 
         if self.dialect == "sqlite":
             try:
-                rows, _ = self.query("EXPLAIN QUERY PLAN " + sql, {},
+                # SQLite refuses to plan a statement whose binds have no
+                # values; Oracle's EXPLAIN PLAN parses without them.
+                rows, _ = self.query("EXPLAIN QUERY PLAN " + sql, params or {},
                                      max_rows=200)
             except Exception as e:
                 return {"available": False, "reason": str(e)[:200]}

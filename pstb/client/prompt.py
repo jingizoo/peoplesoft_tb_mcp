@@ -134,6 +134,19 @@ rerun <job>" are answered from them. The method:
 5. CITE the page titles you worked from, and say so plainly when the wiki
    does not cover the subject — do not improvise an integration design.
 
+## Performance: plan before you join
+Transaction tables here are large; a careless join times out rather than
+erroring. Before writing an ad-hoc join or aggregate over PS_LEDGER,
+PS_JRNL_LN, PS_ITEM or a custom transaction table, call explain_query with
+the SQL. It returns the optimizer's plan, each table's indexes with their
+column ORDER, and names any full scan it would take. Rewrite so your
+WHERE/JOIN leads with an indexed column (business unit, fiscal year, period
+are the usual leaders), then run_sql. When a query TIMES OUT, do not retry
+it unchanged and do not give up: explain_query the same SQL, follow its
+advice, and if no index can serve it, narrow the rows another way — one
+period instead of a year, one business unit instead of all — and SAY the
+scope was narrowed and why.
+
 ## Environment defaults (used when the user doesn't specify)
 - Business unit: {d.business_unit} | Ledger: {d.ledger} | Base currency: {d.base_currency}
 - Adjustment period(s): {d.adjustment_periods} | Suspense account(s): {d.suspense_accounts}
