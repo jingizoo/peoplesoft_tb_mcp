@@ -286,21 +286,27 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
         if resp.text.strip():
             print(f"{DIM}{resp.text.strip()}{RESET}")
 
-        # A model may emit DB and wiki calls in one parallel batch. Execute all
-        # non-wiki calls first; only a successful financial result opens the
-        # wiki phase for a mixed question. Return results in the model's
-        # original call order so Gemini/Ollama transcripts remain valid.
+        # A model may emit DB and wiki calls in one batch, and each call is
+        # dead time — an Oracle query and a Confluence fetch have no reason
+        # to wait for one another. Calls run CONCURRENTLY in two phases:
+        # database tools first, wiki tools after, because the mixed-intent
+        # gate must decide the wiki's fate from the database's OUTCOME
+        # ("wiki only after financial evidence succeeds"), which does not
+        # exist until the first phase completes. Within a phase everything
+        # overlaps; bookkeeping then runs sequentially in the model's
+        # original call order, so observers, logs and transcripts read
+        # exactly as they did when execution was serial.
         indexed_calls = list(enumerate(resp.tool_calls))
-        execution_order = (
-            sorted(indexed_calls, key=lambda item: is_policy_tool(item[1].name))
-            if intent == "mixed" else indexed_calls
-        )
         results_by_index: dict[int, ToolResult] = {}
-        for index, call in execution_order:
+
+        async def run_call(index: int, call) -> tuple:
+            """Decide blocked-or-not, then execute. No shared-state writes:
+            everything the sequential loop mutated is returned and applied
+            by the bookkeeping pass, so concurrent calls cannot race."""
             effective_args = dict(call.args or {})
             blocked = ""
             next_step = ""
-            relevant_financial_db_ok = has_relevant_financial_evidence()
+            was_scope_block = False
             if (
                 surface == "gui"
                 and not request_scope
@@ -315,7 +321,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                     "Ask the user to choose a business unit and ledger before "
                     "calling a financial or database tool."
                 )
-                scope_blocked = True
+                was_scope_block = True
             elif intent == "data" and is_policy_tool(call.name):
                 blocked = (
                     f"{call.name} is not allowed for a data-only question; "
@@ -325,7 +331,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             elif (
                 intent == "mixed"
                 and is_policy_tool(call.name)
-                and not relevant_financial_db_ok
+                and not has_relevant_financial_evidence()
             ):
                 blocked = (
                     f"{call.name} is blocked until a PeopleSoft financial tool "
@@ -374,44 +380,62 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 else await call_mcp_tool(session, call.name, effective_args)
             )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
-            ok, problem = tool_result_status(call.name, out)
-            if tool_observer is not None:
-                tool_observer(
-                    call.name, dict(effective_args), out, elapsed_ms, ok
-                )
-            if is_policy_tool(call.name):
-                if call.name in POLICY_EVIDENCE_TOOLS:
-                    policy_attempted = True
-                    if ok:
-                        policy_ok = True
-                    else:
-                        last_policy_problem = (problem or blocked
-                                               or "wiki lookup failed")
-            else:
-                if ok:
-                    db_ok = True
-                    if call.name in FINANCIAL_EVIDENCE_TOOLS:
-                        covered = financial_tool_domains(call.name)
-                        if call.name == "run_sql":
-                            # Ad-hoc SQL has no fixed domain: a successful
-                            # SELECT the user's question routed to IS the
-                            # financial evidence for that question. Without
-                            # this, correct run_sql answers were replaced by
-                            # a false "could not obtain a PeopleSoft result".
-                            covered = required_financial_domains or {"adhoc"}
-                        covered_financial_domains.update(covered)
+            return (index, call, effective_args, blocked, out, elapsed_ms,
+                    was_scope_block)
+
+        db_phase = [(i, c) for i, c in indexed_calls
+                    if not is_policy_tool(c.name)]
+        wiki_phase = [(i, c) for i, c in indexed_calls
+                      if is_policy_tool(c.name)]
+        for phase in (db_phase, wiki_phase):
+            if not phase:
+                continue
+            outcomes = await asyncio.gather(
+                *(run_call(i, c) for i, c in phase))
+            for (index, call, effective_args, blocked, out, elapsed_ms,
+                 was_scope_block) in sorted(outcomes, key=lambda o: o[0]):
+                if was_scope_block:
+                    scope_blocked = True
+                ok, problem = tool_result_status(call.name, out)
+                if tool_observer is not None:
+                    tool_observer(
+                        call.name, dict(effective_args), out, elapsed_ms, ok
+                    )
+                if is_policy_tool(call.name):
+                    if call.name in POLICY_EVIDENCE_TOOLS:
+                        policy_attempted = True
+                        if ok:
+                            policy_ok = True
+                        else:
+                            last_policy_problem = (problem or blocked
+                                                   or "wiki lookup failed")
                 else:
-                    last_db_problem = problem or blocked or "database tool failed"
-            logged_calls.append({
-                "tool": call.name,
-                "ok": ok,
-                **({"error": (problem or blocked or out)[:240]} if not ok else {}),
-            })
-            if ok:
-                turn_payloads.append(out)
-            results_by_index[index] = ToolResult(
-                call_id=call.id, name=call.name, content=out
-            )
+                    if ok:
+                        db_ok = True
+                        if call.name in FINANCIAL_EVIDENCE_TOOLS:
+                            covered = financial_tool_domains(call.name)
+                            if call.name == "run_sql":
+                                # Ad-hoc SQL has no fixed domain: a successful
+                                # SELECT the user's question routed to IS the
+                                # financial evidence for that question. Without
+                                # this, correct run_sql answers were replaced by
+                                # a false "could not obtain a PeopleSoft result".
+                                covered = required_financial_domains or {"adhoc"}
+                            covered_financial_domains.update(covered)
+                    else:
+                        last_db_problem = (problem or blocked
+                                           or "database tool failed")
+                logged_calls.append({
+                    "tool": call.name,
+                    "ok": ok,
+                    **({"error": (problem or blocked or out)[:240]}
+                       if not ok else {}),
+                })
+                if ok:
+                    turn_payloads.append(out)
+                results_by_index[index] = ToolResult(
+                    call_id=call.id, name=call.name, content=out
+                )
         results = [results_by_index[i] for i in range(len(resp.tool_calls))]
         resp = await asyncio.to_thread(provider.send_tool_results, results)
     else:

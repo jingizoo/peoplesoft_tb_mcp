@@ -411,17 +411,38 @@ def lookup(wiki, question: str, max_pages: int = 3, max_passages: int = 6,
 
     passages: list[dict] = []
     sources: list[dict] = []
-    for hit in hits[: max(int(max_pages or 3), 1)]:
+    selected = hits[: max(int(max_pages or 3), 1)]
+
+    def _fetch(hit) -> tuple:
+        """(hit, page, text, error). Fetches run CONCURRENTLY below: against
+        Confluence each page is an HTTP round trip, and a lookup that fans
+        out to three pages was paying for them in sequence — the caller
+        waited the SUM of the fetches when the slowest one would do. The
+        shared httpx client is thread-safe, and order is restored by mapping
+        over the original hit list."""
         text = hit.get("text") or ""
-        page = None
-        if len(text) < 200:  # search gave little or nothing — fetch the page
-            try:
-                page = wiki.get_page(str(hit.get("id")))
-                text = page.get("text") or ""
-            except Exception as e:
-                sources.append({"title": hit.get("title"), "id": hit.get("id"),
-                                "error": f"fetch failed: {e}"})
-                continue
+        if len(text) >= 200:      # search already returned enough content
+            return hit, None, text, None
+        try:
+            page = wiki.get_page(str(hit.get("id")))
+            return hit, page, page.get("text") or "", None
+        except Exception as e:    # one unreadable page must not kill the lookup
+            return hit, None, "", f"fetch failed: {e}"
+
+    needs_fetch = sum(1 for h in selected if len(h.get("text") or "") < 200)
+    if needs_fetch > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, needs_fetch)) as pool:
+            fetched = list(pool.map(_fetch, selected))
+    else:
+        fetched = [_fetch(h) for h in selected]
+
+    for hit, page, text, fetch_error in fetched:
+        if fetch_error:
+            sources.append({"title": hit.get("title"), "id": hit.get("id"),
+                            "error": fetch_error})
+            continue
         src = {
             "title": hit.get("title") or (page or {}).get("title"),
             "id": hit.get("id"),
