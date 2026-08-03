@@ -734,12 +734,44 @@ if wiki is not None:
             return {"error": f"wiki_search failed: {e}"}
 
     @mcp.tool()
-    def wiki_get_page(page_id: str) -> dict:
-        """Fetch the full text of a wiki page found via wiki_search (pass its id)."""
+    def wiki_get_page(page_id: str, offset: int = 0, max_chars: int = 0) -> dict:
+        """READ a whole wiki page — the tool for TECHNICAL specs and KB
+        articles. wiki_lookup returns a handful of ranked passages, which
+        answers a policy question but is a keyhole view of an integration
+        spec: the record layouts, job names and run controls that make a spec
+        actionable rarely share vocabulary with the question, so passage
+        ranking drops them. For "how does X work" / "how do I" questions,
+        find the page (wiki_search or wiki_lookup sources), then read it ALL
+        with this tool before acting.
+        Long pages arrive in slices: when the result carries next_offset,
+        call again with offset=next_offset until it is absent. Do not act on
+        a spec you have only partly read.
+        page_id: the id from wiki_search results or wiki_lookup sources."""
         try:
-            return wiki.get_page(page_id)
+            page = wiki.get_page(page_id)
         except Exception as e:
             return {"error": f"wiki_get_page failed: {e}"}
+        text = str(page.get("text") or "")
+        # Default slice stays inside the chat client's tool-result budget
+        # (24k chars on the local provider) with room for the JSON wrapper —
+        # otherwise a long spec is truncated mid-sentence with no way to ask
+        # for the rest.
+        cap = max(500, min(int(max_chars or 18_000), 100_000))
+        start = max(0, int(offset or 0))
+        if start >= len(text) and start:
+            return {"error": (
+                f"offset {start} is past the end of this page "
+                f"({len(text)} chars). Re-read from offset 0.")}
+        page["text"] = text[start:start + cap]
+        page["length"] = len(text)
+        page["offset"] = start
+        if start + cap < len(text):
+            page["next_offset"] = start + cap
+            page["note"] = (
+                f"PARTIAL: characters {start}-{start + cap} of {len(text)}. "
+                f"Call wiki_get_page again with offset={start + cap} to "
+                "continue — do not act on a spec you have only partly read.")
+        return page
 
 
 def main() -> None:

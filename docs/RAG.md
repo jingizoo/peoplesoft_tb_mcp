@@ -49,6 +49,33 @@ An error, invalid scope, or `NO DATA` result stops the chain. Wiki text is never
 used as a numerical fallback. Pure policy questions may still use the wiki
 directly, and data-only questions cannot call wiki tools.
 
+## Technical specs and KB articles
+
+The wiki is not only policy pages — integration specs, interface KBs and run
+books live there too, and "how does the IDMart feed work" should be answered
+from them. Two separate defects stopped that, and neither was retrieval:
+
+**The gate locked the wiki out.** Wiki tools are blocked on data-classified
+questions so prose can never substitute for a ledger figure. But the data
+classifier matches domain NOUNS (billing, customers, invoices), and a
+technical question mentions those nouns constantly. "How does the billing
+interface load work" classified as data and every wiki tool was refused —
+the knowledge base was locked precisely when it was asked for. Questions
+about mechanism or procedure now classify as `technical`: free to read the
+wiki AND the database. Figure asks ("how much did the interface load
+yesterday") still classify as data, and the block still protects them.
+
+**Passages are a keyhole view of a spec.** `wiki_lookup` returns a handful of
+BM25-ranked passages — right for a policy sentence, wrong for a spec whose
+record layouts, job names and run controls rarely share vocabulary with the
+question, so ranking drops exactly the parts that make it actionable.
+`wiki_get_page` now reads the WHOLE page in slices (`next_offset` continues a
+long page), and the prompt's research method is: find the page by NAME, read
+all of it, verify the records it names against the live catalog
+(search_records / describe_record / profile_record), then
+remember_record_fact what the spec taught about custom tables — so the next
+question finds them without re-research.
+
 ## Deciding whether retrieval actually helped
 
 BM25 always returns its best candidates. Ask about a subject the wiki has no

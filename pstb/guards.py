@@ -232,16 +232,58 @@ def is_policy_tool(tool_name: str) -> bool:
     return tool_name in POLICY_TOOLS or tool_name.startswith("wiki_")
 
 
+# Technical vocabulary: the question is about how something WORKS or how to DO
+# something — an integration, an interface, a batch job, a setup step. The
+# wiki is the PRIMARY source for these (that is where the specs and KB
+# articles live), yet they routinely mention billing/customers/invoices,
+# which are _DATA_QUERY nouns. Without this signal such questions classified
+# as "data" and every wiki tool was hard-blocked — locking the agent out of
+# the knowledge base precisely when it was asked to use it.
+_TECHNICAL_QUERY = re.compile(
+    r"(?i)\b(?:integrat\w+|interfaces?|feeds?|file layouts?|mappings?|"
+    r"data ?marts?|stag(?:ing|ed)|extracts?|"
+    r"app(?:lication)? ?engine|peoplecode|component interface|"
+    r"process scheduler|run ?controls?|batch(?:es| jobs?)?|sqr|"
+    r"spec(?:ification)?s?\b|knowledge ?base|\bkbs?\b|"
+    r"set ?up|configur\w+|install\w*|implement\w*|"
+    r"re-?runs?|re-?ran|restarts?|resubmits?|reprocess\w*|"
+    r"troubleshoot\w*|debug\w*|fail(?:s|ed|ing|ure)?|error(?:s|ed)?\b)|"
+    r"\bhow (?:does|do|to|is|are)\b|\bsteps? (?:to|for)\b"
+)
+
+# A direct request for a FIGURE. Deliberately narrower than
+# _DATA_ANCHOR_STRONG: "show me how to rerun the feed" contains "show", but
+# it asks for a procedure, not an amount. Only quantity words, money and
+# formatted numbers count here.
+_FIGURE_ASK = re.compile(
+    r"(?i)(?:\bhow (?:much|many)\b|\btotals?\b|\bsum\b|"
+    r"\bwhat (?:is|are|was|were)\b.{0,40}\b(?:balance|total|amount|aging|"
+    r"figure|variance|position)\b|"
+    r"[$€£₹]\s?\d|\b\d[\d,]*\.\d{2}\b|\b\d{1,3}(?:,\d{3})+\b)"
+)
+
+
 def evidence_intent(question: str) -> str:
     """Classify a question for deterministic evidence routing.
 
-    Returns ``policy``, ``data``, ``mixed`` or ``general``. A compliance
-    verdict is always mixed because it requires both a rule and an actual fact,
-    even when the user did not explicitly say "balance" or "amount".
+    Returns ``policy``, ``data``, ``mixed``, ``technical`` or ``general``.
+    A compliance verdict is always mixed because it requires both a rule and
+    an actual fact, even when the user did not explicitly say "balance" or
+    "amount". ``technical`` marks how-does-it-work / how-do-I questions —
+    integrations, interfaces, jobs, setup — whose answer lives in the wiki's
+    specs and KB articles: they may read the wiki freely AND the database,
+    and no consumer gates on them. The number guard still applies to any
+    figure such an answer states.
     """
     text = question or ""
     policy = bool(_POLICY_QUERY.search(text))
     data = bool(_DATA_QUERY.search(text))
+    technical = bool(_TECHNICAL_QUERY.search(text))
+    if technical and data and not _FIGURE_ASK.search(text):
+        # The billing/customer/invoice nouns are the SUBJECT of a technical
+        # question ("how does the billing interface load work"), not a
+        # request for a figure. Same principle as the policy demotion below.
+        data = False
     if policy and data and not _DATA_ANCHOR_STRONG.search(text):
         # Domain vocabulary inside a policy question ("travel expense policy",
         # "who approves a journal over 50k") is not a request for a figure.
@@ -256,6 +298,8 @@ def evidence_intent(question: str) -> str:
         return "policy"
     if data:
         return "data"
+    if technical:
+        return "technical"
     return "general"
 
 

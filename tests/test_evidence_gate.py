@@ -542,3 +542,84 @@ class EvidenceRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TechnicalIntentTests(unittest.TestCase):
+    """Technical questions must not be locked out of the knowledge base.
+
+    The wiki block on data questions exists so wiki prose can never
+    substitute for a ledger figure. But _DATA_QUERY matches domain NOUNS
+    (billing, customers, invoices), and a question about how an integration
+    works mentions those nouns constantly. Before the technical intent, "how
+    does the billing interface load work" classified as data and every
+    wiki tool was refused — locking the agent out of the specs precisely
+    when it was asked to use them.
+    """
+
+    def test_how_it_works_questions_are_technical_not_data(self):
+        for q in (
+            "how does the idmart billing interface load work",
+            "how do I rerun the customer feed from idmart",
+            "set up a new invoice interface from idmart",
+            "show me how to reprocess failed billing interface rows",
+            "what records does the idmart feed load into AR",
+        ):
+            self.assertEqual(evidence_intent(q), "technical", q)
+
+    def test_figure_questions_stay_data_even_with_technical_words(self):
+        # The protection being preserved: an amount must still come from the
+        # database, however the question is phrased.
+        for q in (
+            "how much did the billing interface load yesterday",
+            "what is the AR balance for US001",
+            "show me the trial balance",
+        ):
+            self.assertEqual(evidence_intent(q), "data", q)
+
+    def test_policy_and_mixed_classification_is_untouched(self):
+        self.assertEqual(evidence_intent("What is our capitalization policy?"),
+                         "policy")
+        self.assertEqual(
+            evidence_intent("What is the suspense balance threshold?"), "mixed")
+
+
+class TechnicalRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_technical_question_may_read_the_wiki(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("t1", "wiki_lookup",
+                                         question="idmart interface spec")]),
+            LLMResponse(text="The spec says the feed stages into XX_IDM_STG."),
+        ])
+        session = FakeSession({
+            "wiki_lookup": {
+                "passages": [{"text": "The IDMart feed stages rows into "
+                                      "XX_IDM_STG before posting.",
+                              "term_coverage": 0.8}],
+                "relevance": "strong",
+                "sources": [{"title": "IDMart Interface Spec", "id": "p1"}],
+            },
+        })
+        answer = await agent_turn(
+            provider, session,
+            "how does the idmart billing interface load work",
+            surface="gui", scope=None)
+        self.assertEqual([c[0] for c in session.calls], ["wiki_lookup"],
+                         "a technical question could not reach the wiki")
+        self.assertIn("XX_IDM_STG", answer)
+
+    async def test_a_figure_question_still_cannot_use_wiki_prose(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("f1", "wiki_lookup",
+                                         question="AR balance")]),
+            LLMResponse(text="I cannot answer from the wiki."),
+        ])
+        session = FakeSession({"wiki_lookup": {"passages": []}})
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            await agent_turn(
+                provider, session,
+                "what is the AR balance for US001",
+                surface="gui",
+                scope={"business_unit": "US001", "ledger": "ACTUALS"})
+        self.assertEqual(session.calls, [],
+                         "the figure protection was lost: a data question "
+                         "reached the wiki")

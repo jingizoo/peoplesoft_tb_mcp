@@ -150,6 +150,32 @@ async def main() -> None:
 
             # Policy figures must arrive with provenance, and the bundled
             # fictional pages must never be usable as a filter on real data.
+            # Technical research path: find a KB page by the system's NAME,
+            # then read it whole through pagination. This is the flow a
+            # "how does the <integration> work" question depends on; the
+            # passages tool alone is a keyhole view of a spec.
+            ws2 = await call("wiki_search", query="IDMart interface")
+            assert ws2["results"], "the technical KB page was not findable by name"
+            pid = str(ws2["results"][0]["id"])
+            first = await call("wiki_get_page", page_id=pid, max_chars=800)
+            assert first.get("next_offset"), \
+                f"a {first.get('length')}-char spec did not paginate at 800"
+            whole = first["text"]
+            guard = 0
+            nxt = first["next_offset"]
+            while nxt is not None and guard < 50:
+                part = await call("wiki_get_page", page_id=pid, offset=nxt,
+                                  max_chars=800)
+                whole += part["text"]
+                nxt = part.get("next_offset")
+                guard += 1
+            assert len(whole) == first["length"], \
+                f"reassembled {len(whole)} of {first['length']} chars"
+            assert "XX_IDM_BI_STG" in whole and "BIIF0001" in whole, \
+                "the spec's record and job names did not survive the read"
+            print(f"wiki_get_page pagination: {first['length']} chars in "
+                  f"{guard + 1} slices, reassembly exact ✔")
+
             pol = await call("resolve_policy_value",
                              policy="capitalization_threshold")
             assert pol.get("value") == 5000.0, pol
