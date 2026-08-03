@@ -180,6 +180,23 @@
         },
         "_why": "Per-CUSTOMER by month is not a report the pack covers \u2014 the income statement gives periods across the top but only for GL accounts. So this must go through one grouped query pivoted server-side. Answering it by running a query per month and adding them up in prose cannot work: the number guard rejects figures no tool produced."
       }
+    },
+    {
+      "id": "kb-technical",
+      "question": "How do I rerun the IDMart billing feed after rows error out?",
+      "scope": {},
+      "expect": {
+        "any_tool": [
+          "wiki_lookup",
+          "wiki_get_page",
+          "wiki_search"
+        ],
+        "not_tool": [
+          "get_trial_balance",
+          "get_ar_aging"
+        ],
+        "_why": "a technical how-do-I question about a named integration must reach the knowledge base; before the technical intent it classified as data and every wiki tool was hard-blocked"
+      }
     }
   ]
 }

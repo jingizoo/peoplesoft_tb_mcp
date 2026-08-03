@@ -1398,7 +1398,8 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("localdocs health reports connected", h["connected"] is True)
     check("bundled sample pages flagged as demo",
           h["is_bundled_demo_content"] is True and "fictional" in h["verdict"])
-    check("health lists the pages it serves", h["page_count"] == 3,
+    _md_count = len(list((ROOT / "sample_wiki").glob("*.md")))
+    check("health lists the pages it serves", h["page_count"] == _md_count,
           str(h["page_count"]))
     from pstb.wiki import LocalDocsWiki as _LD
     other = _LD(ROOT / "docs").health()
