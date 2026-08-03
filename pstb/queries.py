@@ -335,7 +335,7 @@ def unposted_journals(db: Database) -> str:
   FROM {p}{j}
  WHERE BUSINESS_UNIT = :bu
    AND FISCAL_YEAR = :fy
-   AND ACCOUNTING_PERIOD BETWEEN 1 AND :maxper
+   AND ACCOUNTING_PERIOD BETWEEN :minper AND :maxper
    AND JRNL_HDR_STATUS NOT IN ('P', 'D')
    {led_clause}
  ORDER BY ACCOUNTING_PERIOD, JOURNAL_DATE, JOURNAL_ID"""
@@ -354,7 +354,7 @@ def out_of_balance_journals(db: Database) -> str:
  WHERE J.BUSINESS_UNIT = :bu
    AND J.LEDGER = :ledger
    AND H.FISCAL_YEAR = :fy
-   AND H.ACCOUNTING_PERIOD BETWEEN 0 AND :maxper
+   AND H.ACCOUNTING_PERIOD BETWEEN :minper AND :maxper
    AND H.JRNL_HDR_STATUS = 'P'
  GROUP BY J.JOURNAL_ID, J.JOURNAL_DATE
 HAVING ABS(SUM(J.MONETARY_AMOUNT)) > 0.005"""

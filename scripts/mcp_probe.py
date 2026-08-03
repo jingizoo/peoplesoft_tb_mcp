@@ -74,7 +74,7 @@ async def main() -> None:
                 "run_sql", "search_records", "describe_record", "list_tables",
                 "describe_table", "profile_record", "compare_records",
                 "run_playbook", "get_ar_aging", "resolve_policy_value",
-                "list_policy_terms",
+                "list_policy_terms", "explain_query",
             }
             names = {t.name for t in listed.tools}
             gone = sorted(REQUIRED - names)
@@ -166,6 +166,23 @@ async def main() -> None:
             assert g_per.get("periods"), "concurrent list_periods wrong"
             assert g_ws.get("results"), "concurrent wiki_search wrong"
             print("3 concurrent tool calls over one stdio session ✔")
+
+            # Plan-before-join: the optimizer's answer must arrive with the
+            # index catalog, alias-resolved to real tables.
+            xp = await call("explain_query", sql=(
+                "SELECT J.JOURNAL_ID FROM PS_JRNL_LN J JOIN PS_JRNL_HEADER H "
+                "ON H.BUSINESS_UNIT = J.BUSINESS_UNIT "
+                "AND H.JOURNAL_ID = J.JOURNAL_ID "
+                "WHERE H.FISCAL_YEAR = 2026"))
+            assert xp.get("advice"), xp
+            joined = " ".join(xp["advice"])
+            assert "PS_JRNL_HEADER" in joined or "run it" in joined.lower(), \
+                f"explain advice unusable: {joined[:120]}"
+            assert any(t.get("indexes") for t in xp.get("tables", [])), \
+                "explain_query returned no index catalog"
+            bad = await call("explain_query", sql="DELETE FROM PS_LEDGER")
+            assert "error" in bad, "DML was explained instead of refused"
+            print("explain_query: plan + index advice, DML refused ✔")
 
             # Technical research path: find a KB page by the system's NAME,
             # then read it whole through pagination. This is the flow a

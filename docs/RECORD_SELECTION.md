@@ -115,3 +115,33 @@ with nothing on the other side of it.
 The boundary that does hold: a taught fact is a **pointer, never authority**.
 Every surface that shows one says so, and the columns always come from the
 catalog. Reject one with `python -m pstb.memory` and it stops being used.
+
+## Planning a join before running it
+
+Large-table queries on a real instance time out rather than erroring, and a
+timeout teaches nothing. Three mechanisms turn "it hung" into "here is what to
+change":
+
+**The index catalog.** `describe_table` now carries each index with its
+columns IN ORDER, because order is the whole game: the optimizer can only use
+an index whose leading columns appear in your predicates. A table with no
+readable index says so plainly — every query there is a full scan and no
+rewrite changes that.
+
+**`explain_query`.** Asks the optimizer how it WOULD run a SELECT, without
+executing it. Returns the plan, each referenced table's rows and indexes, and
+concrete advice: which full scans are planned and which index's leading
+columns the WHERE/JOIN must include to avoid them. The agent is instructed to
+call it before any join over large tables and immediately after any timeout —
+rewrite, re-explain, then run. The cost-gate refusal for unfiltered scans now
+names the available indexes too, so the moment the model needs the catalog is
+the moment it has it.
+
+**Adaptive integrity probes.** The two journal checks in `tb_integrity_check`
+pre-flight their plan. A full-year scan over a big instance gets narrowed to
+the current period — disclosed in the check's headline, never silently — and
+when even the narrowed plan would scan everything, the check refuses in
+milliseconds with the index that would restore it, instead of burning two
+minutes into a timeout that takes the whole playbook down. The balance verdict
+is never affected; a narrowed or refused control check cannot impersonate a
+full one.

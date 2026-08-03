@@ -55,6 +55,19 @@ def _fmt(amount) -> str:
         return str(amount)
 
 
+def _narrowed(ic: dict, check: str) -> Optional[dict]:
+    """The reduced scope a control probe ran at, or None if it ran in full.
+
+    A narrowed check is not incomplete — it ran and its findings are real —
+    but reporting "every journal in scope is posted" when only one period
+    was examined would let a reduced check impersonate the full one.
+    """
+    for row in (ic.get("checks_narrowed") or []):
+        if row.get("check") == check:
+            return row
+    return None
+
+
 def _incomplete(ic: dict, check: str) -> Optional[str]:
     """Why this specific control probe could not run, or None if it ran.
 
@@ -104,10 +117,16 @@ def _step_unposted(ctx: dict) -> tuple:
     why = _incomplete(ic, "unposted_journals")
     if why:
         return "skipped", f"unposted-journal check could not run: {why}", {}
+    scope_note = ""
+    narrow = _narrowed(ic, "unposted_journals")
+    if narrow:
+        scope_note = (f" (checked {narrow['scope']} — {narrow['reason']})")
     if not rows:
-        return "ok", "every journal in scope is posted", {"unposted_journals": []}
+        return ("ok", "every journal in scope is posted" + scope_note,
+                {"unposted_journals": []})
     return ("attention", f"{len(rows)} unposted journal(s) — post or delete "
-            "them before the period is closed", {"unposted_journals": rows})
+            "them before the period is closed" + scope_note,
+            {"unposted_journals": rows})
 
 
 def _step_out_of_balance_journals(ctx: dict) -> tuple:
@@ -118,10 +137,14 @@ def _step_out_of_balance_journals(ctx: dict) -> tuple:
     why = _incomplete(ic, "out_of_balance_journals")
     if why:
         return "skipped", f"journal-balance check could not run: {why}", {}
+    scope_note = ""
+    narrow = _narrowed(ic, "out_of_balance_journals")
+    if narrow:
+        scope_note = (f" (checked {narrow['scope']} — {narrow['reason']})")
     if not rows:
-        return "ok", "all posted journals net to zero", {}
-    return ("attention", f"{len(rows)} posted journal(s) do not net to zero",
-            {"out_of_balance_journals": rows})
+        return "ok", "all posted journals net to zero" + scope_note, {}
+    return ("attention", f"{len(rows)} posted journal(s) do not net to zero"
+            + scope_note, {"out_of_balance_journals": rows})
 
 
 def _step_retained_earnings(ctx: dict) -> tuple:
