@@ -184,6 +184,30 @@ def main() -> int:
     except Exception as e:
         print(f"   AR timing failed: {type(e).__name__}: {e}")
 
+    print("\n6c. Close-readiness inputs (what the playbook actually waits on)")
+    try:
+        from pstb.ar import ARBilling as _ARB
+        from pstb.playbooks import PlaybookRunner as _PR
+        _t0 = time.perf_counter()
+        _res = _PR(engine, _ARB(engine)).run("close_readiness")
+        _wall = (time.perf_counter() - _t0) * 1000
+        print(f"   close_readiness total: {_wall:,.0f} ms "
+              f"(verdict: {_res.get('verdict')})")
+        for _k, _ms in sorted((_res.get("input_timings_ms") or {}).items(),
+                              key=lambda kv: -kv[1]):
+            _flag = "  <-- SLOW" if _ms > 30_000 else ""
+            print(f"     {_ms:8,d} ms  {_k}{_flag}")
+            if _ms > 30_000:
+                PROBLEMS.append(f"close-readiness input {_k}: {_ms:,d} ms")
+        _bal = next((_s for _s in _res.get("steps", [])
+                     if _s.get("step") == "balance"), None)
+        for _k, _ms in sorted(((_bal or {}).get("detail", {})
+                               .get("probe_timings_ms") or {}).items(),
+                              key=lambda kv: -kv[1]):
+            print(f"       integrity/{_k}: {_ms:,d} ms")
+    except Exception as e:
+        print(f"   close-readiness timing failed: {type(e).__name__}: {e}")
+
     print("\n7. Record-shape audit (every record the tools touch, one pass)")
     try:
         audit = engine.audit_record_shapes()
