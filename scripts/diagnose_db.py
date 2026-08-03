@@ -184,6 +184,39 @@ def main() -> int:
     except Exception as e:
         print(f"   AR timing failed: {type(e).__name__}: {e}")
 
+    if db.dialect == "oracle":
+        print("\n6b2. Optimizer statistics (answers: did the DATABASE change?)")
+        # "It worked before" usually means one of two things, and this section
+        # separates them: stale statistics after a month-end load or an
+        # environment refresh flip the optimizer to bad plans with NO code
+        # change at all. NUM_ROWS far below reality, or LAST_ANALYZED from
+        # before the last big load, is that story in two columns.
+        try:
+            owner = (cfg.db.schema or "").strip().rstrip(".").upper()
+            where = "TABLE_NAME IN (:t1,:t2,:t3,:t4,:t5)"
+            sparams = {"t1": "PS_LEDGER", "t2": "PS_JRNL_HEADER",
+                       "t3": "PS_JRNL_LN", "t4": "PS_ITEM", "t5": "PS_BI_HDR"}
+            if owner:
+                where += " AND OWNER = :o"
+                sparams["o"] = owner
+            rows, _ = db.query(
+                f"SELECT TABLE_NAME AS t, NUM_ROWS AS n, "
+                f"TO_CHAR(LAST_ANALYZED, 'YYYY-MM-DD') AS analyzed "
+                f"FROM ALL_TABLES WHERE {where}", sparams, max_rows=10)
+            for r in sorted(rows, key=lambda x: str(x.get("t"))):
+                n = r.get("n")
+                print(f"   {r['t']:16} rows(stats)={n if n is not None else '?':>12} "
+                      f"last_analyzed={r.get('analyzed') or 'NEVER'}")
+                if r.get("analyzed") is None:
+                    PROBLEMS.append(f"{r['t']}: never analyzed — the optimizer "
+                                    "is guessing; ask the DBA to gather stats")
+            print("   -> if last_analyzed predates the latest month-end load, "
+                  "plans are built on stale row counts: ask the DBA to run "
+                  "DBMS_STATS.GATHER_TABLE_STATS before changing any code.")
+        except Exception as e:
+            print(f"   stats check unavailable: {type(e).__name__}: "
+                  f"{str(e)[:120]}")
+
     print("\n6c. Close-readiness inputs (what the playbook actually waits on)")
     try:
         from pstb.ar import ARBilling as _ARB
