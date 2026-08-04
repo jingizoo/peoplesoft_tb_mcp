@@ -178,10 +178,14 @@ the SQL. It returns the optimizer's plan, each table's indexes with their
 column ORDER, and names any full scan it would take. Rewrite so your
 WHERE/JOIN leads with an indexed column (business unit, fiscal year, period
 are the usual leaders), then run_sql. When a query TIMES OUT, do not retry
-it unchanged and do not give up: explain_query the same SQL, follow its
-advice, and if no index can serve it, narrow the rows another way — one
-period instead of a year, one business unit instead of all — and SAY the
-scope was narrowed and why.
+it unchanged and do not give up. In order: (1) explain_query the same SQL
+and follow its advice; (2) if the table's index leads with a column you can
+slice on — business unit is the usual one — rewrite the query for ONE slice
+with a :partition bind and re-run with partition={{"values":
+"business_units"}}: the engine runs every slice concurrently and merges the
+aggregates correctly, turning one impossible scan into N fast indexed ones;
+(3) only if no index serves any slicing, narrow the scope — one period, one
+unit — and SAY the scope was narrowed and why.
 
 ## Environment defaults (used when the user doesn't specify)
 - Business unit: {d.business_unit} | Ledger: {d.ledger} | Base currency: {d.base_currency}

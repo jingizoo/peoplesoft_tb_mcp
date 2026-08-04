@@ -260,6 +260,22 @@ async def main() -> None:
             print(f"tree chain: node EXPENSES -> {tn['account_count']} "
                   f"accounts -> {len(got)} ledger rows via IN-list ✔")
 
+            # Partitioned execution over the wire: one slice per BU, merged.
+            part = await call(
+                "run_sql",
+                sql=("SELECT H.BILL_TO_CUST_ID AS cust, "
+                     "SUM(H.INVOICE_AMOUNT) AS billed "
+                     "FROM PS_BI_HDR H WHERE H.BILL_STATUS = 'INV' "
+                     "AND H.BUSINESS_UNIT = :partition "
+                     "GROUP BY H.BILL_TO_CUST_ID "
+                     "ORDER BY billed DESC FETCH FIRST 3 ROWS ONLY"),
+                partition={"values": "business_units"})
+            assert part.get("partitioned"), part
+            assert part["rows"] and part["rows"][0]["billed"] > 0, part
+            print(f"partitioned run_sql: "
+                  f"{part['partitioned']['strategy']}, "
+                  f"top row {part['rows'][0]['cust']} ✔")
+
             pb = await call("run_playbook", fiscal_year=2026, period=7)
             assert "error" not in pb, f"run_playbook failed: {pb.get('error')}"
             assert pb.get("verdict") in ("passed", "exceptions_found",
