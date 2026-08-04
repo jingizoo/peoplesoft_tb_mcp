@@ -201,3 +201,47 @@ class CostGateHintTests(_EngineCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhereDetectionTests(_EngineCase):
+    """The cost gate must recognize a filter wherever WHERE sits.
+
+    Models write multi-line SQL, so WHERE follows a NEWLINE, not a space.
+    The space-delimited test read a four-predicate query as unfiltered and
+    refused it with "no filter at all" — a message blaming the SQL for a
+    filter it plainly had. Found live on the real instance (2.8M-row
+    PS_BI_HDR, screenshot 2026-08-06).
+    """
+
+    def _huge(self):
+        orig = self.engine._approx_rows
+        self.engine._approx_rows = (
+            lambda t: 2_800_000 if t == "PS_BI_HDR" else orig(t))
+
+    def test_a_newline_before_where_still_counts_as_filtered(self) -> None:
+        self._huge()
+        out = self.engine.run_sql(
+            "SELECT BUSINESS_UNIT, COUNT(*) AS n\n"
+            "FROM PS_BI_HDR\n"
+            "WHERE BILL_STATUS = 'INV' AND INVOICE_AMOUNT > 0\n"
+            "GROUP BY BUSINESS_UNIT")
+        self.assertTrue(out["rows"] is not None)
+        self.assertIn("It ran", (out.get("plan") or {}).get("warning", ""))
+
+    def test_where_inside_an_identifier_is_not_a_filter(self) -> None:
+        # An alias like SOMEWHERE must not read as a WHERE clause — this
+        # query is genuinely unfiltered and must still refuse.
+        self._huge()
+        with self.assertRaises(EngineError) as ctx:
+            self.engine.run_sql(
+                "SELECT BUSINESS_UNIT AS SOMEWHERE FROM PS_BI_HDR "
+                "GROUP BY BUSINESS_UNIT")
+        self.assertIn("no filter at all", str(ctx.exception))
+
+    def test_unfiltered_still_refuses(self) -> None:
+        self._huge()
+        with self.assertRaises(EngineError) as ctx:
+            self.engine.run_sql(
+                "SELECT BUSINESS_UNIT, COUNT(*) FROM PS_BI_HDR "
+                "GROUP BY BUSINESS_UNIT")
+        self.assertIn("no filter at all", str(ctx.exception))
