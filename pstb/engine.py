@@ -2114,6 +2114,72 @@ class TBEngine:
             "re-explain if unsure, then run_sql.")
         return out
 
+    MAX_PARTITIONS_RUN = 200
+
+    def _run_partitioned(self, sql: str, scrubbed: str, partition: dict,
+                         binds: dict, cap: int) -> tuple:
+        """Run one slice per partition value and merge the partials.
+
+        The query is written for ONE slice (a :partition bind marks where
+        the value goes); slices run CONCURRENTLY through the session pool,
+        and the merge applies the correct combiner per aggregate with ORDER
+        BY / FETCH FIRST applied once at the end — a top-20 of each slice
+        is not the top-20 of the whole. This beats a timeout exactly when
+        the partition column is indexed: N index range scans instead of one
+        full scan. When it is not indexed, N slices are N full scans and
+        WORSE — explain_query on one slice tells which case this is.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .partition import PartitionError, merge_partials, parse_mergeable
+
+        bind_name = str(partition.get("bind") or "partition")
+        if not re.search(rf"(?<![:\w]):{re.escape(bind_name)}\b", scrubbed):
+            raise EngineError(
+                f"The SQL does not reference :{bind_name} — write the query "
+                "for ONE partition (e.g. AND BUSINESS_UNIT = "
+                f":{bind_name}) and the engine runs every slice.")
+        values = partition.get("values")
+        if values == "business_units" or values is None:
+            values = sorted({bu for bu, _ in self._ledger_scope_pairs(
+                verify=False)[0]})
+        if isinstance(values, dict):
+            values = values.get("values")
+        values = [v for v in (values or []) if v not in (None, "")]
+        if not values:
+            raise EngineError(
+                "partition.values resolved to nothing — pass a list, a "
+                "from_result reference, or 'business_units'.")
+        if len(values) > self.MAX_PARTITIONS_RUN:
+            raise EngineError(
+                f"{len(values)} partitions exceeds the limit of "
+                f"{self.MAX_PARTITIONS_RUN}; partition on a coarser column.")
+        try:
+            parsed = parse_mergeable(sql)
+        except PartitionError as e:
+            raise EngineError(f"cannot partition this query: {e}")
+
+        def one(value):
+            rows, _ = self.db.query(
+                parsed["chunk_sql"], {**binds, bind_name: value},
+                max_rows=INTERNAL_ROW_CAP)
+            return rows
+
+        with ThreadPoolExecutor(
+                max_workers=min(4, max(1, len(values)))) as pool:
+            partials = list(pool.map(one, values))
+        merged = merge_partials(parsed,
+                                [r for rows in partials for r in rows])
+        info = {
+            "strategy": f"{len(values)} slices on :{bind_name}, merged",
+            "partitions": len(values),
+            "note": ("Aggregates were combined across slices with the "
+                     "correct combiner (sum of sums, max of maxes) and "
+                     "ORDER BY/FETCH applied once after the merge — quote "
+                     "these figures directly."),
+        }
+        return merged, info
+
     def _cost_gate(self, sql: str, scrubbed: str = "") -> dict:
         """Refuse or flag a plan that scans a large table.
 
@@ -2224,7 +2290,8 @@ class TBEngine:
     def run_sql(self, sql: str, max_rows: int = 100,
                 business_unit: str = "", policy_binds: Optional[dict] = None,
                 pivot: Optional[dict] = None,
-                list_binds: Optional[dict] = None) -> dict:
+                list_binds: Optional[dict] = None,
+                partition: Optional[dict] = None) -> dict:
         """Run a guarded SELECT.
 
         policy_binds maps a bind name to a policy figure the wiki defines, e.g.
@@ -2346,12 +2413,22 @@ class TBEngine:
                 + ", so the policy filter would not have been applied. Add it "
                   "to the WHERE clause or drop it from policy_binds.")
 
-        plan_note = self._cost_gate(s, scrubbed)
         cap = min(max(int(max_rows or 100), 1), 500)
-        rows, truncated = self.db.query(s, {**binds, **expanded_lists},
-                                        max_rows=cap)
+        if partition:
+            rows, partition_info = self._run_partitioned(
+                s, scrubbed, partition, {**binds, **expanded_lists}, cap)
+            truncated = len(rows) > cap
+            rows = rows[:cap]
+            plan_note = {}
+        else:
+            plan_note = self._cost_gate(s, scrubbed)
+            rows, truncated = self.db.query(s, {**binds, **expanded_lists},
+                                            max_rows=cap)
+            partition_info = None
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}
+        if partition_info:
+            out["partitioned"] = partition_info
         if pivot:
             # Consolidate HERE. Every total, change and percentage in the
             # result is then a figure a tool produced, which is both what the

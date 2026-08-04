@@ -524,7 +524,8 @@ if cfg.tools.allow_raw_sql:
     def run_sql(sql: str, max_rows: int = 100, business_unit: str = "",
                 source: str = "", policy_binds: Optional[dict] = None,
                 pivot: Optional[dict] = None,
-                list_binds: Optional[dict] = None) -> dict:
+                list_binds: Optional[dict] = None,
+                partition: Optional[dict] = None) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
         CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
         only, DML/DDL rejected, rows capped at 500, every table validated against
@@ -560,6 +561,17 @@ if cfg.tools.allow_raw_sql:
         checked, and the answer guard will reject figures no tool produced.
         Do not run one query per month and add them up; one grouped query is
         both faster and correct.
+        partition: BREAK a slow grouped aggregate into indexed slices and
+        merge — the fix for a query that TIMES OUT. Write the query for ONE
+        slice with a :partition bind (e.g. AND BUSINESS_UNIT = :partition)
+        and pass partition={"values": "business_units"} (or an explicit
+        list, or a from_result reference). Slices run concurrently; SUM/
+        COUNT/MIN/MAX partials merge with the right combiner; ORDER BY /
+        FETCH FIRST apply ONCE after the merge, so a top-20 is the top-20 of
+        the WHOLE, not of each slice. AVG must be rewritten as SUM + COUNT.
+        Partition on an INDEXED column (business unit is the usual one) —
+        explain_query on one slice confirms; slicing an unindexed column is
+        N full scans and worse than the direct query.
         list_binds: CHAIN a set produced by an earlier tool into this query
         WITHOUT retyping the values. Write `IN (:accts)` in the SQL and pass
         list_binds={"accts": {"from_result": "r2", "field": "accounts"}} —
@@ -570,7 +582,7 @@ if cfg.tools.allow_raw_sql:
         ids/accounts by hand into SQL text."""
         return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
                      business_unit=business_unit, policy_binds=policy_binds,
-                     pivot=pivot, list_binds=list_binds)
+                     pivot=pivot, list_binds=list_binds, partition=partition)
 
 
     @mcp.tool()
