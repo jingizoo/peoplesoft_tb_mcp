@@ -161,3 +161,96 @@ class BusinessUnitNameTests(unittest.TestCase):
             self.assertNotEqual(
                 descr.strip(), scope["business_unit"],
                 "descr echoed the code; the UI would render 'US001 US001'")
+
+
+class StaleWhileRevalidateTests(unittest.TestCase):
+    """Scope loading must never make a user wait twice.
+
+    The catalog had a 60-second freshness window, and the request after
+    expiry rebuilt it SYNCHRONOUSLY behind the lock — on a real instance a
+    minute-plus, which is exactly the intermittent "loading of scope times
+    out". Past the window the stale catalog is served instantly and one
+    background thread refreshes; a restart seeds from disk so even the
+    first request of the day is not a rebuild.
+    """
+
+    def setUp(self) -> None:
+        import time as _t
+
+        from fastapi.testclient import TestClient
+
+        from pstb.gui import app as gapp
+
+        self.gapp = gapp
+        self.time = _t
+        self.client = TestClient(gapp.app)
+        self.original = gapp.engine.list_financial_scopes
+        # Ensure a real value exists, then expire it.
+        gapp._scope_cache.update({"value": None, "expires": 0.0,
+                                  "refreshing": False})
+        self.client.get("/api/scopes")
+
+    def tearDown(self) -> None:
+        self.gapp.engine.list_financial_scopes = self.original
+
+    def test_a_stale_catalog_is_served_without_waiting(self) -> None:
+        gapp, _t = self.gapp, self.time
+        rebuild_started = _t.monotonic()
+
+        def slow(**kw):
+            _t.sleep(0.8)
+            return self.original(**kw)
+
+        gapp.engine.list_financial_scopes = slow
+        gapp._scope_cache["expires"] = 0.0            # stale, value present
+        t0 = _t.monotonic()
+        out = self.client.get("/api/scopes").json()
+        waited = _t.monotonic() - t0
+        self.assertTrue(out["ready"])
+        self.assertLess(waited, 0.5,
+                        f"user waited {waited:.2f}s on the rebuild — "
+                        "stale-while-revalidate is not serving stale")
+        # The refresh must actually land.
+        deadline = _t.monotonic() + 5
+        while _t.monotonic() < deadline:
+            with gapp._scope_cache_lock:
+                if (_t.monotonic() < gapp._scope_cache["expires"]
+                        and not gapp._scope_cache["refreshing"]):
+                    break
+            _t.sleep(0.05)
+        else:
+            self.fail("the background refresh never completed")
+
+    def test_only_one_refresh_thread_is_spawned(self) -> None:
+        gapp, _t = self.gapp, self.time
+        calls = {"n": 0}
+
+        def slow(**kw):
+            calls["n"] += 1
+            _t.sleep(0.5)
+            return self.original(**kw)
+
+        gapp.engine.list_financial_scopes = slow
+        gapp._scope_cache.update({"expires": 0.0, "refreshing": False})
+        for _ in range(5):
+            self.client.get("/api/scopes")
+        _t.sleep(1.2)
+        self.assertEqual(calls["n"], 1,
+                         "every stale request spawned its own rebuild — "
+                         "a thundering herd against the real database")
+
+    def test_the_catalog_survives_a_restart_via_disk(self) -> None:
+        gapp = self.gapp
+        persisted = gapp._load_persisted_scope_catalog()
+        self.assertIsNotNone(persisted,
+                             "no catalog on disk after a successful build — "
+                             "every restart pays full discovery again")
+        self.assertTrue(persisted.get("scopes"))
+
+    def test_meta_serves_a_stale_catalog_immediately(self) -> None:
+        # /api/meta may hand out a stale catalog (it is a list of business
+        # units, not a balance) so a restarted server paints instantly.
+        gapp = self.gapp
+        gapp._scope_cache["expires"] = 0.0
+        meta = self.client.get("/api/meta").json()
+        self.assertTrue(meta.get("scopes_ready"))

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import sys
@@ -187,9 +188,78 @@ _provider_sessions = _ProviderSessionStore(
     max_entries=int(os.environ.get("PSTB_CHAT_MAX_SESSIONS", "100")),
 )
 
-_scope_cache: dict = {"expires": 0.0, "value": None}
+_scope_cache: dict = {"expires": 0.0, "value": None, "refreshing": False}
 _scope_cache_lock = threading.RLock()
-_SCOPE_CACHE_SECONDS = 60
+# Freshness window. Was 60 seconds — which made every 61st second's visitor
+# rebuild the whole catalog SYNCHRONOUSLY behind the lock, a minute-plus on a
+# real instance. "Scope loading sometimes times out" was that exact person.
+# A BU/ledger catalog changes approximately never intra-day, so staleness is
+# cheap and waiting is not: past this window the STALE catalog is served
+# instantly and one background thread refreshes it.
+_SCOPE_CACHE_SECONDS = 900
+
+
+def _scope_persist_path() -> Path:
+    """Site-keyed file so a catalog from one database never leaks into
+    another environment's process (dev refresh, config switch)."""
+    import hashlib
+
+    key = hashlib.sha256("|".join([
+        cfg.db.backend, cfg.db.schema or "",
+        cfg.db.oracle_dsn or cfg.db.sqlite_path or "",
+    ]).encode()).hexdigest()[:16]
+    path = cfg.resolve_path(f"logs/scope_cache_{key}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _persist_scope_catalog(value: dict) -> None:
+    try:
+        _scope_persist_path().write_text(json.dumps(value, default=str))
+    except Exception:
+        pass                     # a cache that cannot write is just a cache
+
+
+def _load_persisted_scope_catalog() -> dict | None:
+    """Last known catalog from disk — served STALE on the first request
+    after a restart while a background refresh replaces it. Restarting the
+    server used to reset discovery to zero, so the first visitor of the day
+    paid the full minute; the catalog they get now may be yesterday's for a
+    few seconds, which for a list of business units is the right trade."""
+    try:
+        raw = _scope_persist_path().read_text()
+        value = json.loads(raw)
+        if isinstance(value, dict) and value.get("scopes") is not None:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_scope_catalog_async() -> None:
+    def work() -> None:
+        started = time.monotonic()
+        try:
+            value = engine.list_financial_scopes(include_activity=False)
+        except Exception as e:                    # noqa: BLE001
+            print(f"[pstb] scope catalog refresh failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            with _scope_cache_lock:
+                _scope_cache["refreshing"] = False
+            return
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        with _scope_cache_lock:
+            _scope_cache.update({
+                "value": value,
+                "expires": time.monotonic() + _SCOPE_CACHE_SECONDS,
+                "refreshing": False,
+            })
+        _persist_scope_catalog(value)
+        print(f"[pstb] scope catalog refreshed in {elapsed_ms} ms",
+              file=sys.stderr)
+
+    threading.Thread(target=work, daemon=True,
+                     name="scope-catalog-refresh").start()
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 _SCOPE_DISCOVERY_RE = re.compile(
     r"\b(list|what|which|available|all|exist)\b.*"
@@ -206,30 +276,46 @@ class _ScopeRequired(ValueError):
 
 
 def _financial_scope_catalog(force: bool = False) -> dict:
-    """Return the authoritative PS_LEDGER scope catalog with a short TTL."""
+    """The scope catalog: fresh if young, STALE-BUT-INSTANT if old.
+
+    Nobody waits on a rebuild except the very first request of a
+    deployment's life (no memory, no disk file). Stale requests get the
+    previous catalog immediately and exactly one background thread
+    refreshes; force=True (an explicit user refresh) still rebuilds
+    synchronously because that user asked to wait for truth.
+    """
     now = time.monotonic()
     with _scope_cache_lock:
-        if (
-            not force
-            and _scope_cache["value"] is not None
-            and now < _scope_cache["expires"]
-        ):
-            return _scope_cache["value"]
-        value = engine.list_financial_scopes(include_activity=False)
+        value = _scope_cache["value"]
+        if not force and value is not None:
+            if now >= _scope_cache["expires"] and not _scope_cache["refreshing"]:
+                _scope_cache["refreshing"] = True
+                _refresh_scope_catalog_async()
+            return value
+    # First-ever load, or an explicit refresh: build synchronously.
+    built = engine.list_financial_scopes(include_activity=False)
+    with _scope_cache_lock:
         _scope_cache.update(
-            {"value": value, "expires": now + _SCOPE_CACHE_SECONDS}
+            {"value": built, "expires": time.monotonic() + _SCOPE_CACHE_SECONDS,
+             "refreshing": False}
         )
-        return value
+    _persist_scope_catalog(built)
+    return built
 
 
 def _warm_scope_catalog():
-    """The cached catalog, or None when discovery has not run yet. Never
-    triggers discovery — that is the whole point of the async split."""
-    now = time.monotonic()
+    """The cached catalog (stale is fine — it is a list of business units,
+    not a balance), or None when this deployment has never discovered one.
+    Never triggers discovery — that is the whole point of the async split."""
     with _scope_cache_lock:
-        if _scope_cache["value"] is not None and now < _scope_cache["expires"]:
-            return _scope_cache["value"]
-    return None
+        return _scope_cache["value"]
+
+
+# A restart used to reset discovery to zero; seed from disk so the first
+# request serves instantly and revalidates in the background.
+_persisted = _load_persisted_scope_catalog()
+if _persisted is not None:
+    _scope_cache.update({"value": _persisted, "expires": 0.0})
 
 
 def _scope_options(catalog: dict, business_unit: str = "") -> list[dict]:
