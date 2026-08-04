@@ -147,6 +147,52 @@ class ReportRunner:
         }
 
     # ----------------------------------------------------------- tree lookups
+    def node_accounts(self, business_unit: str = "", tree_name: str = "",
+                      node: str = "") -> dict:
+        """Flatten a tree node into its concrete ACCOUNT LIST — the set
+        producer for chains.
+
+        Trees attach RANGES to nodes, not accounts, so "the accounts in
+        node X" genuinely cannot be answered by a join — the ranges must be
+        resolved against the account master. For a trial balance BY node,
+        rollup_trial_balance already does all of this in one call; this tool
+        exists for every OTHER use of that account set: journals for these
+        accounts, budget rows for them, an ad-hoc run_sql — chained by
+        reference, never retyped.
+        """
+        bu = (business_unit or "").strip() or self.e.cfg.defaults.business_unit
+        tree = (tree_name or "").strip() or self.e.cfg.defaults.account_tree
+        if not (node or "").strip():
+            raise ReportError("node_accounts needs a tree node name — "
+                              "list_trees shows the trees; an unknown node "
+                              "error lists the nodes.")
+        ranges = self._node_ranges(bu, tree, node.strip())
+        setid = self.e.resolve_setid(bu)
+        p = self.db.prefix
+        clauses, params = [], {"setid": setid}
+        for i, (lo, hi) in enumerate(ranges[:500]):
+            params[f"lo{i}"], params[f"hi{i}"] = lo, hi
+            clauses.append(f"(A.ACCOUNT BETWEEN :lo{i} AND :hi{i})")
+        rows, _ = self.db.query(
+            f"""SELECT DISTINCT A.ACCOUNT AS account,
+       {q.opt(self.db, 'PS_GL_ACCOUNT_TBL', 'DESCR', 'descr', 'A')}
+  FROM {p}PS_GL_ACCOUNT_TBL A
+ WHERE A.SETID = :setid AND ({' OR '.join(clauses)})
+ ORDER BY A.ACCOUNT""",
+            params, max_rows=5_000)
+        return {
+            "business_unit": bu, "tree": tree, "node": node.strip(),
+            "ranges": [{"from": lo, "to": hi} for lo, hi in ranges],
+            "accounts": [r["account"] for r in rows],
+            "detail": rows,
+            "account_count": len(rows),
+            "note": ("These are the accounts the node's ranges resolve to in "
+                     "the account master. To use them in another query, "
+                     "REFERENCE this result (list_binds with from_result), "
+                     "do not retype them. For a trial balance by node, call "
+                     "rollup_trial_balance instead — it needs none of this."),
+        }
+
     def _node_ranges(self, bu: str, tree: str, node: str) -> list:
         setid = self.e.resolve_setid(bu)
         key = (setid, tree, node, bu)

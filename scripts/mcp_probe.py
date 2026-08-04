@@ -77,6 +77,7 @@ async def main() -> None:
                 "list_policy_terms", "explain_query",
                 "get_open_payables", "get_vendor_payments",
                 "get_asset_register", "get_project_costs",
+                "get_tree_node_accounts",
             }
             names = {t.name for t in listed.tools}
             gone = sorted(REQUIRED - names)
@@ -243,6 +244,21 @@ async def main() -> None:
             assert "PRJ-300" in pc2["stale"], pc2
             print("AP/AM/PC packs: owe+overdue+stuck, payments, register, "
                   "over-budget+stale ✔")
+
+            # Chain by reference: node -> accounts -> IN-list, over the wire.
+            tn = await call("get_tree_node_accounts", node="EXPENSES")
+            assert tn["account_count"] >= 5, tn
+            chained = await call(
+                "run_sql",
+                sql=("SELECT ACCOUNT, SUM(POSTED_TOTAL_AMT) AS amt "
+                     "FROM PS_LEDGER WHERE BUSINESS_UNIT = 'US001' "
+                     "AND ACCOUNT IN (:accts) GROUP BY ACCOUNT"),
+                list_binds={"accts": tn["accounts"]})
+            got = {r["account"] for r in chained["rows"]}
+            assert got and got <= set(tn["accounts"]), \
+                f"chained rows outside the node's accounts: {got}"
+            print(f"tree chain: node EXPENSES -> {tn['account_count']} "
+                  f"accounts -> {len(got)} ledger rows via IN-list ✔")
 
             pb = await call("run_playbook", fiscal_year=2026, period=7)
             assert "error" not in pb, f"run_playbook failed: {pb.get('error')}"

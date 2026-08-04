@@ -523,7 +523,8 @@ if cfg.tools.allow_raw_sql:
     @mcp.tool()
     def run_sql(sql: str, max_rows: int = 100, business_unit: str = "",
                 source: str = "", policy_binds: Optional[dict] = None,
-                pivot: Optional[dict] = None) -> dict:
+                pivot: Optional[dict] = None,
+                list_binds: Optional[dict] = None) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
         CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
         only, DML/DDL rejected, rows capped at 500, every table validated against
@@ -558,10 +559,18 @@ if cfg.tools.allow_raw_sql:
         recompute or add them up yourself — arithmetic done in prose cannot be
         checked, and the answer guard will reject figures no tool produced.
         Do not run one query per month and add them up; one grouped query is
-        both faster and correct."""
+        both faster and correct.
+        list_binds: CHAIN a set produced by an earlier tool into this query
+        WITHOUT retyping the values. Write `IN (:accts)` in the SQL and pass
+        list_binds={"accts": {"from_result": "r2", "field": "accounts"}} —
+        r2 is the result_id of the earlier result, field is a dot path into
+        it ("accounts", "rows[].account", "customers[].cust_id"). The values
+        are substituted mechanically from that stored result; produce the
+        set in one round, reference it in the next. Never copy a list of
+        ids/accounts by hand into SQL text."""
         return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
                      business_unit=business_unit, policy_binds=policy_binds,
-                     pivot=pivot)
+                     pivot=pivot, list_binds=list_binds)
 
 
     @mcp.tool()
@@ -703,6 +712,22 @@ def resolve_policy_value(policy: str) -> dict:
     # fresh instance starts with an empty cache, so every ask would pay the
     # full wiki cost again.
     return _safe(engine._policy.resolve, policy=policy)
+
+
+@mcp.tool()
+def get_tree_node_accounts(node: str, tree_name: str = "",
+                           business_unit: str = "") -> dict:
+    """Flatten a PeopleSoft TREE NODE into its concrete account list — the
+    SET PRODUCER for cross-module chains. Trees attach account RANGES to
+    nodes, so "the accounts in node X" cannot be answered by a join; this
+    resolves the ranges against the account master. For a trial balance BY
+    node use rollup_trial_balance directly (one call, no chain needed). Use
+    THIS when the account set feeds something else: journals for those
+    accounts, budget rows, any run_sql — then reference the result via
+    list_binds={"accts": {"from_result": "<result_id>", "field":
+    "accounts"}} instead of retyping account numbers."""
+    return _safe(report_runner.node_accounts, business_unit=business_unit,
+                 tree_name=tree_name, node=node)
 
 
 @mcp.tool()
