@@ -299,7 +299,24 @@ CREATE TABLE PS_BUS_UNIT_LED (BUSINESS_UNIT TEXT, LEDGER_GROUP TEXT);
 CREATE TABLE PS_VENDOR (SETID TEXT, VENDOR_ID TEXT, NAME1 TEXT, VENDOR_STATUS TEXT);
 CREATE TABLE PS_VOUCHER (
   BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, VENDOR_ID TEXT, INVOICE_ID TEXT,
-  INVOICE_DT TEXT, GROSS_AMT REAL, ENTRY_STATUS TEXT, CURRENCY_CD TEXT);
+  INVOICE_DT TEXT, DUE_DT TEXT, GROSS_AMT REAL, ENTRY_STATUS TEXT,
+  CLOSE_STATUS TEXT, POST_STATUS TEXT, CURRENCY_CD TEXT);
+-- Asset Management: the register the AM questions read. Delivered AM keys
+-- cost rows by asset and book; category and NBV live on cost/book rows,
+-- not the asset master.
+CREATE TABLE PS_ASSET (
+  BUSINESS_UNIT TEXT, ASSET_ID TEXT, DESCR TEXT, ASSET_STATUS TEXT,
+  ACQUISITION_DT TEXT);
+CREATE TABLE PS_COST (
+  BUSINESS_UNIT TEXT, ASSET_ID TEXT, BOOK TEXT, TRANS_DT TEXT,
+  TRANS_TYPE TEXT, CATEGORY TEXT, COST REAL, CURRENCY_CD TEXT);
+-- Project Costing: PS_PROJ_RESOURCE is the transaction spine — actuals and
+-- budgets are ROWS distinguished by ANALYSIS_TYPE (ACT/BUD), not columns.
+CREATE TABLE PS_PROJECT (
+  BUSINESS_UNIT TEXT, PROJECT_ID TEXT, DESCR TEXT, EFF_STATUS TEXT);
+CREATE TABLE PS_PROJ_RESOURCE (
+  BUSINESS_UNIT TEXT, PROJECT_ID TEXT, ACTIVITY_ID TEXT, ANALYSIS_TYPE TEXT,
+  TRANS_DT TEXT, RESOURCE_AMOUNT REAL, CURRENCY_CD TEXT);
 CREATE TABLE PS_PAYMENT_TBL (
   BANK_SETID TEXT, PYMNT_ID TEXT, VENDOR_ID TEXT, PYMNT_DT TEXT,
   PYMNT_AMT REAL, CURRENCY_CD TEXT, PYMNT_STATUS TEXT);
@@ -464,6 +481,10 @@ def main() -> None:
         ("VOUCHER", "AP Voucher Header", 0, ""),
         ("PAYMENT_TBL", "AP Payment Header", 0, ""),
         ("PYMNT_VCHR_XREF", "Payment to Voucher Cross Reference", 0, ""),
+        ("ASSET", "Asset Master", 0, ""),
+        ("COST", "Asset Cost and Activity", 0, ""),
+        ("PROJECT", "Project Master", 0, ""),
+        ("PROJ_RESOURCE", "Project Cost Transactions", 0, ""),
     ]
     con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
     con.executemany(
@@ -479,10 +500,57 @@ def main() -> None:
         vid = f"VCHR{i:05d}"
         pid = f"PAY{i:05d}"
         _vouchers.append((BU, vid, vend, f"INV-{i:04d}",
-                          month_end(2026, mon), amt, "P", CURR))
+                          month_end(2026, mon), month_end(2026, mon), amt,
+                          "P", "C", "P", CURR))
         _payments.append((SETID, pid, vend, month_end(2026, mon), amt, CURR, "P"))
         _xref.append((BU, vid, pid, amt))
-    con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?)", _vouchers)
+    # OPEN payables — what the AP questions are actually about. One current,
+    # one past due, one large and due soon, one stuck in recycle (the
+    # exception queue), across two vendors.
+    _vouchers += [
+        (BU, "VCHR90001", "V1001", "INV-9001", "2026-07-10", "2026-08-09",
+         18_400.00, "P", "O", "P", CURR),
+        (BU, "VCHR90002", "V1002", "INV-9002", "2026-06-05", "2026-07-05",
+         27_650.00, "P", "O", "P", CURR),        # past due
+        (BU, "VCHR90003", "V1002", "INV-9003", "2026-07-28", "2026-08-27",
+         64_000.00, "P", "O", "P", CURR),        # large, due this month
+        (BU, "VCHR90004", "V1003", "INV-9004", "2026-07-20", "2026-08-19",
+         5_150.00, "R", "O", "U", CURR),         # recycle + unposted
+    ]
+    con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    _vouchers)
+    # Asset register: two categories, one retirement, one fully-in-service
+    # add this year, plus a disposed asset that must not count as in service.
+    con.executemany(
+        "INSERT INTO PS_ASSET VALUES (?,?,?,?,?)",
+        [(BU, "A-0001", "Warehouse forklift", "I", "2024-03-15"),
+         (BU, "A-0002", "Server cluster",     "I", "2025-01-10"),
+         (BU, "A-0003", "Office build-out",   "I", "2026-02-01"),
+         (BU, "A-0004", "Retired delivery van", "D", "2021-06-01")])
+    con.executemany(
+        "INSERT INTO PS_COST VALUES (?,?,?,?,?,?,?,?)",
+        [(BU, "A-0001", "CORP", "2024-03-15", "ADD", "MACH", 62_000.00, CURR),
+         (BU, "A-0002", "CORP", "2025-01-10", "ADD", "IT",   184_000.00, CURR),
+         (BU, "A-0002", "CORP", "2026-03-20", "ADJ", "IT",    12_500.00, CURR),
+         (BU, "A-0003", "CORP", "2026-02-01", "ADD", "FURN",  48_300.00, CURR),
+         (BU, "A-0004", "CORP", "2021-06-01", "ADD", "AUTO",  35_000.00, CURR),
+         (BU, "A-0004", "CORP", "2026-04-30", "RET", "AUTO", -35_000.00, CURR)])
+    # Projects: one healthy, one OVER BUDGET, one stale with budget left.
+    con.executemany(
+        "INSERT INTO PS_PROJECT VALUES (?,?,?,?)",
+        [(BU, "PRJ-100", "ERP Upgrade Phase 2", "A"),
+         (BU, "PRJ-200", "Warehouse Automation", "A"),
+         (BU, "PRJ-300", "Legacy Decommission", "A")])
+    _pr = []
+    for proj, atype, mon, amt in [
+        ("PRJ-100", "BUD", 1, 250_000.00), ("PRJ-100", "ACT", 3, 80_000.00),
+        ("PRJ-100", "ACT", 5, 95_000.00),  ("PRJ-100", "ACT", 7, 40_000.00),
+        ("PRJ-200", "BUD", 1, 120_000.00), ("PRJ-200", "ACT", 4, 70_000.00),
+        ("PRJ-200", "ACT", 6, 85_000.00),  # 155k vs 120k -> overrun
+        ("PRJ-300", "BUD", 1, 90_000.00),  ("PRJ-300", "ACT", 2, 15_000.00),
+    ]:
+        _pr.append((BU, proj, "GEN", atype, month_end(2026, mon), amt, CURR))
+    con.executemany("INSERT INTO PS_PROJ_RESOURCE VALUES (?,?,?,?,?,?,?)", _pr)
     con.executemany("INSERT INTO PS_PAYMENT_TBL VALUES (?,?,?,?,?,?,?)", _payments)
     con.executemany("INSERT INTO PS_PYMNT_VCHR_XREF VALUES (?,?,?,?)", _xref)
     con.executemany(

@@ -134,6 +134,15 @@ rerun <job>" are answered from them. The method:
 5. CITE the page titles you worked from, and say so plainly when the wiki
    does not cover the subject — do not improvise an integration design.
 
+## Module fast paths (AP / AM / PC)
+Payables: "what do we owe / overdue / stuck" -> get_open_payables;
+"whom did we pay / top vendors by spend" -> get_vendor_payments.
+Assets: "what do we own / added / retired" -> get_asset_register.
+Projects: "spend vs budget / over budget / dormant" -> get_project_costs.
+These answer their whole question in one call with the flags precomputed —
+do not reassemble them from run_sql pieces unless the question needs a
+dimension they lack.
+
 ## Compound questions are ONE call, not a loop
 "Top 20 customers across all business units that are still buying" is one
 question to an accountant; do not decompose it into per-unit tool calls

@@ -23,6 +23,7 @@ from .db import Database, DbError
 from .engine import EngineError, TBEngine
 from .ar import ARBilling, ARError
 from .memory import MemoryError_, SiteMemory
+from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
 from .report import ReportError, ReportRunner
 from . import wiki as wiki_mod
@@ -34,6 +35,7 @@ engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 playbooks = PlaybookRunner(engine, ar)
+modules = ModulePacks(engine)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
 from .sources import SourceRegistry
@@ -56,7 +58,7 @@ def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
-            PlaybookError, MemoryError_) as e:
+            PlaybookError, MemoryError_, ModuleError) as e:
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}
@@ -702,6 +704,55 @@ def resolve_policy_value(policy: str) -> dict:
     # full wiki cost again.
     return _safe(engine._policy.resolve, policy=policy)
 
+
+@mcp.tool()
+def get_open_payables(business_unit: str = "", as_of_date: str = "") -> dict:
+    """AP: what do we OWE. Open vouchers by vendor with totals, overdue and
+    due-within-7-days amounts, oldest due date per vendor, and pipeline
+    exceptions (vouchers in recycle or unposted — owed but invisible to a
+    payment run). Use for "what do we owe / open payables / overdue AP /
+    anything stuck in AP". This is the payables mirror of get_ar_aging."""
+    return _safe(modules.open_payables, business_unit=business_unit,
+                 as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_vendor_payments(business_unit: str = "", vendor: str = "",
+                        months: int = 12, n: int = 20,
+                        as_of_date: str = "") -> dict:
+    """AP: whom did we PAY. Payments over a trailing window ranked by vendor
+    — count, total, last payment date; voids excluded where the record
+    carries a status. vendor filters by id or name substring; empty ranks
+    all. Use for "how much did we pay X / top vendors by spend / when did we
+    last pay X"."""
+    return _safe(modules.vendor_payments, business_unit=business_unit,
+                 vendor=vendor, months=months, n=n, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_asset_register(business_unit: str = "", months: int = 12,
+                       as_of_date: str = "") -> dict:
+    """AM: what do we OWN. Asset cost by category with counts, plus this
+    window's additions and retirements. COST basis — net book value needs
+    the site's depreciation record and is never approximated. Use for "what
+    assets do we have / what was added or retired / asset register"."""
+    return _safe(modules.asset_register, business_unit=business_unit,
+                 months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_project_costs(business_unit: str = "", project: str = "",
+                      stale_after_months: int = 3,
+                      as_of_date: str = "") -> dict:
+    """PC: every project's ACTUALS against its BUDGET with the two flags a
+    reviewer scans for first — over_budget and stale (budget remaining but
+    no recent activity). Handles the PS_PROJ_RESOURCE ANALYSIS_TYPE split
+    (BUD* rows are budget, the rest actuals) server-side. pct_used is null
+    when a project has no budget row — unbudgeted, not 0%. Use for "project
+    spend / budget vs actual / which projects are over or dormant"."""
+    return _safe(modules.project_costs, business_unit=business_unit,
+                 project=project, stale_after_months=stale_after_months,
+                 as_of_date=as_of_date)
 
 if wiki is not None:
 

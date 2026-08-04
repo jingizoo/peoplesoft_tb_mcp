@@ -75,6 +75,8 @@ async def main() -> None:
                 "describe_table", "profile_record", "compare_records",
                 "run_playbook", "get_ar_aging", "resolve_policy_value",
                 "list_policy_terms", "explain_query",
+                "get_open_payables", "get_vendor_payments",
+                "get_asset_register", "get_project_costs",
             }
             names = {t.name for t in listed.tools}
             gone = sorted(REQUIRED - names)
@@ -227,6 +229,20 @@ async def main() -> None:
             unknown = await call("resolve_policy_value", policy="bonus_accrual_rate")
             assert "error" in unknown and "capitalization_threshold" in unknown["error"]
             print("unknown policy names list the available ones ✔")
+
+            # Module packs answer their whole question in one call.
+            ap = await call("get_open_payables")
+            assert ap["open_total"] > 0 and ap["overdue_total"] > 0, ap
+            assert ap["pipeline_exceptions"], "the recycle voucher vanished"
+            vp = await call("get_vendor_payments", vendor="Cobalt")
+            assert vp["vendors"] and vp["vendors"][0]["payments"] >= 1, vp
+            amr = await call("get_asset_register", months=8)
+            assert amr["retirements_in_window"], amr
+            pc2 = await call("get_project_costs")
+            assert "PRJ-200" in pc2["over_budget"], pc2
+            assert "PRJ-300" in pc2["stale"], pc2
+            print("AP/AM/PC packs: owe+overdue+stuck, payments, register, "
+                  "over-budget+stale ✔")
 
             pb = await call("run_playbook", fiscal_year=2026, period=7)
             assert "error" not in pb, f"run_playbook failed: {pb.get('error')}"
