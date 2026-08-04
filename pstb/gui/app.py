@@ -112,6 +112,9 @@ class _ProviderSession:
     provider: object
     touched: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Recent tool payloads, so a follow-up turn's restated figures ground
+    # against what this conversation already fetched.
+    payloads: list = field(default_factory=list)
 
 
 class _ProviderSessionStore:
@@ -1076,10 +1079,15 @@ async def chat(payload: dict):
                     "status": "blocked" if blocked else "running",
                     "tool": tool, "args": args_preview})
 
+            prior_payloads = list(provider_entry.payloads)
+
             def _observe_and_record(name, args, out, ms, ok):
                 _activity_add(session_id, {
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
+                if ok and isinstance(out, str):
+                    provider_entry.payloads.append(out)
+                    del provider_entry.payloads[:-12]
                 observe_tool(name, args, out, ms, ok)
 
             try:
@@ -1092,6 +1100,7 @@ async def chat(payload: dict):
                     scope=active_scope,
                     tool_observer=_observe_and_record,
                     tool_started=_on_started,
+                    prior_payloads=prior_payloads,
                 )
             finally:
                 _activity_done(session_id)

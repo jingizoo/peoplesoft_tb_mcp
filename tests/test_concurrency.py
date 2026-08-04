@@ -398,3 +398,37 @@ class ToolStartedHookTests(unittest.IsolatedAsyncioTestCase):
                 scope={"business_unit": "US001", "ledger": "ACTUALS"},
                 tool_started=bomb)
         self.assertIn("fine", answer)
+
+
+class CrossTurnGroundingTests(unittest.IsolatedAsyncioTestCase):
+    """A follow-up that restates a figure the CONVERSATION already fetched
+    must not be withheld. The guard withheld 21,334,221.84 — a full-
+    precision figure from the previous turn's result — as invented, telling
+    the user to ask again for a number it had already delivered."""
+
+    PRIOR = ['{"totals": {"open_ar": 21334221.84}}']
+
+    async def _turn(self, prior):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("a", "get_ar_aging")]),
+            LLMResponse(text="As before, total open AR is 21,334,221.84 and "
+                             "current buckets are unchanged."),
+        ])
+        session = TimedSession({
+            "get_ar_aging": {"scope_status": "ok", "buckets": [
+                {"range": "current", "amount": 12000.5}]}}, delay=0.01)
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            return await agent_turn(
+                provider, session, "show the aging again",
+                surface="gui",
+                scope={"business_unit": "US001", "ledger": "ACTUALS"},
+                prior_payloads=prior)
+
+    async def test_prior_turn_figures_are_grounded(self):
+        answer = await self._turn(self.PRIOR)
+        self.assertIn("21,334,221.84", answer)
+        self.assertNotIn("withheld", answer)
+
+    async def test_without_history_the_guard_still_withholds(self):
+        answer = await self._turn(None)
+        self.assertIn("withheld", answer)
