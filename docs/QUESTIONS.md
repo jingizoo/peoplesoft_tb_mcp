@@ -193,3 +193,53 @@ quotable. The UI renders it as a cross-tab with both total edges.
 
 `change` is always the last column minus the first, and `change_basis` says so
 in the payload — on sparse data that comparison is easy to misread.
+
+## The predetermined question map, by module
+
+What each module's users actually ask — the consultant's checklist — and the
+one call that answers it. Anything not on this map still routes through
+search_records + run_sql (+ pivot); this map is the fast path.
+
+### AP — Payables
+| question | call |
+|---|---|
+| What do we owe, and to whom? | `get_open_payables` |
+| How much is overdue / due this week? | `get_open_payables` (overdue_total, due_within_7_days) |
+| Anything stuck in AP nobody can see? | `get_open_payables` → pipeline_exceptions (recycle/unposted) |
+| Whom did we pay, how much, when? | `get_vendor_payments` |
+| Top vendors by spend | `get_vendor_payments` (empty vendor ranks all) |
+| When did we last pay X? | `get_vendor_payments(vendor=...)` → last_payment_dt |
+
+### AM — Asset Management
+| question | call |
+|---|---|
+| What do we own, by category? | `get_asset_register` |
+| What was added / retired this year? | `get_asset_register(months=12)` |
+| Total asset cost | `get_asset_register` → total_cost (COST basis; NBV needs the depreciation record and is never approximated) |
+
+### GL — General Ledger (already deep)
+| question | call |
+|---|---|
+| Does the TB balance / what's the balance of X | `get_trial_balance`, `get_account_balance` |
+| What changed vs last period/year | `compare_trial_balance` |
+| What makes up this number / who posted it | `drill_to_journals` |
+| Is the ledger ready to close | `run_playbook close_readiness` |
+| Statements | `run_report` (income_statement, balance_sheet, quarterly_expenses) |
+| Any trend/cross-tab | `run_sql` + `pivot` |
+
+### PC — Project Costing
+| question | call |
+|---|---|
+| What has each project spent vs budget? | `get_project_costs` |
+| Which projects are over budget? | `get_project_costs` → over_budget |
+| Which are dormant with budget left? | `get_project_costs` → stale |
+| One project's detail | `get_project_costs(project=...)` |
+
+### The design rule behind every row
+Each of these is a CHAIN — filter, group, compare, flag — and chains run
+server-side in one call. Derived figures (totals, overdue, pct_used) are in
+the payload so the number guard grounds them; flags carry their evidence
+(last_payment_dt, last_activity, due dates); shapes adapt per site with
+record_notes; and what cannot be computed honestly (NBV without the
+depreciation record, pct_used without a budget row) is null with a stated
+reason, never approximated.
