@@ -2139,7 +2139,12 @@ class TBEngine:
             # index — the user cannot do better without a DBA, and blocking
             # it would make every unindexed custom record unqueryable. Warn
             # loudly instead, so the cost is visible but the work is possible.
-            filtered = " WHERE " in (scrubbed or sql).upper()
+            # \bWHERE\b, not " WHERE ": models write multi-line SQL, and a
+            # WHERE at the start of a line follows a NEWLINE. The
+            # space-delimited test read a four-predicate query as "no filter
+            # at all" and refused it — with a message blaming the user's SQL
+            # for a filter it plainly had.
+            filtered = bool(re.search(r"(?i)\bWHERE\b", scrubbed or sql))
             hints = []
             for x in big[:3]:
                 idx = self.db.indexes(x["object"])
