@@ -354,3 +354,47 @@ class ConcurrentPlaybookContextTests(unittest.TestCase):
         probes = balance["detail"]["probe_timings_ms"]
         self.assertIn("tb_aggregate", probes)
         self.assertIn("out_of_balance_journals", probes)
+
+
+class ToolStartedHookTests(unittest.IsolatedAsyncioTestCase):
+    """The UI can only say "running get_trial_balance" if a hook fires at
+    DISPATCH — the completion observer alone leaves a 40s query mute."""
+
+    async def test_started_fires_before_completion(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("a", "get_trial_balance")]),
+            LLMResponse(text="ok"),
+        ])
+        session = TimedSession({
+            "get_trial_balance": {"scope_status": "ok"}}, delay=0.05)
+        events = []
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            await agent_turn(
+                provider, session, "show me the trial balance",
+                surface="gui",
+                scope={"business_unit": "US001", "ledger": "ACTUALS"},
+                tool_observer=lambda n, a, o, ms, ok: events.append(
+                    ("done", n)),
+                tool_started=lambda n, a, blocked: events.append(
+                    ("started", n, blocked)))
+        self.assertEqual(events[0], ("started", "get_trial_balance", False))
+        self.assertEqual(events[1], ("done", "get_trial_balance"))
+
+    async def test_a_crashing_hook_cannot_break_the_turn(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("a", "get_trial_balance")]),
+            LLMResponse(text="fine"),
+        ])
+        session = TimedSession({
+            "get_trial_balance": {"scope_status": "ok"}}, delay=0.02)
+
+        def bomb(*a):
+            raise RuntimeError("observer crashed")
+
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            answer = await agent_turn(
+                provider, session, "show me the trial balance",
+                surface="gui",
+                scope={"business_unit": "US001", "ledger": "ACTUALS"},
+                tool_started=bomb)
+        self.assertIn("fine", answer)

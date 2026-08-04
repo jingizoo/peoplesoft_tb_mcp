@@ -188,6 +188,35 @@ _provider_sessions = _ProviderSessionStore(
     max_entries=int(os.environ.get("PSTB_CHAT_MAX_SESSIONS", "100")),
 )
 
+_activity: dict = {}                    # session_id -> live turn activity
+_activity_lock = threading.Lock()
+_ACTIVITY_MAX_EVENTS = 60
+
+
+def _activity_reset(session_id: str) -> None:
+    with _activity_lock:
+        _activity[session_id] = {"active": True, "events": []}
+        if len(_activity) > 200:            # forgotten sessions, bounded
+            for key in list(_activity)[:-100]:
+                _activity.pop(key, None)
+
+
+def _activity_add(session_id: str, event: dict) -> None:
+    with _activity_lock:
+        slot = _activity.get(session_id)
+        if slot is None:
+            return
+        slot["events"].append({**event, "t": time.time()})
+        del slot["events"][:-_ACTIVITY_MAX_EVENTS]
+
+
+def _activity_done(session_id: str) -> None:
+    with _activity_lock:
+        slot = _activity.get(session_id)
+        if slot is not None:
+            slot["active"] = False
+
+
 _scope_cache: dict = {"expires": 0.0, "value": None, "refreshing": False}
 _scope_cache_lock = threading.RLock()
 # Freshness window. Was 60 seconds — which made every 61st second's visitor
@@ -1039,15 +1068,33 @@ async def chat(payload: dict):
 
         async with provider_entry.lock:
             set_tool_result_limit(cfg, provider_name)
-            answer = await agent_turn(
-                provider,
-                session,
-                message,
-                qlog=qlog,
-                surface="gui",
-                scope=active_scope,
-                tool_observer=observe_tool,
-            )
+            _activity_reset(session_id)
+
+            def _on_started(tool: str, args_preview: str,
+                            blocked: bool) -> None:
+                _activity_add(session_id, {
+                    "status": "blocked" if blocked else "running",
+                    "tool": tool, "args": args_preview})
+
+            def _observe_and_record(name, args, out, ms, ok):
+                _activity_add(session_id, {
+                    "status": "done" if ok else "failed",
+                    "tool": name, "ms": ms})
+                observe_tool(name, args, out, ms, ok)
+
+            try:
+                answer = await agent_turn(
+                    provider,
+                    session,
+                    message,
+                    qlog=qlog,
+                    surface="gui",
+                    scope=active_scope,
+                    tool_observer=_observe_and_record,
+                    tool_started=_on_started,
+                )
+            finally:
+                _activity_done(session_id)
         await per_turn.aclose()
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
@@ -1080,6 +1127,20 @@ def feedback(payload: dict):
     qlog.log_feedback(turn_id, (payload or {}).get("verdict", "bad"),
                       (payload or {}).get("note", ""))
     return {"ok": True}
+
+
+@app.get("/api/activity")
+def activity(session_id: str = ""):
+    """What the current turn is doing RIGHT NOW — polled by the page while
+    its /api/chat request is in flight, so 'Working…' can say which tool is
+    running instead of leaving a spinner to speak for a 40-second query."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return {"active": False, "events": []}
+    with _activity_lock:
+        slot = _activity.get(session_id)
+        if slot is None:
+            return {"active": False, "events": []}
+        return {"active": slot["active"], "events": list(slot["events"])}
 
 
 @app.post("/api/chat/reset")

@@ -132,6 +132,14 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
   color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
 .build-tag{margin-left:auto;color:var(--muted);font-size:11px;font-family:ui-monospace,monospace;cursor:help}
 .scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.tool-card{margin:6px 0}
+.tool-card>summary{cursor:pointer;list-style:none;display:flex;align-items:center;
+  gap:8px;padding:4px 8px;border:1px solid var(--line);border-radius:8px;
+  background:var(--bg);font-size:13px;user-select:none}
+.tool-card>summary::-webkit-details-marker{display:none}
+.tool-card>summary .chev{transition:transform .15s;font-size:10px;color:var(--muted)}
+.tool-card[open]>summary .chev{transform:rotate(90deg)}
+.tool-card>.inline{margin-top:6px}
 .scope-chip{border:1px solid var(--line);background:var(--bg);border-radius:20px;padding:5px 10px;
   cursor:pointer;color:var(--ink);font-weight:600}
 .scope-chip:hover{border-color:var(--accent);color:var(--accent)}
@@ -1438,6 +1446,25 @@ async function send(messageOverride,appendUser){
   i.value=''; if(appendUser) msgs.append(el('div','msg me',esc(m)));
   const think=el('div','msg bot','<span class="spin"></span> Working…');
   msgs.append(think); msgs.scrollTop=msgs.scrollHeight;
+  // While the one-shot request runs, poll what the turn is DOING so a
+  // 40-second query reads as "running get_trial_balance — 38s", not a
+  // spinner asking for faith.
+  const tStart=Date.now();
+  const poll=setInterval(async()=>{
+    try{
+      const a=await (await fetch('/api/activity?session_id='+
+        encodeURIComponent(CHAT_SESSION_ID))).json();
+      const ev=a.events||[];
+      const running=[...ev].reverse().find(e=>e.status==='running');
+      const done=ev.filter(e=>e.status==='done').length;
+      const secs=Math.round((Date.now()-tStart)/1000);
+      let line='Working… '+secs+'s';
+      if(running) line='<b>'+esc(running.tool)+'</b> '+esc(running.args||'')+
+        ' — running, '+secs+'s'+(done?' · '+done+' step'+(done===1?'':'s')+' done':'');
+      else if(done) line='thinking over '+done+' result'+(done===1?'':'s')+'… '+secs+'s';
+      think.innerHTML='<span class="spin"></span> '+line;
+    }catch(e){}
+  },700);
   try{
     const ctl=new AbortController();
     const timer=setTimeout(()=>ctl.abort(),REQ_TIMEOUT_MS);
@@ -1449,6 +1476,7 @@ async function send(messageOverride,appendUser){
         }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
     const j=await r.json();
+    clearInterval(poll);
     think.remove();
     if(sendSession!==CHAT_SESSION_ID) return; // cleared mid-flight — stale answer
     if(j.scope_required){
@@ -1461,13 +1489,21 @@ async function send(messageOverride,appendUser){
     }
     if(j.scope) setChatScope(j.scope,false);
     (j.tool_calls||[]).forEach(c=>{
-      const step=el('div','step');
-      step.innerHTML='<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
+      // Everything arrives WITH the answer, so the sources render COLLAPSED:
+      // the reply is what the user came for, and each card is one click away
+      // behind a header that already says tool, args, status and duration.
+      const card=document.createElement('details');
+      card.className='tool-card';
+      const summary=document.createElement('summary');
+      summary.innerHTML='<span class="chev">\u25B6</span>'+
+        '<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
         '<span class="args" title="'+esc(JSON.stringify(c.args||{}))+'">'+esc(compactArgs(c.args))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
-      msgs.append(step);
+      card.append(summary);
       const node=renderToolResult(c.tool,c.result,c.args||{});
-      if(node){ const holder=el('div','inline'); holder.append(node); msgs.append(holder); }
+      if(node){ const holder=el('div','inline'); holder.append(node); card.append(holder); }
+      else card.className='tool-card no-body';
+      msgs.append(card);
     });
     if(!r.ok||j.error) msgs.append(el('div','msg err',esc(j.error||j.detail||'Request failed')));
     else if(j.answer){
@@ -1482,6 +1518,7 @@ async function send(messageOverride,appendUser){
       msgs.append(b);
     }
   }catch(e){
+    clearInterval(poll);
     think.remove();
     const m2=e.name==='AbortError'
       ? 'Timed out after '+(REQ_TIMEOUT_MS/1000)+'s. The tool call is still running against the '+

@@ -286,7 +286,8 @@ def _evidence_nudge(intent: str, db_ok: bool, relevant_financial_db_ok: bool,
 async def agent_turn(provider: LLMProvider, session: ClientSession,
                      user_text: str, qlog=None, surface: str = "terminal",
                      scope: dict | None = None,
-                     tool_observer: Callable | None = None) -> str:
+                     tool_observer: Callable | None = None,
+                     tool_started: Callable | None = None) -> str:
     """Run one model turn with deterministic source ordering.
 
     ``scope`` is an optional, user-validated request scope. Concrete values are
@@ -457,6 +458,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             arg_preview = _compact_args(effective_args)
             marker = "⊘" if blocked else "⚙"
             print(f"{DIM}  {marker} {call.name}({arg_preview}){RESET}")
+            if tool_started is not None:
+                # Fires when the call is DISPATCHED, not when it returns —
+                # the difference between a UI that says "working…" and one
+                # that says "running get_trial_balance, 40s so far".
+                try:
+                    tool_started(call.name, arg_preview, bool(blocked))
+                except Exception:
+                    pass
 
             started = time.perf_counter()
             out = (
