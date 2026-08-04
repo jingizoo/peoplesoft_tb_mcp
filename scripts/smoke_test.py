@@ -1195,9 +1195,12 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     # Read the file rather than importing it: pstb.client.chat pulls in the
     # mcp package, and this suite must run on the system interpreter with no
     # virtualenv (that is how it verifies a box before install).
+    _chat_src = (ROOT / "pstb" / "client" / "chat.py").read_text(
+        encoding="utf-8")
     check("the guard is wired into the turn, not just available",
-          "ungrounded_figures(answer, turn_payloads)" in
-          (ROOT / "pstb" / "client" / "chat.py").read_text(encoding="utf-8"))
+          "invented = ungrounded_figures(" in _chat_src)
+    check("the guard grounds against prior turns, not just this one",
+          "list(turn_payloads) + list(prior_payloads or [])" in _chat_src)
 
     print("== build identity ==")
     from pstb.version import build_info as _bi, label as _bl, source_fingerprint

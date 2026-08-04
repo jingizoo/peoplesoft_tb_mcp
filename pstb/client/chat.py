@@ -287,7 +287,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      user_text: str, qlog=None, surface: str = "terminal",
                      scope: dict | None = None,
                      tool_observer: Callable | None = None,
-                     tool_started: Callable | None = None) -> str:
+                     tool_started: Callable | None = None,
+                     prior_payloads: list | None = None) -> str:
     """Run one model turn with deterministic source ordering.
 
     ``scope`` is an optional, user-validated request scope. Concrete values are
@@ -599,7 +600,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # this exact product ($1,234,567.89 alongside balanced=true), so this is
     # the difference between "told not to" and "cannot".
     if not gate_replaced_answer and turn_payloads:
-        invented = ungrounded_figures(answer, turn_payloads)
+        # Ground against RECENT turns too. A follow-up legitimately restates
+        # a figure the conversation already fetched — the model can see that
+        # prior tool result in its own history — and withholding
+        # 21,334,221.84 as "invented" because it came from the PREVIOUS
+        # turn taught a user that nothing works. Prior payloads ground
+        # figures only; they never satisfy this turn's evidence gates.
+        invented = ungrounded_figures(
+            answer, list(turn_payloads) + list(prior_payloads or []))
         if invented:
             answer = (
                 "I withheld that answer: it stated "
