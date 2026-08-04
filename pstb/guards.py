@@ -395,8 +395,29 @@ def _same_scope_value(field: str, left, right) -> bool:
         return False
 
 
+_ALL_BU_RE = re.compile(
+    r"(?i)\b(?:across|over|for|in|from)\s+all\s+(?:the\s+)?"
+    r"(?:bus?|business\s*units?|units?|companies)\b|"
+    r"\ball\s+business\s*units?\b|\bevery\s+(?:bu|business\s*unit)\b|"
+    r"\b(?:company|enterprise|organi[sz]ation)-?\s?wide\b")
+
+
+def wants_all_business_units(question: str) -> bool:
+    """The question itself asks to cross business units.
+
+    The selected scope pins one BU so an answer can never silently mix
+    units. But "across all business units" IS the user changing that scope,
+    in words, for one question — and refusing it turned an explicit request
+    into a per-unit crawl that ran out of model rounds before it ran out of
+    units. Detection is textual and conservative: only phrasings that name
+    the crossing unlock it.
+    """
+    return bool(_ALL_BU_RE.search(question or ""))
+
+
 def apply_request_scope(tool_name: str, args: Mapping | None,
-                        request_scope: Mapping | None) -> dict:
+                        request_scope: Mapping | None,
+                        allow_bu_override: bool = False) -> dict:
     """Return tool arguments with the validated request scope enforced.
 
     Empty model arguments are treated as omissions and receive the request
@@ -429,6 +450,13 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
                 # and refusing it made the selected period a cage: no other
                 # period or year could be asked about without changing the
                 # scope first. The model's explicit value wins.
+                continue
+            if field == "business_unit" and allow_bu_override:
+                # The user's own words crossed the units ("across all
+                # business units"), so the chip's BU is their default, not
+                # their answer. The model's explicit value — another unit,
+                # or "ALL" — is honoured for this turn only; absent that
+                # phrasing the conflict below still refuses.
                 continue
             raise ScopeConflict(
                 f"{tool_name}.{tool_arg}={current!r} conflicts with the "

@@ -28,6 +28,7 @@ from ..guards import (
     ScopeConflict,
     apply_request_scope,
     evidence_intent,
+    wants_all_business_units,
     financial_tool_domains,
     is_policy_tool,
     normalize_request_scope,
@@ -223,6 +224,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     """
     request_scope = normalize_request_scope(scope)
     intent = evidence_intent(user_text)
+    bu_override = wants_all_business_units(user_text)
     required_financial_domains = question_financial_domains(user_text)
     financial_fact_required = (
         intent == "data" and bool(required_financial_domains)
@@ -344,7 +346,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             if not blocked:
                 try:
                     effective_args = apply_request_scope(
-                        call.name, effective_args, request_scope
+                        call.name, effective_args, request_scope,
+                        allow_bu_override=bu_override,
                     )
                 except ScopeConflict as e:
                     blocked = f"REQUEST_SCOPE_CONFLICT: {e}"

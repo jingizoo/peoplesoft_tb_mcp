@@ -651,16 +651,34 @@ class ARBilling:
 
     def top_billing_customers(self, business_unit: str = "", n: int = 10,
                               months: int = 12, as_of_date: str = "",
-                              display_currency: str = "") -> dict:
+                              display_currency: str = "",
+                              active_within_months: int = 0) -> dict:
         """Top customers by FINALIZED billing (BILL_STATUS='INV') over a
         trailing window. Groups by customer AND currency — mixed currencies are
-        never silently summed; pass display_currency to convert server-side."""
-        bu = self._bu(business_unit)
+        never silently summed; pass display_currency to convert server-side.
+
+        business_unit="ALL" ranks across EVERY business unit in one query.
+        "Top 20 customers across all BUs still buying" is one question to an
+        accountant and used to be five to this system — a per-BU loop over
+        separate model rounds that ran out of turns before it ran out of BUs.
+        The whole chain now runs here: one grouped query, per-BU currency
+        normalization, one ranking.
+
+        active_within_months=N keeps only customers with an invoice in the
+        last N months — the mechanical meaning of "still buying". Every row
+        carries last_invoice_dt so the claim is grounded, not inferred.
+        """
+        bu_all = str(business_unit or "").strip().upper() in {"ALL", "*"}
+        bu = "ALL" if bu_all else self._bu(business_unit)
         asof = self._asof(as_of_date)
         since = (_iso(asof) - dt.timedelta(days=max(int(months or 12), 1) * 30)
                  ).isoformat()
+        active_since = ""
+        if int(active_within_months or 0) > 0:
+            active_since = (_iso(asof) - dt.timedelta(
+                days=int(active_within_months) * 30)).isoformat()
         p = self.db.prefix
-        setid = self.e.resolve_setid(bu, "CUSTOMER")
+        setid = None if bu_all else self.e.resolve_setid(bu, "CUSTOMER")
         bi = self._cols("PS_BI_HDR")
         record_notes: list[str] = []
         if bi:
@@ -684,28 +702,69 @@ class ARBilling:
         tb_name = f"C.{_cs['name']} AS name" if _cs["name"] else "NULL AS name"
         tb_group = f", C.{_cs['name']}" if _cs["name"] else ""
         record_notes.extend(n for n in _cs["notes"] if n not in record_notes)
-        rows, _ = self.db.query(
-            f"""SELECT H.BILL_TO_CUST_ID AS cust_id, {tb_name},
+        having = (f" HAVING MAX(H.INVOICE_DT) >= {self.db.date_bind('active_since')}"
+                  if active_since else "")
+        params: dict = {"bu": bu, "setid": setid, "since": since,
+                        "active_since": active_since}
+        if bu_all:
+            # Across BUs the setid-scoped name join no longer applies (each
+            # BU may resolve a different customer setid), so names attach
+            # from a deduplicated one-row-per-customer subquery instead of a
+            # keyed join — a customer defined under two setids must not rank
+            # twice. BUSINESS_UNIT stays in the group so a blank invoice
+            # currency can be normalized to THAT unit's base, not the
+            # scoped one.
+            name_col = (f"MAX(N.{_cs['name']})" if _cs["name"] else "NULL")
+            rows, _ = self.db.query(
+                f"""SELECT H.BILL_TO_CUST_ID AS cust_id,
+       {name_col} AS name,
+       H.BUSINESS_UNIT AS bu, {cur_sel}, COUNT(*) AS invoices,
+       SUM(H.INVOICE_AMOUNT) AS billed,
+       MAX(H.INVOICE_DT) AS last_invoice
+  FROM {p}PS_BI_HDR H
+  LEFT JOIN (SELECT CUST_ID{', ' + _cs['name'] if _cs['name'] else ''}
+               FROM {p}PS_CUSTOMER GROUP BY CUST_ID{
+                   ', ' + _cs['name'] if _cs['name'] else ''}) N
+    ON N.CUST_ID = H.BILL_TO_CUST_ID
+ WHERE H.BILL_STATUS = 'INV'
+   AND H.INVOICE_DT >= {self.db.date_bind('since')}
+ GROUP BY H.BILL_TO_CUST_ID, H.BUSINESS_UNIT{group_cur}{having}""",
+                params, max_rows=50_000,
+            )
+        else:
+            rows, _ = self.db.query(
+                f"""SELECT H.BILL_TO_CUST_ID AS cust_id, {tb_name},
+       H.BUSINESS_UNIT AS bu,
        {cur_sel}, COUNT(*) AS invoices,
-       SUM(H.INVOICE_AMOUNT) AS billed
+       SUM(H.INVOICE_AMOUNT) AS billed,
+       MAX(H.INVOICE_DT) AS last_invoice
   FROM {p}PS_BI_HDR H
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
  WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
- GROUP BY H.BILL_TO_CUST_ID{tb_group}{group_cur}""",
-            {"bu": bu, "setid": setid, "since": since}, max_rows=10_000,
-        )
-        base = self.e.base_currency_for(bu) or "USD"
+ GROUP BY H.BILL_TO_CUST_ID{tb_group}, H.BUSINESS_UNIT{group_cur}{having}""",
+                params, max_rows=10_000,
+            )
+        base_by_bu: dict = {}
+        for r in rows:
+            row_bu = str(r.get("bu") or "")
+            if row_bu not in base_by_bu:
+                base_by_bu[row_bu] = (self.e.base_currency_for(row_bu)
+                                      or "USD")
+        base = (base_by_bu.get(bu) or "USD") if not bu_all else "USD"
         # A blank BI_CURRENCY_CD means the invoice is in the BU base currency
         # — normalize it so mixed-currency detection and conversion see it.
-        currencies = sorted({(r["currency"] or "").upper() or base for r in rows})
+        currencies = sorted({(r["currency"] or "").upper()
+                             or base_by_bu.get(str(r.get("bu") or ""), base)
+                             for r in rows})
         disp = (display_currency or "").strip().upper()
         mixed = len(currencies) > 1
         fx_notes = []
         by_cust: dict[str, dict] = {}
         for r in rows:
             amt = float(r["billed"] or 0)
-            cur = (r["currency"] or "").upper() or base
+            cur = ((r["currency"] or "").upper()
+                   or base_by_bu.get(str(r.get("bu") or ""), base))
             if disp and cur != disp:
                 fx = self.e.exchange_rate(cur, disp, as_of_date=asof)
                 amt = amt * fx["rate"]
@@ -715,10 +774,16 @@ class ARBilling:
             c = by_cust.setdefault(r["cust_id"], {
                 "cust_id": r["cust_id"], "name": r.get("name"),
                 "invoices": 0, "billed": 0.0, "currencies": set(),
+                "business_units": set(), "last_invoice": "",
             })
             c["invoices"] += int(r["invoices"] or 0)
             c["billed"] += amt
             c["currencies"].add(disp or cur)
+            if r.get("bu"):
+                c["business_units"].add(str(r["bu"]))
+            last = str(r.get("last_invoice") or "")
+            if last > c["last_invoice"]:
+                c["last_invoice"] = last
         if mixed and not disp:
             return {
                 "business_unit": bu, "window_months": int(months or 12),
@@ -741,12 +806,16 @@ class ARBilling:
         total = sum(c["billed"] for c in ranked) or 1.0
         top = []
         for c in ranked[: max(int(n or 10), 1)]:
-            top.append({
+            entry = {
                 "cust_id": c["cust_id"], "name": c["name"],
                 "invoices": c["invoices"], "billed": r2(c["billed"]),
                 "share_pct": r2(c["billed"] / total * 100),
                 "currency": disp or (currencies[0] if currencies else ""),
-            })
+                "last_invoice_dt": c["last_invoice"] or None,
+            }
+            if bu_all:
+                entry["business_units"] = sorted(c["business_units"])
+            top.append(entry)
         out = {
             "business_unit": bu, "window_months": int(months or 12),
             "since": since, "as_of": asof,
@@ -758,6 +827,18 @@ class ARBilling:
                      "This is BILLING volume, not open AR — see get_ar_aging "
                      "for what is owed."),
         }
+        if bu_all:
+            out["scope"] = ("ALL business units — cross-unit ranking was "
+                            "requested in the question; each customer row "
+                            "lists the units it billed under")
+        if active_since:
+            out["active_within_months"] = int(active_within_months)
+            out["active_since"] = active_since
+            out["activity_note"] = (
+                f"only customers with a finalized invoice on or after "
+                f"{active_since} are included — that is the operational "
+                "meaning of 'still buying' here; each row's "
+                "last_invoice_dt is the evidence")
         if fx_notes:
             out["fx_applied"] = fx_notes
             out["fx_note"] = ("Converted server-side at effective-dated "

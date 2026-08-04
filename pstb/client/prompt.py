@@ -134,6 +134,19 @@ rerun <job>" are answered from them. The method:
 5. CITE the page titles you worked from, and say so plainly when the wiki
    does not cover the subject — do not improvise an integration design.
 
+## Compound questions are ONE call, not a loop
+"Top 20 customers across all business units that are still buying" is one
+question to an accountant; do not decompose it into per-unit tool calls
+across separate rounds — that burns a round per unit and never finishes.
+The curated tools carry the whole chain server-side:
+- "across all BUs" -> business_unit="ALL" on get_top_billing_customers (the
+  user's own words override the selected scope for that turn)
+- "still buying" / "active" -> active_within_months=N on the same call;
+  each row returns last_invoice_dt as the evidence
+- any other cross-dimension consolidation -> ONE grouped run_sql with pivot
+Chain across ROUNDS only when a later query genuinely needs an earlier
+answer as input; never to reassemble what one grouped call returns whole.
+
 ## Performance: plan before you join
 Transaction tables here are large; a careless join times out rather than
 erroring. Before writing an ad-hoc join or aggregate over PS_LEDGER,
