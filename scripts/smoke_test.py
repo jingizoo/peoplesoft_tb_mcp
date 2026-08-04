@@ -1278,6 +1278,13 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("scope bar does not echo the unit code as its own name",
           _rejs.search(r"name\s*===\s*bu", _clean) is not None,
           "the descr-equals-code guard is gone")
+    check("tool result cards are collapsible and start collapsed",
+          "details" in _script and "tool-card" in _script
+          and "renderToolResult(c.tool,c.result" in _script,
+          "the collapsible card rendering is gone from the chat script")
+    check("the page polls live activity while a turn runs",
+          "/api/activity" in _script and "clearInterval(poll)" in _script,
+          "the activity poller is gone — Working… is a mute spinner again")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
