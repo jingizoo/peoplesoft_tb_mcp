@@ -516,11 +516,24 @@ function renderScopeChooser(options,onChoose,title){
     use.onclick=async()=>{
       let chosen=o;
       if(!Number(o.fiscal_year||0)||!Number(o.period||0)){
-        use.disabled=true;use.textContent='Loading…';
+        // Selecting a scope must be INSTANT. The latest-posted lookup is a
+        // MIN/MAX aggregate over the balance table — the slow query class on
+        // a real instance — and blocking the click on it turned "Use this
+        // scope" into minutes of waiting and a Retry button. BU+ledger are
+        // the only hard fields: set the scope NOW as "any year · any
+        // period" (fully functional — every tool resolves the current
+        // period itself) and let the detail arrive in the background,
+        // updating the chip if it ever lands, silently not if it cannot.
+        chosen={...o,fiscal_year:null,period:null};
+        api('/api/scope?'+qs({business_unit:o.business_unit,
+                              ledger:o.ledger}))
+          .then(latest=>{if(latest&&Number(latest.fiscal_year||0))
+            setChatScope({...o,...latest},false);})
+          .catch(()=>{});
+      }
+      if(false){
         try{
-          const latest=await api('/api/scope?'+qs({
-            business_unit:o.business_unit,ledger:o.ledger
-          }));
+          const latest=null;
           chosen={...o,...latest};
         }catch(e){
           use.disabled=false;use.textContent='Retry';
