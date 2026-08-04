@@ -175,6 +175,78 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
     return _truncate_json(text, MAX_TOOL_RESULT_CHARS)
 
 
+class ResultRefError(RuntimeError):
+    pass
+
+
+def _resolve_path(payload, path: str) -> list:
+    """Follow a dot path ("accounts", "rows[].account") into a payload and
+    return the scalar values it reaches."""
+    current = [payload]
+    for segment in (path or "").split("."):
+        if not segment:
+            raise ResultRefError(f"empty segment in field path {path!r}")
+        is_list = segment.endswith("[]")
+        key = segment[:-2] if is_list else segment
+        nxt = []
+        for node in current:
+            if isinstance(node, dict) and key in node:
+                value = node[key]
+                if is_list:
+                    if not isinstance(value, list):
+                        raise ResultRefError(
+                            f"{key!r} is not a list in this result")
+                    nxt.extend(value)
+                else:
+                    nxt.append(value)
+        current = nxt
+    out = []
+    for value in current:
+        if isinstance(value, list):
+            out.extend(v for v in value
+                       if isinstance(v, (str, int, float))
+                       and not isinstance(v, bool))
+        elif isinstance(value, (str, int, float)) \
+                and not isinstance(value, bool):
+            out.append(value)
+    return out
+
+
+def resolve_result_refs(args, turn_results: dict):
+    """Replace {"from_result": "rN", "field": "..."} with the actual values.
+
+    This is how a chain hands values from one tool to the next WITHOUT the
+    model retyping them. The model wires references — "the accounts from
+    r2" — and the client substitutes the real list straight out of the
+    stored result, the same way the request scope is injected. Forty
+    accounts arrive as forty accounts, not thirty-nine and a transposition;
+    the number guard protects answers, and this protects arguments.
+    """
+    if isinstance(args, dict):
+        if "from_result" in args:
+            rid = str(args.get("from_result") or "")
+            if rid not in turn_results:
+                have = ", ".join(sorted(turn_results)) or "none yet"
+                raise ResultRefError(
+                    f"result {rid!r} does not exist (available: {have}). "
+                    "Produce the set in one round, then reference it in the "
+                    "NEXT round — results in the same batch have no id yet.")
+            field = str(args.get("field") or "")
+            values = _resolve_path(turn_results[rid], field)
+            if not values:
+                keys = ", ".join(sorted(turn_results[rid])[:12])
+                raise ResultRefError(
+                    f"field {field!r} reached no values in {rid} "
+                    f"(top-level keys: {keys}). Fix the path — e.g. "
+                    "'accounts' or 'rows[].account'.")
+            return values
+        return {k: resolve_result_refs(v, turn_results)
+                for k, v in args.items()}
+    if isinstance(args, list):
+        return [resolve_result_refs(v, turn_results) for v in args]
+    return args
+
+
 def _blocked_result(reason: str, next_step: str) -> str:
     """Provider-neutral function response for a call stopped by a guard."""
     return json.dumps({
@@ -225,6 +297,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     request_scope = normalize_request_scope(scope)
     intent = evidence_intent(user_text)
     bu_override = wants_all_business_units(user_text)
+    turn_results: dict = {}
     required_financial_domains = question_financial_domains(user_text)
     financial_fact_required = (
         intent == "data" and bool(required_financial_domains)
@@ -355,6 +428,15 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                         "Use the request scope exactly, or ask the user to "
                         "change the scope before retrying."
                     )
+            if not blocked:
+                try:
+                    effective_args = resolve_result_refs(
+                        effective_args, turn_results)
+                except ResultRefError as e:
+                    blocked = f"RESULT_REF: {e}"
+                    next_step = (
+                        "Correct the from_result reference and call again."
+                    )
             # RAG relevance is a server-side invariant, not a model preference.
             # The model may paraphrase a nudge as a useless query such as
             # "evidence gate policy"; always retrieve passages for what the
@@ -435,6 +517,18 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                        if not ok else {}),
                 })
                 if ok:
+                    # Successful results get an id (r1, r2, ...) the model
+                    # can REFERENCE in later rounds instead of retyping the
+                    # values — see resolve_result_refs.
+                    try:
+                        parsed = json.loads(out)
+                        if isinstance(parsed, dict):
+                            rid = f"r{len(turn_results) + 1}"
+                            turn_results[rid] = parsed
+                            parsed["result_id"] = rid
+                            out = json.dumps(parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                     turn_payloads.append(out)
                 results_by_index[index] = ToolResult(
                     call_id=call.id, name=call.name, content=out

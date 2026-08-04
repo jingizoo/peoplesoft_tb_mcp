@@ -134,6 +134,20 @@ rerun <job>" are answered from them. The method:
 5. CITE the page titles you worked from, and say so plainly when the wiki
    does not cover the subject — do not improvise an integration design.
 
+## Chaining across modules: produce a set, then REFERENCE it
+Some questions cross tools: "journal activity for every account in tree
+node EXPENSES", "payments to the vendors on our over-budget projects".
+The chain is two rounds, and the values NEVER pass through your hands:
+1. Produce the set (get_tree_node_accounts, get_project_costs, an aging).
+   Every successful result carries a result_id (r1, r2, ...).
+2. Reference it: run_sql with `IN (:accts)` and
+   list_binds={{"accts": {{"from_result": "r1", "field": "accounts"}}}}.
+   The client substitutes the real values from that stored result.
+Never retype a list of accounts/ids from one result into another call —
+a forty-account chain must carry forty accounts, not thirty-nine and a
+typo. For a trial balance by tree node, skip the chain entirely:
+rollup_trial_balance does it in one call.
+
 ## Module fast paths (AP / AM / PC)
 Payables: "what do we owe / overdue / stuck" -> get_open_payables;
 "whom did we pay / top vendors by spend" -> get_vendor_payments.

@@ -2205,7 +2205,8 @@ class TBEngine:
 
     def run_sql(self, sql: str, max_rows: int = 100,
                 business_unit: str = "", policy_binds: Optional[dict] = None,
-                pivot: Optional[dict] = None) -> dict:
+                pivot: Optional[dict] = None,
+                list_binds: Optional[dict] = None) -> dict:
         """Run a guarded SELECT.
 
         policy_binds maps a bind name to a policy figure the wiki defines, e.g.
@@ -2264,6 +2265,49 @@ class TBEngine:
         # model wrote sargable SQL, and it costs nothing because EXPLAIN does
         # not execute. This is what lets allow_raw_sql stay on with
         # confidence against a real ledger.
+        # LIST BINDS: a set produced by an earlier tool (accounts in a tree
+        # node, customers from an aging) arrives here as a named list and is
+        # expanded into `IN (:name_0, :name_1, ...)`. The values were never
+        # retyped by the model — the client resolves them straight out of the
+        # producing result — so a forty-account chain carries forty accounts,
+        # not thirty-nine and a transposition.
+        expanded_lists: dict = {}
+        for lname, values in (list_binds or {}).items():
+            if not re.match(r"^[A-Za-z_]\w*$", str(lname or "")):
+                raise EngineError(f"{lname!r} is not a usable list bind name")
+            if isinstance(values, dict):
+                values = values.get("values")
+            if not isinstance(values, (list, tuple)):
+                raise EngineError(
+                    f"list_binds[{lname!r}] must be a list of values (or a "
+                    "from_result reference the client resolves before the "
+                    "call reaches the server)")
+            vals = [v for v in values if v is not None]
+            if not vals:
+                raise EngineError(
+                    f"list_binds[{lname!r}] resolved to NO values — the "
+                    "producing step found nothing, so this query would "
+                    "return an unfiltered or empty result that reads as an "
+                    "answer. Report the empty upstream result instead.")
+            if len(vals) > 1000:
+                raise EngineError(
+                    f"list_binds[{lname!r}] carries {len(vals)} values; 1000 "
+                    "is the limit (Oracle's IN-list ceiling). Aggregate with "
+                    "a broader filter instead of enumerating.")
+            pattern = re.compile(rf"(?<![:\w]):{re.escape(str(lname))}\b")
+            if not pattern.search(scrubbed):
+                raise EngineError(
+                    f"The SQL does not reference :{lname}, so the "
+                    "chained set would not be applied. Write "
+                    f"`IN (:{lname})` where the filter belongs.")
+            names = []
+            for i, v in enumerate(vals):
+                expanded_lists[f"{lname}_{i}"] = v
+                names.append(f":{lname}_{i}")
+            replacement = ", ".join(names)
+            s = pattern.sub(replacement, s)
+            scrubbed = self._scrub_sql(s)
+
         binds, provenance, refusals = self._policy_binds(policy_binds)
         if refusals:
             raise EngineError(
@@ -2286,7 +2330,8 @@ class TBEngine:
 
         plan_note = self._cost_gate(s, scrubbed)
         cap = min(max(int(max_rows or 100), 1), 500)
-        rows, truncated = self.db.query(s, binds, max_rows=cap)
+        rows, truncated = self.db.query(s, {**binds, **expanded_lists},
+                                        max_rows=cap)
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}
         if pivot:
