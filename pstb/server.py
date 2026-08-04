@@ -266,15 +266,27 @@ def get_top_billing_customers(
     months: int = 12,
     as_of_date: str = "",
     display_currency: str = "",
+    active_within_months: int = 0,
 ) -> dict:
     """Top customers by FINALIZED billing volume (PS_BI_HDR, status INV) over a
     trailing window, with invoice counts and share of total. Use for "top N
     billing customers / who do we bill the most". Mixed currencies are never
     summed — pass display_currency to rank on converted totals (rates applied
-    server-side). This is billing volume; open balances are get_ar_aging."""
+    server-side). This is billing volume; open balances are get_ar_aging.
+    business_unit="ALL" ranks across EVERY business unit in ONE call — use it
+    whenever the user says "across all BUs / company-wide"; NEVER loop this
+    tool per business unit, that burns a model round per unit and never
+    finishes. Cross-BU rankings should pass display_currency, since units
+    bill in different currencies.
+    active_within_months=N keeps only customers with an invoice in the last
+    N months — the tool-level meaning of "still buying / active customers"
+    (each row carries last_invoice_dt as evidence). A compound ask like
+    "top 20 customers across all BUs still buying" is exactly ONE call:
+    business_unit="ALL", n=20, active_within_months=3."""
     return _safe(
         ar.top_billing_customers, business_unit=business_unit, n=n,
         months=months, as_of_date=as_of_date, display_currency=display_currency,
+        active_within_months=active_within_months,
     )
 
 
