@@ -623,3 +623,28 @@ class TechnicalRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls, [],
                          "the figure protection was lost: a data question "
                          "reached the wiki")
+
+
+class ScaledRestatementTests(unittest.TestCase):
+    """"$4.55M" for a payload 4,548,123.45 is the same fact at a coarser
+    unit. The guard withheld a correct AR aging answer over exactly this,
+    telling the user to ask again — a false positive that reads as total
+    breakage. Scaled restatements are grounded; inventions still are not."""
+
+    PAYLOAD = ['{"buckets": [{"amount": 4548123.45}], "total": 908846.06}']
+
+    def test_million_restatements_are_grounded(self):
+        from pstb.guards import ungrounded_figures
+
+        for answer in ("Over-90 receivables stand at 4.55 million.",
+                       "Roughly 4.5M is past due.",
+                       "Total open AR is about 0.9M."):
+            self.assertEqual(ungrounded_figures(answer, self.PAYLOAD), [],
+                             answer)
+
+    def test_an_invented_figure_is_still_withheld(self):
+        from pstb.guards import ungrounded_figures
+
+        self.assertEqual(
+            ungrounded_figures("Receivables are 7.77 million.", self.PAYLOAD),
+            ["7.77"])

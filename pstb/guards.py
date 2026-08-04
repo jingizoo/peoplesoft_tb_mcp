@@ -579,6 +579,21 @@ def payload_numbers(payloads) -> set:
                     found.add(_numeric_key(match))
         else:
             walk(raw)
+    # Ground unit-scaled RESTATEMENTS of payload figures. "$4.55M" for a
+    # payload 4,548,123.45 is the same fact at a coarser unit, not an
+    # invented number — and withholding a correct aging answer over it
+    # taught the user that nothing works. For every payload figure large
+    # enough to restate, the thousand/million/billion forms at one and two
+    # decimals are grounded too.
+    for key in list(found):
+        try:
+            value = float(key)
+        except ValueError:
+            continue
+        for divisor in (1e3, 1e6, 1e9):
+            if abs(value) >= divisor:
+                for digits in (0, 1, 2):
+                    found.add(_numeric_key(str(round(value / divisor, digits))))
     return found
 
 
