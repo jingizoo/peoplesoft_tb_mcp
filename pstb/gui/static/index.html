@@ -240,6 +240,18 @@ const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElemen
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[];
+let SCOPE_YEARS_STALE=false;
+function lazyLoadScopeYears(){
+  if(!SCOPE_YEARS_STALE||!CHAT_SCOPE) return;
+  SCOPE_YEARS_STALE=false;
+  api('/api/scope?'+qs({business_unit:CHAT_SCOPE.business_unit,
+    ledger:CHAT_SCOPE.ledger}))
+    .then(d=>{if(d&&d.fiscal_years&&d.fiscal_years.length){
+      SCOPE_YEARS=d.fiscal_years;
+      if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
+    }})
+    .catch(()=>{SCOPE_YEARS_STALE=true;});
+}
 let BU_NAMES={};
 let PENDING_TIME={}, SYNC_TIME_SELECTS=null;
 let SCOPE_DISCOVERING=false, SCOPE_LOAD_ERROR='';
@@ -421,16 +433,11 @@ function setChatScope(value,announce){
   const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
   CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
   if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
-  // Refresh the selectable fiscal years for this BU/ledger in the background;
-  // the editor uses them next time it opens.
-  api('/api/scope?'+qs({business_unit:next.business_unit,ledger:next.ledger}))
-    .then(d=>{if(d&&d.fiscal_years&&d.fiscal_years.length){
-      SCOPE_YEARS=d.fiscal_years;
-      // Repopulate: the selects were built before this landed, so
-      // without this the year list offers only the latest year.
-      if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
-    }})
-    .catch(()=>{});
+  // The fiscal-year list costs MIN/MAX aggregates over PS_LEDGER — heavy on
+  // a real instance — and at page load nobody has opened the year picker
+  // yet. Fetch it LAZILY on first interaction with the selects instead of
+  // eagerly on every scope set: page load issues zero PS_LEDGER aggregates.
+  SCOPE_YEARS_STALE=true;
   if(announce&&changed&&$('#msgs')){
     $('#msgs').append(el('div','msg bot',
       '<div class="who">New database context</div>'+esc(scopeLabel(next))+
@@ -438,6 +445,11 @@ function setChatScope(value,announce){
     $('#msgs').scrollTop=$('#msgs').scrollHeight;
   }
 }
+document.addEventListener('focusin',e=>{
+  if(e.target&&(e.target.id==='f-fy'||e.target.id==='f-per'||
+     e.target.id==='scope-fy'||e.target.id==='scope-per'))
+    lazyLoadScopeYears();
+});
 function scopeYearOptions(){
   const found=(SCOPE_YEARS||[]).slice();
   (META.financial_scopes||[]).forEach(s=>(s.ledgers||[]).forEach(l=>
