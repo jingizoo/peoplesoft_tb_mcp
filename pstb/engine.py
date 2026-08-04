@@ -182,7 +182,8 @@ class TBEngine:
                 kept.extend(chunk)      # cannot prove empty — keep them
         return kept or pairs
 
-    def _ledger_scope_pairs(self) -> tuple[list[tuple[str, str]], bool]:
+    def _ledger_scope_pairs(self, verify: bool = True
+                            ) -> tuple[list[tuple[str, str]], bool]:
         """Accessible BU/ledger pairs, from SETUP tables wherever possible.
 
         Order matters for a real instance: setup tables are small and indexed;
@@ -206,6 +207,8 @@ class TBEngine:
             pairs, truncated = _collect(q.scope_setup_pairs(self.db),
                                         SCOPE_ROW_CAP)
             if pairs:
+                if not verify:
+                    return pairs, truncated
                 return self._with_ledger_data(pairs), truncated
         except DbError:
             pass  # setup records not granted at this site — try the next source
@@ -1521,7 +1524,8 @@ class TBEngine:
             })
         return {"business_units": rows, "truncated": truncated}
 
-    def list_financial_scopes(self, include_activity: bool = True) -> dict:
+    def list_financial_scopes(self, include_activity: bool = True,
+                              verify_pairs: bool = True) -> dict:
         """Business units with base currency, their ledgers, and the fiscal
         years/periods that hold data — in one deterministic catalog response.
 
@@ -1536,7 +1540,16 @@ class TBEngine:
         it does not probe every scope's history. Set ``include_activity`` only
         when fiscal-year ranges and latest periods are actually required.
         """
-        pairs, truncated = self._ledger_scope_pairs()
+        # verify_pairs=False skips the ledger existence probes — the ONE
+        # stage of discovery that can be slow on a real instance (batched
+        # DISTINCTs over the balance table, each able to consume the full
+        # query timeout when the optimizer picks a bad plan). The setup reads
+        # that remain are hundreds of rows on any installation, so an
+        # unverified catalog builds in milliseconds ANYWHERE. The cost is
+        # honest and small: a unit that exists in setup but has never been
+        # posted to may be offered, and choosing it reports "no ledger data
+        # in scope" — an answer, not a failure.
+        pairs, truncated = self._ledger_scope_pairs(verify=verify_pairs)
         enriched = self._business_unit_enrichment()
         scopes: dict[str, dict] = {}
         for bu, ledger in pairs:

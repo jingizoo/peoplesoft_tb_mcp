@@ -292,14 +292,40 @@ def _financial_scope_catalog(force: bool = False) -> dict:
                 _scope_cache["refreshing"] = True
                 _refresh_scope_catalog_async()
             return value
-    # First-ever load, or an explicit refresh: build synchronously.
-    built = engine.list_financial_scopes(include_activity=False)
+    # First-ever load: build the UNVERIFIED catalog — setup reads only,
+    # milliseconds on any installation — because this is the one synchronous
+    # build left, and if it could time out, the retry button would repeat
+    # the same doomed build forever with nothing ever cached to serve stale.
+    # The verified catalog (ledger existence probes and all) is what the
+    # background refresh builds and replaces this with. An explicit
+    # force=True refresh still builds verified synchronously: that user
+    # asked to wait for truth.
+    if force:
+        built = engine.list_financial_scopes(include_activity=False)
+    else:
+        built = engine.list_financial_scopes(include_activity=False,
+                                             verify_pairs=False)
+        built["verified"] = False
+        built["note"] = ((built.get("note") or "") +
+                         " Scope pairs not yet verified against ledger "
+                         "data; a background refresh is confirming them."
+                         ).strip()
     with _scope_cache_lock:
+        already_refreshing = _scope_cache["refreshing"]
         _scope_cache.update(
-            {"value": built, "expires": time.monotonic() + _SCOPE_CACHE_SECONDS,
-             "refreshing": False}
+            {"value": built,
+             # An unverified catalog is immediately stale on purpose, so the
+             # next request triggers the verified background refresh.
+             "expires": (time.monotonic() + _SCOPE_CACHE_SECONDS if force
+                         else 0.0),
+             "refreshing": already_refreshing}
         )
     _persist_scope_catalog(built)
+    if not force:
+        with _scope_cache_lock:
+            if not _scope_cache["refreshing"]:
+                _scope_cache["refreshing"] = True
+                _refresh_scope_catalog_async()
     return built
 
 

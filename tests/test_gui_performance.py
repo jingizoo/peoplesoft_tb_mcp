@@ -174,6 +174,16 @@ class StaleWhileRevalidateTests(unittest.TestCase):
     first request of the day is not a rebuild.
     """
 
+    def _drain(self, seconds: float = 4.0) -> None:
+        """Wait out any in-flight background refresh so state cannot bleed
+        between tests sharing the module-level cache."""
+        deadline = self.time.monotonic() + seconds
+        while self.time.monotonic() < deadline:
+            with self.gapp._scope_cache_lock:
+                if not self.gapp._scope_cache["refreshing"]:
+                    return
+            self.time.sleep(0.05)
+
     def setUp(self) -> None:
         import time as _t
 
@@ -185,13 +195,16 @@ class StaleWhileRevalidateTests(unittest.TestCase):
         self.time = _t
         self.client = TestClient(gapp.app)
         self.original = gapp.engine.list_financial_scopes
-        # Ensure a real value exists, then expire it.
+        # A deterministic base: force builds the VERIFIED catalog
+        # synchronously and spawns no background thread.
         gapp._scope_cache.update({"value": None, "expires": 0.0,
                                   "refreshing": False})
-        self.client.get("/api/scopes")
+        self.client.get("/api/scopes", params={"force": "true"})
+        self._drain()
 
     def tearDown(self) -> None:
         self.gapp.engine.list_financial_scopes = self.original
+        self._drain()
 
     def test_a_stale_catalog_is_served_without_waiting(self) -> None:
         gapp, _t = self.gapp, self.time
@@ -234,7 +247,7 @@ class StaleWhileRevalidateTests(unittest.TestCase):
         gapp._scope_cache.update({"expires": 0.0, "refreshing": False})
         for _ in range(5):
             self.client.get("/api/scopes")
-        _t.sleep(1.2)
+        self._drain()
         self.assertEqual(calls["n"], 1,
                          "every stale request spawned its own rebuild — "
                          "a thundering herd against the real database")
@@ -254,3 +267,75 @@ class StaleWhileRevalidateTests(unittest.TestCase):
         gapp._scope_cache["expires"] = 0.0
         meta = self.client.get("/api/meta").json()
         self.assertTrue(meta.get("scopes_ready"))
+
+
+class FirstBuildCannotTimeOutTests(unittest.TestCase):
+    """#57's stale-serving needs one successful build to EVER exist. On an
+    instance whose ledger existence probes reliably time out, the first
+    synchronous build died, the UI offered retry, and retry repeated the
+    same doomed build — no convergence, ever. The first build therefore
+    skips the probes (setup reads only, milliseconds anywhere) and the
+    verified catalog arrives via the background refresh when it can."""
+
+    def setUp(self) -> None:
+        import time as _t
+
+        from fastapi.testclient import TestClient
+
+        from pstb.gui import app as gapp
+
+        self.gapp = gapp
+        self.time = _t
+        self.client = TestClient(gapp.app)
+        self.orig_probe = gapp.engine._with_ledger_data
+
+    def tearDown(self) -> None:
+        self.gapp.engine._with_ledger_data = self.orig_probe
+        deadline = self.time.monotonic() + 4.0
+        while self.time.monotonic() < deadline:
+            with self.gapp._scope_cache_lock:
+                if not self.gapp._scope_cache["refreshing"]:
+                    break
+            self.time.sleep(0.05)
+
+    def test_verify_false_issues_zero_probes(self) -> None:
+        gapp = self.gapp
+        calls = {"n": 0}
+        gapp.engine._with_ledger_data = (
+            lambda pairs, *a, **k: (calls.__setitem__("n", calls["n"] + 1)
+                                    or self.orig_probe(pairs)))
+        out = gapp.engine.list_financial_scopes(include_activity=False,
+                                                verify_pairs=False)
+        self.assertEqual(calls["n"], 0)
+        self.assertTrue(out.get("scopes"))
+
+    def test_first_build_survives_probes_that_always_die(self) -> None:
+        gapp, _t = self.gapp, self.time
+
+        def doomed(pairs):
+            _t.sleep(0.6)
+            raise RuntimeError("probe timeout")
+
+        gapp.engine._with_ledger_data = doomed
+        gapp._scope_cache.update({"value": None, "expires": 0.0,
+                                  "refreshing": False})
+        t0 = _t.monotonic()
+        out = self.client.get("/api/scopes").json()
+        waited = _t.monotonic() - t0
+        self.assertTrue(out.get("ready") and out.get("scopes"),
+                        "no catalog on the doomed box — retry would loop "
+                        "forever")
+        self.assertLess(waited, 0.5,
+                        f"first build waited {waited:.2f}s on the probes")
+
+
+    def test_the_unverified_catalog_says_so(self) -> None:
+        gapp = self.gapp
+        gapp._scope_cache.update({"value": None, "expires": 0.0,
+                                  "refreshing": True})   # suppress refresh
+        self.client.get("/api/scopes")
+        with gapp._scope_cache_lock:
+            value = gapp._scope_cache["value"]
+            gapp._scope_cache["refreshing"] = False
+        self.assertIs(value.get("verified"), False)
+        self.assertIn("not yet verified", value.get("note", ""))
