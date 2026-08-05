@@ -1648,6 +1648,20 @@ function renderQlogReport(r){
   }
   return c;
 }
+function renderDiagConnectors(cx){
+  const c=el('div','card');
+  c.append(el('h2',null,'External sources <span class="sub">connector health; fixtures = sample mode, not live</span>'));
+  if(!cx||cx.error||!(cx.sources||[]).length){ c.append(el('div','pad',esc((cx&&cx.error)||'no connectors configured'))); return c; }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Source</th><th>Mode</th><th class="num">Latency</th><th></th></tr></thead><tbody>'+
+    cx.sources.map(s2=>'<tr><td><b>'+esc(s2.source)+'</b></td>'+
+      '<td>'+esc(s2.mode||'')+(s2.note?' <span class="sub">'+esc(s2.note)+'</span>':'')+'</td>'+
+      '<td class="num">'+(s2.latency_ms!==undefined?s2.latency_ms+' ms':'')+'</td>'+
+      '<td>'+(s2.ok?'<span class="badge ok">reachable</span>':'<span class="badge bad" title="'+esc(s2.problem||'')+'">down</span>')+'</td></tr>').join('')+
+    '</tbody>';
+  c.append(t);
+  return c;
+}
 function renderDiag(d,holder){
   holder.innerHTML='';
   if(d.problems&&d.problems.length){
@@ -1658,6 +1672,7 @@ function renderDiag(d,holder){
   }
   holder.append(renderDiagStats(d.stats));
   holder.append(renderDiagIndexes(d.indexes));
+  if(d.connectors) holder.append(renderDiagConnectors(d.connectors));
   if(d.timings) holder.append(renderDiagTimings(d.timings));
   if(d.dba_summary){
     const c=el('div','card');

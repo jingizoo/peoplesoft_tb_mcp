@@ -735,8 +735,10 @@ def diagnostics(include_timings: int = 0):
     a slow instance — the GUI keeps it behind its own explicit button.
     """
     from pstb import diagnostics as _diag
+    from pstb.connectors import coupa as _coupa_mod
     return _guard(_diag.run, db=engine.db, engine=engine,
-                  include_timings=bool(include_timings))
+                  include_timings=bool(include_timings),
+                  connectors=[_coupa_mod.from_env()])
 
 
 @app.get("/api/question-report")
