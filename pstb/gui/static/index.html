@@ -140,6 +140,15 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .tool-card>summary .chev{transition:transform .15s;font-size:10px;color:var(--muted)}
 .tool-card[open]>summary .chev{transform:rotate(90deg)}
 .tool-card>.inline{margin-top:6px}
+.viz{margin:6px 0 2px}
+.viz svg{display:block;width:100%;height:auto}
+.viz .vleg{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 2px;font-size:12px;color:var(--ink)}
+.viz .vleg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.viz .sub{font-size:11px;color:var(--muted)}
+.viz-tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:6px 9px;font-size:12px;box-shadow:var(--shadow);z-index:60;display:none}
+.viz-tip .r{display:flex;gap:6px;align-items:center;white-space:nowrap;margin-top:2px}
+.viz-tip i{display:inline-block;width:8px;height:8px;border-radius:2px;flex:none}
 .scope-chip{border:1px solid var(--line);background:var(--bg);border-radius:20px;padding:5px 10px;
   cursor:pointer;color:var(--ink);font-weight:600}
 .scope-chip:hover{border-color:var(--accent);color:var(--accent)}
@@ -563,6 +572,198 @@ function showScopeChooser(){
 }
 
 
+/* ===== charts — SVG built from verified payload values only =====
+   No library, no CDN (the deployment box has no internet), and no model in
+   the loop: every plotted number comes straight out of a tool payload, the
+   same doctrine as the tables. Palette is fixed-order categorical, validated
+   for CVD separation and contrast on both surfaces; the data table below
+   each chart is the accessibility fallback for the low-contrast light
+   slots. */
+const VIZ_COLORS={light:['#2a78d6','#eb6834','#1baf7a','#eda100'],
+                  dark:['#3987e5','#d95926','#199e70','#c98500']};
+function vizPal(){
+  return matchMedia('(prefers-color-scheme:dark)').matches
+    ?VIZ_COLORS.dark:VIZ_COLORS.light;
+}
+let VIZ_TIP=null;
+function vizTip(){
+  if(!VIZ_TIP){VIZ_TIP=el('div','viz-tip');document.body.append(VIZ_TIP);}
+  return VIZ_TIP;
+}
+function vizFmt(v){
+  const a=Math.abs(v);
+  if(a>=1e9) return (v/1e9).toFixed(1).replace(/\.0$/,'')+'B';
+  if(a>=1e6) return (v/1e6).toFixed(1).replace(/\.0$/,'')+'M';
+  if(a>=1e4) return Math.round(v/1e3)+'K';
+  return String(Math.round(v*100)/100);
+}
+function vizFull(v){
+  return (v===null||v===undefined)?'—'
+    :Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+function vizTicks(lo,hi){
+  const span=(hi-lo)||1, mag=Math.pow(10,Math.floor(Math.log10(span/4)));
+  const step=[1,2,2.5,5,10].map(m=>m*mag).find(s=>span/s<=4.5)||mag*10;
+  const out=[];
+  for(let v=Math.ceil(lo/step)*step; v<=hi+step/1e6; v+=step) out.push(v);
+  return out;
+}
+function vizChart(spec){
+  // spec: {type:'line'|'bar', x:[labels], series:[{name,values}], note?}
+  const pal=vizPal(), n=spec.x.length;
+  if(n<2||!spec.series.length) return null;
+  const W=640,H=240,ML=56,MR=spec.type==='line'?116:16,MT=12,MB=26;
+  const PW=W-ML-MR, PH=H-MT-MB;
+  let lo=0,hi=0;
+  spec.series.forEach(s=>s.values.forEach(v=>{
+    if(v<lo)lo=v; if(v>hi)hi=v;}));
+  if(lo===hi) hi=lo+1;
+  const ticks=vizTicks(lo,hi);
+  lo=Math.min(lo,ticks[0]); hi=Math.max(hi,ticks[ticks.length-1]);
+  const Y=v=>MT+PH-(v-lo)/(hi-lo)*PH;
+  const X=i=>ML+(n===1?PW/2:i*PW/(n-1));
+  let g='';
+  ticks.forEach(t=>{
+    g+='<line x1="'+ML+'" x2="'+(W-MR)+'" y1="'+Y(t)+'" y2="'+Y(t)+
+      '" style="stroke:var(--line);stroke-width:'+(t===0?1.5:1)+'"/>'+
+      '<text x="'+(ML-7)+'" y="'+(Y(t)+3.5)+'" text-anchor="end" font-size="10.5"'+
+      ' style="fill:var(--muted)" class="num">'+esc(vizFmt(t))+'</text>';
+  });
+  const step=Math.ceil(n/8); // x labels: at most ~8, never rotated
+  spec.x.forEach((lb,i)=>{
+    if(i%step&&i!==n-1) return;
+    g+='<text x="'+X(spec.type==='bar'?i:i)+'" y="'+(H-8)+'" text-anchor="middle"'+
+      ' font-size="10.5" style="fill:var(--muted)">'+esc(String(lb).slice(0,12))+'</text>';
+  });
+  if(spec.type==='line'){
+    spec.series.forEach((s,si)=>{
+      const pts=s.values.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+      g+='<polyline points="'+pts+'" fill="none" stroke="'+pal[si%pal.length]+
+        '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+    });
+    // direct labels at line ends, ink-colored text with a series chip,
+    // nudged apart so ≤4 labels never collide
+    const ends=spec.series.map((s,si)=>({si,name:s.name,y:Y(s.values[n-1])}))
+      .sort((a,b)=>a.y-b.y);
+    ends.forEach((e2,i)=>{ if(i&&e2.y-ends[i-1].y<13) e2.y=ends[i-1].y+13; });
+    ends.forEach(e2=>{
+      g+='<circle cx="'+(W-MR+6)+'" cy="'+e2.y+'" r="3.5" fill="'+pal[e2.si%pal.length]+'"/>'+
+        '<text x="'+(W-MR+13)+'" y="'+(e2.y+3.5)+'" font-size="11" style="fill:var(--ink)">'+
+        esc(String(e2.name).slice(0,15))+'</text>';
+    });
+  } else {
+    const vals=spec.series[0].values, band=PW/n,
+      bw=Math.max(3,Math.min(band-4,46));
+    vals.forEach((v,i)=>{
+      const x=ML+i*band+(band-bw)/2, y0=Y(0), y1=Y(v),
+        top=Math.min(y0,y1), h2=Math.max(1.5,Math.abs(y0-y1)),
+        r=Math.min(4,bw/2,h2), up=v>=0;
+      // rounded at the DATA end only, square at the baseline
+      g+='<path data-i="'+i+'" d="M'+x+','+(up?top+h2:top)+
+        (up?' V'+(top+r)+' Q'+x+','+top+' '+(x+r)+','+top+' H'+(x+bw-r)+
+             ' Q'+(x+bw)+','+top+' '+(x+bw)+','+(top+r)+' V'+(top+h2)
+           :' V'+(top+h2-r)+' Q'+x+','+(top+h2)+' '+(x+r)+','+(top+h2)+
+             ' H'+(x+bw-r)+' Q'+(x+bw)+','+(top+h2)+' '+(x+bw)+','+(top+h2-r)+' V'+top)+
+        ' Z" fill="'+pal[0]+'"/>';
+      if(n<=6) g+='<text x="'+(x+bw/2)+'" y="'+(up?top-5:top+h2+11)+
+        '" text-anchor="middle" font-size="10.5" style="fill:var(--ink)" class="num">'+
+        esc(vizFmt(v))+'</text>';
+    });
+  }
+  const box=el('div','viz');
+  if(spec.series.length>1){
+    const leg=el('div','vleg');
+    leg.innerHTML=spec.series.map((s,si)=>'<span><i style="background:'+
+      pal[si%pal.length]+'"></i>'+esc(String(s.name))+'</span>').join('');
+    box.append(leg);
+  }
+  const holder=el('div');
+  holder.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="chart">'+
+    g+'<line class="vx" y1="'+MT+'" y2="'+(MT+PH)+
+    '" style="stroke:var(--muted);stroke-width:1;display:none"/>'+
+    '<g class="vdots"></g>'+
+    '<rect x="'+ML+'" y="'+MT+'" width="'+PW+'" height="'+PH+'" fill="transparent"/></svg>';
+  const svg=holder.firstChild;
+  box.append(svg);
+  if(spec.note) box.append(el('div','sub',esc(spec.note)));
+  // hover layer: crosshair + tooltip on lines, per-bar tooltip on bars
+  const tip=vizTip();
+  svg.addEventListener('mousemove',ev=>{
+    const rc=svg.getBoundingClientRect(), sx=W/rc.width;
+    const px=(ev.clientX-rc.left)*sx;
+    let i=spec.type==='line'
+      ?Math.round((px-ML)/(PW/(n-1)))
+      :Math.floor((px-ML)/(PW/n));
+    if(i<0||i>=n){tip.style.display='none';return;}
+    if(spec.type==='line'){
+      const vx=svg.querySelector('.vx');
+      vx.setAttribute('x1',X(i)); vx.setAttribute('x2',X(i));
+      vx.style.display='';
+      svg.querySelector('.vdots').innerHTML=spec.series.map((s,si)=>
+        '<circle cx="'+X(i)+'" cy="'+Y(s.values[i])+'" r="4" fill="'+
+        pal[si%pal.length]+'" style="stroke:var(--panel);stroke-width:2"/>').join('');
+    }
+    tip.innerHTML='<b>'+esc(String(spec.x[i]))+'</b>'+
+      spec.series.map((s,si)=>'<div class="r"><i style="background:'+
+        pal[si%pal.length]+'"></i>'+esc(String(s.name))+
+        ' <span class="num">'+vizFull(s.values[i])+'</span></div>').join('');
+    tip.style.display='block';
+    tip.style.left=Math.min(ev.clientX+14,innerWidth-tip.offsetWidth-8)+'px';
+    tip.style.top=(ev.clientY+14)+'px';
+  });
+  svg.addEventListener('mouseleave',()=>{
+    tip.style.display='none';
+    const vx=svg.querySelector('.vx'); if(vx) vx.style.display='none';
+    svg.querySelector('.vdots').innerHTML='';
+  });
+  return box;
+}
+function vizFromRows(rows){
+  // Conservative trend detection over plain row sets: exactly one row per
+  // time point, a recognizable time column, numeric measures. Anything
+  // ambiguous stays a table — a wrong chart is worse than no chart.
+  if(!Array.isArray(rows)||rows.length<3||rows.length>60) return null;
+  const keys=Object.keys(rows[0]||{});
+  const isNum=k=>rows.every(r=>r[k]===null||typeof r[k]==='number');
+  const yearKey=keys.find(k=>/^(fiscal_year|year|fy)$/i.test(k)&&isNum(k)&&
+    rows.every(r=>r[k]===null||(r[k]>=1990&&r[k]<=2100)));
+  const perKey=keys.find(k=>/period/i.test(k)&&isNum(k)&&
+    rows.every(r=>r[k]===null||(r[k]>=0&&r[k]<=998)));
+  const dateKey=keys.find(k=>/(^|_)(dt|date|month)$/i.test(k)&&
+    rows.every(r=>typeof r[k]==='string'));
+  let xOf=null, timeKeys=[];
+  if(yearKey&&perKey){ xOf=r=>r[yearKey]+'-P'+r[perKey]; timeKeys=[yearKey,perKey]; }
+  else if(dateKey){ xOf=r=>String(r[dateKey]).slice(0,10); timeKeys=[dateKey]; }
+  else if(yearKey){ xOf=r=>String(r[yearKey]); timeKeys=[yearKey]; }
+  else if(perKey&&rows.length<=14){ xOf=r=>'P'+r[perKey]; timeKeys=[perKey]; }
+  if(!xOf) return null;
+  const sorted=[...rows].sort((a,b)=>{
+    for(const k of timeKeys){
+      const d=(typeof a[k]==='number')?a[k]-b[k]:String(a[k]).localeCompare(String(b[k]));
+      if(d) return d;
+    } return 0;
+  });
+  const xs=sorted.map(xOf);
+  if(new Set(xs).size!==xs.length) return null;
+  const measures=keys.filter(k=>!timeKeys.includes(k)&&isNum(k)&&
+    sorted.some(r=>r[k]!==null));
+  if(!measures.length) return null;
+  // ONE axis, always. A count column next to an amount column differs by
+  // orders of magnitude and would flatline at zero — drop it with a note
+  // rather than fake a second y-scale.
+  const mag=k=>Math.max(...sorted.map(r=>Math.abs(r[k]||0)));
+  const top=Math.max(...measures.map(mag));
+  const kept=measures.filter(k=>mag(k)>=top/100).slice(0,4);
+  const skipped=measures.filter(k=>!kept.includes(k));
+  if(!kept.length) return null;
+  return vizChart({type:'line',x:xs,
+    series:kept.map(k=>({name:k.replace(/_/g,' '),
+      values:sorted.map(r=>r[k]===null?0:+r[k])})),
+    note:'Plotted from the rows below.'+
+      (skipped.length?' Not plotted (different scale, one axis only): '+
+        skipped.map(k=>k.replace(/_/g,' ')).join(', ')+'.':'')});
+}
+
 /* ===== inline renderers — the UI, not the model, produces every figure ===== */
 function tiles(items){
   const g=el('div','tiles');
@@ -810,6 +1011,16 @@ function renderPivot(p){
     esc(String(p.row_field||'row').replace(/_/g,' '))+(p.row_count===1?'':'s')+
     (p.truncated?', truncated':'')+'</span>'));
   const cols=p.columns||[], rows=p.rows||[];
+  // A cross-tab IS a trend answer — chart it above the working table.
+  if(cols.length>=2&&rows.length){
+    const ranked=[...rows].sort((a,b)=>Math.abs(b.total||0)-Math.abs(a.total||0));
+    const viz=vizChart({type:'line',x:cols.map(String),
+      series:ranked.slice(0,4).map(r=>({name:String(r.row),
+        values:(r.values||[]).map(v=>v===null||v===undefined?0:+v)})),
+      note:(rows.length>4?'Top 4 of '+rows.length+' by total. ':'')+
+        'Every point is a value from the table below; blanks plot as zero activity.'});
+    if(viz) c.append(viz);
+  }
   const n=v=>(v===null||v===undefined)?'—'
     :Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
   const sc=el('div'); sc.style.maxHeight='420px'; sc.style.overflow='auto';
@@ -860,6 +1071,8 @@ function renderSql(d){
   }
   const rows=d.rows||[];
   if(rows.length){
+    const viz=vizFromRows(rows);
+    if(viz) c.append(viz);
     const sc=el('div'); sc.style.maxHeight='340px'; sc.style.overflow='auto';
     const t=el('table');
     t.innerHTML='<thead><tr>'+Object.keys(rows[0]).map(k=>'<th'+
@@ -1045,6 +1258,15 @@ function renderAging(d){
     ['Credits / on-account',money(t.credit_amt),'','cr'],
     ['Disputed',money(t.disputed_amt),'','cr']
   ]));
+  const bt=(d.buckets||[]).map(b=>({b,v:Number(t[b]||0)}));
+  if(bt.length>=2){
+    const bc=el('div','card');
+    bc.append(el('h2',null,'Aging profile <span class="sub">open AR by bucket'+
+      (d.display_currency?' · '+esc(d.display_currency):'')+'</span>'));
+    const viz=vizChart({type:'bar',x:bt.map(o=>o.b),
+      series:[{name:'Open AR',values:bt.map(o=>o.v)}]});
+    if(viz){ bc.append(viz); frag.append(bc); }
+  }
   const tiecard=el('div','card');
   if(tie.evaluated===false){
     tiecard.append(el('h2',null,'GL tie-out <span class="badge dim">Not evaluated</span>'+
@@ -1513,6 +1735,8 @@ async function send(messageOverride,appendUser){
       return;
     }
     if(j.scope) setChatScope(j.scope,false);
+    const wantChart=/\b(chart|graph|plot|trend|visuali[sz]e)/i.test(m);
+    const turnCards=[];
     (j.tool_calls||[]).forEach(c=>{
       // Everything arrives WITH the answer, so the sources render COLLAPSED:
       // the reply is what the user came for, and each card is one click away
@@ -1529,7 +1753,14 @@ async function send(messageOverride,appendUser){
       if(node){ const holder=el('div','inline'); holder.append(node); card.append(holder); }
       else card.className='tool-card no-body';
       msgs.append(card);
+      turnCards.push(card);
     });
+    if(wantChart){
+      // The user asked to SEE it — open the first card that drew a chart
+      // instead of leaving it behind a collapsed header.
+      const cc=turnCards.find(cd=>cd.querySelector('.viz'));
+      if(cc) cc.open=true;
+    }
     if(!r.ok||j.error) msgs.append(el('div','msg err',esc(j.error||j.detail||'Request failed')));
     else if(j.answer){
       const b=el('div','msg bot');
