@@ -34,6 +34,8 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+from .connectors import coupa as _coupa_mod
+coupa = _coupa_mod.from_env()
 playbooks = PlaybookRunner(engine, ar)
 modules = ModulePacks(engine)
 memory = SiteMemory(cfg.resolve_path(
@@ -764,6 +766,64 @@ def get_vendor_payments(business_unit: str = "", vendor: str = "",
     last pay X"."""
     return _safe(modules.vendor_payments, business_unit=business_unit,
                  vendor=vendor, months=months, n=n, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def coupa_health() -> dict:
+    """Coupa connectivity: mode (live vs bundled sample fixtures),
+    reachability, latency. Call when Coupa data looks wrong or missing —
+    fixture mode means COUPA_BASE_URL is not configured on this host."""
+    return _safe(coupa.health)
+
+
+@mcp.tool()
+def get_coupa_invoices(status: str = "", supplier: str = "",
+                       days: int = 30, max_rows: int = 50) -> dict:
+    """Coupa invoices over a trailing window with per-currency totals.
+    status filters exactly (approved, paid, pending_approval, draft);
+    supplier matches by normalized name. Use for "what invoices are in
+    Coupa / what did supplier X invoice us / Coupa invoice status". This
+    is the PROCUREMENT side; the ledger's AP view is get_open_payables."""
+    return _safe(coupa.invoices, status=status, supplier=supplier,
+                 days=days, max_rows=max_rows)
+
+
+@mcp.tool()
+def get_coupa_stuck_approvals(days_pending: int = 3) -> dict:
+    """Coupa invoices sitting in pending approval past a threshold, with
+    the current approver and days pending, slowest first. Use for "what is
+    stuck in approvals / why hasn't X been booked" — the close cannot book
+    what approval is still holding."""
+    return _safe(coupa.stuck_approvals, days_pending=days_pending)
+
+
+@mcp.tool()
+def get_coupa_rni(min_amount: float = 0.0) -> dict:
+    """Coupa received-not-invoiced by PO line — the month-end ACCRUAL
+    CANDIDATES: value received from suppliers with no invoice yet. Totals
+    are per currency, never summed across. Use for "what should we accrue /
+    received not invoiced / open receipts"."""
+    return _safe(coupa.received_not_invoiced, min_amount=min_amount)
+
+
+@mcp.tool()
+def get_coupa_supplier_spend(months: int = 12, top_n: int = 10) -> dict:
+    """Coupa invoice spend ranked by supplier and currency over a trailing
+    window. Use for "top suppliers by spend / how much have we bought from
+    X". Procurement view; cash actually PAID is get_vendor_payments."""
+    return _safe(coupa.supplier_spend, months=months, top_n=top_n)
+
+
+@mcp.tool()
+def coupa_to_ap_tie(days: int = 90) -> dict:
+    """RECONCILIATION: approved/paid Coupa invoices vs PS vouchers, matched
+    server-side on invoice number with the supplier verified against the
+    vendor master. Reports matched pairs, amount breaks (same invoice,
+    different amount — the dangerous kind), and invoices that never reached
+    AP. Use for "did everything approved in Coupa land in AP / AP
+    completeness". Every figure comes from this payload — never recompute
+    differences in prose."""
+    return _safe(coupa.ap_tie, db=db, days=days)
 
 
 @mcp.tool()

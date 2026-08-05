@@ -163,12 +163,27 @@ def _dba_summary(db, stats: dict, indexes: dict,
     return "\n".join(lines)
 
 
-def run(db, engine, include_timings: bool = False) -> dict[str, Any]:
+def connector_health(connectors) -> dict:
+    """Health of every registered external source, fault-isolated."""
+    out = []
+    for c in connectors or []:
+        try:
+            out.append(c.health())
+        except Exception as e:
+            out.append({"source": getattr(c, "name", "?"), "ok": False,
+                        "problem": f"{type(e).__name__}: {str(e)[:200]}"})
+    return {"sources": out}
+
+
+def run(db, engine, include_timings: bool = False,
+        connectors=None) -> dict[str, Any]:
     """All sections, each independently fault-isolated: one broken catalog
     view must not blank the whole panel."""
     out: dict[str, Any] = {"backend": db.dialect, "problems": []}
     for key, fn in (("stats", lambda: stats_age(db)),
-                    ("indexes", lambda: index_summary(db))):
+                    ("indexes", lambda: index_summary(db)),
+                    ("connectors",
+                     lambda: connector_health(connectors))):
         try:
             out[key] = fn()
         except Exception as e:
@@ -188,6 +203,11 @@ def run(db, engine, include_timings: bool = False) -> dict[str, Any]:
                     + ("never gathered" if r["last_analyzed"] is None
                        else f"{r['age_days']} days old")
                     + " — the optimizer is planning on stale row counts")
+    for src in out.get("connectors", {}).get("sources", []):
+        if not src.get("ok"):
+            out["problems"].append(
+                f"connector {src.get('source')}: "
+                f"{src.get('problem', 'unreachable')}")
     for t in out.get("indexes", {}).get("tables", []):
         if not t["indexes"]:
             out["problems"].append(f"{t['table']}: {t['note']}")
