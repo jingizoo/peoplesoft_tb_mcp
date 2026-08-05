@@ -1313,6 +1313,20 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("mixed-magnitude measures are dropped, never dual-axed",
           "one axis only" in _script,
           "the one-axis guard in vizFromRows is gone")
+
+    # The diagnostics panel replaces the shell script nobody runs on the box.
+    # Its quick mode must stay catalog-only (safe on an instance where data
+    # scans take minutes) and the slow timing run must stay behind its own
+    # explicit button, never on tab open.
+    check("the diagnostics tab exists and auto-runs only the quick checks",
+          'data-v="diag"' in _html and "go(false); // catalog-only" in _script,
+          "the Diagnostics tab or its catalog-only auto-run is gone")
+    check("the timing run stays behind an explicit button",
+          "include_timings=" in _script and "onclick=()=>go(true)" in _script,
+          "the slow close-readiness measurement lost its explicit gate")
+    check("the DBA summary is copyable text",
+          "clipboard.writeText(d.dba_summary)" in _script,
+          "the copy-paste DBA summary is gone")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,

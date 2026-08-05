@@ -211,6 +211,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="reports">Reports</button>
     <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
+    <button data-v="diag">Diagnostics</button>
     <div class="navfoot" id="navfoot"></div>
   </nav>
 
@@ -1511,7 +1512,7 @@ function chrome(){
   $('#l-adj').classList.toggle('hide',!(isTB||isRpt));
   $('#csv').classList.toggle('hide',!isTB);
 }
-function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,ar:viewAR,compare:viewCompare,chat:viewChat}[VIEW])(); }
+function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,ar:viewAR,compare:viewCompare,chat:viewChat,diag:viewDiag}[VIEW])(); }
 
 /* ---------- tab views (same renderers the chat uses) ---------- */
 async function viewTB(){
@@ -1546,6 +1547,102 @@ async function viewCompare(){
       period:s2.per,top:40}));
     $('#wrap').innerHTML=''; $('#wrap').append(renderCompare(d));
   }catch(e){ oops(e.message); }
+}
+
+/* ---------- diagnostics ---------- */
+function renderDiagStats(st){
+  const c=el('div','card');
+  c.append(el('h2',null,'Optimizer statistics <span class="sub">stale plans, not code, are the usual "it worked before"</span>'));
+  if(!st||st.error){ c.append(el('div','pad',esc((st&&st.error)||'unavailable'))); return c; }
+  if(!st.available){ c.append(el('div','pad',esc(st.note||''))); return c; }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Table</th><th class="num">Rows (per stats)</th>'+
+    '<th>Last analyzed</th><th></th></tr></thead><tbody>'+
+    st.tables.map(r=>'<tr><td><b>'+esc(r.table)+'</b></td>'+
+      '<td class="num">'+(r.stats_rows===null?'?':Number(r.stats_rows).toLocaleString())+'</td>'+
+      '<td>'+esc(r.last_analyzed||'NEVER')+(r.age_days!==null&&r.age_days!==undefined?' <span class="sub">'+r.age_days+'d ago</span>':'')+'</td>'+
+      '<td>'+(r.stale?'<span class="badge bad">stale</span>':'<span class="badge ok">fresh</span>')+'</td></tr>').join('')+
+    '</tbody>';
+  c.append(t);
+  return c;
+}
+function renderDiagIndexes(ix){
+  const c=el('div','card');
+  c.append(el('h2',null,'Indexes on hot tables <span class="sub">a filter can only use an index whose leading columns it names</span>'));
+  if(!ix||ix.error){ c.append(el('div','pad',esc((ix&&ix.error)||'unavailable'))); return c; }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Table</th><th>Index</th><th>Columns (in order)</th></tr></thead><tbody>'+
+    ix.tables.map(r=>r.indexes.length
+      ? r.indexes.map((x,i)=>'<tr><td>'+(i?'':'<b>'+esc(r.table)+'</b>')+'</td><td>'+esc(x.name)+
+          (x.unique?' <span class="badge dim">unique</span>':'')+'</td><td>'+esc(x.columns.join(', '))+'</td></tr>').join('')
+      : '<tr><td><b>'+esc(r.table)+'</b></td><td colspan="2"><span class="badge warn">'+esc(r.note)+'</span></td></tr>'
+    ).join('')+'</tbody>';
+  c.append(t);
+  return c;
+}
+function renderDiagTimings(tm){
+  const c=el('div','card');
+  c.append(el('h2',null,'Close-readiness inputs <span class="sub">measured by really running the playbook</span>'));
+  if(!tm||tm.error){ c.append(el('div','pad',esc((tm&&tm.error)||'unavailable'))); return c; }
+  c.append(el('div','pad','One full run: <b>'+Number(tm.total_ms).toLocaleString()+' ms</b> · verdict '+esc(String(tm.verdict))));
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Input</th><th class="num">ms</th><th></th></tr></thead><tbody>'+
+    tm.inputs.map(i=>'<tr><td>'+esc(i.name)+'</td><td class="num">'+Number(i.ms).toLocaleString()+'</td>'+
+      '<td>'+(i.slow?'<span class="badge bad">slow</span>':'')+'</td></tr>').join('')+
+    tm.probes.map(p2=>'<tr><td class="sub">integrity / '+esc(p2.name)+'</td><td class="num">'+
+      Number(p2.ms).toLocaleString()+'</td><td></td></tr>').join('')+'</tbody>';
+  c.append(t);
+  return c;
+}
+function renderDiag(d,holder){
+  holder.innerHTML='';
+  if(d.problems&&d.problems.length){
+    const pc=el('div','card');
+    pc.append(el('h2',null,'Findings <span class="badge warn">'+d.problems.length+'</span>'));
+    pc.append(el('div','pad',d.problems.map(p2=>'&bull; '+esc(p2)).join('<br>')));
+    holder.append(pc);
+  }
+  holder.append(renderDiagStats(d.stats));
+  holder.append(renderDiagIndexes(d.indexes));
+  if(d.timings) holder.append(renderDiagTimings(d.timings));
+  if(d.dba_summary){
+    const c=el('div','card');
+    c.append(el('h2',null,'Summary for your DBA <span class="sub">copy-paste as is</span>'));
+    const btn=el('button','btn','Copy');
+    btn.style.margin='0 0 8px 14px';
+    const pre=el('pre');
+    pre.style.cssText='margin:0 14px 12px;padding:10px;background:var(--bg);border:1px solid var(--line);'+
+      'border-radius:7px;font-size:11.5px;overflow:auto;max-height:340px;white-space:pre';
+    pre.textContent=d.dba_summary;
+    btn.onclick=()=>{navigator.clipboard.writeText(d.dba_summary).then(()=>{btn.textContent='Copied \u2713';
+      setTimeout(()=>btn.textContent='Copy',1500);});};
+    c.append(btn,pre);
+    holder.append(c);
+  }
+}
+async function viewDiag(){
+  const w=$('#wrap'); w.innerHTML='';
+  const intro=el('div','card');
+  intro.append(el('h2',null,'Site diagnostics <span class="sub">catalog checks are instant; the timing run really executes close readiness</span>'));
+  const bar=el('div','pad');
+  const quick=el('button','btn','Run checks');
+  const timed=el('button','btn ghost','Also measure close-readiness inputs (slow)');
+  timed.style.marginLeft='8px';
+  bar.append(quick,timed); intro.append(bar); w.append(intro);
+  const holder=el('div'); w.append(holder);
+  async function go(withTimings){
+    quick.disabled=timed.disabled=true;
+    holder.innerHTML='<div class="card"><div class="pad"><span class="spin"></span> '+
+      (withTimings?'Running close readiness to time its inputs\u2026 this takes as long as the real playbook.':'Reading catalog views\u2026')+'</div></div>';
+    try{
+      const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
+      renderDiag(d,holder);
+    }catch(e){ holder.innerHTML=''; holder.append(el('div','msg err',esc(e.message))); }
+    quick.disabled=timed.disabled=false;
+  }
+  quick.onclick=()=>go(false);
+  timed.onclick=()=>go(true);
+  go(false); // catalog-only: instant and safe on open
 }
 
 /* ---------- account drawer ---------- */

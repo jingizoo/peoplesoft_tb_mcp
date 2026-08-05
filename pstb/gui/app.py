@@ -726,6 +726,19 @@ def integrity(business_unit: str = "", ledger: str = "", fiscal_year: int = 0, p
     )
 
 
+@app.get("/api/diagnostics")
+def diagnostics(include_timings: int = 0):
+    """Site health: stats age, hot-table indexes, optional input timings.
+
+    quick mode touches catalog views only; include_timings=1 runs the real
+    close-readiness playbook to measure its inputs and can take minutes on
+    a slow instance — the GUI keeps it behind its own explicit button.
+    """
+    from pstb import diagnostics as _diag
+    return _guard(_diag.run, db=engine.db, engine=engine,
+                  include_timings=bool(include_timings))
+
+
 @app.get("/api/rollup")
 def rollup(
     business_unit: str = "", ledger: str = "", fiscal_year: int = 0,
