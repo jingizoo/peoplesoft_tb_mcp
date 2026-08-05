@@ -739,6 +739,20 @@ def diagnostics(include_timings: int = 0):
                   include_timings=bool(include_timings))
 
 
+@app.get("/api/question-report")
+def question_report():
+    """Deterministic what-to-optimize-next report over the question log."""
+    from pstb import qlog_report as _qr
+    if not qlog.path:
+        return {"turns": 0, "failed": 0, "flags": {}, "tools": [],
+                "repeat_failures": [], "recent_failed": [], "suggestions": [],
+                "note": "question logging is not configured"}
+    r = _guard(_qr.analyze, path=qlog.path)
+    if isinstance(r, dict) and "error" not in r:
+        r["text"] = _qr.report_text(r)
+    return r
+
+
 @app.get("/api/rollup")
 def rollup(
     business_unit: str = "", ledger: str = "", fiscal_year: int = 0,

@@ -1327,6 +1327,9 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the DBA summary is copyable text",
           "clipboard.writeText(d.dba_summary)" in _script,
           "the copy-paste DBA summary is gone")
+    check("the diagnostics tab shows the question-log report",
+          "renderQlogReport" in _script and "/api/question-report" in _script,
+          "the learning-loop card is gone from Diagnostics")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
