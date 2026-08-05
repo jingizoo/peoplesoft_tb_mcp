@@ -1594,6 +1594,29 @@ function renderDiagTimings(tm){
   c.append(t);
   return c;
 }
+function renderQlogReport(r){
+  const c=el('div','card');
+  c.append(el('h2',null,'Question log <span class="sub">'+
+    (r.turns?r.turns+' turns, '+r.failed+' failed or thumbed down':'no turns logged yet')+'</span>'));
+  if(r.error){ c.append(el('div','pad',esc(r.error))); return c; }
+  if(r.note){ c.append(el('div','pad',esc(r.note))); return c; }
+  if(r.suggestions&&r.suggestions.length){
+    c.append(el('div','pad','<b>What to do next, in order</b><br>'+
+      r.suggestions.map((s2,i)=>(i+1)+'. '+esc(s2)).join('<br>')));
+  } else if(r.turns){
+    c.append(el('div','pad','<span class="badge ok">nothing actionable</span> no failures, errors or repeats'));
+  }
+  if(r.recent_failed&&r.recent_failed.length){
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>When</th><th>Question</th><th>Flags</th></tr></thead><tbody>'+
+      r.recent_failed.map(f=>'<tr><td>'+esc(f.ts)+'</td><td>'+esc(f.question)+'</td>'+
+        '<td>'+f.flags.map(x=>'<span class="badge warn">'+esc(x)+'</span>').join(' ')+'</td></tr>').join('')+
+      '</tbody>';
+    const sc=el('div'); sc.style.maxHeight='260px'; sc.style.overflow='auto'; sc.append(t);
+    c.append(sc);
+  }
+  return c;
+}
 function renderDiag(d,holder){
   holder.innerHTML='';
   if(d.problems&&d.problems.length){
@@ -1637,6 +1660,7 @@ async function viewDiag(){
     try{
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
+      try{ holder.append(renderQlogReport(await api('/api/question-report'))); }catch(e2){}
     }catch(e){ holder.innerHTML=''; holder.append(el('div','msg err',esc(e.message))); }
     quick.disabled=timed.disabled=false;
   }
