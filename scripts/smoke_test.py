@@ -1339,6 +1339,22 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           and "prefers-reduced-motion" in _html,
           "the splash overlay, its removal, or its reduced-motion fallback "
           "is gone")
+
+    # Figure provenance: every grounded number in an answer links to the
+    # card that produced it. The transform runs over ALREADY-ESCAPED text;
+    # losing that order would let model output inject markup.
+    check("answer figures link to their source cards",
+          "buildFigureIndex" in _script and "linkFigures" in _script
+          and "data-card" in _script,
+          "figure provenance is gone from the answer renderer")
+    check("figure linking runs over escaped text only",
+          "linkFigures(mdLite(esc(j.answer))" in _script,
+          "esc() no longer runs before mdLite/linkFigures — model text "
+          "could inject markup")
+    check("clicking a figure opens and flashes its source card",
+          "closest&&e.target.closest('.fig')" in _script
+          and "card.open=true" in _script,
+          "the figure click handler is gone")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
