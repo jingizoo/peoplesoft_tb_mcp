@@ -1288,6 +1288,31 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the page polls live activity while a turn runs",
           "/api/activity" in _script and "clearInterval(poll)" in _script,
           "the activity poller is gone — Working… is a mute spinner again")
+
+    # Charts are drawn by the UI from verified payload values — same doctrine
+    # as the tables, no library, no CDN (the deployment box has no internet),
+    # and never the model retyping numbers. Assert the module and each wiring
+    # point separately: a lost integration renders tables silently, which
+    # reads as "charts stopped working" with no error anywhere.
+    check("the chart module exists and stays dependency-free",
+          "function vizChart(" in _script and "function vizFromRows(" in _script
+          and "cdn" not in _clean.lower() and "<script src" not in _html,
+          "vizChart/vizFromRows missing, or an external script crept in")
+    check("pivots chart their trend above the table",
+          "vizChart({type:'line',x:cols.map(String)" in _script,
+          "renderPivot no longer draws the consolidated trend")
+    check("plain SQL rows auto-chart when they look like a trend",
+          "vizFromRows(rows)" in _script,
+          "renderSql lost its trend detection")
+    check("aging renders the bucket profile as bars",
+          "'Aging profile" in _script,
+          "renderAging lost the bucket bar chart")
+    check("asking for a chart opens the card that drew one",
+          "wantChart" in _script and "querySelector('.viz')" in _script,
+          "the ask-for-chart auto-open is gone")
+    check("mixed-magnitude measures are dropped, never dual-axed",
+          "one axis only" in _script,
+          "the one-axis guard in vizFromRows is gone")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
