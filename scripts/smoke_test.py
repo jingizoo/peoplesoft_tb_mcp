@@ -1355,6 +1355,30 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           "closest&&e.target.closest('.fig')" in _script
           and "card.open=true" in _script,
           "the figure click handler is gone")
+
+    # Full-data export. The file must beat the screen: the endpoint
+    # RE-RUNS the tool at the export ceiling rather than serializing the
+    # capped preview the browser holds.
+    check("result cards offer a full-data CSV download",
+          "csvButton(" in _script and "/api/export" in _script
+          and "hasTable(" in _script,
+          "the CSV download button is gone from result cards")
+    check("the CSV button does not toggle the card it sits in",
+          "ev.preventDefault(); ev.stopPropagation();" in _script,
+          "clicking CSV would open/close the source card")
+    from pstb import export as _export
+    check("exported text cells cannot execute in Excel",
+          _export.to_csv({"columns": ["v"],
+                          "rows": [{"v": "=cmd|calc"}]}).count("'=cmd") == 1,
+          "formula-injection neutralization is gone from the CSV writer")
+    check("a truncated export says so in the FILENAME",
+          "TRUNCATED" in _export.filename("t", 50, True),
+          "a capped export would look complete in a downloads folder")
+    _srv_src = (ROOT / "pstb" / "server.py").read_text(encoding="utf-8")
+    _run_sql_tool = _srv_src[_srv_src.index("def run_sql("):][:1400]
+    check("the model cannot raise its own row ceiling",
+          "row_ceiling" not in _run_sql_tool,
+          "the export ceiling leaked into the model-facing run_sql tool")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,

@@ -27,12 +27,13 @@ from ..engine import EngineError, TBEngine
 from .. import queries as query_sql
 from ..ar import ARBilling, ARError
 from ..qlog import QuestionLog
+from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse, JSONResponse, Response
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
         "The web UI needs FastAPI. Install it with:\n"
@@ -571,7 +572,7 @@ def _session_id(payload: dict) -> str:
 def _guard(fn, **kw):
     try:
         return fn(**kw)
-    except (EngineError, DbError, ReportError, ARError) as e:
+    except (EngineError, DbError, ReportError, ARError, ExportError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # surface the reason instead of a bare 500
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
@@ -753,6 +754,44 @@ def question_report():
     if isinstance(r, dict) and "error" not in r:
         r["text"] = _qr.report_text(r)
     return r
+
+
+@app.post("/api/export")
+def export_csv(payload: dict):
+    """Full-population CSV for one result card.
+
+    The browser holds a display-capped preview; this re-runs the same tool
+    server-side at the export ceiling so the file has the whole row set,
+    not the page. Tools that cannot return more rows fall back to
+    exporting the payload the caller already has, and the response says
+    which happened.
+    """
+    from .. import export as _export
+    from ..connectors import coupa as _coupa_mod
+    from ..modules import ModulePacks
+
+    body = payload or {}
+    tool = str(body.get("tool") or "")
+    if not tool:
+        raise HTTPException(status_code=400, detail="tool is required")
+    registry = _export.build_registry(
+        engine=engine, ar=ar, modules=ModulePacks(engine),
+        report_runner=report_runner, coupa=_coupa_mod.from_env())
+    out = _guard(_export.export, tool=tool, args=body.get("args") or {},
+                 registry=registry, payload=body.get("result"))
+    return Response(
+        content=out["csv"], media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{out["filename"]}"',
+            "X-Export-Rows": str(out["rows"]),
+            "X-Export-Truncated": "1" if out["truncated"] else "0",
+            "X-Export-Rerun": "1" if out["rerun"] else "0",
+            "X-Export-Note": out["note"],
+            "Access-Control-Expose-Headers":
+                "X-Export-Rows, X-Export-Truncated, X-Export-Rerun, "
+                "X-Export-Note, Content-Disposition",
+        })
 
 
 @app.get("/api/rollup")
