@@ -1330,6 +1330,15 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the diagnostics tab shows the question-log report",
           "renderQlogReport" in _script and "/api/question-report" in _script,
           "the learning-loop card is gone from Diagnostics")
+    check("the page chrome names no company or vendor",
+          "PeopleSoft" not in _html and "Oracle" not in _html
+          and "TransUnion" not in _html,
+          "a company/vendor name crept back into the GUI")
+    check("the splash screen exists and cannot outlive the page",
+          'id="splash"' in _html and "sp.remove()" in _script
+          and "prefers-reduced-motion" in _html,
+          "the splash overlay, its removal, or its reduced-motion fallback "
+          "is gone")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
