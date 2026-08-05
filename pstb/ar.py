@@ -285,10 +285,19 @@ class ARBilling:
                               f"{base}: {e}"}
 
         if not fy:
+            # Name what DOES exist instead of dead-ending: unknown BU, an
+            # unposted ledger, or the wrong ledger name each read identically
+            # as "no ledger data" and sent users away with no next move.
+            try:
+                diag = self.e._scope_diagnosis(
+                    bu, self.e.resolve_ledger_for(bu), 0)
+            except Exception:
+                diag = None
             return {"evaluated": False, "control_accounts": accounts,
                     "subledger_total": r2(subledger),
                     "reason": f"No posted ledger data for business unit {bu!r} — "
-                              "nothing to reconcile against."}
+                              "nothing to reconcile against.",
+                    **({"scope_diagnosis": diag} if diag else {})}
         gl_total, failures = 0.0, []
         for acct in accounts:
             try:

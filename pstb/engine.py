@@ -438,7 +438,8 @@ class TBEngine:
             return dt.date.today().year, 12
 
     def _defaults(
-        self, business_unit: str, fiscal_year: int, period: int, ledger: str
+        self, business_unit: str, fiscal_year: int, period: int, ledger: str,
+        notes: list | None = None,
     ) -> tuple[str, int, int, str]:
         # Only pay scope discovery when the caller actually omitted the scope.
         # Calling it unconditionally put a catalog query in front of EVERY
@@ -452,9 +453,33 @@ class TBEngine:
             cur_fy, cur_per = self._current_fy_period()
             if fy == 0:
                 fy = cur_fy
+                # A defaulted year must be one that HOLDS data. The fiscal
+                # calendar answers "which year is today in", but an instance
+                # is often posted only through an earlier year (a dev refresh,
+                # or a slow close) — defaulting to the calendar year turned
+                # every unscoped GL question there into "no ledger data
+                # found". An explicitly requested year is never overridden.
+                posted_fy, posted_per = self.last_posted_period(bu, led)
+                if posted_fy and posted_fy < fy:
+                    if notes is not None:
+                        notes.append(
+                            f"fiscal_year defaulted to {posted_fy}: the "
+                            f"fiscal calendar puts today in {fy}, but "
+                            f"{led} for {bu} is only posted through "
+                            f"{posted_fy} period {posted_per}. Pass "
+                            "fiscal_year to query a different year.")
+                    fy = posted_fy
+                    if per == 0:
+                        per = posted_per or 12
             if per == 0:
                 per = cur_per if fy == cur_fy else 12
         return bu, fy, per, led
+
+    @staticmethod
+    def _with_scope_notes(payload: dict, notes: list) -> dict:
+        if notes:
+            payload["scope_notes"] = list(notes)
+        return payload
 
     def _scope_diagnosis(self, bu: str, led: str, fy: int) -> dict:
         """Explain why a scope returned no ledger rows: unknown BU, unknown
@@ -502,7 +527,8 @@ class TBEngine:
         return {
             "scope_status": "no_data_for_period",
             "detail": (
-                f"No {led} rows for {bu} in fiscal year {fy}. "
+                (f"No {led} rows for {bu} in fiscal year {fy}. " if fy
+                 else f"No posted {led} rows for {bu}. ")
                 + (f"Retry with one of these fiscal years: {years}."
                    if years else "This ledger has no data at all.")
             ),
@@ -694,7 +720,8 @@ class TBEngine:
         include_adjustments: bool = False,
         max_rows: int = 0,
     ) -> dict:
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         basis = "regular"
         if per in self._adj_periods():
             # Asking for "period 998" means the post-adjustment year-end
@@ -786,7 +813,7 @@ class TBEngine:
                 + diag["detail"]
                 + " Report this as 'no data found', never as a zero or balanced TB."
             )
-        return result
+        return self._with_scope_notes(result, scope_notes)
 
     def account_balance(
         self,
@@ -799,7 +826,8 @@ class TBEngine:
     ) -> dict:
         if not account:
             raise EngineError("account is required")
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, through_period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, through_period, ledger, notes=scope_notes)
         adj = set(self._adj_periods())
         # An adjustment period is a reporting basis, not a point on the monthly
         # trend: "through 998" means through the last regular period, adjustments
@@ -834,7 +862,7 @@ class TBEngine:
             running += act
             trend.append({"period": p, "activity": r2(act), "ending": r2(running)})
         adj_amt = sum(v for k, v in by_per.items() if k in adj)
-        return {
+        return self._with_scope_notes({
             "account": account.strip(),
             "descr": meta["descr"],
             "type": meta["type"],
@@ -855,7 +883,7 @@ class TBEngine:
                 "ending_incl_adjustments adds adjustment period(s) "
                 f"{sorted(adj)} once. Do not add them together."
             ),
-        }
+        }, scope_notes)
 
     def compare_trial_balance(
         self,
@@ -870,7 +898,8 @@ class TBEngine:
         min_abs_change: float = 0.0,
         top: int = 25,
     ) -> dict:
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         vfy = int(vs_fiscal_year or 0) or fy
         vper = int(vs_period or 0)
         if vper == 0:
@@ -924,7 +953,7 @@ class TBEngine:
             )
         rows.sort(key=lambda r: abs(r["change"]), reverse=True)
         capped = rows[: max(int(top or 25), 1)]
-        return {
+        return self._with_scope_notes({
             "business_unit": bu,
             "ledger": led,
             "current": {"fiscal_year": fy, "period": per},
@@ -934,7 +963,7 @@ class TBEngine:
             "accounts_changed": len(rows),
             "shown": len(capped),
             "total_change": r2(sum(r["change"] for r in rows)),
-        }
+        }, scope_notes)
 
     def drill_to_journals(
         self,
@@ -950,7 +979,8 @@ class TBEngine:
             raise EngineError("account is required")
         if not period:
             raise EngineError("period is required for journal drill-down")
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         params: dict = {
             "bu": bu, "ledger": led, "acct": account.strip(), "fy": fy, "per": per,
         }
@@ -972,7 +1002,7 @@ class TBEngine:
             float(r["amt"] or 0) for r in ledger_rows if int(r["period"]) == per
         )
         tie = (not truncated) and abs(jrnl_total - ledger_activity) < BALANCE_EPS
-        return {
+        return self._with_scope_notes({
             "business_unit": bu,
             "ledger": led,
             "account": account.strip(),
@@ -991,7 +1021,7 @@ class TBEngine:
                 else "Journal total differs from ledger activity — lines may be truncated, "
                 "or activity came from sources not captured here (e.g. summarized posts)."
             ),
-        }
+        }, scope_notes)
 
     def search_accounts(self, query: str = "", account_type: str = "",
                     limit: int = 50, business_unit: str = "") -> dict:
@@ -1029,7 +1059,8 @@ class TBEngine:
         period: int = 0,
         ledger: str = "",
     ) -> dict:
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         issues: list[str] = []
 
         _t0 = time.perf_counter()
@@ -1039,7 +1070,7 @@ class TBEngine:
         _tb_ms = int((time.perf_counter() - _t0) * 1000)
         if not piv:
             diag = self._scope_diagnosis(bu, led, fy)
-            return {
+            return self._with_scope_notes({
                 "business_unit": bu,
                 "ledger": led,
                 "fiscal_year": fy,
@@ -1057,7 +1088,7 @@ class TBEngine:
                     "found for this scope and confirm the business unit, ledger, and "
                     "fiscal year before drawing any conclusion."
                 ),
-            }
+            }, scope_notes)
         total_ending = sum(s["ending"] for s in piv.values())
         balanced = abs(total_ending) < BALANCE_EPS
         if not balanced:
@@ -1189,7 +1220,7 @@ class TBEngine:
         if incomplete:
             issues.append(f"{len(incomplete)} control check(s) could not run")
 
-        return {
+        return self._with_scope_notes({
             "business_unit": bu,
             "ledger": led,
             "fiscal_year": fy,
@@ -1226,7 +1257,7 @@ class TBEngine:
                    "affect whether the TB balances."
                    if issues else "No control exceptions found.")
             ),
-        }
+        }, scope_notes)
 
     def _retained_earnings_roll(self, bu: str, led: str, fy: int) -> dict:
         prior = self._pivot(
@@ -1277,7 +1308,8 @@ class TBEngine:
         level: int = 2,
         ledger: str = "",
     ) -> dict:
-        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger)
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         tree = (tree_name or "").strip() or self.cfg.defaults.account_tree
         setid = self.resolve_setid(bu)
         rows, _ = self.db.query(
@@ -1319,7 +1351,7 @@ class TBEngine:
                     "ending_cr": cr,
                 }
             )
-        return {
+        return self._with_scope_notes({
             "business_unit": bu,
             "ledger": led,
             "fiscal_year": fy,
@@ -1331,7 +1363,7 @@ class TBEngine:
             "nodes": nodes,
             "total_ending": r2(sum(n["ending"] for n in nodes)),
             "note": "Accounts not covered by any leaf range at this level are excluded.",
-        }
+        }, scope_notes)
 
     def list_trees(self) -> dict:
         rows, _ = self.db.query(q.trees_list(self.db), {}, max_rows=100)
