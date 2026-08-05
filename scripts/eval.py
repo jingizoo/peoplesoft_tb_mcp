@@ -86,8 +86,20 @@ def _grade(case: dict, answer: str, calls: list) -> list:
 
     wanted_args = expect.get("tool_args_contain") or {}
     if wanted_args:
+        def _arg_matches(actual, expected) -> bool:
+            # A structured argument (a pivot spec, a partition spec) matches
+            # when the expected string names one of its keys or appears in
+            # its JSON — "pivot": "row_field" means "a pivot spec carrying
+            # row_field was passed", not string equality against a dict.
+            if isinstance(actual, dict):
+                return str(expected) in actual or str(expected) in json.dumps(actual)
+            if isinstance(actual, list):
+                return str(expected) in json.dumps(actual)
+            return str(actual) == str(expected)
+
         hit = any(
-            all(str(c.get("args", {}).get(k)) == str(v) for k, v in wanted_args.items())
+            all(_arg_matches(c.get("args", {}).get(k), v)
+                for k, v in wanted_args.items())
             for c in calls
         )
         if not hit:

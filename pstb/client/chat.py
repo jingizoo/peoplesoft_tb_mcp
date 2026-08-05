@@ -309,6 +309,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     rounds = 0
     hit_limit = False
     nudges = 0
+    sql_remedy_pending = False
     db_ok = False
     covered_financial_domains: set[str] = set()
     policy_ok = False
@@ -334,6 +335,22 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             data_ok = (
                 relevant_financial_db_ok if financial_fact_required else db_ok
             )
+            # A failed run_sql whose error LISTED the real columns is a
+            # solved problem the model abandoned: retrying with those
+            # columns is one round, wandering to a different tool rarely
+            # answers the question that needed ad-hoc SQL. It outranks the
+            # generic evidence nudge and shares its MAX_NUDGES bound.
+            if nudges < MAX_NUDGES and sql_remedy_pending:
+                nudges += 1
+                sql_remedy_pending = False
+                resp = await asyncio.to_thread(
+                    provider.send_user,
+                    "Your run_sql failed, but the error message listed the "
+                    "REAL columns of every table you referenced. Rewrite the "
+                    "query using only those columns and call run_sql again "
+                    "now — do not switch to a different tool.",
+                )
+                continue
             needed = _evidence_nudge(
                 intent,
                 data_ok,
@@ -507,6 +524,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 else:
                     if ok:
                         db_ok = True
+                        if call.name == "run_sql":
+                            sql_remedy_pending = False
                         if call.name in FINANCIAL_EVIDENCE_TOOLS:
                             covered = financial_tool_domains(call.name)
                             if call.name == "run_sql":
@@ -520,6 +539,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                     else:
                         last_db_problem = (problem or blocked
                                            or "database tool failed")
+                        if (call.name == "run_sql"
+                                and "has columns:" in
+                                str(problem or blocked or out or "")):
+                            sql_remedy_pending = True
                 logged_calls.append({
                     "tool": call.name,
                     "ok": ok,
