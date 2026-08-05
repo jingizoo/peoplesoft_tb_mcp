@@ -153,6 +153,10 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
   #splash .sb,#splash .sl{animation:none;stroke-dashoffset:0}
 }
 .tool-card>.inline{margin-top:6px}
+.csvbtn{margin-left:auto;background:transparent;color:var(--muted);border:1px solid var(--line);
+  border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.csvbtn:hover:not(:disabled){color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+.csvbtn:disabled{opacity:.7;cursor:default}
 .fig{border-bottom:1px dashed var(--accent);cursor:pointer;font-variant-numeric:tabular-nums}
 .fig:hover{background:var(--accent-soft)}
 .trail{font-size:11px;color:var(--muted);margin:2px 0 8px}
@@ -679,6 +683,57 @@ function linkFigures(html,map){
         '" title="from '+esc(src.tool)+' \u2014 click to open the source">'+
         num+suf+'</span>';
     });
+}
+
+/* ===== full-data export =====
+   The card shows a capped preview; the download re-runs the tool
+   server-side at the export ceiling, so the file is the whole
+   population rather than the page. */
+function hasTable(r){
+  if(Array.isArray(r)) return r.length>0&&r[0]&&typeof r[0]==='object';
+  if(!r||typeof r!=='object') return false;
+  if(r.pivot&&(r.pivot.rows||[]).length) return true;
+  return Object.values(r).some(v=>Array.isArray(v)&&v.length>0&&
+    v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)));
+}
+async function downloadExport(tool,args,result,btn){
+  const label=btn.textContent;
+  btn.textContent='exporting…'; btn.disabled=true;
+  try{
+    const r=await fetch('/api/export',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tool:tool,args:args||{},result:result})});
+    if(!r.ok){
+      let detail=''; try{ detail=(await r.json()).detail||''; }catch(e2){}
+      throw new Error(detail||('export failed (HTTP '+r.status+')'));
+    }
+    const blob=await r.blob();
+    const cd=r.headers.get('Content-Disposition')||'';
+    const m=cd.match(/filename="([^"]+)"/);
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=m?m[1]:(tool+'.csv');
+    a.click(); URL.revokeObjectURL(a.href);
+    const rows=r.headers.get('X-Export-Rows')||'?';
+    const cut=r.headers.get('X-Export-Truncated')==='1';
+    btn.textContent=(cut?'\u26a0 ':'\u2713 ')+rows+' rows';
+    btn.title=r.headers.get('X-Export-Note')||'';
+  }catch(e){
+    btn.textContent='export failed';
+    btn.title=e.message;
+  }
+  setTimeout(()=>{btn.textContent=label;btn.disabled=false;
+    btn.title=CSV_HINT;},5000);
+}
+const CSV_HINT='Download the FULL result as CSV \u2014 re-run server-side, '+
+  'beyond the rows shown here';
+function csvButton(tool,args,result){
+  const b=el('button','csvbtn','CSV');
+  b.type='button'; b.title=CSV_HINT;
+  b.setAttribute('aria-label','Download full '+tool+' result as CSV');
+  b.onclick=ev=>{ ev.preventDefault(); ev.stopPropagation();
+    downloadExport(tool,args,result,b); };
+  return b;
 }
 
 /* ===== charts — SVG built from verified payload values only =====
@@ -2012,6 +2067,8 @@ async function send(messageOverride,appendUser){
         '<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
         '<span class="args" title="'+esc(JSON.stringify(c.args||{}))+'">'+esc(compactArgs(c.args))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
+      if(c.ok!==false&&hasTable(c.result))
+        summary.append(csvButton(c.tool,c.args||{},c.result));
       card.append(summary);
       card.id='src-'+(++CARDSEQ);
       const node=renderToolResult(c.tool,c.result,c.args||{});

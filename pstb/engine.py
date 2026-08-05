@@ -2353,7 +2353,8 @@ class TBEngine:
                 business_unit: str = "", policy_binds: Optional[dict] = None,
                 pivot: Optional[dict] = None,
                 list_binds: Optional[dict] = None,
-                partition: Optional[dict] = None) -> dict:
+                partition: Optional[dict] = None,
+                row_ceiling: int = 0) -> dict:
         """Run a guarded SELECT.
 
         policy_binds maps a bind name to a policy figure the wiki defines, e.g.
@@ -2475,7 +2476,12 @@ class TBEngine:
                 + ", so the policy filter would not have been applied. Add it "
                   "to the WHERE clause or drop it from policy_binds.")
 
-        cap = min(max(int(max_rows or 100), 1), 500)
+        # 500 rows is the ceiling for a MODEL-issued query: more than that
+        # is context the model cannot read and a payload nobody scrolls.
+        # row_ceiling raises it for CSV export only. It is deliberately
+        # absent from the MCP tool signature, so a model cannot lift its
+        # own limit -- the export endpoint is the only caller that can.
+        cap = min(max(int(max_rows or 100), 1), int(row_ceiling or 0) or 500)
         if partition:
             try:
                 rows, partition_info = self._run_partitioned(
