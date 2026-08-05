@@ -432,3 +432,71 @@ class CrossTurnGroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_without_history_the_guard_still_withholds(self):
         answer = await self._turn(None)
         self.assertIn("withheld", answer)
+
+
+class FailFirstSession(TimedSession):
+    """TimedSession that errors selected calls once, then succeeds, and
+    records the order of tool names."""
+
+    def __init__(self, outputs, delay=0.01):
+        super().__init__(outputs, delay)
+        self.calls: list = []
+        self._fail: dict = {}
+
+    def fail_once(self, tool, message):
+        self._fail[tool] = message
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name in self._fail:
+            msg = self._fail.pop(name)
+            return SimpleNamespace(
+                content=[SimpleNamespace(text=json.dumps({"error": msg}))],
+                is_error=True,
+            )
+        return await super().call_tool(name, arguments)
+
+
+class SqlRemedyNudgeTests(unittest.IsolatedAsyncioTestCase):
+    """When run_sql fails with the real-columns remedy and the model tries
+    to answer anyway, the loop sends it back to retry the query — once,
+    bounded by MAX_NUDGES — instead of shipping an answer built without
+    the data the question needed."""
+
+    async def test_remedied_sql_failure_triggers_a_retry_nudge(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("a", "run_sql",
+                                         sql="SELECT NOPE FROM PS_BI_HDR")]),
+            LLMResponse(text="I could not build the table."),
+            LLMResponse(tool_calls=[call("b", "run_sql",
+                                         sql="SELECT INVOICE FROM PS_BI_HDR")]),
+            LLMResponse(text="Here is the table."),
+        ])
+        session = FailFirstSession({"run_sql": {"rows": [{"INVOICE": "X"}],
+                                               "row_count": 1}})
+        session.fail_once("run_sql", "Column not found — no such column: "
+                                     "NOPE. PS_BI_HDR has columns: INVOICE, "
+                                     "INVOICE_AMOUNT")
+        answer = await agent_turn(provider, session, "billed by month",
+                                  surface="gui",
+                                  scope={"business_unit": "US001",
+                                         "ledger": "ACTUALS"})
+        sqls = [c for c in session.calls if c[0] == "run_sql"]
+        self.assertEqual(len(sqls), 2,
+                         "the loop must send the model back to retry run_sql")
+        self.assertIn("Here is the table", answer)
+
+    async def test_failures_without_the_remedy_do_not_loop(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[call("a", "run_sql", sql="SELECT 1")]),
+            LLMResponse(text="That query timed out; narrow the scope."),
+        ])
+        session = FailFirstSession({"run_sql": {"rows": []}})
+        session.fail_once("run_sql", "Query exceeded the 120s timeout.")
+        await agent_turn(provider, session, "billed by month",
+                         surface="gui",
+                         scope={"business_unit": "US001",
+                                "ledger": "ACTUALS"})
+        sqls = [c for c in session.calls if c[0] == "run_sql"]
+        self.assertEqual(len(sqls), 1,
+                         "a timeout is not a solved problem — no retry loop")

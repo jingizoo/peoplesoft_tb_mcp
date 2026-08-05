@@ -2319,6 +2319,36 @@ class TBEngine:
             resolver = PolicyResolver(None, None)
         return resolver.resolve_binds(policy_binds)
 
+    def _sql_error_remedy(self, sql: str, err: Exception) -> str:
+        """A failed ad-hoc query must teach, not just fail. The model writes
+        SQL from memory of PeopleSoft, and memory invents columns; the raw
+        'no such column' leaves it guessing again. Appending the REAL column
+        lists of the tables it referenced turns the retry into a one-round
+        fix. Catalog lookups only — this never touches data tables."""
+        msg = str(err)
+        if not re.search(r"(?i)no such column|invalid identifier|"
+                         r"no such table|table or view does not exist|"
+                         r"unknown column", msg):
+            return msg
+        parts, seen = [], set()
+        for t in re.findall(r"(?i)\b(?:from|join)\s+([A-Za-z_][\w.]*)", sql):
+            name = t.split(".")[-1].upper()
+            if name in seen or len(parts) >= 5:
+                continue
+            seen.add(name)
+            try:
+                cols = sorted(self.db.columns(name) or [])
+            except Exception:
+                cols = []
+            parts.append(f"{name} has columns: {', '.join(cols)}" if cols
+                         else f"{name} does not exist at this site")
+        if parts:
+            msg += (" — rewrite using only columns that exist. "
+                    + " | ".join(parts)
+                    + ". If the field you need is on none of these, find "
+                      "the right record with search_records first.")
+        return msg
+
     def run_sql(self, sql: str, max_rows: int = 100,
                 business_unit: str = "", policy_binds: Optional[dict] = None,
                 pivot: Optional[dict] = None,
@@ -2447,15 +2477,24 @@ class TBEngine:
 
         cap = min(max(int(max_rows or 100), 1), 500)
         if partition:
-            rows, partition_info = self._run_partitioned(
-                s, scrubbed, partition, {**binds, **expanded_lists}, cap)
+            try:
+                rows, partition_info = self._run_partitioned(
+                    s, scrubbed, partition, {**binds, **expanded_lists}, cap)
+            except (DbError, EngineError) as e:
+                raise EngineError(self._sql_error_remedy(s, e))
             truncated = len(rows) > cap
             rows = rows[:cap]
             plan_note = {}
         else:
-            plan_note = self._cost_gate(s, scrubbed)
-            rows, truncated = self.db.query(s, {**binds, **expanded_lists},
-                                            max_rows=cap)
+            # The cost gate's EXPLAIN hits a bad column before execution
+            # does, so the remedy must wrap BOTH. Non-schema errors (refusals,
+            # timeouts) pass through _sql_error_remedy untouched.
+            try:
+                plan_note = self._cost_gate(s, scrubbed)
+                rows, truncated = self.db.query(s, {**binds, **expanded_lists},
+                                                max_rows=cap)
+            except (DbError, EngineError) as e:
+                raise EngineError(self._sql_error_remedy(s, e))
             partition_info = None
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
                "sql_executed": s}

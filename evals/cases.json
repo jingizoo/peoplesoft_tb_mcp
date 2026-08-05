@@ -102,6 +102,8 @@
       },
       "expect": {
         "any_tool": [
+          "get_vendor_payments",
+          "get_open_payables",
           "search_records",
           "run_sql",
           "get_record_map"
@@ -111,7 +113,7 @@
           "don't have access",
           "limited to GL"
         ],
-        "_why": "no curated AP tool exists; the agent must reach it, not refuse"
+        "_why": "the AP pack now covers this \u2014 the curated tool is the best route; reaching via record search or SQL stays acceptable. Refusing is the only failure."
       }
     },
     {
@@ -196,6 +198,24 @@
           "get_ar_aging"
         ],
         "_why": "a technical how-do-I question about a named integration must reach the knowledge base; before the technical intent it classified as data and every wiki tool was hard-blocked"
+      }
+    },
+    {
+      "id": "top-billing-all",
+      "question": "Who are our top 5 billing customers across all business units in USD?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_top_billing_customers"
+        ],
+        "tool_args_contain": {
+          "business_unit": "ALL"
+        },
+        "not_refused": true,
+        "_why": "cross-BU ranking is ONE call with business_unit=ALL \u2014 a per-unit loop burns a model round per unit and never finishes"
       }
     }
   ]
