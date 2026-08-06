@@ -275,3 +275,40 @@ class ChatResponsivenessTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpSessionDiagnosisTests(unittest.TestCase):
+    """'Shared MCP session unavailable' must carry its own diagnosis. The
+    stdio exception is TaskGroup noise; the real reason died with the
+    subprocess's stderr, so the app re-imports the server capturing it and
+    /api/meta tells the page, which shows a banner instead of leaving the
+    cause in a terminal nobody watches."""
+
+    def test_import_check_reports_a_clean_import(self):
+        from pstb.gui import app as gapp
+        detail = gapp._server_import_check()
+        self.assertIn("imports cleanly", detail,
+                      "on a healthy install the check must say the failure "
+                      "is in the handshake, not the server")
+
+    def test_import_check_captures_the_real_stderr(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from pstb.gui import app as gapp
+        boom = SimpleNamespace(returncode=1, stdout="", stderr=(
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "oracledb.exceptions.DatabaseError: ORA-01017: invalid "
+            "username/password; logon denied"))
+        with patch("subprocess.run", return_value=boom):
+            detail = gapp._server_import_check()
+        self.assertIn("ORA-01017", detail,
+                      "the diagnosis must surface the database's own error")
+
+    def test_meta_reports_session_state(self):
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+        with TestClient(gapp.app) as client:
+            body = client.get("/api/meta").json()
+            self.assertIn("mcp_session", body)
+            self.assertIn("shared", body["mcp_session"])

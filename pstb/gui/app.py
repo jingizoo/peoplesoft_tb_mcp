@@ -70,6 +70,32 @@ except WikiError:
 _MCP: dict = {"session": None, "tools": None, "error": None}
 
 
+def _server_import_check() -> str:
+    """Why did `python -m pstb.server` die? Import it in a subprocess that
+    captures stderr and return the tail. The server connects to the database
+    at import time, so the dominant failures (Oracle logon, config, a broken
+    partial pull) all surface here with their real message."""
+    import subprocess
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
+                         + os.pathsep + env.get("PYTHONPATH", ""))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", "import pstb.server"],
+            capture_output=True, text=True, timeout=90, env=env)
+    except subprocess.TimeoutExpired:
+        return ("server import timed out after 90s — usually a database "
+                "connection hanging; check VPN/listener reachability")
+    except Exception as probe_err:
+        return f"import check could not run: {probe_err}"
+    if proc.returncode == 0:
+        return ("the server imports cleanly, so the failure is in the MCP "
+                "handshake itself — check that the venv's mcp package "
+                "matches (pip show mcp) and retry")
+    tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+    return f"server failed to start: {tail[-600:]}"
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
     stack = contextlib.AsyncExitStack()
@@ -89,8 +115,14 @@ async def _lifespan(_app):
         _MCP["session"] = session
         _MCP["tools"] = tool_specs(await session.list_tools())
     except Exception as e:                      # degrade, never fail to boot
-        _MCP["error"] = str(e)
-        print(f"[pstb] shared MCP session unavailable ({e}); "
+        # The exception from a dead stdio subprocess is usually noise
+        # ("unhandled errors in a TaskGroup") while the REAL reason — an
+        # Oracle logon rejection, a config error, a broken pull — died with
+        # the subprocess's stderr. Re-run the import in a subprocess that
+        # captures stderr, so the user sees ORA-01017 instead of a shrug.
+        detail = _server_import_check()
+        _MCP["error"] = str(e) + (f" | {detail}" if detail else "")
+        print(f"[pstb] shared MCP session unavailable ({_MCP['error']}); "
               "falling back to one server per turn", file=sys.stderr)
     try:
         yield
@@ -595,6 +627,9 @@ def meta():
             "account_tree": d.account_tree,
         },
         "build": _build_info(),
+        "mcp_session": {"shared": _MCP["session"] is not None,
+                        **({"error": _MCP["error"]} if _MCP["error"]
+                           else {})},
         "backend": cfg.db.backend,
         "use_views": cfg.db.use_views,
         "wiki": getattr(wiki, "provider_name", None),
