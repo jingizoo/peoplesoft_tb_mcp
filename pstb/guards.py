@@ -62,6 +62,15 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_report",
     "run_sql",
     "run_playbook",
+    "get_open_payables",
+    "get_vendor_payments",
+    "get_asset_register",
+    "get_project_costs",
+    "get_coupa_invoices",
+    "get_coupa_stuck_approvals",
+    "get_coupa_rni",
+    "get_coupa_supplier_spend",
+    "coupa_to_ap_tie",
 }
 
 # Request-scope field -> tool argument. The right-hand value differs only where
@@ -114,6 +123,10 @@ _TOOL_SCOPE_ARGS = {
     },
     "list_ledgers": {"business_unit": "business_unit"},
     "search_accounts": {"business_unit": "business_unit"},
+    "get_open_payables": {"business_unit": "business_unit"},
+    "get_vendor_payments": {"business_unit": "business_unit"},
+    "get_asset_register": {"business_unit": "business_unit"},
+    "get_project_costs": {"business_unit": "business_unit"},
 }
 
 # WHICH scope fields are governance and which are convenience.
@@ -188,10 +201,26 @@ _QUESTION_DOMAINS = {
     ),
     "journal": re.compile(r"(?i)\bjournals?\b"),
     "billing": re.compile(r"(?i)\b(?:billing|invoices?)\b"),
+    # "owe" is direction-sensitive: money owed TO US is receivables; money
+    # WE owe is payables. The blanket owe[ds]? match sent "how much do we
+    # owe our vendors" to the AR domain, where no AP tool could ever ground
+    # it — the gate then discarded the answer get_open_payables had just
+    # produced and told the user it had no PeopleSoft result.
     "ar": re.compile(
         r"(?i)\b(?:receivables?|aging|open items?|"
-        r"owe[ds]?|owing|due|overdue|past[ -]due|collections?)\b"
+        r"owes?\s+us|owed\s+to\s+us|who\s+owes|"
+        r"due|overdue|past[ -]due|collections?)\b"
     ),
+    "ap": re.compile(
+        r"(?i)\b(?:payables?|vouchers?|vendors?|suppliers?|"
+        r"pay(?:ment)?\s+runs?)\b"
+        r"|\b(?:we|do\s+we|should\s+we|how\s+much\s+do\s+we)\s+owe\b"
+    ),
+    "am": re.compile(
+        r"(?i)\b(?:assets?|capitali[sz]\w+|depreciat\w+|"
+        r"fixed\s+assets?|retire(?:d|ments?))\b"
+    ),
+    "pc": re.compile(r"(?i)\bprojects?\b"),
     "customer": re.compile(r"(?i)\bcustomers?\b"),
     "fx": re.compile(r"(?i)\b(?:currenc(?:y|ies)|exchange rates?)\b"),
     "variance": re.compile(
@@ -220,6 +249,22 @@ _TOOL_DOMAINS = {
     "get_billing_workbench": {"billing"},
     "run_report": {"report", "balance", "variance"},
     "run_playbook": {"balance", "journal", "ar", "billing", "report"},
+    # Module packs and connectors. Domains are what a tool can GROUND, and
+    # they are deliberately generous where the tool really computes the
+    # fact: open payables reports overdue/due amounts, so it grounds those
+    # words even though they also appear in AR questions. The gate is a
+    # safety net — a false refusal costs the user the answer a tool just
+    # produced; a false accept only means the model routed oddly and the
+    # number guard still checks every figure.
+    "get_open_payables": {"ap", "ar", "billing", "balance"},
+    "get_vendor_payments": {"ap", "report"},
+    "get_asset_register": {"am", "report", "balance"},
+    "get_project_costs": {"pc", "report", "variance"},
+    "get_coupa_invoices": {"ap", "billing"},
+    "get_coupa_stuck_approvals": {"ap", "billing"},
+    "get_coupa_rni": {"ap", "billing", "balance"},
+    "get_coupa_supplier_spend": {"ap", "report"},
+    "coupa_to_ap_tie": {"ap", "billing", "balance"},
 }
 
 
@@ -396,9 +441,16 @@ def _same_scope_value(field: str, left, right) -> bool:
 
 
 _ALL_BU_RE = re.compile(
-    r"(?i)\b(?:across|over|for|in|from)\s+all\s+(?:the\s+)?"
+    # "across BUs" means across BUs whether or not the user says "all" —
+    # requiring the word "all" made the scope guard read "compare this
+    # across business units" as a single-unit question and block the
+    # override the user was explicitly asking for.
+    r"(?i)\b(?:across|over)\s+(?:the\s+)?(?:all\s+)?"
+    r"(?:bus?|business\s*units?|units?|companies)\b|"
+    r"\b(?:for|in|from)\s+all\s+(?:the\s+)?"
     r"(?:bus?|business\s*units?|units?|companies)\b|"
     r"\ball\s+business\s*units?\b|\bevery\s+(?:bu|business\s*unit)\b|"
+    r"\bcross[- ]bu\b|"
     r"\b(?:company|enterprise|organi[sz]ation)-?\s?wide\b")
 
 
