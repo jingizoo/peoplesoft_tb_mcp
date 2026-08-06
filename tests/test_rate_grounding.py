@@ -116,6 +116,26 @@ class DeclaredOnlyGroundingTests(unittest.TestCase):
             {"numerator": 1, "denominator": 4}]})])
         self.assertEqual(rates.get("25"), PAYLOAD_DECLARED)
 
+    def test_a_percent_key_may_hold_a_map_or_list(self) -> None:
+        # get_ar_aging declares bucket_share_pct as a MAP of bucket ->
+        # share. Requiring a scalar under the key caveated a share the tool
+        # had just computed — found by sweeping real payloads, not by
+        # reading the code.
+        rates = payload_rates([json.dumps(
+            {"bucket_share_pct": {"current": 26.01, "1-30": 51.23}})])
+        self.assertEqual(rates.get("26.01"), PAYLOAD_DECLARED)
+        self.assertEqual(rates.get("51.23"), PAYLOAD_DECLARED)
+        self.assertEqual(
+            payload_rates([json.dumps({"share_pct": [12.5, 87.5]})]).get("12.5"),
+            PAYLOAD_DECLARED)
+
+    def test_rhetorical_zero_and_hundred_are_never_flagged(self) -> None:
+        for text in ("I am 100% confident in this reconciliation.",
+                     "0% of invoices are disputed.",
+                     "100 percent of vouchers posted."):
+            self.assertEqual(rate_findings(text, ['{"a": 1}']), [],
+                             f"idiom flagged as an unverified rate: {text!r}")
+
     def test_booleans_are_not_rates(self) -> None:
         self.assertEqual(payload_rates([json.dumps({"is_rate": True})]), {})
 
@@ -286,3 +306,41 @@ class ToolsDeclareTheirPercentagesTests(unittest.TestCase):
                       rate_caveat(rate_findings(
                           "The standard GST rate is 18%.", payloads)),
                       "the fabrication must still be caught alongside it")
+
+
+class NoFalsePositivesOnRealPayloadsTests(unittest.TestCase):
+    """The question that matters in practice is not "does it catch the
+    fabrication" but "does it stay quiet on correct answers". A sweep over
+    REAL tool output caught three false positives that reading the code did
+    not — including one introduced by the same PR. This pins the sweep."""
+
+    def test_percentages_the_tools_declare_are_never_flagged(self) -> None:
+        import pstb.server as srv
+        aging = srv.get_ar_aging()
+        top = srv.get_top_billing_customers(display_currency="USD")
+        proj = srv.get_project_costs()
+        cases = [
+            (aging, f"{aging['overdue_pct']}% of open AR is overdue."),
+            (aging, "The current bucket is "
+                    f"{aging['bucket_share_pct']['current']}% of the total."),
+            (aging, f"About {round(aging['overdue_pct'])}% is past due."),
+            (aging, "I am 100% confident in this reconciliation."),
+            (top, "The largest customer is "
+                  f"{top['customers'][0]['share_pct']}% of billings."),
+            (proj, "Budget utilisation is "
+                   f"{proj['projects'][0]['pct_used']}%."),
+        ]
+        for payload, sentence in cases:
+            self.assertEqual(
+                rate_caveat(rate_findings(sentence,
+                                          [json.dumps(payload, default=str)])),
+                "", f"false caveat on a correct answer: {sentence!r}")
+
+    def test_the_fabrication_is_still_caught_beside_them(self) -> None:
+        import pstb.server as srv
+        for payload in (srv.get_ar_aging(),
+                        srv.get_exchange_rate(from_currency="USD",
+                                              to_currency="EUR")):
+            self.assertIn("did not come from", rate_caveat(rate_findings(
+                "The standard GST rate is 18%.",
+                [json.dumps(payload, default=str)])))

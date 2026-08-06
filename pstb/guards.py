@@ -690,6 +690,8 @@ _RATE_KEY = re.compile(
     r"|(?:^|_)(?:tax|vat|gst|sales_tax|discount|withholding|interest"
     r"|growth|margin|utilization)_rate$")
 
+_RHETORICAL_RATES = {"0", "100"}
+
 PAYLOAD_DECLARED = "payload"
 USER_STATED = "user_stated"
 
@@ -722,13 +724,29 @@ def payload_rates(payloads, question: str = "") -> dict:
         if rates.get(key) != PAYLOAD_DECLARED:
             rates[key] = source
 
+    def note_leaves(node) -> None:
+        # A percent-named key may hold a MAP or a LIST of percentages, not
+        # just one scalar: get_ar_aging declares bucket_share_pct as
+        # {"current": 26.01, "1-30": 51.23, ...}. Requiring a scalar there
+        # caveated a share the tool had just computed. The key still has to
+        # name the unit — this widens what a declaration may CONTAIN, never
+        # what counts as one.
+        if isinstance(node, bool):
+            return
+        if isinstance(node, (int, float)):
+            note(node, PAYLOAD_DECLARED)
+        elif isinstance(node, dict):
+            for value in node.values():
+                note_leaves(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                note_leaves(value)
+
     def walk(node) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
-                if (isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and _RATE_KEY.search(str(key))):
-                    note(value, PAYLOAD_DECLARED)
+                if _RATE_KEY.search(str(key)):
+                    note_leaves(value)
                 elif str(key) == "ratios" and isinstance(value, list):
                     # An explicit producer declaration: "this numerator over
                     # this denominator is this percent, on this basis". The
@@ -785,6 +803,13 @@ def rate_findings(answer: str, payloads, question: str = "") -> list:
         if key in seen:
             continue
         seen.add(key)
+        # 0% and 100% are idiom far more often than measurement — "I am
+        # 100% confident", "0% of invoices are disputed" — and no
+        # fabricated benchmark ever looks like either. Flagging them was
+        # pure noise, and noise is what teaches people to skip the caveat
+        # that mattered.
+        if key in _RHETORICAL_RATES:
+            continue
         source = rates.get(key)
         if source is None:
             # Tolerate a rounded restatement of a declared rate, the same
