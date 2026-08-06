@@ -35,6 +35,8 @@ from ..guards import (
     promises_tool_call,
     question_financial_domains,
     tool_result_status,
+    rate_caveat,
+    rate_findings,
     ungrounded_figures,
     unevidenced_verdict,
 )
@@ -658,6 +660,27 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             )
             logged_calls.append({"tool": "_verdict_guard", "ok": False,
                                  "error": f"verdict without {missing}"})
+
+    # Rates get a caveat, never a withhold. A percentage passes the figure
+    # guard untouched (see guards._FIGURE_EXEMPT), so "the standard rate is
+    # 18%" — recalled from training data and presented as this company's
+    # configured rate — has been reaching users with nothing objecting.
+    # Grounding here is declared-only: a tool said "this is a percent", or
+    # the user typed it. Nothing is derived by dividing payload numbers.
+    #
+    # Deliberately NOT recorded in logged_calls: qlog.log_turn flags a turn
+    # as FAILED when any call carries ok=False, and this clause is designed
+    # to fire routinely on healthy turns. Marking them failures would
+    # poison the question-log learning loop that decides what to build
+    # next. The clause is visible in the answer text, which is the record.
+    if not gate_replaced_answer:
+        caveat = rate_caveat(
+            rate_findings(answer,
+                          list(turn_payloads) + list(prior_payloads or []),
+                          user_text))
+        if caveat:
+            answer += "\n\n" + caveat
+
     if qlog is not None:
         turn_id = qlog.log_turn(surface=surface, provider=provider.name,
                                 question=user_text, calls=logged_calls,

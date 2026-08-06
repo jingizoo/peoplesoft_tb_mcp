@@ -508,6 +508,16 @@ class ARBilling:
         for k in ("credit_amt", "disputed_amt"):
             totals[k] = r2(sum(c[k] for c in customers))
 
+        # Declare the bucket shares rather than leaving the model to divide
+        # in prose. "How much of our AR is overdue" is asked as a PERCENTAGE
+        # far more often than as an amount, and a percentage the machinery
+        # did not emit is one the answer guard cannot verify — so an
+        # undeclared share is both an ungrounded figure and a missing
+        # answer. Costs no query: these are the totals already computed.
+        overdue = r2(sum(totals[lb] for lb in labels[1:]))
+        base = totals["total"] or 0.0
+        shares = ({lb: r2(totals[lb] / base * 100.0) for lb in labels}
+                  if base else {})
         out = {
             "business_unit": bu,
             "as_of": asof,
@@ -515,6 +525,9 @@ class ARBilling:
             "buckets": labels,
             "customers": customers,
             "totals": totals,
+            "overdue_total": overdue,
+            "overdue_pct": r2(overdue / base * 100.0) if base else None,
+            "bucket_share_pct": shares,
             "gl_tie": self._gl_tie(bu),
             "note": (
                 f"All amounts converted server-side to {disp}. Positive = owed "

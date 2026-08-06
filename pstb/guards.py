@@ -647,3 +647,198 @@ def _is_number(text: str) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+# ------------------------------------------------------------ rate grounding
+# Percentages are the LEAST protected numbers here and the likeliest to be
+# invented. _FIGURE_EXEMPT deliberately lets them past the withhold guard,
+# and that exemption must stay: _FIGURE matches "25.00" inside "25.00%", and
+# the prompt mandates two-decimal formatting, so deleting it would withhold
+# every correctly formatted rate answer on day one. The cost of the
+# exemption is that "the standard rate is 18%" — a figure recalled from
+# training data and presented as this company's configured rate — reaches
+# the user with nothing objecting.
+#
+# So rates get a SEPARATE scanner with its own grounding set, which appends
+# a caveat and NEVER withholds. A wrong rate is a sentence the user can
+# check; a withheld answer is a product that looks broken.
+#
+# Grounding is DECLARED-ONLY, and that restraint is the design. The obvious
+# alternative -- derive percentages from ratios of payload numbers -- was
+# implemented and measured while designing this: over one realistic
+# 29-scalar finance payload it grounded 62 of the 101 integer percentages,
+# including the fabricated 18 and the 25 it existed to question. A grounding
+# rule that authorises the fabrication it was built to catch is worse than
+# no rule, because it looks like protection.
+_RATE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d+)?)\s*(?:%|percent\b)")
+
+# A key whose NAME declares its value is a PERCENT. The producer asserts the
+# unit; nothing is inferred.
+#
+# "pct"/"percent" may sit anywhere in the key (pct_used, percent_complete,
+# share_pct, change_percent) — this repo produces both orders.
+#
+# A bare "rate" is deliberately NOT a percent, and that exclusion is the
+# whole reason this is an allowlist. get_exchange_rate emits
+# {"rate": 18.34567891} (engine.py) — an FX multiplier — and USD/MXN sitting
+# near 18 grounded the exact "the standard rate is 18%" fabrication this
+# layer exists to catch. Verified before the fix: a single FX call anywhere
+# in the payload window silenced the caveat completely. Only the *_rate
+# names that really carry percentages are admitted.
+_RATE_KEY = re.compile(
+    r"(?i)(?:^|_)(?:pct|percent)(?:_|$)"
+    r"|(?:^|_)(?:tax|vat|gst|sales_tax|discount|withholding|interest"
+    r"|growth|margin|utilization)_rate$")
+
+PAYLOAD_DECLARED = "payload"
+USER_STATED = "user_stated"
+
+
+def payload_rates(payloads, question: str = "") -> dict:
+    """Percentages the machinery DECLARED, plus the ones the user typed.
+
+    Returns {canonical rate: source}. A payload declaration outranks the
+    user's own figure, so a rate the ledger actually produced is never
+    downgraded to "your number".
+
+    Deliberately independent of payload_numbers(), which is left untouched:
+    that set already carries thousand/million/billion restatements at 0-2
+    decimals, so small values are dense in it and deriving rates from it
+    would inherit exactly the pollution described above.
+    """
+    rates: dict = {}
+
+    def note(value, source: str) -> None:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return
+        # Key on MAGNITUDE, exactly as the figure guard compares signed
+        # ledger amounts (see ungrounded_figures). A declared change_pct of
+        # -21.84 is written in prose as "down 21.84%", and _RATE has no sign
+        # group, so a signed key would false-caveat every DECLINING
+        # percentage this repo computes.
+        key = _numeric_key(str(num)).lstrip("-")
+        if rates.get(key) != PAYLOAD_DECLARED:
+            rates[key] = source
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and _RATE_KEY.search(str(key))):
+                    note(value, PAYLOAD_DECLARED)
+                elif str(key) == "ratios" and isinstance(value, list):
+                    # An explicit producer declaration: "this numerator over
+                    # this denominator is this percent, on this basis". The
+                    # tool did the arithmetic and owns the basis; the guard
+                    # never divides two numbers itself.
+                    for entry in value:
+                        if not isinstance(entry, dict):
+                            continue
+                        if isinstance(entry.get("pct"), (int, float)):
+                            note(entry["pct"], PAYLOAD_DECLARED)
+                            continue
+                        num = entry.get("numerator")
+                        den = entry.get("denominator")
+                        if (isinstance(num, (int, float))
+                                and isinstance(den, (int, float)) and den):
+                            note(num / den * 100.0, PAYLOAD_DECLARED)
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+
+    for raw in payloads or []:
+        if isinstance(raw, str):
+            try:
+                walk(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        else:
+            walk(raw)
+
+    # The user's own figure grounds a restatement of itself. Without this,
+    # answering "our GST works out to 25% - is that right?" gets caveated
+    # for repeating the number the controller just typed, which reads as
+    # the system calling them a liar.
+    for match in _RATE.finditer(question or ""):
+        note(match.group(1), USER_STATED)
+    return rates
+
+
+def rate_findings(answer: str, payloads, question: str = "") -> list:
+    """Rates stated in the answer that no tool result declared.
+
+    Each finding is {"rate": as written, "source": None | "user_stated"}.
+    A rate the machinery declared produces no finding at all.
+    """
+    if not answer:
+        return []
+    rates = payload_rates(payloads, question)
+    findings: list = []
+    seen: set = set()
+    for match in _RATE.finditer(answer):
+        stated_text = match.group(1)
+        key = _numeric_key(stated_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        source = rates.get(key)
+        if source is None:
+            # Tolerate a rounded restatement of a declared rate, the same
+            # way the figure guard does: a payload 8.05 reported as "8.1%"
+            # is the same fact, not an invention.
+            try:
+                stated = float(stated_text)
+            except ValueError:
+                continue
+            decimals = (len(stated_text.split(".")[1])
+                        if "." in stated_text else 0)
+            for grounded, grounded_source in rates.items():
+                if not _is_number(grounded):
+                    continue
+                if (round(abs(float(grounded)), decimals)
+                        == round(abs(stated), decimals)):
+                    source = grounded_source
+                    break
+        if source == PAYLOAD_DECLARED:
+            continue
+        findings.append({"rate": match.group(0).strip(), "source": source})
+    return findings
+
+
+def rate_caveat(findings) -> str:
+    """One bracketed clause covering every unverified rate in an answer.
+
+    One clause, never several: a paragraph of warnings trains the reader to
+    skip all of them, including the one that mattered.
+    """
+    if not findings:
+        return ""
+    unsourced = [f["rate"] for f in findings if not f.get("source")]
+    from_user = [f["rate"] for f in findings
+                 if f.get("source") == USER_STATED]
+    def listed(rates: list) -> str:
+        # Same shape as the money guard's message: naming three and
+        # silently dropping the rest understates the problem.
+        return ", ".join(rates[:3]) + (" and others" if len(rates) > 3 else "")
+
+    parts: list = []
+    if unsourced:
+        parts.append(
+            listed(unsourced)
+            + " did not come from any tool result this turn — treat "
+            + ("it" if len(unsourced) == 1 else "them")
+            + " as unconfirmed rather than a rate retrieved from your data.")
+    if from_user:
+        parts.append(
+            listed(from_user)
+            + " is the figure you gave me; I did not retrieve or verify "
+              "it against the ledger."
+            if len(from_user) == 1 else
+            listed(from_user)
+            + " are figures you gave me; I did not retrieve or verify "
+              "them against the ledger.")
+    return "[" + " ".join(parts) + "]"
