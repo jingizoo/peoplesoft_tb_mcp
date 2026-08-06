@@ -1618,6 +1618,18 @@ async function viewAR(){
 /* ---------- boot ---------- */
 (async function(){
   try{ META=await api('/api/meta'); }catch(e){ oops('Cannot reach the server: '+e.message); return; }
+  if(META.mcp_session&&!META.mcp_session.shared){
+    // The engine fell back to one server per question. If the cause is
+    // fatal (a database logon, a broken install) every question will fail
+    // the same way — say WHY at the top of the page, not in a terminal
+    // nobody is watching.
+    const b=el('div','msg err');
+    b.style.margin='10px 16px';
+    b.innerHTML='<b>Chat engine degraded:</b> the shared answer server could not start, '+
+      'so questions run slower and may fail.<br><span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px">'+
+      esc(META.mcp_session.error||'no detail captured')+'</span>';
+    document.body.prepend(b);
+  }
   renderBuildTag();   // META carries the build; the tag renders before this resolves
   const bu=$('#f-bu'), lg=$('#f-ledger'), per=$('#f-per');
   const sc0=META.scope||{};
