@@ -1379,6 +1379,33 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the model cannot raise its own row ceiling",
           "row_ceiling" not in _run_sql_tool,
           "the export ceiling leaked into the model-facing run_sql tool")
+
+    # Rate grounding. Percentages bypass the withhold guard by design, so
+    # they get a caveat layer instead. Both halves are pinned: the caveat
+    # must fire on an unsourced rate, and it must NEVER escalate to a
+    # withhold, because a withheld answer reads as a broken product.
+    from pstb.guards import (payload_rates as _prates,
+                             rate_caveat as _rcav,
+                             rate_findings as _rfind)
+    check("a rate no tool declared is caveated",
+          "did not come from any tool result" in
+          _rcav(_rfind("the standard rate is 18%", ['{"total": 250000}'])),
+          "a fabricated standard rate reaches the user unchallenged")
+    check("a rate the machinery declared passes clean",
+          _rcav(_rfind("share is 42.5%", ['{"share_pct": 42.5}'])) == "",
+          "a declared percentage is being caveated — this is the noise "
+          "failure that makes users stop reading warnings")
+    check("rate grounding is declared-only, never derived",
+          _prates(['{"tax": 250000, "sales": 1000000}']) == {},
+          "rates are being derived from pairs of payload numbers, which "
+          "grounds the very fabrications this layer exists to catch")
+    check("the user's own figure is acknowledged, not condemned",
+          "you gave me" in _rcav(_rfind(
+              "25% is high", ['{"a": 1}'], "our GST is 25%, right?")),
+          "restating the user's own number is treated as fabrication")
+    check("percentages never reach the withhold guard",
+          ungrounded_figures("the rate is 25.00%", ['{"a": 1}']) == [],
+          "removing the % exemption withholds every formatted rate answer")
     check("scope label reads the business-unit name",
           _rejs.search(r"buName\s*\(\s*value\.business_unit\s*\)",
                        _clean) is not None,
