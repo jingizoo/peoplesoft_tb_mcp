@@ -217,6 +217,28 @@
         "not_refused": true,
         "_why": "cross-BU ranking is ONE call with business_unit=ALL \u2014 a per-unit loop burns a model round per unit and never finishes"
       }
+    },
+    {
+      "id": "ap-owe",
+      "question": "How much do we owe our vendors right now?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_open_payables",
+          "get_vendor_payments",
+          "run_playbook"
+        ],
+        "not_refused": true,
+        "answer_lacks": [
+          "could not obtain",
+          "only authorized",
+          "not authorized"
+        ],
+        "_why": "the verbatim complaint: the tool worked but the evidence gate discarded its answer because AP tools carried no domains and 'owe' belonged to AR. The gate must accept what the AP pack grounds, and the model must never claim an authorization restriction no tool stated."
+      }
     }
   ]
 }
