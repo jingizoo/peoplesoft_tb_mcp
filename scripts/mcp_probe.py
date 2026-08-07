@@ -71,6 +71,8 @@ async def main() -> None:
             # stop existing. Naming them is the only way that shows up.
             REQUIRED = {
                 "get_invoice_totals", "get_customer_intelligence",
+                "get_invoice_lifecycle", "get_dso_trend",
+                "get_cash_outlook", "get_vendor_intelligence",
                 "coupa_health", "get_coupa_invoices",
                 "get_coupa_stuck_approvals", "get_coupa_rni",
                 "get_coupa_supplier_spend", "coupa_to_ap_tie",

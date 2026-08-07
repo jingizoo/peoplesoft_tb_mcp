@@ -295,6 +295,51 @@ def get_top_billing_customers(
 
 
 @mcp.tool()
+def get_invoice_lifecycle(business_unit: str = "") -> dict:
+    """Where is the billing delay: the pipeline from the billing interface
+    to AR as STAGES — interface waiting/error, bills by status with amounts
+    and ages, finalized-but-not-in-AR orphans, open in AR — with the
+    bottleneck named. Use for "where is the delay / how does an invoice
+    flow / what is stuck between order and cash". Cycle times appear only
+    where the site stores creation timestamps; otherwise current stage
+    ages are reported and the limitation is disclosed."""
+    return _safe(ar.invoice_lifecycle, business_unit=business_unit)
+
+
+@mcp.tool()
+def get_dso_trend(business_unit: str = "", fiscal_year: int = 0) -> dict:
+    """Monthly DSO (days sales outstanding) computed from the ledger:
+    ending AR control balance / period revenue x days in period, revenue
+    from ACCOUNT_TYPE='R' postings. Formula disclosed in the payload. Use
+    for "DSO trend / are we collecting faster or slower". Chartable."""
+    return _safe(ar.dso_trend, business_unit=business_unit,
+                 fiscal_year=fiscal_year)
+
+
+@mcp.tool()
+def get_cash_outlook(business_unit: str = "", weeks: int = 8) -> dict:
+    """Expected cash by week from DUE DATES: inflows from open AR items,
+    outflows from open vouchers, net per currency, overdue in its own
+    bucket. This is due-date arithmetic — the starting point a treasurer
+    refines — NOT a payment-behavior forecast, and the payload says so.
+    Use for "cash outlook / what is due in and out over the next weeks"."""
+    return _safe(ar.cash_outlook, business_unit=business_unit, weeks=weeks)
+
+
+@mcp.tool()
+def get_vendor_intelligence(business_unit: str = "", months: int = 12,
+                            n: int = 20) -> dict:
+    """Top vendors with HOW WE PAY them: payment totals and share, plus
+    amount-weighted days early/late versus voucher due dates, and computed
+    observations (paying early = cash handed over sooner than required;
+    late = relationship risk; concentration). The AP mirror of customer
+    intelligence. Use for "top vendors / do we pay early or late / vendor
+    concentration". Copy observations verbatim — they are arithmetic."""
+    return _safe(modules.vendor_intelligence, business_unit=business_unit,
+                 months=months, n=n)
+
+
+@mcp.tool()
 def get_customer_intelligence(business_unit: str = "", n: int = 20,
                               months: int = 12,
                               display_currency: str = "") -> dict:

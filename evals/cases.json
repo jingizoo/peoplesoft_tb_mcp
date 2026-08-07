@@ -349,6 +349,93 @@
         "not_refused": true,
         "_why": "a close-control chip that has always been on the page but never had a pinned case."
       }
+    },
+    {
+      "id": "invoice-lifecycle",
+      "question": "Where is the billing delay?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_invoice_lifecycle",
+          "get_billing_workbench"
+        ],
+        "not_refused": true,
+        "_why": "the process question: stages and the bottleneck, not a table dump."
+      }
+    },
+    {
+      "id": "post-close-watch",
+      "question": "Is everything okay after the close?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook"
+        ],
+        "not_refused": true,
+        "_why": "post-close assurance runs the composed watch, not ad-hoc queries."
+      }
+    },
+    {
+      "id": "cash-outlook",
+      "question": "What is our cash outlook for the next 8 weeks?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_cash_outlook"
+        ],
+        "not_refused": true,
+        "_why": "due-date cash arithmetic must route to the outlook tool."
+      }
+    },
+    {
+      "id": "vendor-intelligence",
+      "question": "Do we pay our top vendors early or late?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_vendor_intelligence",
+          "get_vendor_payments"
+        ],
+        "not_refused": true,
+        "_why": "pay-behavior question, AP side."
+      }
+    },
+    {
+      "id": "dso-trend",
+      "question": "Show the DSO trend for this year",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_dso_trend"
+        ],
+        "not_refused": true,
+        "_why": "the collections-speed KPI, computed from the ledger with the formula disclosed."
+      }
     }
   ]
 }

@@ -29,6 +29,13 @@ class ModuleError(RuntimeError):
     pass
 
 
+def _iso_opt(day):
+    """A date or None — blank strings and NULLs are honest absences."""
+    if day is None or str(day).strip() in ("", "None"):
+        return None
+    return _iso(str(day))
+
+
 def _iso(s: str) -> dt.date:
     return dt.date.fromisoformat(str(s)[:10])
 
@@ -173,6 +180,102 @@ class ModulePacks:
         return out
 
     # ---- AP: whom did we pay ---------------------------------------------
+    def vendor_intelligence(self, business_unit: str = "",
+                            months: int = 12, n: int = 20,
+                            as_of_date: str = "") -> dict:
+        """Top vendors with HOW WE PAY them — terms versus actual behavior
+        — plus computed observations, mirror of customer intelligence.
+
+        Days early/late per payment = payment date minus voucher due date
+        via the payment cross-reference, weighted by amount and computed
+        in Python. Negative = we pay early (cash handed over sooner than
+        required); positive = late (relationship and terms risk). Both are
+        observations with figures, never advice from thin air.
+        """
+        bu = self._bu(business_unit)
+        asof = self._asof(as_of_date)
+        since = (_iso(asof) - dt.timedelta(
+            days=max(int(months or 12), 1) * 30)).isoformat()
+        self._need("PS_VOUCHER", ["BUSINESS_UNIT", "VOUCHER_ID",
+                                  "VENDOR_ID", "GROSS_AMT"])
+        p = self.db.prefix
+        rows, _ = self.db.query(
+            f"SELECT V.VENDOR_ID AS vendor_id, N.NAME1 AS vendor, "
+            f"P.PYMNT_DT AS paid_dt, V.DUE_DT AS due_dt, "
+            f"X.PAID_AMT AS amount, P.CURRENCY_CD AS currency "
+            f"FROM {p}PS_PYMNT_VCHR_XREF X "
+            f"JOIN {p}PS_VOUCHER V ON V.BUSINESS_UNIT = X.BUSINESS_UNIT "
+            f"AND V.VOUCHER_ID = X.VOUCHER_ID "
+            f"JOIN {p}PS_PAYMENT_TBL P ON P.PYMNT_ID = X.PYMNT_ID "
+            f"LEFT JOIN {p}PS_VENDOR N ON N.VENDOR_ID = V.VENDOR_ID "
+            f"WHERE V.BUSINESS_UNIT = :bu "
+            f"AND P.PYMNT_DT >= {self.db.date_bind('since')}",
+            {"bu": bu, "since": since}, max_rows=10_000)
+        vendors: dict = {}
+        for r in rows:
+            v = vendors.setdefault(str(r["vendor_id"]), {
+                "vendor_id": str(r["vendor_id"]),
+                "vendor": str(r["vendor"] or ""),
+                "payments": 0, "paid_total": 0.0, "currency":
+                str(r["currency"] or ""), "timing_weight": 0.0,
+                "timed_amount": 0.0})
+            amt = float(r["amount"] or 0)
+            v["payments"] += 1
+            v["paid_total"] = r2(v["paid_total"] + amt)
+            paid, due = _iso_opt(r.get("paid_dt")), _iso_opt(r.get("due_dt"))
+            if paid and due and amt:
+                v["timing_weight"] += (paid - due).days * amt
+                v["timed_amount"] += amt
+        ranked = sorted(vendors.values(), key=lambda v: -v["paid_total"])
+        ranked = ranked[:max(int(n or 20), 1)]
+        total_paid = sum(v["paid_total"] for v in vendors.values()) or 1.0
+        observations = []
+        for v in ranked:
+            v["share_pct"] = r2(v["paid_total"] / total_paid * 100.0)
+            v["avg_days_vs_due"] = (
+                int(round(v["timing_weight"] / v["timed_amount"]))
+                if v["timed_amount"] else None)
+            del v["timing_weight"], v["timed_amount"]
+            days = v["avg_days_vs_due"]
+            if days is not None and days <= -5:
+                observations.append({
+                    "kind": "early_payment", "vendor_id": v["vendor_id"],
+                    "avg_days_vs_due": days, "paid_total": v["paid_total"],
+                    "text": (f"{v['vendor'] or v['vendor_id']} is paid on "
+                             f"average {-days} days BEFORE due across "
+                             f"{v['paid_total']:,.2f} — cash handed over "
+                             "early; if no early-pay discount exists, the "
+                             "terms are a free lever.")})
+            if days is not None and days >= 10:
+                observations.append({
+                    "kind": "late_payment", "vendor_id": v["vendor_id"],
+                    "avg_days_vs_due": days, "paid_total": v["paid_total"],
+                    "text": (f"{v['vendor'] or v['vendor_id']} is paid on "
+                             f"average {days} days AFTER due — a supplier "
+                             "relationship and terms-compliance risk worth "
+                             "a look.")})
+        if ranked and ranked[0]["share_pct"] >= 40:
+            observations.append({
+                "kind": "concentration", "vendor_id": ranked[0]["vendor_id"],
+                "share_pct": ranked[0]["share_pct"],
+                "text": (f"{ranked[0]['vendor'] or ranked[0]['vendor_id']} "
+                         f"receives {ranked[0]['share_pct']}% of payment "
+                         "value — supply concentration worth a second "
+                         "source conversation.")})
+        notes = []
+        if not self._cols("PS_VENDOR_ADDR"):
+            notes.append("PS_VENDOR_ADDR not present — vendor geography "
+                         "is not available at this site.")
+        return {
+            "business_unit": bu, "since": since, "as_of": asof,
+            "window_months": int(months or 12),
+            "vendors": ranked, "observations": observations,
+            **({"record_notes": notes} if notes else {}),
+            "note": ("Timing = payment date minus voucher due date via the "
+                     "payment cross-reference, amount-weighted. "
+                     "Observations are computed, never invented."),
+        }
+
     def duplicate_payments(self, business_unit: str = "",
                            months: int = 12, tolerance_days: int = 7,
                            as_of_date: str = "") -> dict:

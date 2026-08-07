@@ -62,6 +62,10 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_report",
     "run_sql",
     "run_playbook",
+    "get_invoice_lifecycle",
+    "get_dso_trend",
+    "get_cash_outlook",
+    "get_vendor_intelligence",
     "get_customer_intelligence",
     "get_invoice_totals",
     "get_duplicate_payments",
@@ -126,6 +130,11 @@ _TOOL_SCOPE_ARGS = {
     },
     "list_ledgers": {"business_unit": "business_unit"},
     "search_accounts": {"business_unit": "business_unit"},
+    "get_invoice_lifecycle": {"business_unit": "business_unit"},
+    "get_dso_trend": {"business_unit": "business_unit",
+                      "fiscal_year": "fiscal_year"},
+    "get_cash_outlook": {"business_unit": "business_unit"},
+    "get_vendor_intelligence": {"business_unit": "business_unit"},
     "get_customer_intelligence": {"business_unit": "business_unit"},
     "get_invoice_totals": {"business_unit": "business_unit",
                            "fiscal_year": "fiscal_year"},
@@ -263,6 +272,10 @@ _TOOL_DOMAINS = {
     # safety net — a false refusal costs the user the answer a tool just
     # produced; a false accept only means the model routed oddly and the
     # number guard still checks every figure.
+    "get_invoice_lifecycle": {"billing", "ar", "report"},
+    "get_dso_trend": {"ar", "balance", "report", "variance"},
+    "get_cash_outlook": {"ar", "ap", "balance", "report"},
+    "get_vendor_intelligence": {"ap", "report"},
     "get_customer_intelligence": {"billing", "customer", "ar", "report",
                                   "fx"},
     "get_invoice_totals": {"billing", "report", "balance"},
