@@ -919,6 +919,32 @@ def get_coupa_supplier_spend(months: int = 12, top_n: int = 10) -> dict:
 
 
 @mcp.tool()
+def get_coupa_budget_lines(period: str = "") -> dict:
+    """Budget lines as the procurement system holds them: account
+    segments, period, amount. Use when asked what the budget IS. period
+    filters like "FY2026". Segment meanings are per-tenant configuration
+    and are reported, never assumed."""
+    return _safe(coupa.budget_lines, period=period)
+
+
+@mcp.tool()
+def coupa_budget_variance(business_unit: str = "", fiscal_year: int = 0,
+                          period: int = 0, top: int = 25) -> dict:
+    """RECONCILIATION: procurement-system BUDGET vs PeopleSoft ACTUALS,
+    matched on natural account, year-to-date. Use for "budget vs actual /
+    are we over budget / where are we overspending" AT SITES THAT BUDGET
+    IN PROCUREMENT rather than in a ledger. Reports compared lines with
+    variance and favourability, plus two separate lists that mean
+    different things: unbudgeted spend (expense with no budget line) and
+    unspent budget. Revenue is excluded — procurement budgets cover
+    spend. If budgets live in a PeopleSoft ledger instead, use
+    get_budget_variance."""
+    return _safe(coupa.budget_variance, engine=engine,
+                 business_unit=business_unit, fiscal_year=fiscal_year,
+                 period=period, top=top)
+
+
+@mcp.tool()
 def coupa_to_ap_tie(days: int = 90) -> dict:
     """RECONCILIATION: approved/paid Coupa invoices vs PS vouchers, matched
     server-side on invoice number with the supplier verified against the

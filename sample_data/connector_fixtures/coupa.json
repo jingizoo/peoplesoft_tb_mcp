@@ -6,75 +6,303 @@
     "INV-9002 lands at a different amount (the tie-out's amount break),",
     "and CINV-2088 never reached AP. Supplier names carry Inc/Co suffix",
     "noise to exercise normalized matching against PS_VENDOR.NAME1.",
-    "To record a live fixture: save the JSON a GET returns under its path."
+    "To record a live fixture: save the JSON a GET returns under its path.",
+    "budget_lines are the SITE'S REAL SHAPE: budgets live in Coupa, not in a PeopleSoft BUDGET ledger. segment-1 is the natural account, segment-2 the cost centre. 6700 has no PS actuals on purpose \u2014 an unspent budget line must be visible, not silently dropped."
   ],
   "/api/suppliers": [
-    {"id": 11, "name": "Ridgeline Supply Co.", "status": "active"},
-    {"id": 12, "name": "Cobalt IT Services Inc", "status": "active"},
-    {"id": 13, "name": "Harbor Freight Lines", "status": "active"},
-    {"id": 14, "name": "Meridian Analytics LLC", "status": "active"}
+    {
+      "id": 11,
+      "name": "Ridgeline Supply Co.",
+      "status": "active"
+    },
+    {
+      "id": 12,
+      "name": "Cobalt IT Services Inc",
+      "status": "active"
+    },
+    {
+      "id": 13,
+      "name": "Harbor Freight Lines",
+      "status": "active"
+    },
+    {
+      "id": 14,
+      "name": "Meridian Analytics LLC",
+      "status": "active"
+    }
   ],
   "/api/invoices": [
-    {"id": 9101, "invoice-number": "INV-9003", "status": "approved",
-     "supplier": {"name": "Cobalt IT Services Inc"}, "total": 64000.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-07-28",
-     "submitted-at": "2026-07-25"},
-    {"id": 9102, "invoice-number": "INV-9001", "status": "paid",
-     "supplier": {"name": "Ridgeline Supply Co."}, "total": 18400.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-07-10",
-     "submitted-at": "2026-07-08"},
-    {"id": 9103, "invoice-number": "INV-0005", "status": "approved",
-     "supplier": {"name": "Cobalt IT Services Inc"}, "total": 9900.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-06-30",
-     "submitted-at": "2026-06-28"},
-    {"id": 9104, "invoice-number": "INV-9002", "status": "approved",
-     "supplier": {"name": "Cobalt IT Services Inc"}, "total": 27950.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-06-05",
-     "submitted-at": "2026-06-03"},
-    {"id": 9105, "invoice-number": "CINV-2088", "status": "approved",
-     "supplier": {"name": "Meridian Analytics LLC"}, "total": 12750.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-07-22",
-     "submitted-at": "2026-07-20"},
-    {"id": 9106, "invoice-number": "CINV-2101", "status": "pending_approval",
-     "supplier": {"name": "Ridgeline Supply Co."}, "total": 4300.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-07-23",
-     "pending-since": "2026-07-24",
-     "current-approval": {"approver": {"name": "D. Okafor"}}},
-    {"id": 9107, "invoice-number": "CINV-2102", "status": "pending_approval",
-     "supplier": {"name": "Harbor Freight Lines"}, "total": 61000.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-08-01",
-     "pending-since": "2026-08-03",
-     "current-approval": {"approver": {"name": "P. Anand"}}},
-    {"id": 9108, "invoice-number": "CINV-2103", "status": "draft",
-     "supplier": {"name": "Meridian Analytics LLC"}, "total": 900.0,
-     "currency": {"code": "USD"}, "invoice-date": "2026-08-02"}
+    {
+      "id": 9101,
+      "invoice-number": "INV-9003",
+      "status": "approved",
+      "supplier": {
+        "name": "Cobalt IT Services Inc"
+      },
+      "total": 64000.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-07-28",
+      "submitted-at": "2026-07-25"
+    },
+    {
+      "id": 9102,
+      "invoice-number": "INV-9001",
+      "status": "paid",
+      "supplier": {
+        "name": "Ridgeline Supply Co."
+      },
+      "total": 18400.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-07-10",
+      "submitted-at": "2026-07-08"
+    },
+    {
+      "id": 9103,
+      "invoice-number": "INV-0005",
+      "status": "approved",
+      "supplier": {
+        "name": "Cobalt IT Services Inc"
+      },
+      "total": 9900.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-06-30",
+      "submitted-at": "2026-06-28"
+    },
+    {
+      "id": 9104,
+      "invoice-number": "INV-9002",
+      "status": "approved",
+      "supplier": {
+        "name": "Cobalt IT Services Inc"
+      },
+      "total": 27950.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-06-05",
+      "submitted-at": "2026-06-03"
+    },
+    {
+      "id": 9105,
+      "invoice-number": "CINV-2088",
+      "status": "approved",
+      "supplier": {
+        "name": "Meridian Analytics LLC"
+      },
+      "total": 12750.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-07-22",
+      "submitted-at": "2026-07-20"
+    },
+    {
+      "id": 9106,
+      "invoice-number": "CINV-2101",
+      "status": "pending_approval",
+      "supplier": {
+        "name": "Ridgeline Supply Co."
+      },
+      "total": 4300.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-07-23",
+      "pending-since": "2026-07-24",
+      "current-approval": {
+        "approver": {
+          "name": "D. Okafor"
+        }
+      }
+    },
+    {
+      "id": 9107,
+      "invoice-number": "CINV-2102",
+      "status": "pending_approval",
+      "supplier": {
+        "name": "Harbor Freight Lines"
+      },
+      "total": 61000.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-08-01",
+      "pending-since": "2026-08-03",
+      "current-approval": {
+        "approver": {
+          "name": "P. Anand"
+        }
+      }
+    },
+    {
+      "id": 9108,
+      "invoice-number": "CINV-2103",
+      "status": "draft",
+      "supplier": {
+        "name": "Meridian Analytics LLC"
+      },
+      "total": 900.0,
+      "currency": {
+        "code": "USD"
+      },
+      "invoice-date": "2026-08-02"
+    }
   ],
   "/api/purchase_order_lines": [
-    {"order-header-number": "PO-7001", "line-num": 1,
-     "supplier": {"name": "Ridgeline Supply Co."},
-     "description": "Warehouse racking",
-     "received-amount": 12000.0, "invoiced-amount": 9000.0,
-     "currency": {"code": "USD"}},
-    {"order-header-number": "PO-7002", "line-num": 1,
-     "supplier": {"name": "Meridian Analytics LLC"},
-     "description": "Data platform subscription",
-     "received-amount": 7500.0, "invoiced-amount": 0.0,
-     "currency": {"code": "USD"}},
-    {"order-header-number": "PO-7003", "line-num": 2,
-     "supplier": {"name": "Cobalt IT Services Inc"},
-     "description": "Laptop refresh",
-     "received-amount": 5400.0, "invoiced-amount": 5400.0,
-     "currency": {"code": "USD"}},
-    {"order-header-number": "PO-7004", "line-num": 1,
-     "supplier": {"name": "Harbor Freight Lines"},
-     "description": "Freight surcharge credit",
-     "received-amount": 2100.0, "invoiced-amount": 2600.0,
-     "currency": {"code": "USD"}},
-    {"order-header-number": "PO-7005", "line-num": 1,
-     "supplier": {"name": "Ridgeline Supply Co."},
-     "description": "EU site fit-out",
-     "received-amount": 4400.0, "invoiced-amount": 1400.0,
-     "currency": {"code": "EUR"}}
+    {
+      "order-header-number": "PO-7001",
+      "line-num": 1,
+      "supplier": {
+        "name": "Ridgeline Supply Co."
+      },
+      "description": "Warehouse racking",
+      "received-amount": 12000.0,
+      "invoiced-amount": 9000.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "order-header-number": "PO-7002",
+      "line-num": 1,
+      "supplier": {
+        "name": "Meridian Analytics LLC"
+      },
+      "description": "Data platform subscription",
+      "received-amount": 7500.0,
+      "invoiced-amount": 0.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "order-header-number": "PO-7003",
+      "line-num": 2,
+      "supplier": {
+        "name": "Cobalt IT Services Inc"
+      },
+      "description": "Laptop refresh",
+      "received-amount": 5400.0,
+      "invoiced-amount": 5400.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "order-header-number": "PO-7004",
+      "line-num": 1,
+      "supplier": {
+        "name": "Harbor Freight Lines"
+      },
+      "description": "Freight surcharge credit",
+      "received-amount": 2100.0,
+      "invoiced-amount": 2600.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "order-header-number": "PO-7005",
+      "line-num": 1,
+      "supplier": {
+        "name": "Ridgeline Supply Co."
+      },
+      "description": "EU site fit-out",
+      "received-amount": 4400.0,
+      "invoiced-amount": 1400.0,
+      "currency": {
+        "code": "EUR"
+      }
+    }
   ],
-  "/oauth2/token": {"access_token": "fixture-token", "expires_in": 900}
+  "/oauth2/token": {
+    "access_token": "fixture-token",
+    "expires_in": 900
+  },
+  "/api/budget_lines": [
+    {
+      "id": 501,
+      "name": "FY26 Cost of Goods",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "5000",
+        "segment-2": "1000"
+      },
+      "budgeted-amount": 767929.63,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "id": 502,
+      "name": "FY26 Salaries",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "6000",
+        "segment-2": "1000"
+      },
+      "budgeted-amount": 676704.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "id": 503,
+      "name": "FY26 Benefits",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "6100",
+        "segment-2": "1000"
+      },
+      "budgeted-amount": 135340.8,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "id": 504,
+      "name": "FY26 Rent",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "6200",
+        "segment-2": "2000"
+      },
+      "budgeted-amount": 128217.6,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "id": 505,
+      "name": "FY26 Travel",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "6400",
+        "segment-2": "2000"
+      },
+      "budgeted-amount": 85120.0,
+      "currency": {
+        "code": "USD"
+      }
+    },
+    {
+      "id": 506,
+      "name": "FY26 Marketing programs",
+      "period": "FY2026",
+      "account": {
+        "segment-1": "6700",
+        "segment-2": "2000"
+      },
+      "budgeted-amount": 40000.0,
+      "currency": {
+        "code": "USD"
+      }
+    }
+  ]
 }

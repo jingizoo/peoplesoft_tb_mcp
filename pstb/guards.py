@@ -63,6 +63,8 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_sql",
     "run_playbook",
     "get_budget_variance",
+    "coupa_budget_variance",
+    "get_coupa_budget_lines",
     "get_invoice_lifecycle",
     "get_dso_trend",
     "get_cash_outlook",
@@ -134,6 +136,10 @@ _TOOL_SCOPE_ARGS = {
     "get_budget_variance": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "coupa_budget_variance": {
+        "business_unit": "business_unit", "fiscal_year": "fiscal_year",
+        "period": "period",
     },
     "get_invoice_lifecycle": {"business_unit": "business_unit"},
     "get_dso_trend": {"business_unit": "business_unit",
@@ -278,6 +284,8 @@ _TOOL_DOMAINS = {
     # produced; a false accept only means the model routed oddly and the
     # number guard still checks every figure.
     "get_budget_variance": {"balance", "report", "variance"},
+    "coupa_budget_variance": {"balance", "report", "variance", "ap"},
+    "get_coupa_budget_lines": {"report", "ap"},
     "get_invoice_lifecycle": {"billing", "ar", "report"},
     "get_dso_trend": {"ar", "balance", "report", "variance"},
     "get_cash_outlook": {"ar", "ap", "balance", "report"},

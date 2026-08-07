@@ -157,3 +157,78 @@ class ServerRegistrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoupaBudgetTests(unittest.TestCase):
+    """Budgets live in the procurement system at this deployment, not in a
+    PeopleSoft budget ledger — so budget-vs-actual is a CROSS-SYSTEM
+    reconciliation, and its honesty rules differ from the ledger tool's."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from pstb.config import Config
+        from pstb.db import Database
+        from pstb.engine import TBEngine
+        cls.db = Database(Config.sample(ROOT))
+        cls.engine = TBEngine(cls.db, Config.sample(ROOT))
+        cls.c = _coupa()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.db.close()
+
+    def _out(self, **kw):
+        return self.c.budget_variance(self.engine, business_unit="US001",
+                                      fiscal_year=2026, period=6, **kw)
+
+    def test_budget_lines_report_the_segment_meanings(self) -> None:
+        out = self.c.budget_lines(period="FY2026")
+        self.assertTrue(out["budget_lines"])
+        self.assertIn("segment_map", out,
+                      "segment meanings are per-tenant; assuming them "
+                      "silently is how a mapping error becomes a number")
+
+    def test_matched_lines_carry_variance_and_favourability(self) -> None:
+        rows = {r["account"]: r for r in self._out(top=50)["rows"]}
+        travel = rows["6400"]
+        self.assertGreater(travel["variance"], 0)
+        self.assertFalse(travel["favourable"])
+        self.assertTrue(rows["5000"]["favourable"])
+
+    def test_the_two_failure_directions_stay_separate(self) -> None:
+        out = self._out()
+        self.assertEqual([u["account"] for u in out["budget_not_spent"]],
+                         ["6700"],
+                         "a budget line with no ledger activity must be "
+                         "visible, not silently dropped")
+        self.assertTrue(out["unbudgeted_spend"])
+        overlap = ({u["account"] for u in out["unbudgeted_spend"]}
+                   & {u["account"] for u in out["budget_not_spent"]})
+        self.assertFalse(overlap)
+
+    def test_revenue_is_excluded_and_the_count_disclosed(self) -> None:
+        out = self._out()
+        for u in out["unbudgeted_spend"]:
+            self.assertNotEqual(u["account"][:1], "4",
+                                "revenue flagged as unbudgeted SPEND is "
+                                "noise — procurement budgets cover spend")
+        self.assertGreater(out["population"]["revenue_accounts_excluded"], 0)
+
+    def test_the_match_basis_and_fixture_mode_are_disclosed(self) -> None:
+        out = self._out()
+        self.assertIn("segment-1", out["match_basis"])
+        self.assertIn("SAMPLE", out["note"])
+
+    def test_no_budget_for_the_year_refuses_with_the_remedy(self) -> None:
+        out = self.c.budget_variance(self.engine, business_unit="US001",
+                                     fiscal_year=2099, period=6)
+        self.assertFalse(out["evaluated"])
+        self.assertIn("budget period naming", out["reason"])
+
+    def test_the_ledger_tool_points_here_when_it_cannot_help(self) -> None:
+        from pstb.engine import EngineError
+        with self.assertRaises(EngineError) as ctx:
+            self.engine.budget_variance(business_unit="US001",
+                                        fiscal_year=2026, period=6,
+                                        budget_ledger="NOSUCH")
+        self.assertIn("coupa_budget_variance", str(ctx.exception))

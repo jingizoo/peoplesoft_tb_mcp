@@ -248,6 +248,8 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
             coupa.invoices, a, {"max_rows": cap})
         reg["get_coupa_stuck_approvals"] = lambda a, cap: _call_filtered(
             coupa.stuck_approvals, a, {})
+        reg["get_coupa_budget_lines"] = lambda a, cap: _call_filtered(
+            coupa.budget_lines, a, {})
         reg["get_coupa_rni"] = lambda a, cap: _call_filtered(
             coupa.received_not_invoiced, a, {})
         reg["get_coupa_supplier_spend"] = lambda a, cap: _call_filtered(
