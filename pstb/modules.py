@@ -327,13 +327,12 @@ class ModulePacks:
             {"bu": bu, "since": since}, max_rows=200)
         near = []
         if cand:
-            detail, _ = self.db.query(
+            detail, truncated = self.db.query(
                 f"SELECT VENDOR_ID AS vendor_id, VOUCHER_ID AS voucher_id, "
                 f"INVOICE_ID AS invoice_id, INVOICE_DT AS dt, "
                 f"GROSS_AMT AS amount "
                 f"FROM {p}PS_VOUCHER WHERE BUSINESS_UNIT = :bu "
-                f"AND V0.INVOICE_DT >= {self.db.date_bind('since')}"
-                .replace("V0.", ""),
+                f"AND INVOICE_DT >= {self.db.date_bind('since')}",
                 {"bu": bu, "since": since}, max_rows=5000)
             wanted = {(str(c["vendor_id"]), float(c["amount"] or 0))
                       for c in cand}
@@ -359,7 +358,13 @@ class ModulePacks:
                             "invoices": [str(a["invoice_id"]),
                                          str(b["invoice_id"])]})
         exact_total = r2(sum(x["total"] for x in exact))
+        notes = []
+        if cand and truncated:
+            notes.append("More than 5,000 vouchers in the window — the "
+                         "same-amount pair scan covered the first 5,000; "
+                         "narrow the window for full coverage.")
         return {
+            **({"record_notes": notes} if notes else {}),
             "business_unit": bu, "since": since, "as_of": asof,
             "window_months": int(months or 12),
             "tolerance_days": int(tolerance_days or 7),

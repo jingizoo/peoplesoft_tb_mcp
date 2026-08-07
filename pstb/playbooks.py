@@ -104,8 +104,8 @@ def _step_suspense(ctx: dict) -> tuple:
         return "ok", "no suspense balances", {"suspense_balances": []}
     total = sum(float(r.get("ending") or 0) for r in rows)
     return ("attention",
-            f"{len(rows)} suspense account(s) holding {_fmt(total)} — clear "
-            "or reclassify before close",
+            f"{len(rows)} suspense account(s) holding {_fmt(total)} — "
+            "clear or reclassify",
             {"suspense_balances": rows})
 
 

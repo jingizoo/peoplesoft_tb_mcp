@@ -833,7 +833,8 @@ class ARBilling:
         }
 
     def invoice_lifecycle(self, business_unit: str = "",
-                          as_of_date: str = "") -> dict:
+                          as_of_date: str = "",
+                          lookback_days: int = 365) -> dict:
         """Where is the billing delay: the order-to-cash pipeline as
         stages with counts, amounts and ages, and the bottleneck named.
 
@@ -884,13 +885,21 @@ class ARBilling:
                                                  str(r["st"]))})
 
         # Stage 3: finalized but never reached AR — billed, invisible.
+        # Date-floored, same as the workbench and for the same reason: an
+        # unfloored NOT EXISTS is a full-history anti-join on a real
+        # PS_BI_HDR (millions of rows), and the review that added this
+        # floor found the hazard already documented one screen down.
+        since = (asof - dt.timedelta(
+            days=max(int(lookback_days or 365), 1))).isoformat()
         rows, _ = self.db.query(
             f"SELECT COUNT(*) AS n, SUM(H.INVOICE_AMOUNT) AS amt "
             f"FROM {p}PS_BI_HDR H WHERE H.BUSINESS_UNIT = :bu "
-            f"AND H.BILL_STATUS = 'INV' AND NOT EXISTS "
+            f"AND H.BILL_STATUS = 'INV' "
+            f"AND H.INVOICE_DT >= {self.db.date_bind('since')} "
+            f"AND NOT EXISTS "
             f"(SELECT 1 FROM {p}PS_ITEM I WHERE "
             f"I.BUSINESS_UNIT = H.BUSINESS_UNIT AND I.ITEM = H.INVOICE)",
-            {"bu": bu}, max_rows=1)
+            {"bu": bu, "since": since}, max_rows=1)
         orphan = rows[0] if rows else {}
         stages.append({"stage": "finalized_not_in_ar",
                        "n": int(orphan.get("n") or 0),
@@ -922,7 +931,9 @@ class ARBilling:
             rows, _ = self.db.query(
                 f"SELECT {add_col} AS created, INVOICE_DT AS finalized "
                 f"FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu "
-                f"AND BILL_STATUS = 'INV'", {"bu": bu}, max_rows=5000)
+                f"AND BILL_STATUS = 'INV' "
+                f"AND INVOICE_DT >= {self.db.date_bind('since')}",
+                {"bu": bu, "since": since}, max_rows=5000)
             gaps = sorted((_iso(str(r["finalized"])) -
                            _iso(str(r["created"]))).days
                           for r in rows
@@ -955,9 +966,12 @@ class ARBilling:
                  "why": "largest value sitting outside AR right now"}
                 if bottleneck else None),
             **({"record_notes": notes} if notes else {}),
+            "lookback_days": int(lookback_days or 365),
             "note": ("Pipeline from the billing interface to AR. "
                      "Visibility starts at the interface; upstream order "
-                     "records vary by site and are not assumed."),
+                     "records vary by site and are not assumed. Orphan and "
+                     "cycle checks cover the lookback window, not all "
+                     "history."),
         }
 
     def dso_trend(self, business_unit: str = "",
@@ -1046,10 +1060,22 @@ class ARBilling:
             f"SELECT DUE_DT AS due, BAL_AMT AS amt, BAL_CURRENCY AS cur "
             f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu "
             f"AND ITEM_STATUS = 'O'", {"bu": bu}, max_rows=DETAIL_ROW_CAP)
+        vcols = self._cols("PS_VOUCHER")
+        notes: list = []
+        if not vcols or "CLOSE_STATUS" in vcols:
+            open_pred = "V.CLOSE_STATUS = 'O'"
+        else:
+            open_pred = (f"NOT EXISTS (SELECT 1 FROM "
+                         f"{p}PS_PYMNT_VCHR_XREF X "
+                         f"WHERE X.BUSINESS_UNIT = V.BUSINESS_UNIT "
+                         f"AND X.VOUCHER_ID = V.VOUCHER_ID)")
+            notes.append("PS_VOUCHER here has no CLOSE_STATUS; 'open' "
+                         "means no payment cross-reference exists, which "
+                         "misses partial payments.")
         vchr, _ = self.db.query(
             f"SELECT V.DUE_DT AS due, V.GROSS_AMT AS amt, "
             f"V.CURRENCY_CD AS cur FROM {p}PS_VOUCHER V "
-            f"WHERE V.BUSINESS_UNIT = :bu AND V.CLOSE_STATUS = 'O'",
+            f"WHERE V.BUSINESS_UNIT = :bu AND {open_pred}",
             {"bu": bu}, max_rows=DETAIL_ROW_CAP)
         starts = [asof + dt.timedelta(days=7 * i) for i in range(weeks)]
 
@@ -1106,6 +1132,7 @@ class ARBilling:
             "business_unit": bu, "as_of": asof.isoformat(),
             "weeks": weeks, "rows": rows_out,
             "totals_by_currency": totals,
+            **({"record_notes": notes} if notes else {}),
             "note": ("Due-date arithmetic over open AR items and open "
                      "vouchers — the starting point a treasurer refines, "
                      "NOT a payment-behavior forecast. Overdue is its own "
