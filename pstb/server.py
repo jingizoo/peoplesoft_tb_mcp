@@ -860,6 +860,19 @@ def coupa_to_ap_tie(days: int = 90) -> dict:
 
 
 @mcp.tool()
+def get_duplicate_payments(business_unit: str = "", months: int = 12,
+                           tolerance_days: int = 7) -> dict:
+    """AP audit: possible duplicate vouchers. Two disclosed lists — the
+    same vendor invoice number vouchered twice (near-certain duplicate),
+    and same vendor + same amount within a few days under different
+    invoice numbers (a REVIEW list; recurring charges look like this).
+    Use for "any duplicate payments / did we pay anything twice". An empty
+    result is a real answer."""
+    return _safe(modules.duplicate_payments, business_unit=business_unit,
+                 months=months, tolerance_days=tolerance_days)
+
+
+@mcp.tool()
 def get_asset_register(business_unit: str = "", months: int = 12,
                        as_of_date: str = "") -> dict:
     """AM: what do we OWN. Asset cost by category with counts, plus this

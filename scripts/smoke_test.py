@@ -1384,6 +1384,23 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     # with the same evidence the first did. A module named semantics.py
     # invites contributions by analogy; this check makes the bar explicit.
     from pstb.semantics import SEEDS as _SEEDS
+    # Every suggestion chip on the page must be a question the eval suite
+    # actually tests — a suggested prompt that fails is the fastest way to
+    # lose a first-time user. The pin is exact text equality, so a chip
+    # cannot drift from its tested wording.
+    import re as _rechips
+    _chip_block = _rechips.search(
+        r"// Every chip below is PINNED[\s\S]*?\]\.forEach", _html)
+    check("the chip block exists", _chip_block is not None)
+    _chips = _rechips.findall(r"'([^']+)'", _chip_block.group(0))
+    _eval_qs = {c["question"] for c in json.loads(
+        (ROOT / "evals" / "cases.json").read_text())["cases"]}
+    _untested = sorted(set(_chips) - _eval_qs)
+    check("every suggestion chip is a tested eval question",
+          not _untested,
+          "chips with no eval case: " + "; ".join(_untested))
+    check("the page suggests a healthy breadth", len(_chips) >= 10)
+
     check("the concept register holds exactly its one evidenced seed",
           list(_SEEDS) == ["billing_invoiced"],
           "a concept was seeded without the review its docstring demands — "

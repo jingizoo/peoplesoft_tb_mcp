@@ -2041,9 +2041,21 @@ function viewChat(){
     msgs.append(holder);
   }
   const chips=el('div','chips');
-  ['What business units and ledgers exist?','Does the trial balance balance?','Why did travel expense change this period?',
-   'Is the suspense balance within policy?','What is our capitalization threshold?','Run the income statement','Show the AR aging','Any invoices stuck in billing?','Top 20 billing customers in INR',
-   'Are there unposted journals?'].forEach(q=>{
+  // Every chip below is PINNED to an eval case with the same question
+  // text (smoke enforces it), so a suggestion on this page is a promise
+  // the suite keeps — never an untested guess.
+  ['Who are my top customers, where are they based and what do they buy?',
+   'Give me the total invoice amount',
+   'Show the AR aging',
+   'How much do we owe our vendors right now?',
+   'Any duplicate vendor payments?',
+   'Is AP complete for month-end?',
+   'Did everything approved in Coupa land in AP?',
+   'Does the trial balance balance?',
+   'Are there unposted journals?',
+   'Are we ready to close the period?',
+   'Who are our top 5 billing customers across all business units in USD?',
+   'What is our capitalization threshold?'].forEach(q=>{
     const c=el('button','chip',esc(q)); c.type='button';
     c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
   });

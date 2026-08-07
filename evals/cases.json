@@ -294,6 +294,61 @@
         "not_refused": true,
         "_why": "the enriched customer question must route to the intelligence tool, not a bare ranking and not ad-hoc SQL joins."
       }
+    },
+    {
+      "id": "duplicate-payments",
+      "question": "Any duplicate vendor payments?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_duplicate_payments"
+        ],
+        "not_refused": true,
+        "_why": "the AP audit chip: must route to the duplicate detector, and the staged INV-DUP01 pair must ground the answer."
+      }
+    },
+    {
+      "id": "coupa-tie",
+      "question": "Did everything approved in Coupa land in AP?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "coupa_to_ap_tie",
+          "run_playbook"
+        ],
+        "not_refused": true,
+        "_why": "the cross-system reconciliation chip."
+      }
+    },
+    {
+      "id": "unposted-journals",
+      "question": "Are there unposted journals?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "tb_integrity_check",
+          "run_playbook",
+          "drill_to_journals",
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "a close-control chip that has always been on the page but never had a pinned case."
+      }
     }
   ]
 }
