@@ -256,6 +256,26 @@
         "not_refused": true,
         "_why": "the canonical semantic-default question: total invoice amount means FINALIZED bills, and the tool that encodes that (with the population disclosure) must win the routing over raw SQL or the billing workbench."
       }
+    },
+    {
+      "id": "ap-completeness-playbook",
+      "question": "Is AP complete for month-end?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook",
+          "coupa_to_ap_tie",
+          "get_coupa_rni",
+          "get_open_payables"
+        ],
+        "not_refused": true,
+        "_why": "a broad AP-completeness question should run the composed playbook (ideal) or at minimum reach the AP tools \u2014 never refuse or answer from the ledger alone."
+      }
     }
   ]
 }
