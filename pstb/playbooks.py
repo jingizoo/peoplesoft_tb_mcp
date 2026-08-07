@@ -299,7 +299,114 @@ def _step_late_posts(ctx: dict) -> tuple:
             lp)
 
 
+# --------------------------------------------------------- daily-brief steps
+def _step_billing_exceptions(ctx: dict) -> tuple:
+    wb = ctx.get("workbench")
+    if not isinstance(wb, dict):
+        return "skipped", f"billing workbench could not run: {wb}", {}
+    errors = [r for r in (wb.get("interface") or [])
+              if str(r.get("status")) == "ERR"]
+    stuck = wb.get("stuck_invoices") or []
+    if not errors and not stuck:
+        return "ok", "no interface errors, nothing stuck in billing", {}
+    parts = []
+    if errors:
+        parts.append(f"{sum(int(r.get('n') or 0) for r in errors)} "
+                     "interface line(s) in ERROR")
+    if stuck:
+        parts.append(f"{len(stuck)} invoice(s) stuck past the threshold")
+    return ("attention", " and ".join(parts) + " — billing that cannot "
+            "become revenue until someone acts",
+            {"interface_errors": errors, "stuck_invoices": stuck[:20]})
+
+
+def _step_orphans(ctx: dict) -> tuple:
+    wb = ctx.get("workbench")
+    if not isinstance(wb, dict):
+        return "skipped", f"billing workbench could not run: {wb}", {}
+    orphans = wb.get("finalized_not_in_ar") or []
+    if not orphans:
+        return "ok", "every finalized invoice reached AR", {}
+    total = r2(sum(float(o.get("amount") or 0) for o in orphans))
+    return ("attention",
+            f"{len(orphans)} finalized invoice(s) totalling {_fmt(total)} "
+            "never reached AR — billed revenue the collectors cannot see",
+            {"finalized_not_in_ar": orphans[:20]})
+
+
+def _step_duplicates(ctx: dict) -> tuple:
+    dup = ctx.get("duplicates")
+    if not isinstance(dup, dict):
+        return "skipped", f"duplicate scan could not run: {dup}", {}
+    exact = dup.get("exact_invoice_duplicates") or []
+    near = dup.get("same_amount_pairs") or []
+    if not exact and not near:
+        return "ok", "no duplicate vendor payments in the window", {}
+    parts = []
+    if exact:
+        parts.append(f"{len(exact)} same-invoice duplicate(s) totalling "
+                     f"{_fmt(dup.get('exact_total'))}")
+    if near:
+        parts.append(f"{len(near)} same-amount pair(s) worth eyes")
+    return ("attention", " and ".join(parts), dup)
+
+
+def _step_ap_pipeline(ctx: dict) -> tuple:
+    return _step_voucher_pipeline(ctx)
+
+
+def _step_cash_squeeze(ctx: dict) -> tuple:
+    cash = ctx.get("cash")
+    if not isinstance(cash, dict):
+        return "skipped", f"cash outlook could not run: {cash}", {}
+    tight = {cur: t for cur, t in
+             (cash.get("totals_by_currency") or {}).items()
+             if t.get("net", 0) < 0}
+    if not tight:
+        return ("ok", "expected inflows cover expected outflows over the "
+                "next two weeks (due-date basis)", cash)
+    detail = " · ".join(
+        f"{cur}: {_fmt(t['expected_in'])} in vs {_fmt(t['expected_out'])} "
+        f"out (net {_fmt(t['net'])})" for cur, t in tight.items())
+    return ("attention",
+            f"more due OUT than IN over the next two weeks — {detail} "
+            "(due-date arithmetic, not a forecast)", cash)
+
+
 PLAYBOOKS: dict = {
+    "daily_brief": {
+        "title": "Daily brief — what needs attention",
+        "description": (
+            "The first question of the day, answered from exceptions only: "
+            "billing interface errors and stuck invoices, finalized bills "
+            "that never reached AR, duplicate vendor payments, vouchers "
+            "invisible to payment runs, journals posted into the closed "
+            "period, and whether the next two weeks' due-dates squeeze "
+            "cash. Every step is a genuine exception check — a quiet day "
+            "reads 'nothing needs attention', and means it."
+        ),
+        "context": ("workbench", "duplicates", "payables", "late_posts",
+                    "cash", "latest_posted"),
+        "pin_to_latest_posted": True,
+        "steps": [
+            Step("billing_exceptions", "Billing interface and stuck bills",
+                 "errors and stalls here delay revenue recognition",
+                 _step_billing_exceptions),
+            Step("orphans", "Finalized invoices reached AR",
+                 "billed but not in AR is revenue nobody is collecting",
+                 _step_orphans),
+            Step("duplicates", "Duplicate vendor payments",
+                 "the audit question every close asks", _step_duplicates),
+            Step("ap_pipeline", "Vouchers stuck in the pipeline",
+                 "owed but invisible to payment runs", _step_ap_pipeline),
+            Step("late_posts", "Closed period unchanged",
+                 "post-close journal activity moves numbers silently",
+                 _step_late_posts),
+            Step("cash_squeeze", "Two-week cash pressure",
+                 "more due out than in deserves a morning look",
+                 _step_cash_squeeze),
+        ],
+    },
     "post_close_watch": {
         "title": "Post-close watch",
         "description": (
@@ -498,6 +605,12 @@ class PlaybookRunner:
                              business_unit=bu), str),
             "late_posts": ("late_posts",
                            lambda: self._late_posts(bu, fy, period), str),
+            "duplicates": ("duplicates",
+                           lambda: self.modules.duplicate_payments(
+                               business_unit=bu, months=3), str),
+            "cash": ("cash",
+                     lambda: self.ar.cash_outlook(
+                         business_unit=bu, weeks=2), str),
         }
         wanted = inputs or ("integrity", "aging", "workbench",
                             "latest_posted")
