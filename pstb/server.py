@@ -36,7 +36,7 @@ report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 from .connectors import coupa as _coupa_mod
 coupa = _coupa_mod.from_env()
-playbooks = PlaybookRunner(engine, ar)
+playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
@@ -513,7 +513,9 @@ def run_playbook(playbook: str = "", business_unit: str = "", ledger: str = "",
                  fiscal_year: int = 0, period: int = 0) -> dict:
     """Run a review workflow end to end and return a composed verdict.
 
-    playbook: close_readiness (default) or receivables_health — see
+    playbook: close_readiness (default), receivables_health, or
+    ap_completeness ("is AP complete for month-end / did everything
+    approved reach AP / what should we accrue" as ONE composed check) — see
     list_playbooks. Each step calls the same curated tool the individual
     question would, so the numbers cannot disagree.
     Read "verdict": passed = every step ran and found nothing;

@@ -226,7 +226,81 @@ def _step_aging_overdue(ctx: dict) -> tuple:
             {"totals": totals, "buckets": buckets})
 
 
+# ----------------------------------------------------- AP completeness steps
+def _step_procurement_tie(ctx: dict) -> tuple:
+    tie = ctx.get("ap_tie")
+    if not isinstance(tie, dict):
+        return "skipped", f"procurement tie could not run: {tie}", {}
+    if not tie.get("evaluated"):
+        return ("skipped",
+                tie.get("reason") or "tie not evaluated", tie)
+    mode = (" — SAMPLE procurement fixtures, not live data"
+            if ctx.get("coupa_mode") == "fixtures" else "")
+    breaks = tie.get("amount_breaks") or []
+    missing = tie.get("missing_in_ap") or []
+    if not breaks and not missing:
+        return ("ok",
+                f"every approved invoice has a matching voucher "
+                f"({tie.get('matched')} matched){mode}", tie)
+    missing_total = sum(float(m.get("total") or 0) for m in missing)
+    return ("attention",
+            f"{len(missing)} approved invoice(s) never reached AP "
+            f"({_fmt(missing_total)}) and {len(breaks)} matched at a "
+            f"different amount{mode}", tie)
+
+
+def _step_accrual_candidates(ctx: dict) -> tuple:
+    rni = ctx.get("rni")
+    if not isinstance(rni, dict):
+        return "skipped", f"received-not-invoiced could not run: {rni}", {}
+    mode = (" — SAMPLE procurement fixtures, not live data"
+            if ctx.get("coupa_mode") == "fixtures" else "")
+    lines = rni.get("lines") or []
+    if not lines:
+        return "ok", f"nothing received awaits an invoice{mode}", rni
+    totals = rni.get("rni_totals_by_currency") or {}
+    return ("attention",
+            f"{len(lines)} PO line(s) received but not invoiced — accrue "
+            + " · ".join(f"{_fmt(v)} {c}" for c, v in sorted(totals.items()))
+            + mode, rni)
+
+
+def _step_voucher_pipeline(ctx: dict) -> tuple:
+    pay = ctx.get("payables")
+    if not isinstance(pay, dict):
+        return "skipped", f"open payables could not run: {pay}", {}
+    exceptions = pay.get("pipeline_exceptions") or []
+    if not exceptions:
+        return "ok", "no vouchers stuck in recycle or unposted", pay
+    total = sum(float(x.get("amount") or 0) for x in exceptions)
+    return ("attention",
+            f"{len(exceptions)} voucher(s) in recycle/unposted holding "
+            f"{_fmt(total)} — owed but invisible to a payment run",
+            {"pipeline_exceptions": exceptions})
+
+
 PLAYBOOKS: dict = {
+    "ap_completeness": {
+        "title": "AP completeness (month-end)",
+        "description": (
+            "Did everything that should hit payables actually hit it: "
+            "approved procurement invoices reconciled to vouchers, received-"
+            "not-invoiced value listed for accrual, and vouchers stuck in "
+            "recycle or unposted surfaced before the period closes."
+        ),
+        "context": ("ap_tie", "rni", "payables"),
+        "steps": [
+            Step("procurement_tie", "Approved invoices reached AP",
+                 "an approved invoice that never became a voucher is a "
+                 "liability the ledger cannot see", _step_procurement_tie),
+            Step("accruals", "Received-not-invoiced accruals",
+                 "value received without an invoice must be accrued at "
+                 "month-end", _step_accrual_candidates),
+            Step("voucher_pipeline", "Vouchers stuck in the pipeline",
+                 "recycle and unposted vouchers are owed but invisible to "
+                 "payment runs", _step_voucher_pipeline),
+        ],
+    },
     "close_readiness": {
         "title": "Close readiness",
         "description": (
@@ -284,9 +358,18 @@ PLAYBOOKS: dict = {
 
 
 class PlaybookRunner:
-    def __init__(self, engine: TBEngine, ar: Optional[ARBilling] = None):
+    def __init__(self, engine: TBEngine, ar: Optional[ARBilling] = None,
+                 modules=None, coupa=None):
         self.e = engine
         self.ar = ar or ARBilling(engine)
+        if modules is None:
+            from .modules import ModulePacks
+            modules = ModulePacks(engine)
+        self.modules = modules
+        if coupa is None:
+            from .connectors import coupa as _coupa_mod
+            coupa = _coupa_mod.from_env()
+        self.coupa = coupa
 
     def list_playbooks(self) -> dict:
         return {
@@ -302,7 +385,8 @@ class PlaybookRunner:
                      "needing attention; never re-run the steps yourself."),
         }
 
-    def _context(self, bu: str, ledger: str, fy: int, period: int) -> dict:
+    def _context(self, bu: str, ledger: str, fy: int, period: int,
+                 inputs: Optional[tuple] = None) -> dict:
         """Gather every input once. Steps read this rather than querying, so
         a playbook costs one pass over the tools it wraps.
 
@@ -343,22 +427,36 @@ class PlaybookRunner:
         # as the whole diagnosis.
         from concurrent.futures import ThreadPoolExecutor
 
+        # Each playbook declares which inputs it needs; gathering the
+        # close-readiness set for an AP playbook would bill the user four
+        # ledger queries for checks it never runs.
+        available = {
+            "integrity": ("integrity",
+                          lambda: self.e.tb_integrity_check(
+                              business_unit=bu, ledger=ledger,
+                              fiscal_year=fy, period=period),
+                          lambda msg: {"scope_status": "error",
+                                       "detail": msg}),
+            "aging": ("aging",
+                      lambda: self.ar.aging(business_unit=bu), str),
+            "workbench": ("workbench",
+                          lambda: self.ar.billing_workbench(
+                              business_unit=bu), str),
+            "latest_posted": ("latest_posted", latest,
+                              lambda msg: (None, None)),
+            "rni": ("rni", lambda: self.coupa.received_not_invoiced(), str),
+            "ap_tie": ("ap_tie",
+                       lambda: self.coupa.ap_tie(self.e.db), str),
+            "payables": ("payables",
+                         lambda: self.modules.open_payables(
+                             business_unit=bu), str),
+        }
+        wanted = inputs or ("integrity", "aging", "workbench",
+                            "latest_posted")
+        ctx["coupa_mode"] = getattr(self.coupa, "mode", "")
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [
-                pool.submit(gather, "integrity",
-                            lambda: self.e.tb_integrity_check(
-                                business_unit=bu, ledger=ledger,
-                                fiscal_year=fy, period=period),
-                            lambda msg: {"scope_status": "error",
-                                         "detail": msg}),
-                pool.submit(gather, "aging",
-                            lambda: self.ar.aging(business_unit=bu), str),
-                pool.submit(gather, "workbench",
-                            lambda: self.ar.billing_workbench(
-                                business_unit=bu), str),
-                pool.submit(gather, "latest_posted", latest,
-                            lambda msg: (None, None)),
-            ]
+            futures = [pool.submit(gather, *available[name])
+                       for name in wanted]
             timings: dict = {}
             for future in futures:
                 key, value, elapsed_ms = future.result()
@@ -383,7 +481,8 @@ class PlaybookRunner:
             )
         bu, fy, per, led = self.e._defaults(business_unit, fiscal_year,
                                             period, ledger)
-        ctx = self._context(bu, led, fy, per)
+        ctx = self._context(bu, led, fy, per,
+                            inputs=spec.get("context"))
 
         results = []
         for step in spec["steps"]:
