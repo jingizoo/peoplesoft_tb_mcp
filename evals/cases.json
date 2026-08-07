@@ -436,6 +436,23 @@
         "not_refused": true,
         "_why": "the collections-speed KPI, computed from the ledger with the formula disclosed."
       }
+    },
+    {
+      "id": "daily-brief",
+      "question": "What needs my attention today?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook"
+        ],
+        "not_refused": true,
+        "_why": "the first question of the day runs the composed brief, never a scatter of ad-hoc calls."
+      }
     }
   ]
 }

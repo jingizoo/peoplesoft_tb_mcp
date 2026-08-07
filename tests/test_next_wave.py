@@ -168,3 +168,41 @@ class PostCloseWatchTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyBriefTests(Base):
+    def test_the_staged_exceptions_surface_and_quiet_checks_stay_quiet(self):
+        runner = PlaybookRunner(self.engine, self.ar)
+        out = runner.run("daily_brief")
+        by = {s2["step"]: s2["status"] for s2 in out["steps"]}
+        self.assertEqual(by["billing_exceptions"], "attention")
+        self.assertEqual(by["orphans"], "attention")
+        self.assertEqual(by["ap_pipeline"], "attention")
+        self.assertEqual(by["duplicates"], "ok",
+                         "the staged duplicates are outside the 3-month "
+                         "brief window — a quiet check must stay quiet")
+        self.assertEqual(by["cash_squeeze"], "ok")
+        self.assertEqual(by["late_posts"], "ok")
+
+    def test_it_gathers_only_its_own_inputs(self):
+        runner = PlaybookRunner(self.engine, self.ar)
+        out = runner.run("daily_brief")
+        self.assertEqual(set(out["input_timings_ms"]),
+                         {"workbench", "duplicates", "payables",
+                          "late_posts", "cash", "latest_posted"})
+
+    def test_a_dead_input_makes_the_brief_incomplete(self):
+        class DeadAr(type(self.ar)):
+            pass
+
+        runner = PlaybookRunner(self.engine, self.ar)
+        original = runner.ar.cash_outlook
+        runner.ar.cash_outlook = lambda **kw: (_ for _ in ()).throw(
+            RuntimeError("cash source down"))
+        try:
+            out = runner.run("daily_brief")
+        finally:
+            runner.ar.cash_outlook = original
+        self.assertEqual(out["verdict"], "incomplete",
+                         "a brief that could not check cash must never "
+                         "read as 'nothing needs attention'")
