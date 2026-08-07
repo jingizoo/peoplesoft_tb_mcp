@@ -1331,6 +1331,7 @@ function renderToolResult(name,data,args){
     if(name==='drill_to_journals') return renderJournals(data);
     if(name==='list_financial_scopes') return renderScopes(data);
     if(name==='run_report') return renderReport(data);
+    if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
     if(name==='get_billing_workbench') return renderBilling(data);
@@ -1410,6 +1411,51 @@ async function viewReports(){
   else holder.append(el('div','empty','No report definitions found in reports/.'));
 }
 
+function renderInvoiceTotals(d){
+  const frag=document.createDocumentFragment();
+  const money2=v=>Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  if(d.scope_status==='empty_after_default'){
+    const c=el('div','card');
+    c.append(el('h2',null,'Total invoiced <span class="badge warn">empty after default</span>'));
+    c.append(el('div','pad',esc(d.detail||'')));
+    frag.append(c); return frag;
+  }
+  const totals=Object.entries(d.invoiced_total_by_currency||{});
+  const pop=d.population||{};
+  const pipeTotals=Object.entries(pop.pipeline_total_by_currency||{});
+  frag.append(tiles([
+    ['Invoiced (finalized)', totals.map(([c2,v])=>money2(v)+' '+c2).join('  ·  ')||'0',
+     d.invoice_count+' invoices','dr'],
+    ['Pipeline — not included', pipeTotals.length?pipeTotals.map(([c2,v])=>money2(v)+' '+c2).join(' · '):'0',
+     (pop.excluded_pipeline||[]).reduce((a,x)=>a+x.n,0)+' bills could still become revenue','cr'],
+    ['Cancelled — never revenue', (pop.excluded_terminal||[]).map(x=>money2(x.amount)+' '+x.currency).join(' · ')||'0',
+     (pop.excluded_terminal||[]).reduce((a,x)=>a+x.n,0)+' bills','']
+  ]));
+  const c=el('div','card');
+  c.append(el('h2',null,'What this number counted <span class="sub">every default, disclosed</span>'));
+  const ap=(pop.applied||[]).map(a2=>'<tr><td><code>'+esc(a2.predicate)+'</code></td>'+
+    '<td>'+esc(a2.meaning)+'</td><td class="sub">'+esc(a2.source)+'</td></tr>').join('');
+  const ex=[...(pop.excluded_pipeline||[]).map(x=>({...x,cls:'warn',lbl:'pipeline'})),
+            ...(pop.excluded_terminal||[]).map(x=>({...x,cls:'bad',lbl:'cancelled'}))]
+    .map(x=>'<tr><td><span class="badge '+x.cls+'">'+esc(x.status)+'</span> '+esc(x.descr)+'</td>'+
+      '<td class="num">'+x.n+'</td><td class="num">'+
+      (pop.amount_basis==='unavailable_pre_finalization'?'<span class="sub">n/a pre-final</span>':money2(x.amount)+' '+esc(x.currency))+
+      '</td></tr>').join('');
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Counted</th><th>Meaning</th><th>Source</th></tr></thead><tbody>'+ap+'</tbody>';
+  c.append(t);
+  if(ex){
+    const t2=el('table');
+    t2.innerHTML='<thead><tr><th>Not counted</th><th class="num">Bills</th><th class="num">Amount</th></tr></thead><tbody>'+ex+'</tbody>';
+    c.append(t2);
+  }
+  if(pop.amount_basis==='unavailable_pre_finalization')
+    c.append(el('div','pad','<span class="badge warn">counts only</span> '+
+      'Excluded amounts are unreliable before finalization writes them — trust the bill counts.'));
+  c.append(el('div','pad sub','Override: '+esc(pop.override||'')));
+  frag.append(c);
+  return frag;
+}
 function renderAging(d){
   if(d.scope_status&&d.scope_status!=='ok') return noData(d);
   const frag=document.createDocumentFragment();

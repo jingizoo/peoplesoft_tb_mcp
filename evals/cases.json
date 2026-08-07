@@ -239,6 +239,23 @@
         ],
         "_why": "the verbatim complaint: the tool worked but the evidence gate discarded its answer because AP tools carried no domains and 'owe' belonged to AR. The gate must accept what the AP pack grounds, and the model must never claim an authorization restriction no tool stated."
       }
+    },
+    {
+      "id": "invoice-total-population",
+      "question": "Give me the total invoice amount",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_invoice_totals"
+        ],
+        "not_refused": true,
+        "_why": "the canonical semantic-default question: total invoice amount means FINALIZED bills, and the tool that encodes that (with the population disclosure) must win the routing over raw SQL or the billing workbench."
+      }
     }
   ]
 }

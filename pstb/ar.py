@@ -671,6 +671,163 @@ class ARBilling:
             out["record_notes"] = cs["notes"]
         return out
 
+    # Bill statuses by lifecycle class. INV is the only status that IS
+    # revenue; the pipeline statuses can still become revenue; CAN never
+    # will. Splitting the exclusions is the point: lumping a cancelled
+    # bill with a ready-to-invoice one tells a controller upside that
+    # does not exist.
+    _BILL_PIPELINE = {"NEW": "new bill", "RDY": "ready to invoice",
+                      "HLD": "on hold", "TMP": "temporary", "PND": "pending"}
+    _BILL_TERMINAL = {"CAN": "cancelled"}
+
+    def invoice_totals(self, business_unit: str = "",
+                       fiscal_year: int = 0) -> dict:
+        """Total FINALIZED invoice amount, with a population block that
+        says exactly what was counted and what was left out.
+
+        "Give me total invoice amount" means finalized bills only
+        (BILL_STATUS = 'INV') — but the default must be VISIBLE, split
+        into pipeline (could still become revenue) vs cancelled (never
+        will), and it must refuse rather than answer 0.00 when the
+        default itself emptied the result. One query: the same grouped
+        aggregate produces the answer AND its counterfactual.
+        """
+        bu = self._bu(business_unit)
+        p = self.db.prefix
+        cols = self._cols("PS_BI_HDR")
+        date_col = "ACCOUNTING_DT"
+        notes: list = []
+        if cols and "ACCOUNTING_DT" not in cols:
+            date_col = "INVOICE_DT"
+            notes.append("PS_BI_HDR here has no ACCOUNTING_DT; the window "
+                         "uses INVOICE_DT instead.")
+        fy = int(fiscal_year or 0)
+        window = None
+        if fy:
+            try:
+                periods = self.e.list_periods(fy)["periods"]
+                window = (str(periods[0]["begin_dt"])[:10],
+                          str(periods[-1]["end_dt"])[:10])
+            except Exception:
+                notes.append(f"No fiscal calendar for {fy}; the total "
+                             "covers the entire history.")
+        where = f"BUSINESS_UNIT = :bu"
+        params: dict = {"bu": bu}
+        if window:
+            where += (f" AND {date_col} >= {self.db.date_bind('w0')}"
+                      f" AND {date_col} <= {self.db.date_bind('w1')}")
+            params.update({"w0": window[0], "w1": window[1]})
+        rows, _ = self.db.query(
+            f"SELECT BILL_STATUS AS status, BI_CURRENCY_CD AS currency, "
+            f"COUNT(*) AS n, SUM(INVOICE_AMOUNT) AS amount "
+            f"FROM {p}PS_BI_HDR WHERE {where} "
+            f"GROUP BY BILL_STATUS, BI_CURRENCY_CD",
+            params, max_rows=200,
+        )
+        by_status = []
+        inv_total: dict[str, float] = {}
+        inv_count = 0
+        pipeline: list = []
+        terminal: list = []
+        for r in rows:
+            status = str(r["status"] or "")
+            cur = str(r["currency"] or "")
+            n = int(r["n"] or 0)
+            amt = r2(float(r["amount"] or 0.0))
+            if status == "INV":
+                cls = "finalized"
+                inv_total[cur] = r2(inv_total.get(cur, 0.0) + amt)
+                inv_count += n
+            elif status in self._BILL_TERMINAL:
+                cls = "excluded_terminal"
+                terminal.append({"status": status,
+                                 "descr": self._BILL_TERMINAL[status],
+                                 "currency": cur, "n": n, "amount": amt})
+            else:
+                cls = "excluded_pipeline"
+                pipeline.append({"status": status,
+                                 "descr": self._BILL_PIPELINE.get(
+                                     status, "unrecognized status"),
+                                 "currency": cur, "n": n, "amount": amt})
+            by_status.append({"status": status, "class": cls,
+                              "currency": cur, "n": n, "amount": amt})
+        window_applied = {
+            "predicate": "BILL_STATUS = 'INV'",
+            "source": "built-in default: billing_invoiced",
+            "meaning": "finalized bills only — the only status that is "
+                       "revenue",
+        }
+        applied = [window_applied,
+                   {"predicate": f"BUSINESS_UNIT = '{bu}'",
+                    "source": "request scope", "meaning": "your selected "
+                    "business unit"}]
+        if window:
+            applied.append({
+                "predicate": f"{date_col} in {window[0]}..{window[1]}",
+                "source": f"fiscal year {fy} from the request scope",
+                "meaning": "the scope's fiscal year, by accounting date"})
+        else:
+            applied.append({
+                "predicate": "no date window",
+                "source": "no fiscal year in scope",
+                "meaning": "the total covers the entire history"})
+        # A live instance often carries 0.00 on non-final headers until the
+        # finalization run writes the amount — a currency total over those
+        # rows would be a confident falsehood, so render counts only.
+        amount_basis = "header"
+        if any(x["n"] > 0 and x["amount"] == 0.0 for x in pipeline + terminal):
+            amount_basis = "unavailable_pre_finalization"
+            notes.append("One or more excluded statuses carry zero header "
+                         "amounts (normal before finalization) — excluded "
+                         "AMOUNTS are unreliable here; trust the counts.")
+        pipeline_share_pct: dict[str, float] = {}
+        if amount_basis == "header":
+            for cur in inv_total:
+                pipe_cur = sum(x["amount"] for x in pipeline
+                               if x["currency"] == cur)
+                base = inv_total[cur] + pipe_cur
+                if base:
+                    pipeline_share_pct[cur] = r2(pipe_cur / base * 100.0)
+        if inv_count == 0 and rows:
+            return {
+                "scope_status": "empty_after_default",
+                "business_unit": bu,
+                "detail": (
+                    "No FINALIZED bills (BILL_STATUS = 'INV') match this "
+                    "scope — the zero comes from the finalized-only "
+                    "default, not from an empty table. Statuses that DO "
+                    "exist here: "
+                    + ", ".join(f"{x['status']} ({x['n']})"
+                                for x in by_status)
+                    + ". Ask for 'all bill statuses' to see everything."),
+                "by_status": by_status,
+            }
+        return {
+            "business_unit": bu,
+            "invoiced_total_by_currency": inv_total,
+            "invoice_count": inv_count,
+            "by_status": by_status,
+            "population": {
+                "concept": "total invoiced (finalized billing)",
+                "applied": applied,
+                "date_governor": date_col,
+                "excluded_pipeline": pipeline,
+                "excluded_terminal": terminal,
+                "pipeline_total_by_currency": {
+                    cur: r2(sum(x["amount"] for x in pipeline
+                                if x["currency"] == cur))
+                    for cur in {x["currency"] for x in pipeline}},
+                "pipeline_share_pct": pipeline_share_pct,
+                "amount_basis": amount_basis,
+                "override": "ask for 'all bill statuses' or name a status",
+            },
+            **({"record_notes": notes} if notes else {}),
+            "note": ("Finalized bills only; the population block lists "
+                     "every applied default and everything excluded, "
+                     "pipeline separated from cancelled. Totals are per "
+                     "currency and never summed across."),
+        }
+
     def top_billing_customers(self, business_unit: str = "", n: int = 10,
                               months: int = 12, as_of_date: str = "",
                               display_currency: str = "",
