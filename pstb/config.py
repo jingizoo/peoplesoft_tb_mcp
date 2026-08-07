@@ -108,6 +108,10 @@ class Config:
     # the curated tools use); entries here are reachable from run_sql /
     # list_tables / describe_table / search_records via source=<name>.
     sources: dict = field(default_factory=dict)
+    # Concept overrides: which codes define a named population at THIS site,
+    # e.g. semantics: {billing_invoiced: {values: [INV, PRO]}}. Approved
+    # site-memory facts outrank this; the built-in seed backstops both.
+    semantics: dict = field(default_factory=dict)
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
@@ -190,6 +194,8 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.llm, data.get("llm"))
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
+        if isinstance(data.get("semantics"), dict):
+            cfg.semantics = data["semantics"]
         for name, block in (data.get("sources") or {}).items():
             src = DbCfg()
             _apply_section(src, block)

@@ -692,8 +692,12 @@ class ARBilling:
         default itself emptied the result. One query: the same grouped
         aggregate produces the answer AND its counterfactual.
         """
+        from .semantics import resolve as resolve_concept
         bu = self._bu(business_unit)
         p = self.db.prefix
+        sem = resolve_concept("billing_invoiced", cfg=self.cfg,
+                              memory=getattr(self.e, "_memory", None))
+        finalized = set(sem.values)
         cols = self._cols("PS_BI_HDR")
         date_col = "ACCOUNTING_DT"
         notes: list = []
@@ -734,7 +738,7 @@ class ARBilling:
             cur = str(r["currency"] or "")
             n = int(r["n"] or 0)
             amt = r2(float(r["amount"] or 0.0))
-            if status == "INV":
+            if status in finalized:
                 cls = "finalized"
                 inv_total[cur] = r2(inv_total.get(cur, 0.0) + amt)
                 inv_count += n
@@ -752,11 +756,11 @@ class ARBilling:
             by_status.append({"status": status, "class": cls,
                               "currency": cur, "n": n, "amount": amt})
         window_applied = {
-            "predicate": "BILL_STATUS = 'INV'",
-            "source": "built-in default: billing_invoiced",
-            "meaning": "finalized bills only — the only status that is "
-                       "revenue",
+            "predicate": sem.predicate,
+            "source": sem.source,
+            "meaning": sem.concept.meaning,
         }
+        notes.extend(sem.notes)
         applied = [window_applied,
                    {"predicate": f"BUSINESS_UNIT = '{bu}'",
                     "source": "request scope", "meaning": "your selected "
@@ -793,7 +797,7 @@ class ARBilling:
                 "scope_status": "empty_after_default",
                 "business_unit": bu,
                 "detail": (
-                    "No FINALIZED bills (BILL_STATUS = 'INV') match this "
+                    f"No FINALIZED bills ({sem.predicate}) match this "
                     "scope — the zero comes from the finalized-only "
                     "default, not from an empty table. Statuses that DO "
                     "exist here: "

@@ -1380,6 +1380,15 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           "row_ceiling" not in _run_sql_tool,
           "the export ceiling leaked into the model-facing run_sql tool")
 
+    # The concept register stays ONE seed until a second concept arrives
+    # with the same evidence the first did. A module named semantics.py
+    # invites contributions by analogy; this check makes the bar explicit.
+    from pstb.semantics import SEEDS as _SEEDS
+    check("the concept register holds exactly its one evidenced seed",
+          list(_SEEDS) == ["billing_invoiced"],
+          "a concept was seeded without the review its docstring demands — "
+          "add it deliberately and update this check in the same change")
+
     # Rate grounding. Percentages bypass the withhold guard by design, so
     # they get a caveat layer instead. Both halves are pinned: the caveat
     # must fire on an unsourced rate, and it must NEVER escalate to a
