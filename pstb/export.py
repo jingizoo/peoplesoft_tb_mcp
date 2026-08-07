@@ -207,6 +207,12 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
         reg["search_accounts"] = lambda a, cap: _call_filtered(
             engine.search_accounts, a, {"max_rows": cap})
     if ar is not None:
+        reg["get_invoice_lifecycle"] = lambda a, cap: _call_filtered(
+            ar.invoice_lifecycle, a, {})
+        reg["get_dso_trend"] = lambda a, cap: _call_filtered(
+            ar.dso_trend, a, {})
+        reg["get_cash_outlook"] = lambda a, cap: _call_filtered(
+            ar.cash_outlook, a, {})
         reg["get_customer_intelligence"] = lambda a, cap: _call_filtered(
             ar.customer_intelligence, a, {"n": cap})
         reg["get_invoice_totals"] = lambda a, cap: _call_filtered(
@@ -222,6 +228,8 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
     if modules is not None:
         reg["get_open_payables"] = lambda a, cap: _call_filtered(
             modules.open_payables, a, {})
+        reg["get_vendor_intelligence"] = lambda a, cap: _call_filtered(
+            modules.vendor_intelligence, a, {"n": cap})
         reg["get_duplicate_payments"] = lambda a, cap: _call_filtered(
             modules.duplicate_payments, a, {})
         reg["get_vendor_payments"] = lambda a, cap: _call_filtered(

@@ -832,6 +832,288 @@ class ARBilling:
                      "currency and never summed across."),
         }
 
+    def invoice_lifecycle(self, business_unit: str = "",
+                          as_of_date: str = "") -> dict:
+        """Where is the billing delay: the order-to-cash pipeline as
+        stages with counts, amounts and ages, and the bottleneck named.
+
+        Visibility starts at the billing interface (order-management
+        records vary too much per site to assume). Historical cycle times
+        need a creation timestamp; where PS_BI_HDR has none, the tool says
+        so and reports current pipeline AGES instead — an honest "where
+        is it stuck now" rather than a fabricated "how fast was it".
+        """
+        bu = self._bu(business_unit)
+        asof = _iso(self._asof(as_of_date))
+        p = self.db.prefix
+        stages: list = []
+        notes: list = []
+
+        # Stage 1: the billing interface — rows waiting or in error.
+        if self._cols("PS_INTFC_BI"):
+            rows, _ = self.db.query(
+                f"SELECT LOAD_STATUS_BI AS st, COUNT(*) AS n "
+                f"FROM {p}PS_INTFC_BI WHERE BUSINESS_UNIT = :bu "
+                f"GROUP BY LOAD_STATUS_BI", {"bu": bu}, max_rows=20)
+            by = {str(r["st"]): int(r["n"] or 0) for r in rows}
+            stages.append({"stage": "interface_waiting", "n": by.get("NEW", 0),
+                           "amount": None, "oldest_days": None,
+                           "meaning": "loaded, not yet a bill"})
+            stages.append({"stage": "interface_error", "n": by.get("ERR", 0),
+                           "amount": None, "oldest_days": None,
+                           "meaning": "stuck until someone fixes the row"})
+        else:
+            notes.append("PS_INTFC_BI not present — interface visibility "
+                         "not available at this site.")
+
+        # Stage 2: bills in the pipeline, aged by accounting date.
+        rows, _ = self.db.query(
+            f"SELECT BILL_STATUS AS st, COUNT(*) AS n, "
+            f"SUM(INVOICE_AMOUNT) AS amt, MIN(ACCOUNTING_DT) AS oldest "
+            f"FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu "
+            f"AND BILL_STATUS IN ('NEW','PND','HLD','RDY','TMP') "
+            f"GROUP BY BILL_STATUS", {"bu": bu}, max_rows=20)
+        for r in rows:
+            oldest = _iso_opt(r.get("oldest"))
+            stages.append({
+                "stage": f"bill_{str(r['st']).lower()}",
+                "n": int(r["n"] or 0),
+                "amount": r2(float(r["amt"] or 0)),
+                "oldest_days": (asof - oldest).days if oldest else None,
+                "meaning": BILL_STATUS_DESCR.get(str(r["st"]),
+                                                 str(r["st"]))})
+
+        # Stage 3: finalized but never reached AR — billed, invisible.
+        rows, _ = self.db.query(
+            f"SELECT COUNT(*) AS n, SUM(H.INVOICE_AMOUNT) AS amt "
+            f"FROM {p}PS_BI_HDR H WHERE H.BUSINESS_UNIT = :bu "
+            f"AND H.BILL_STATUS = 'INV' AND NOT EXISTS "
+            f"(SELECT 1 FROM {p}PS_ITEM I WHERE "
+            f"I.BUSINESS_UNIT = H.BUSINESS_UNIT AND I.ITEM = H.INVOICE)",
+            {"bu": bu}, max_rows=1)
+        orphan = rows[0] if rows else {}
+        stages.append({"stage": "finalized_not_in_ar",
+                       "n": int(orphan.get("n") or 0),
+                       "amount": r2(float(orphan.get("amt") or 0)),
+                       "oldest_days": None,
+                       "meaning": "billed but not yet an open item — "
+                                  "revenue the collectors cannot see"})
+
+        # Stage 4: open in AR, aged by due date.
+        rows, _ = self.db.query(
+            f"SELECT COUNT(*) AS n, SUM(BAL_AMT) AS amt, "
+            f"MIN(DUE_DT) AS oldest FROM {p}PS_ITEM "
+            f"WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'",
+            {"bu": bu}, max_rows=1)
+        open_row = rows[0] if rows else {}
+        oldest = _iso_opt(open_row.get("oldest"))
+        stages.append({"stage": "open_in_ar",
+                       "n": int(open_row.get("n") or 0),
+                       "amount": r2(float(open_row.get("amt") or 0)),
+                       "oldest_days": (asof - oldest).days if oldest else None,
+                       "meaning": "awaiting payment"})
+
+        # Cycle times only where a creation timestamp exists.
+        cols = self._cols("PS_BI_HDR")
+        add_col = next((c for c in ("ADD_DTTM", "ADD_DT", "ENTRY_DT")
+                        if cols and c in cols), None)
+        cycle = None
+        if add_col:
+            rows, _ = self.db.query(
+                f"SELECT {add_col} AS created, INVOICE_DT AS finalized "
+                f"FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu "
+                f"AND BILL_STATUS = 'INV'", {"bu": bu}, max_rows=5000)
+            gaps = sorted((_iso(str(r["finalized"])) -
+                           _iso(str(r["created"]))).days
+                          for r in rows
+                          if r.get("created") and r.get("finalized"))
+            if gaps:
+                cycle = {"basis": f"{add_col} -> INVOICE_DT",
+                         "n": len(gaps),
+                         "p50_days": gaps[len(gaps) // 2],
+                         "p90_days": gaps[min(len(gaps) - 1,
+                                              int(len(gaps) * 0.9))]}
+        else:
+            notes.append("PS_BI_HDR carries no creation timestamp at this "
+                         "site — historical cycle times are unavailable; "
+                         "the stage ages above are the honest substitute.")
+
+        candidates = [s2 for s2 in stages
+                      if s2["n"] and s2["stage"] not in ("open_in_ar",)]
+        bottleneck = (max(candidates,
+                          key=lambda s2: (s2.get("amount") or 0,
+                                          s2.get("oldest_days") or 0))
+                      if candidates else None)
+        return {
+            "business_unit": bu, "as_of": asof.isoformat(),
+            "stages": stages,
+            **({"cycle_time": cycle} if cycle else {}),
+            "bottleneck": (
+                {"stage": bottleneck["stage"],
+                 "amount": bottleneck.get("amount"),
+                 "n": bottleneck["n"],
+                 "why": "largest value sitting outside AR right now"}
+                if bottleneck else None),
+            **({"record_notes": notes} if notes else {}),
+            "note": ("Pipeline from the billing interface to AR. "
+                     "Visibility starts at the interface; upstream order "
+                     "records vary by site and are not assumed."),
+        }
+
+    def dso_trend(self, business_unit: str = "",
+                  fiscal_year: int = 0) -> dict:
+        """Monthly DSO from the ledger's own numbers, formula disclosed.
+
+        DSO(period) = ending AR balance / period revenue * days in period.
+        Both sides come straight from PS_LEDGER — the AR control account's
+        cumulative balance and the signed sum of ACCOUNT_TYPE='R' accounts
+        (credits negative, so revenue = -sum). No model, no estimate.
+        """
+        bu = self._bu(business_unit)
+        led = self.e.resolve_ledger_for(bu)
+        fy = int(fiscal_year or 0) or self.e.last_posted_period(bu, led)[0]
+        if not fy:
+            raise ARError(f"No posted ledger data for {bu!r} — DSO needs "
+                          "a fiscal year with activity.")
+        p = self.db.prefix
+        controls = [str(a) for a in
+                    (self.cfg.defaults.ar_control_accounts or ["1100"])]
+        abinds = {f"a{i}": a for i, a in enumerate(controls)}
+        aexpr = "(" + ", ".join(f":{k}" for k in abinds) + ")"
+        ar_rows, _ = self.db.query(
+            f"SELECT ACCOUNTING_PERIOD AS per, SUM(POSTED_TOTAL_AMT) AS amt "
+            f"FROM {p}PS_LEDGER WHERE BUSINESS_UNIT = :bu AND LEDGER = :led "
+            f"AND FISCAL_YEAR = :fy AND ACCOUNT IN {aexpr} "
+            f"GROUP BY ACCOUNTING_PERIOD",
+            {"bu": bu, "led": led, "fy": fy, **abinds}, max_rows=30)
+        setid = self.e.resolve_setid(bu, "GL_ACCOUNT")
+        rev_rows, _ = self.db.query(
+            f"SELECT L.ACCOUNTING_PERIOD AS per, "
+            f"SUM(L.POSTED_TOTAL_AMT) AS amt "
+            f"FROM {p}PS_LEDGER L JOIN {p}PS_GL_ACCOUNT_TBL A "
+            f"ON A.ACCOUNT = L.ACCOUNT AND A.SETID = :setid "
+            f"WHERE L.BUSINESS_UNIT = :bu AND L.LEDGER = :led "
+            f"AND L.FISCAL_YEAR = :fy AND A.ACCOUNT_TYPE = 'R' "
+            f"GROUP BY L.ACCOUNTING_PERIOD",
+            {"bu": bu, "led": led, "fy": fy, "setid": setid}, max_rows=30)
+        adj = set(self.e._adj_periods()) | {0}
+        ar_by = {int(r["per"]): float(r["amt"] or 0) for r in ar_rows}
+        rev_by = {int(r["per"]): -float(r["amt"] or 0) for r in rev_rows}
+        periods = sorted((set(ar_by) | set(rev_by)) - adj)
+        try:
+            cal = {int(x["period"]): x
+                   for x in self.e.list_periods(fy)["periods"]}
+        except Exception:
+            cal = {}
+        rows_out = []
+        running = sum(v for k, v in ar_by.items() if k == 0)
+        for per in periods:
+            running = r2(running + ar_by.get(per, 0.0))
+            revenue = r2(rev_by.get(per, 0.0))
+            entry = cal.get(per, {})
+            days = 30
+            if entry:
+                days = ((_iso(str(entry["end_dt"])) -
+                         _iso(str(entry["begin_dt"]))).days + 1)
+            dso = r2(running / revenue * days) if revenue > 0 else None
+            rows_out.append({
+                "fiscal_year": fy, "period": per,
+                "ar_ending": running, "revenue": revenue,
+                "dso_days": dso})
+        return {
+            "business_unit": bu, "ledger": led, "fiscal_year": fy,
+            "rows": rows_out,
+            "formula": ("DSO = ending AR control balance / period revenue "
+                        "x days in period; revenue = -(sum of "
+                        "ACCOUNT_TYPE 'R' postings), credits negative"),
+            "ar_control_accounts": controls,
+            "note": ("Computed from the ledger only. A period with zero "
+                     "or negative revenue shows no DSO rather than a "
+                     "misleading number."),
+        }
+
+    def cash_outlook(self, business_unit: str = "",
+                     weeks: int = 8, as_of_date: str = "") -> dict:
+        """Expected cash by week from DUE DATES — arithmetic, not a
+        forecast, and it says so. Inflows are open AR items; outflows are
+        open vouchers. Overdue lands in its own bucket because 'due last
+        month' is not a plan for next week."""
+        bu = self._bu(business_unit)
+        asof = _iso(self._asof(as_of_date))
+        weeks = max(1, min(int(weeks or 8), 13))
+        p = self.db.prefix
+        items, _ = self.db.query(
+            f"SELECT DUE_DT AS due, BAL_AMT AS amt, BAL_CURRENCY AS cur "
+            f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu "
+            f"AND ITEM_STATUS = 'O'", {"bu": bu}, max_rows=DETAIL_ROW_CAP)
+        vchr, _ = self.db.query(
+            f"SELECT V.DUE_DT AS due, V.GROSS_AMT AS amt, "
+            f"V.CURRENCY_CD AS cur FROM {p}PS_VOUCHER V "
+            f"WHERE V.BUSINESS_UNIT = :bu AND V.CLOSE_STATUS = 'O'",
+            {"bu": bu}, max_rows=DETAIL_ROW_CAP)
+        starts = [asof + dt.timedelta(days=7 * i) for i in range(weeks)]
+
+        def bucket(due):
+            if due is None:
+                return None
+            if due < asof:
+                return "overdue"
+            for i, start in enumerate(starts):
+                if due < start + dt.timedelta(days=7):
+                    return start.isoformat()
+            return "beyond"
+
+        acc: dict = {}
+        currencies: set = set()
+        for src, sign_key in ((items, "expected_in"), (vchr, "expected_out")):
+            for r in src:
+                cur = str(r.get("cur") or "")
+                currencies.add(cur)
+                b = bucket(_iso_opt(r.get("due")))
+                if b is None:
+                    b = "overdue"
+                slot = acc.setdefault((b, cur), {"expected_in": 0.0,
+                                                 "expected_out": 0.0})
+                slot[sign_key] = r2(slot[sign_key] + float(r["amt"] or 0))
+        order = ["overdue"] + [s.isoformat() for s in starts] + ["beyond"]
+        rows_out = []
+        for b in order:
+            for cur in sorted(currencies):
+                slot = acc.get((b, cur))
+                if not slot:
+                    continue
+                rows_out.append({
+                    "week": b, "currency": cur,
+                    "expected_in": r2(slot["expected_in"]),
+                    "expected_out": r2(slot["expected_out"]),
+                    "net": r2(slot["expected_in"] - slot["expected_out"])})
+        # The totals a summary sentence needs, precomputed — a model that
+        # adds buckets in prose states figures no payload contains, and
+        # the guard rightly withholds the answer. Give it the numbers.
+        totals: dict = {}
+        for r in rows_out:
+            t = totals.setdefault(r["currency"], {
+                "expected_in": 0.0, "expected_out": 0.0, "net": 0.0,
+                "overdue_in": 0.0, "overdue_out": 0.0})
+            if r["week"] == "overdue":
+                t["overdue_in"] = r2(t["overdue_in"] + r["expected_in"])
+                t["overdue_out"] = r2(t["overdue_out"] + r["expected_out"])
+            else:
+                t["expected_in"] = r2(t["expected_in"] + r["expected_in"])
+                t["expected_out"] = r2(t["expected_out"] + r["expected_out"])
+                t["net"] = r2(t["net"] + r["net"])
+        return {
+            "business_unit": bu, "as_of": asof.isoformat(),
+            "weeks": weeks, "rows": rows_out,
+            "totals_by_currency": totals,
+            "note": ("Due-date arithmetic over open AR items and open "
+                     "vouchers — the starting point a treasurer refines, "
+                     "NOT a payment-behavior forecast. Overdue is its own "
+                     "bucket (and its own totals); amounts stay per "
+                     "currency. State totals from totals_by_currency — "
+                     "never add buckets yourself."),
+        }
+
     def customer_intelligence(self, business_unit: str = "", n: int = 20,
                               months: int = 12, display_currency: str = "",
                               as_of_date: str = "") -> dict:

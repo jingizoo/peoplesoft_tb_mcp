@@ -279,7 +279,53 @@ def _step_voucher_pipeline(ctx: dict) -> tuple:
             {"pipeline_exceptions": exceptions})
 
 
+# ------------------------------------------------------ post-close steps
+def _step_late_posts(ctx: dict) -> tuple:
+    lp = ctx.get("late_posts")
+    if not isinstance(lp, dict):
+        return "skipped", f"late-post check could not run: {lp}", {}
+    rows = lp.get("rows") or []
+    if not lp.get("period_end"):
+        return ("skipped",
+                "no calendar end date for the watched period", lp)
+    if not rows:
+        return ("ok",
+                f"no journals posted into {lp['fiscal_year']}/"
+                f"{lp['period']} after {lp['period_end']}", lp)
+    return ("attention",
+            f"{len(rows)} journal(s) posted into the closed period AFTER "
+            f"its end date ({lp['period_end']}) — the numbers moved after "
+            "everyone stopped looking",
+            lp)
+
+
 PLAYBOOKS: dict = {
+    "post_close_watch": {
+        "title": "Post-close watch",
+        "description": (
+            "The dangerous window is AFTER the close: a late journal lands "
+            "in a closed period, a tie that held on close day drifts, "
+            "suspense refills. This re-checks the just-closed period — "
+            "balance, suspense, unposted journals, and journals posted "
+            "after the period ended."
+        ),
+        "context": ("integrity", "late_posts", "latest_posted"),
+        "pin_to_latest_posted": True,
+        "steps": [
+            Step("balance_still", "Closed period still balances",
+                 "an out-of-balance closed period means something moved "
+                 "after close", _step_integrity),
+            Step("suspense_still", "Suspense still clear",
+                 "suspense refilling after close is unbooked reality",
+                 _step_suspense),
+            Step("unposted_into_closed", "No unposted journals remain",
+                 "an unposted entry dated in a closed period will change "
+                 "history when someone posts it", _step_unposted),
+            Step("late_posts", "Nothing posted after the period ended",
+                 "post-close journal activity is how closed numbers move "
+                 "silently", _step_late_posts),
+        ],
+    },
     "ap_completeness": {
         "title": "AP completeness (month-end)",
         "description": (
@@ -450,6 +496,8 @@ class PlaybookRunner:
             "payables": ("payables",
                          lambda: self.modules.open_payables(
                              business_unit=bu), str),
+            "late_posts": ("late_posts",
+                           lambda: self._late_posts(bu, fy, period), str),
         }
         wanted = inputs or ("integrity", "aging", "workbench",
                             "latest_posted")
@@ -470,6 +518,34 @@ class PlaybookRunner:
         ctx["_input_timings_ms"] = timings
         return ctx
 
+    def _late_posts(self, bu: str, fy: int, period: int) -> dict:
+        """Journals in (fy, period) whose POSTED_DATE is after the
+        period's calendar end — the numbers moved after close."""
+        cols = self.e.db.columns("PS_JRNL_HEADER")
+        if cols and "POSTED_DATE" not in cols:
+            return {"rows": [], "period_end": None,
+                    "note": "PS_JRNL_HEADER has no POSTED_DATE here"}
+        end = None
+        try:
+            cal = self.e.list_periods(fy)["periods"]
+            end = next((str(x["end_dt"])[:10] for x in cal
+                        if int(x["period"]) == int(period)), None)
+        except Exception:
+            pass
+        if not end:
+            return {"rows": [], "period_end": None}
+        p = self.e.db.prefix
+        rows, _ = self.e.db.query(
+            f"SELECT JOURNAL_ID AS journal_id, POSTED_DATE AS posted, "
+            f"SOURCE AS source, OPRID AS oprid "
+            f"FROM {p}PS_JRNL_HEADER WHERE BUSINESS_UNIT = :bu "
+            f"AND FISCAL_YEAR = :fy AND ACCOUNTING_PERIOD = :per "
+            f"AND POSTED_DATE > {self.e.db.date_bind('end')}",
+            {"bu": bu, "fy": fy, "per": int(period), "end": end},
+            max_rows=200)
+        return {"fiscal_year": fy, "period": int(period),
+                "period_end": end, "rows": rows}
+
     def run(self, playbook: str = "", business_unit: str = "",
             ledger: str = "", fiscal_year: int = 0, period: int = 0) -> dict:
         name = (playbook or "").strip() or "close_readiness"
@@ -481,6 +557,11 @@ class PlaybookRunner:
             )
         bu, fy, per, led = self.e._defaults(business_unit, fiscal_year,
                                             period, ledger)
+        if spec.get("pin_to_latest_posted") and not (fiscal_year and period):
+            # The just-closed period is the one under watch, not today's.
+            lfy, lper = self.e.last_posted_period(bu, led)
+            if lfy:
+                fy, per = lfy, lper
         ctx = self._context(bu, led, fy, per,
                             inputs=spec.get("context"))
 

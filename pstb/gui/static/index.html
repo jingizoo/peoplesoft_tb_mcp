@@ -2055,6 +2055,9 @@ function viewChat(){
    'Are there unposted journals?',
    'Are we ready to close the period?',
    'Who are our top 5 billing customers across all business units in USD?',
+   'Where is the billing delay?',
+   'Is everything okay after the close?',
+   'What is our cash outlook for the next 8 weeks?',
    'What is our capitalization threshold?'].forEach(q=>{
     const c=el('button','chip',esc(q)); c.type='button';
     c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
