@@ -53,6 +53,16 @@ class LlmCfg:
     provider: str = "ollama"  # ollama | gemini
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
+    # Ollama defaults to a 2048-token context. This system prompt alone is
+    # ~5,500 tokens, so the default SILENTLY TRUNCATED it — the record map,
+    # the worked examples and half the doctrine never reached the model,
+    # and every local-model routing failure was measured against a prompt
+    # it could not see. Sized for prompt + tool results + history.
+    # 16384 is MEASURED, not guessed: at Ollama's 2048 default the prompt
+    # is silently cut; 8192 still truncates and fails the eval suite;
+    # 32768 passes but runs ~28% slower for no benefit (23.3s vs 18.0s on
+    # the same case). Re-measure before changing.
+    ollama_num_ctx: int = 16384
     gemini_model: str = "gemini-2.5-pro"
     gemini_project: str = ""
     gemini_location: str = "us-central1"

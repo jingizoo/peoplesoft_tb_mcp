@@ -21,6 +21,7 @@ class OllamaProvider(LLMProvider):
         self.client = ollama.Client(host=cfg.llm.ollama_host)
         self.model = cfg.llm.ollama_model
         self.temperature = cfg.llm.temperature
+        self.num_ctx = int(getattr(cfg.llm, "ollama_num_ctx", 32768) or 32768)
         self.system_prompt = system_prompt
         self.tools_payload = [
             {
@@ -44,7 +45,8 @@ class OllamaProvider(LLMProvider):
                 model=self.model,
                 messages=self.messages,
                 tools=self.tools_payload,
-                options={"temperature": self.temperature},
+                options={"temperature": self.temperature,
+                         "num_ctx": self.num_ctx},
             )
         except self._ollama.ResponseError as e:
             hint = ""

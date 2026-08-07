@@ -1085,10 +1085,15 @@ async def chat(payload: dict):
                 "turn_id": None,
             }
 
-    from ..client.chat import agent_turn, set_tool_result_limit
+    from ..client.chat import agent_turn, tool_result_limit
     from ..client.prompt import system_prompt
 
     calls: list = []
+    # Owned OUTSIDE the try so a failed turn cannot leak it. On the
+    # fallback path this stack holds an MCP subprocess — a Python process
+    # plus its database logon — and closing it only on the success path
+    # leaked one per errored turn until the GUI was restarted.
+    per_turn: "contextlib.AsyncExitStack | None" = None
     try:
         # Use the shared, lifespan-owned server when it is up; otherwise fall
         # back to a per-turn subprocess so a chat never fails outright.
@@ -1173,7 +1178,7 @@ async def chat(payload: dict):
             })
 
         async with provider_entry.lock:
-            set_tool_result_limit(cfg, provider_name)
+            result_limit = tool_result_limit(cfg, provider_name)
             _activity_reset(session_id)
 
             def _on_started(tool: str, args_preview: str,
@@ -1204,10 +1209,10 @@ async def chat(payload: dict):
                     tool_observer=_observe_and_record,
                     tool_started=_on_started,
                     prior_payloads=prior_payloads,
+                    result_limit=result_limit,
                 )
             finally:
                 _activity_done(session_id)
-        await per_turn.aclose()
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup
@@ -1226,6 +1231,10 @@ async def chat(payload: dict):
             status_code=500,
             content={"error": f"{type(root).__name__}: {root}", "tool_calls": calls},
         )
+    finally:
+        if per_turn is not None:
+            with contextlib.suppress(Exception):
+                await per_turn.aclose()
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
             "scope": active_scope,
             "turn_id": getattr(agent_turn, "last_turn_id", None)}

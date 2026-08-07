@@ -37,10 +37,22 @@ sys.path.insert(0, str(ROOT))
 SNAPSHOT_DIR = ROOT / "logs" / "monitor"
 
 
-def _key(playbook: str, bu: str, ledger: str) -> str:
-    safe = "".join(c if c.isalnum() or c in "-_" else "_"
-                   for c in f"{playbook}-{bu}-{ledger}")
-    return safe
+def _key(playbook: str, bu: str, ledger: str,
+         fiscal_year: int = 0, period: int = 0) -> str:
+    """Snapshot identity INCLUDES the period under review.
+
+    Without it, the first run of a new period diffs against the previous
+    period's findings: every cleared item reads as fixed and every new
+    one as a regression, on the same morning a controller most needs the
+    report to be trustworthy. A period change is a new baseline, not a
+    diff.
+    """
+    scope = f"{playbook}-{bu}-{ledger}"
+    if fiscal_year:
+        scope += f"-FY{fiscal_year}"
+        if period:
+            scope += f"P{period}"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in scope)
 
 
 def _load_previous(path: Path) -> dict:
@@ -183,7 +195,8 @@ def main() -> int:
         print(f"monitor: run failed — {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
-    key = _key(args.playbook, current["business_unit"], current["ledger"])
+    key = _key(args.playbook, current["business_unit"], current["ledger"],
+               current.get("fiscal_year") or 0, current.get("period") or 0)
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     latest = SNAPSHOT_DIR / f"{key}.json"
     history = SNAPSHOT_DIR / f"{key}.history.jsonl"
