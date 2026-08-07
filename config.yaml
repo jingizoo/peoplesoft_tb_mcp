@@ -30,6 +30,8 @@ llm:
   gemini_location: us-central1
   gemini_thinking_budget: -1      # -1 model default; >0 caps thinking tokens (latency/cost)
   temperature: 0.2
+  gemini_force_tool_round: true   # force a tool call on tool-needing questions
+  gemini_routing_temperature: 0.0 # greedy decoding for tool selection
   max_tool_result_chars: 0        # 0 = auto (24k local models, 120k gemini)
 
 wiki:
