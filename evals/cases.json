@@ -456,7 +456,7 @@
     },
     {
       "id": "budget-variance",
-      "question": "How are we tracking against budget this year?",
+      "question": "How are we tracking against our Coupa budget this year?",
       "scope": {
         "business_unit": "US001",
         "ledger": "ACTUALS",
@@ -465,10 +465,12 @@
       },
       "expect": {
         "any_tool": [
-          "get_budget_variance"
+          "coupa_budget_variance",
+          "get_budget_variance",
+          "get_coupa_budget_lines"
         ],
         "not_refused": true,
-        "_why": "budget-vs-actual is its own question with its own vocabulary; it must not fall back to a plain trial balance or a period comparison."
+        "_why": "budgets live in the procurement system at this deployment; the cross-system tool is the right route, and the ledger-budget tool refuses with a pointer to it."
       }
     }
   ]

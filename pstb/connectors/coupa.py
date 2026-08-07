@@ -164,6 +164,162 @@ class CoupaConnector(RestConnector):
                 "count": len(ranked), "truncated": len(ranked) > top_n}
 
     # ------------------------------------------------------- reconciliation
+    def budget_lines(self, period: str = "") -> dict:
+        """Budget lines as Coupa holds them: account segments, period,
+        amount. segment-1 is conventionally the natural account and
+        segment-2 the cost centre, but that is a per-tenant CHART
+        CONFIGURATION, so the mapping is reported, never assumed silently.
+        """
+        rows = self.get("/api/budget_lines", {"limit": 500}) or []
+        want = (period or "").strip().upper()
+        out = []
+        for r in rows:
+            acct = r.get("account") or {}
+            entry = {
+                "id": r.get("id"),
+                "name": str(r.get("name") or ""),
+                "period": str(r.get("period") or "").upper(),
+                "account": str(acct.get("segment-1")
+                               or acct.get("segment_1") or ""),
+                "cost_centre": str(acct.get("segment-2")
+                                   or acct.get("segment_2") or ""),
+                "budget": float(r.get("budgeted-amount")
+                                or r.get("budgeted_amount") or 0.0),
+                "currency": str((r.get("currency") or {}).get("code") or ""),
+            }
+            if want and entry["period"] != want:
+                continue
+            out.append(entry)
+        return {"source": "coupa", "mode": self.mode,
+                "period": want or "all", "count": len(out),
+                "budget_lines": out,
+                "segment_map": {"segment-1": "natural account",
+                                "segment-2": "cost centre"},
+                "note": ("Budget lives in Coupa at this deployment, not in "
+                         "a PeopleSoft budget ledger. Segment meanings are "
+                         "a per-tenant chart configuration — confirm them "
+                         "before trusting a mapping.")}
+
+    def budget_variance(self, engine, business_unit: str = "",
+                        fiscal_year: int = 0, period: int = 0,
+                        top: int = 25) -> dict:
+        """Coupa BUDGET vs PeopleSoft ACTUALS, matched on natural account.
+
+        The cross-system shape this site actually has. Match basis is
+        disclosed, and the two failure directions are reported separately
+        because they mean different things: a budget line with no ledger
+        activity is unspent plan, while ledger spend with no budget line
+        is unbudgeted — the one a controller wants to see first.
+        """
+        bu = (business_unit or "").strip() or \
+            engine.effective_defaults()["business_unit"]
+        led = engine.resolve_ledger_for(bu)
+        fy = int(fiscal_year or 0) or engine.last_posted_period(bu, led)[0]
+        per = int(period or 0) or engine.last_posted_period(bu, led)[1]
+        if not fy:
+            return {"evaluated": False,
+                    "reason": f"No posted ledger data for {bu!r} to compare "
+                              "the Coupa budget against."}
+        lines = self.budget_lines(period=f"FY{fy}")["budget_lines"]
+        if not lines:
+            return {"evaluated": False, "business_unit": bu,
+                    "fiscal_year": fy,
+                    "reason": (f"Coupa holds no budget lines for FY{fy}. "
+                               "Check the budget period naming in Coupa "
+                               "(this tool matches on 'FY<year>').")}
+        rows = engine._period_sums(bu, led, fy, per, include_adj=True)
+        actual: dict = {}
+        descr: dict = {}
+        types: dict = {}
+        for r in rows:
+            p_ = int(r.get("period") or 0)
+            if p_ < 1 or p_ > per:
+                continue
+            acct = str(r.get("account") or "")
+            actual[acct] = actual.get(acct, 0.0) + float(r.get("amt") or 0.0)
+            descr.setdefault(acct, str(r.get("descr") or ""))
+            types.setdefault(acct, str(r.get("acct_type") or ""))
+        budget: dict = {}
+        currencies = set()
+        for line in lines:
+            budget[line["account"]] = round(
+                budget.get(line["account"], 0.0) + line["budget"], 2)
+            currencies.add(line["currency"])
+        compared, unbudgeted, unspent = [], [], []
+        revenue_excluded = 0
+        for acct in sorted(set(actual) | set(budget)):
+            a = round(actual.get(acct, 0.0), 2)
+            b = round(budget.get(acct, 0.0), 2)
+            atype = types.get(acct, "")
+            if acct not in budget:
+                # Coupa budgets SPEND. Revenue having no Coupa budget line
+                # is the expected shape, not a finding, and balance-sheet
+                # accounts were never in scope — flagging either as
+                # "unbudgeted" is the noise that makes a real unbudgeted
+                # expense easy to miss.
+                if atype == "E" and a:
+                    unbudgeted.append({"account": acct,
+                                       "descr": descr.get(acct, ""),
+                                       "actual": a})
+                elif atype == "R":
+                    revenue_excluded += 1
+                continue
+            if acct not in actual:
+                unspent.append({"account": acct, "budget": b,
+                                "descr": descr.get(acct, "")})
+                continue
+            variance = round(a - b, 2)
+            compared.append({
+                "account": acct, "descr": descr.get(acct, ""),
+                "account_type": atype, "actual": a, "budget": b,
+                "variance": variance,
+                "variance_pct": (round(variance / abs(b) * 100.0, 2)
+                                 if b else None),
+                # Expense and revenue both read "favourable" when the
+                # variance is negative; see the PS-side tool for why the
+                # account TYPE decides this and never the sign.
+                "favourable": variance < 0 if atype in ("R", "E") else None,
+            })
+        compared.sort(key=lambda r: -abs(r["variance"]))
+        truncated = len(compared) > max(int(top or 25), 1)
+        return {
+            "source": "coupa+peoplesoft", "evaluated": True,
+            "business_unit": bu, "ledger": led,
+            "fiscal_year": fy, "through_period": per,
+            "mode": self.mode,
+            "budget_currencies": sorted(c for c in currencies if c),
+            "match_basis": ("Coupa budget-line account segment-1 matched to "
+                            "the PeopleSoft natural ACCOUNT; ledger side is "
+                            f"year-to-date activity, periods 1..{per}"),
+            "rows": compared[:max(int(top or 25), 1)],
+            "row_count": len(compared), "truncated": truncated,
+            "unbudgeted_spend": unbudgeted,
+            "budget_not_spent": unspent,
+            "population": {
+                "concept": "Coupa spend budget vs ledger actuals",
+                "applied": [
+                    {"predicate": "ACCOUNT_TYPE = 'E' for unbudgeted spend",
+                     "source": "Coupa budgets procurable SPEND",
+                     "meaning": "revenue and balance-sheet accounts are not "
+                                "expected to carry a Coupa budget line"},
+                    {"predicate": f"periods 1..{per} of FY{fy}",
+                     "source": "the request scope",
+                     "meaning": "year-to-date ledger activity"},
+                ],
+                "revenue_accounts_excluded": revenue_excluded,
+            },
+            "note": ("Budget from Coupa, actuals from the ledger. Unbudgeted "
+                     "spend and unspent budget are listed separately — they "
+                     "are different problems. Expenses that never flow "
+                     "through procurement (depreciation, payroll "
+                     "allocations) legitimately have no Coupa budget — "
+                     "judge the unbudgeted list with that in mind. Confirm "
+                     "the segment mapping before acting: segment meanings "
+                     "are per-tenant."
+                     + (" SAMPLE procurement fixtures, not live data."
+                        if self.mode == "fixtures" else "")),
+        }
+
     def ap_tie(self, db, days: int = 90,
                today: Optional[dt.date] = None) -> dict:
         """Approved Coupa invoices vs PS vouchers, matched server-side.

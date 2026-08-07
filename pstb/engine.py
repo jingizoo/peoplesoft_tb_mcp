@@ -928,10 +928,12 @@ class TBEngine:
         if names and budget_led not in names:
             raise EngineError(
                 f"No ledger named {budget_led!r} for {bu}. Ledgers here: "
-                f"{', '.join(sorted(names))}. Budget comparison needs a "
-                "budget ledger — this site may keep budgets in Commitment "
-                "Control (the KK records) instead, which is a different "
-                "structure and not read by this tool.")
+                f"{', '.join(sorted(names))}. This deployment does not "
+                "budget in the ledger. If budgets live in the procurement "
+                "system, use coupa_budget_variance instead — it compares "
+                "the Coupa budget to these actuals. Sites budgeting in "
+                "Commitment Control (the KK records) are a third, "
+                "different structure this tool does not read.")
         actual = self._period_sums(bu, led, fy, per, dept=dept,
                                    account=account.strip(), include_adj=True)
         budget = self._period_sums(bu, budget_led, fy, per, dept=dept,
