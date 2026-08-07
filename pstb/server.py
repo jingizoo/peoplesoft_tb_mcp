@@ -295,6 +295,20 @@ def get_top_billing_customers(
 
 
 @mcp.tool()
+def get_invoice_totals(business_unit: str = "", fiscal_year: int = 0) -> dict:
+    """Total FINALIZED invoice amount (BILL_STATUS='INV') with a population
+    block naming every applied default and everything excluded — pipeline
+    bills (could still become revenue) separated from cancelled (never
+    will). Use for "total invoice amount / how much have we invoiced /
+    total billed". Totals are per currency, never summed across. When the
+    finalized-only default empties the result it says so instead of
+    answering 0.00. Pipeline detail by status is get_billing_workbench;
+    open balances are get_ar_aging."""
+    return _safe(ar.invoice_totals, business_unit=business_unit,
+                 fiscal_year=fiscal_year)
+
+
+@mcp.tool()
 def get_ar_aging(
     business_unit: str = "",
     as_of_date: str = "",

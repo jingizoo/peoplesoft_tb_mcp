@@ -207,6 +207,8 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
         reg["search_accounts"] = lambda a, cap: _call_filtered(
             engine.search_accounts, a, {"max_rows": cap})
     if ar is not None:
+        reg["get_invoice_totals"] = lambda a, cap: _call_filtered(
+            ar.invoice_totals, a, {})
         reg["get_ar_aging"] = lambda a, cap: _call_filtered(
             ar.aging, a, {"detail": True, "max_rows": cap})
         reg["get_top_billing_customers"] = lambda a, cap: _call_filtered(

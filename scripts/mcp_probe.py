@@ -70,6 +70,7 @@ async def main() -> None:
             # parses, the server still starts, and six discovery tools simply
             # stop existing. Naming them is the only way that shows up.
             REQUIRED = {
+                "get_invoice_totals",
                 "coupa_health", "get_coupa_invoices",
                 "get_coupa_stuck_approvals", "get_coupa_rni",
                 "get_coupa_supplier_spend", "coupa_to_ap_tie",
