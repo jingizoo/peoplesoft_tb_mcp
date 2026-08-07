@@ -60,6 +60,12 @@ class LlmCfg:
     # 2.5-pro enforces a minimum); >0 caps the thinking token budget.
     gemini_thinking_budget: int = -1
     temperature: float = 0.2
+    # Routing discipline (Gemini): on the user turn of a question that needs
+    # tools, force a function call (tool_config mode ANY) so the model cannot
+    # skip straight to prose, and decode greedily — tool selection is a
+    # decision, not a writing task. Chained/prose turns keep `temperature`.
+    gemini_force_tool_round: bool = True
+    gemini_routing_temperature: float = 0.0
     # 0 = auto: 24k chars for local models, 120k for Gemini (1M-token context).
     max_tool_result_chars: int = 0
 

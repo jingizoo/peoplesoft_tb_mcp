@@ -303,6 +303,12 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     bu_override = wants_all_business_units(user_text)
     turn_results: dict = {}
     required_financial_domains = question_financial_domains(user_text)
+    # Tell the provider whether this question should open with a tool call.
+    # The Gemini provider forces function-calling mode ANY on that first
+    # turn (greedy-decoded), which makes "answered from memory without
+    # looking" structurally impossible for tool-needing questions. Other
+    # providers simply carry the attribute.
+    provider.expect_tool_call = intent != "general"
     financial_fact_required = (
         intent == "data" and bool(required_financial_domains)
     )
