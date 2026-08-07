@@ -198,6 +198,8 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
             engine.trial_balance, a, {"max_rows": cap})
         reg["run_sql"] = lambda a, cap: _call_filtered(
             engine.run_sql, a, {"max_rows": cap, "row_ceiling": cap})
+        reg["get_budget_variance"] = lambda a, cap: _call_filtered(
+            engine.budget_variance, a, {"top": cap})
         reg["drill_to_journals"] = lambda a, cap: _call_filtered(
             engine.drill_to_journals, a, {"max_rows": cap})
         reg["rollup_trial_balance"] = lambda a, cap: _call_filtered(

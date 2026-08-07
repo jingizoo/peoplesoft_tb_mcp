@@ -206,3 +206,67 @@ class DailyBriefTests(Base):
         self.assertEqual(out["verdict"], "incomplete",
                          "a brief that could not check cash must never "
                          "read as 'nothing needs attention'")
+
+
+class BudgetVarianceTests(Base):
+    """Budget comparison has its own vocabulary — favourability depends on
+    the account type, not the sign of the variance."""
+
+    def _out(self, **kw):
+        return self.engine.budget_variance(
+            business_unit="US001", fiscal_year=2026, period=6, **kw)
+
+    def test_under_spending_is_favourable_under_earning_is_not(self):
+        out = self._out(top=50)
+        by = {r["account"]: r for r in out["rows"]}
+        travel = by["6400"]
+        self.assertGreater(travel["variance"], 0)
+        self.assertFalse(travel["favourable"],
+                         "spending MORE than budget cannot be favourable")
+        cogs = by["5000"]
+        self.assertLess(cogs["variance"], 0)
+        self.assertTrue(cogs["favourable"])
+        rev = by["4000"]
+        self.assertLess(rev["variance"], 0)
+        self.assertTrue(rev["favourable"],
+                        "revenue below budget is MORE negative and means "
+                        "more revenue — favourable")
+
+    def test_balance_sheet_excluded_by_default_and_disclosed(self):
+        out = self._out()
+        self.assertTrue(all(r["account_type"] in ("R", "E")
+                            for r in out["rows"]))
+        pop = out["population"]
+        self.assertGreater(pop["excluded_balance_sheet_accounts"], 0)
+        self.assertIn("ACCOUNT_TYPE", pop["applied"][0]["predicate"])
+        wide = self._out(include_balance_sheet=True, top=100)
+        self.assertTrue(any(r["account_type"] == "A" for r in wide["rows"]))
+
+    def test_totals_never_merge_revenue_and_expense(self):
+        out = self._out(top=100)
+        self.assertEqual(set(out["totals"]), {"revenue", "expense"})
+        for side in out["totals"].values():
+            self.assertAlmostEqual(
+                side["variance"], round(side["actual"] - side["budget"], 2),
+                places=2)
+
+    def test_opening_balances_are_not_in_a_ytd_comparison(self):
+        # Period 0 is the balance-sheet opening balance; budgets have none,
+        # so folding it in would report it all as variance.
+        self.assertIn("period 0 opening balances excluded",
+                      self._out()["basis"])
+
+    def test_a_missing_budget_ledger_refuses_with_the_remedy(self):
+        from pstb.engine import EngineError
+        with self.assertRaises(EngineError) as ctx:
+            self._out(budget_ledger="NOSUCH")
+        msg = str(ctx.exception)
+        self.assertIn("No ledger named", msg)
+        self.assertIn("Commitment Control", msg,
+                      "sites that budget in KK need to be told, not left "
+                      "guessing why the tool found nothing")
+
+    def test_the_budget_ledger_cannot_be_the_actuals_ledger(self):
+        from pstb.engine import EngineError
+        with self.assertRaises(EngineError):
+            self._out(budget_ledger="ACTUALS")

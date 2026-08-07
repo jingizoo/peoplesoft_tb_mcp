@@ -147,6 +147,30 @@ def compare_trial_balance(
 
 
 @mcp.tool()
+def get_budget_variance(
+    business_unit: str = "", fiscal_year: int = 0, period: int = 0,
+    ledger: str = "", budget_ledger: str = "", account: str = "",
+    dept: str = "", top: int = 25, min_abs_variance: float = 0.0,
+    include_balance_sheet: bool = False,
+) -> dict:
+    """Actual vs BUDGET year-to-date by account, with variance, % and
+    FAVOURABILITY. Use for "budget vs actual / are we over budget / where
+    are we overspending / variance to plan". Profit-and-loss accounts only
+    by default (budgets are set on the P&L; the payload discloses this and
+    include_balance_sheet=true overrides). Favourability comes from the
+    account TYPE, never the sign — under-spending is favourable,
+    under-earning is not. Totals are split revenue vs expense because one
+    merged total of signed amounts means nothing. For period-over-period
+    movement use compare_trial_balance instead."""
+    return _safe(
+        engine.budget_variance, business_unit=business_unit,
+        fiscal_year=fiscal_year, period=period, ledger=ledger,
+        budget_ledger=budget_ledger, account=account, dept=dept, top=top,
+        min_abs_variance=min_abs_variance,
+        include_balance_sheet=include_balance_sheet)
+
+
+@mcp.tool()
 def drill_to_journals(
     account: str,
     period: int,
