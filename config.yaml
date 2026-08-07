@@ -22,6 +22,12 @@ db:
   use_views: false        # set true once sql/oracle/XX_TB_*.sql views are deployed
   query_timeout_seconds: 120   # abort a query rather than hanging the UI        # set true once sql/oracle/XX_TB_*.sql views are deployed
 
+# Concept overrides: which codes define a named population at THIS site.
+# Approved site-memory facts outrank this; the built-in seed backstops both.
+# semantics:
+#   billing_invoiced:
+#     values: [INV, PRO]
+
 llm:
   provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)
   ollama_host: http://localhost:11434
