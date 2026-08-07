@@ -107,6 +107,33 @@ class QueryBudgetTests(unittest.TestCase):
         self._assert_budget("tb_integrity_check", 8,
                             lambda: self.engine.tb_integrity_check())
 
+    def test_next_wave_tool_budgets(self) -> None:
+        # The review that added these found the wave had shipped with no
+        # budgets at all — the exact drift the speed gate exists to stop.
+        from pstb.ar import ARBilling
+        from pstb.modules import ModulePacks
+        ar = ARBilling(self.engine)
+        modules = ModulePacks(self.engine)
+        for name, budget, fn in [
+            ("get_invoice_lifecycle", 4,
+             lambda: ar.invoice_lifecycle(business_unit="US001",
+                                          as_of_date="2026-08-06")),
+            ("get_dso_trend", 2,
+             lambda: ar.dso_trend(business_unit="US001")),
+            ("get_cash_outlook", 2,
+             lambda: ar.cash_outlook(business_unit="US001",
+                                     as_of_date="2026-08-06")),
+            ("get_vendor_intelligence", 2,
+             lambda: modules.vendor_intelligence(business_unit="US001",
+                                                 as_of_date="2026-08-06")),
+            ("get_duplicate_payments", 3,
+             lambda: modules.duplicate_payments(business_unit="US001",
+                                                as_of_date="2026-08-06")),
+            ("get_invoice_totals", 1,
+             lambda: ar.invoice_totals(business_unit="US001")),
+        ]:
+            self._assert_budget(name, budget, fn)
+
     def test_warm_scope_subroutines_are_free(self) -> None:
         # The subroutines every tool leans on must serve from cache when
         # warm: a per-call probe here multiplies across every tool call.
