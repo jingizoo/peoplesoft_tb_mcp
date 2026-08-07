@@ -343,6 +343,12 @@ CREATE TABLE PS_BI_HDR (
   BUSINESS_UNIT TEXT, INVOICE TEXT, BILL_STATUS TEXT, BILL_TO_CUST_ID TEXT,
   INVOICE_DT TEXT, ACCOUNTING_DT TEXT, INVOICE_AMOUNT REAL,
   BI_CURRENCY_CD TEXT, BILL_TYPE_ID TEXT, BILL_SOURCE_ID TEXT);
+CREATE TABLE PS_CUST_ADDRESS (
+  SETID TEXT, CUST_ID TEXT, ADDRESS_SEQ_NUM INTEGER,
+  CITY TEXT, STATE TEXT, COUNTRY TEXT);
+CREATE TABLE PS_BI_LINE (
+  BUSINESS_UNIT TEXT, INVOICE TEXT, LINE_SEQ_NUM INTEGER,
+  IDENTIFIER TEXT, DESCR TEXT, NET_EXTENDED_AMT REAL);
 CREATE TABLE PS_INTFC_BI (
   INTFC_ID INTEGER, INTFC_LINE_NUM INTEGER, TRANS_TYPE_BI TEXT,
   BUSINESS_UNIT TEXT, BILL_TO_CUST_ID TEXT, BILL_SOURCE_ID TEXT,
@@ -682,6 +688,45 @@ def main() -> None:
         (BU, "INV-2606ORPH", "INV", "C1007", "2026-06-28", "2026-06-28", 27_500.00, CURR, "STD", "CRM"),
     ]
     con.executemany("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)", hdrs)
+
+    # Customer geography — primary address per customer (sequence 1).
+    con.executemany(
+        "INSERT INTO PS_CUST_ADDRESS VALUES (?,?,?,?,?,?)",
+        [
+            (SETID, "C1001", 1, "Columbus", "OH", "USA"),
+            (SETID, "C1002", 1, "Austin", "TX", "USA"),
+            (SETID, "C1003", 1, "Portland", "OR", "USA"),
+            (SETID, "C1004", 1, "Newark", "NJ", "USA"),
+            (SETID, "C1005", 1, "Chicago", "IL", "USA"),
+            (SETID, "C1006", 1, "Toronto", "ON", "CAN"),
+            (SETID, "C1007", 1, "Denver", "CO", "USA"),
+            (SETID, "C1008", 1, "Miami", "FL", "USA"),
+        ])
+
+    # Bill lines: what each invoice actually charged. Lines sum EXACTLY to
+    # the header amount (a 70/30 split into a customer-specific product
+    # pair), so line-level product mix reconciles to header billing to the
+    # penny — the same coherence rule the AR/GL tie follows.
+    catalog = [
+        ("LIC-SAAS", "Platform subscription"),
+        ("SVC-CONSULT", "Consulting services"),
+        ("HW-EQUIP", "Equipment"),
+        ("MNT-SUPPORT", "Support & maintenance"),
+        ("FRT", "Freight & handling"),
+    ]
+    line_rows = []
+    for bu_, inv, status, cid, *_rest, amt, cur, _bt, _bs in [
+        (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9])
+        for h in hdrs
+    ]:
+        k = int(cid[1:]) % len(catalog)
+        primary, secondary = catalog[k], catalog[(k + 2) % len(catalog)]
+        first = r2(amt * 0.7)
+        rest = r2(amt - first)
+        line_rows.append((bu_, inv, 1, primary[0], primary[1], first))
+        if rest:
+            line_rows.append((bu_, inv, 2, secondary[0], secondary[1], rest))
+    con.executemany("INSERT INTO PS_BI_LINE VALUES (?,?,?,?,?,?)", line_rows)
 
     con.executemany(
         "INSERT INTO PS_INTFC_BI VALUES (?,?,?,?,?,?,?,?)",

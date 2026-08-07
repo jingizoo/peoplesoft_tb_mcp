@@ -1331,6 +1331,7 @@ function renderToolResult(name,data,args){
     if(name==='drill_to_journals') return renderJournals(data);
     if(name==='list_financial_scopes') return renderScopes(data);
     if(name==='run_report') return renderReport(data);
+    if(name==='get_customer_intelligence') return renderCustomerIntel(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
@@ -1411,6 +1412,40 @@ async function viewReports(){
   else holder.append(el('div','empty','No report definitions found in reports/.'));
 }
 
+function renderCustomerIntel(d){
+  const frag=document.createDocumentFragment();
+  const m2=v=>Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const c=el('div','card');
+  c.append(el('h2',null,'Customer intelligence <span class="sub">'+
+    (d.customers||[]).length+' customers · billed in '+esc(d.display_currency||'')+
+    ' · last '+d.window_months+' months</span>'));
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Customer</th><th>Based in</th><th>Buys</th>'+
+    '<th class="num">Billed</th><th class="num">Share</th><th class="num">Overdue</th><th class="num">Days late</th></tr></thead><tbody>'+
+    (d.customers||[]).map(cu=>{
+      const loc=cu.location?[cu.location.city,cu.location.state,cu.location.country]
+        .filter(Boolean).join(', '):'<span class="sub">n/a</span>';
+      const prods=(cu.top_products||[]).map(p2=>esc(p2.identifier)).join(' · ')||'<span class="sub">n/a</span>';
+      return '<tr><td><b>'+esc(cu.cust_id)+'</b> '+esc(cu.name||'')+'</td>'+
+        '<td>'+loc+'</td><td>'+prods+'</td>'+
+        '<td class="num">'+m2(cu.billed)+'</td>'+
+        '<td class="num">'+(cu.share_pct!==undefined?cu.share_pct.toFixed(1)+'%':'')+'</td>'+
+        '<td class="num">'+(cu.overdue_amt?m2(cu.overdue_amt):'—')+'</td>'+
+        '<td class="num">'+(cu.avg_days_late||'—')+'</td></tr>';
+    }).join('')+'</tbody>';
+  const sc=el('div'); sc.style.maxHeight='380px'; sc.style.overflow='auto'; sc.append(t);
+  c.append(sc); frag.append(c);
+  if((d.observations||[]).length){
+    const oc=el('div','card');
+    oc.append(el('h2',null,'Observations <span class="sub">computed from the records above — not generated advice</span>'));
+    const cls={concentration:'warn',late_payment:'bad',disputes:'warn',lapsed:'dim'};
+    oc.append(el('div','pad',(d.observations||[]).map(o=>
+      '<div style="margin:4px 0"><span class="badge '+(cls[o.kind]||'dim')+'">'+esc(o.kind.replace(/_/g,' '))+'</span> '+
+      esc(o.text)+'</div>').join('')));
+    frag.append(oc);
+  }
+  return frag;
+}
 function renderInvoiceTotals(d){
   const frag=document.createDocumentFragment();
   const money2=v=>Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});

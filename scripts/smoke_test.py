@@ -1464,7 +1464,13 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     cal = next(x for x in rm["domains"]["chartfields_setup"]
                if x["record"] == "PS_CAL_DETP_TBL")
     check("small REFERENCE table NOT warned", "warning" not in cal)
-    absent = next(x for x in rm["domains"]["billing"] if x["record"] == "PS_BI_LINE")
+    # PS_BI_LINE is seeded now (customer intelligence needs product mix);
+    # PS_BI_ACCT_ENTRY is the honest-absence case instead.
+    lines = next(x for x in rm["domains"]["billing"]
+                 if x["record"] == "PS_BI_LINE")
+    check("seeded bill lines are reported present", lines["present"] is True)
+    absent = next(x for x in rm["domains"]["billing"]
+                  if x["record"] == "PS_BI_ACCT_ENTRY")
     check("absent record reported honestly", absent["present"] is False)
 
     print("== exchange rates (effective-dated, server-side math) ==")

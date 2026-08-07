@@ -276,6 +276,24 @@
         "not_refused": true,
         "_why": "a broad AP-completeness question should run the composed playbook (ideal) or at minimum reach the AP tools \u2014 never refuse or answer from the ledger alone."
       }
+    },
+    {
+      "id": "customer-intelligence",
+      "question": "Who are my top customers, where are they based and what do they buy?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_customer_intelligence"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "the enriched customer question must route to the intelligence tool, not a bare ranking and not ad-hoc SQL joins."
+      }
     }
   ]
 }

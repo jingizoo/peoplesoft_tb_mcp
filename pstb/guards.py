@@ -62,6 +62,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_report",
     "run_sql",
     "run_playbook",
+    "get_customer_intelligence",
     "get_invoice_totals",
     "get_open_payables",
     "get_vendor_payments",
@@ -124,6 +125,7 @@ _TOOL_SCOPE_ARGS = {
     },
     "list_ledgers": {"business_unit": "business_unit"},
     "search_accounts": {"business_unit": "business_unit"},
+    "get_customer_intelligence": {"business_unit": "business_unit"},
     "get_invoice_totals": {"business_unit": "business_unit",
                            "fiscal_year": "fiscal_year"},
     "get_open_payables": {"business_unit": "business_unit"},
@@ -259,6 +261,8 @@ _TOOL_DOMAINS = {
     # safety net — a false refusal costs the user the answer a tool just
     # produced; a false accept only means the model routed oddly and the
     # number guard still checks every figure.
+    "get_customer_intelligence": {"billing", "customer", "ar", "report",
+                                  "fx"},
     "get_invoice_totals": {"billing", "report", "balance"},
     "get_open_payables": {"ap", "ar", "billing", "balance"},
     "get_vendor_payments": {"ap", "report"},
