@@ -51,13 +51,21 @@ MAX_TOOL_RESULT_CHARS = 24_000  # mutable via set_tool_result_limit()
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 
 
-def set_tool_result_limit(cfg: Config, provider_name: str) -> None:
+def tool_result_limit(cfg: Config, provider_name: str) -> int:
     """Size tool results to the model. Local 8B models drown past ~24k chars;
     Gemini 2.5 Pro has a 1M-token window and chains better when it sees whole
     results instead of truncated rows."""
-    global MAX_TOOL_RESULT_CHARS
     explicit = int(getattr(cfg.llm, "max_tool_result_chars", 0) or 0)
-    MAX_TOOL_RESULT_CHARS = explicit or (120_000 if provider_name == "gemini" else 24_000)
+    return explicit or (120_000 if provider_name == "gemini" else 24_000)
+
+
+def set_tool_result_limit(cfg: Config, provider_name: str) -> None:
+    """Set the PROCESS default (terminal client, tests). The GUI passes a
+    per-turn limit instead: mutating a module global from a request handler
+    let one browser session's provider decide another session's truncation,
+    and a 120k limit applied to a local model is a context overflow."""
+    global MAX_TOOL_RESULT_CHARS
+    MAX_TOOL_RESULT_CHARS = tool_result_limit(cfg, provider_name)
 
 
 def _repo_root() -> Path:
@@ -161,7 +169,8 @@ def _compact_args(args: dict, limit: int = 90) -> str:
     return line
 
 
-async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
+async def call_mcp_tool(session: ClientSession, name: str, args: dict,
+                        limit: int = 0) -> str:
     try:
         res = await session.call_tool(name, arguments=args)
         chunks = [c.text for c in res.content if getattr(c, "text", None)]
@@ -174,7 +183,7 @@ async def call_mcp_tool(session: ClientSession, name: str, args: dict) -> str:
             text = f"TOOL ERROR: {text}"
     except Exception as e:
         text = f"TOOL ERROR: {type(e).__name__}: {e}"
-    return _truncate_json(text, MAX_TOOL_RESULT_CHARS)
+    return _truncate_json(text, limit or MAX_TOOL_RESULT_CHARS)
 
 
 class ResultRefError(RuntimeError):
@@ -290,7 +299,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      scope: dict | None = None,
                      tool_observer: Callable | None = None,
                      tool_started: Callable | None = None,
-                     prior_payloads: list | None = None) -> str:
+                     prior_payloads: list | None = None,
+                     result_limit: int = 0) -> str:
     """Run one model turn with deterministic source ordering.
 
     ``scope`` is an optional, user-validated request scope. Concrete values are
@@ -497,7 +507,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             out = (
                 _blocked_result(blocked, next_step)
                 if blocked
-                else await call_mcp_tool(session, call.name, effective_args)
+                else await call_mcp_tool(session, call.name, effective_args,
+                                        limit=result_limit)
             )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return (index, call, effective_args, blocked, out, elapsed_ms,
