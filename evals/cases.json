@@ -453,6 +453,23 @@
         "not_refused": true,
         "_why": "the first question of the day runs the composed brief, never a scatter of ad-hoc calls."
       }
+    },
+    {
+      "id": "budget-variance",
+      "question": "How are we tracking against budget this year?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_budget_variance"
+        ],
+        "not_refused": true,
+        "_why": "budget-vs-actual is its own question with its own vocabulary; it must not fall back to a plain trial balance or a period comparison."
+      }
     }
   ]
 }

@@ -885,6 +885,184 @@ class TBEngine:
             ),
         }, scope_notes)
 
+    def budget_variance(
+        self,
+        business_unit: str = "",
+        fiscal_year: int = 0,
+        period: int = 0,
+        ledger: str = "",
+        budget_ledger: str = "",
+        account: str = "",
+        dept: str = "",
+        top: int = 25,
+        min_abs_variance: float = 0.0,
+        include_balance_sheet: bool = False,
+    ) -> dict:
+        """Actual vs budget through a period, by account, with variance and
+        favourability — the question a cost-centre owner asks every month.
+
+        Deliberately a sibling of compare_trial_balance rather than an
+        option on it: that tool compares two POINTS IN TIME and its
+        defaults, prior-year basis and new/gone framing are all
+        time-comparison semantics. Budget comparison is a different
+        question with a different vocabulary (favourable/unfavourable,
+        which depends on whether the account is revenue or expense).
+
+        Sign convention: ledger amounts are signed with credits negative,
+        so revenue arrives negative. Favourability is therefore computed
+        from the ACCOUNT TYPE, never from the sign of the variance alone —
+        spending less than budget is favourable, earning less is not.
+        """
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period,
+                                          ledger, notes=scope_notes)
+        budget_led = (budget_ledger or "").strip().upper() or "BUDGET"
+        if budget_led == led:
+            raise EngineError(
+                f"The budget ledger cannot be the actuals ledger ({led}). "
+                "Pass budget_ledger explicitly, e.g. BUDGET.")
+        known = self.list_ledgers(business_unit=bu).get("ledgers") or []
+        names = {str(x.get("ledger") or x.get("l") or "") if isinstance(x, dict)
+                 else str(x) for x in known}
+        names.discard("")
+        if names and budget_led not in names:
+            raise EngineError(
+                f"No ledger named {budget_led!r} for {bu}. Ledgers here: "
+                f"{', '.join(sorted(names))}. Budget comparison needs a "
+                "budget ledger — this site may keep budgets in Commitment "
+                "Control (the KK records) instead, which is a different "
+                "structure and not read by this tool.")
+        actual = self._period_sums(bu, led, fy, per, dept=dept,
+                                   account=account.strip(), include_adj=True)
+        budget = self._period_sums(bu, budget_led, fy, per, dept=dept,
+                                   account=account.strip(), include_adj=True)
+
+        def cumulative(rows: list) -> dict:
+            """YTD ACTIVITY, periods 1..per. Period 0 is the balance-sheet
+            opening balance and budgets almost never carry one, so folding
+            it in would report every balance-sheet account as a giant
+            variance against nothing."""
+            out: dict = {}
+            for r in rows:
+                p_ = int(r.get("period") or 0)
+                if p_ < 1 or p_ > per:
+                    continue
+                key = str(r.get("account") or "")
+                out[key] = out.get(key, 0.0) + float(r.get("amt") or 0.0)
+            return out
+
+        act, bud = cumulative(actual), cumulative(budget)
+        types = {str(r.get("account")): {"type": str(r.get("acct_type") or ""),
+                                         "descr": str(r.get("descr") or "")}
+                 for r in actual + budget if r.get("account")}
+        rows = []
+        excluded_bs = 0
+        for acct in sorted(set(act) | set(bud)):
+            atype = types.get(acct, {}).get("type", "")
+            # Budgets are set on the P&L. Comparing a balance-sheet
+            # account to a budget that was never loaded reports the whole
+            # balance as a variance — noise that buries the real lines.
+            if not include_balance_sheet and atype not in ("R", "E"):
+                excluded_bs += 1
+                continue
+            a, b = r2(act.get(acct, 0.0)), r2(bud.get(acct, 0.0))
+            variance = r2(a - b)
+            if abs(variance) < float(min_abs_variance or 0.0):
+                continue
+            # Expense: actual BELOW budget is favourable. Revenue (credit,
+            # so more negative is more revenue): actual below budget is
+            # unfavourable. Anything else has no favourability meaning.
+            if atype == "E":
+                favourable = variance < 0
+            elif atype == "R":
+                favourable = variance < 0
+            else:
+                favourable = None
+            rows.append({
+                "account": acct,
+                "descr": types.get(acct, {}).get("descr", ""),
+                "account_type": atype,
+                "actual": a, "budget": b,
+                "variance": variance,
+                "variance_pct": (r2(variance / abs(b) * 100.0)
+                                 if b else None),
+                "favourable": favourable,
+            })
+        rows.sort(key=lambda r: -abs(r["variance"]))
+        truncated = len(rows) > max(int(top or 25), 1)
+        shown = rows[: max(int(top or 25), 1)]
+        # Split by type: revenue is negative and expense positive, so one
+        # merged total is a number with no meaning.
+        totals: dict = {}
+        for label, code in (("revenue", "R"), ("expense", "E")):
+            side = [r for r in rows if r["account_type"] == code]
+            if not side:
+                continue
+            a = r2(sum(r["actual"] for r in side))
+            b = r2(sum(r["budget"] for r in side))
+            totals[label] = {
+                "actual": a, "budget": b, "variance": r2(a - b),
+                "favourable": (a - b) < 0,
+            }
+        return self._with_scope_notes({
+            "business_unit": bu, "ledger": led, "budget_ledger": budget_led,
+            "fiscal_year": fy, "through_period": per,
+            "rows": shown, "row_count": len(rows), "truncated": truncated,
+            "totals": totals,
+            "basis": (f"year-to-date ACTIVITY, periods 1..{per} of FY{fy}, "
+                      f"{led} vs {budget_led} (period 0 opening balances "
+                      f"excluded — budgets do not carry them)"),
+            "population": {
+                "concept": "budget variance (profit & loss)",
+                "applied": [
+                    {"predicate": ("ACCOUNT_TYPE IN ('R','E')"
+                                   if not include_balance_sheet
+                                   else "all account types"),
+                     "source": "tool default: budgets are set on the P&L",
+                     "meaning": ("revenue and expense accounts only"
+                                 if not include_balance_sheet
+                                 else "every account type")},
+                    {"predicate": f"periods 1..{per}",
+                     "source": "the request scope's period",
+                     "meaning": "year-to-date activity"},
+                ],
+                "excluded_balance_sheet_accounts": excluded_bs,
+                "override": "pass include_balance_sheet=true to see them",
+            },
+            "note": (
+                "Amounts are signed as the ledger stores them (credits "
+                "negative), so revenue is negative and variance = actual - "
+                "budget. 'favourable' is derived from the ACCOUNT TYPE, not "
+                "from the sign: under-spending an expense is favourable, "
+                "under-earning revenue is not. Accounts with no type "
+                "carry favourable = null rather than a guess."
+            ),
+        }, scope_notes)
+
+    def _account_types(self, business_unit: str, accounts: list) -> dict:
+        """ACCOUNT_TYPE and description for a set of accounts, by SETID."""
+        if not accounts:
+            return {}
+        setid = self.resolve_setid(business_unit, "GL_ACCOUNT")
+        p = self.db.prefix
+        out: dict = {}
+        for i in range(0, len(accounts), 500):
+            chunk = accounts[i:i + 500]
+            binds = {f"a{j}": a for j, a in enumerate(chunk)}
+            expr = "(" + ", ".join(f":{k}" for k in binds) + ")"
+            try:
+                rows, _ = self.db.query(
+                    f"SELECT ACCOUNT AS account, ACCOUNT_TYPE AS t, "
+                    f"DESCR AS descr FROM {p}PS_GL_ACCOUNT_TBL "
+                    f"WHERE SETID = :setid AND ACCOUNT IN {expr}",
+                    {"setid": setid, **binds}, max_rows=len(chunk))
+            except DbError:
+                return out
+            for r in rows:
+                out[str(r["account"])] = {"type": str(r.get("t") or ""),
+                                          "descr": str(r.get("descr") or "")}
+        return out
+
     def compare_trial_balance(
         self,
         business_unit: str = "",
