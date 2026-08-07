@@ -64,6 +64,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_playbook",
     "get_customer_intelligence",
     "get_invoice_totals",
+    "get_duplicate_payments",
     "get_open_payables",
     "get_vendor_payments",
     "get_asset_register",
@@ -128,6 +129,7 @@ _TOOL_SCOPE_ARGS = {
     "get_customer_intelligence": {"business_unit": "business_unit"},
     "get_invoice_totals": {"business_unit": "business_unit",
                            "fiscal_year": "fiscal_year"},
+    "get_duplicate_payments": {"business_unit": "business_unit"},
     "get_open_payables": {"business_unit": "business_unit"},
     "get_vendor_payments": {"business_unit": "business_unit"},
     "get_asset_register": {"business_unit": "business_unit"},
@@ -264,6 +266,7 @@ _TOOL_DOMAINS = {
     "get_customer_intelligence": {"billing", "customer", "ar", "report",
                                   "fx"},
     "get_invoice_totals": {"billing", "report", "balance"},
+    "get_duplicate_payments": {"ap", "report"},
     "get_open_payables": {"ap", "ar", "billing", "balance"},
     "get_vendor_payments": {"ap", "report"},
     "get_asset_register": {"am", "report", "balance"},
@@ -316,6 +319,20 @@ _FIGURE_ASK = re.compile(
 )
 
 
+# Reconciliation phrasings: "did X land in AP", "does the subledger tie",
+# "matched against". These are DATA questions even when they contain
+# "approved" — approving an invoice is a transaction event, not a policy —
+# and classifying them as policy replaced a grounded tie-out answer with a
+# wiki refusal. An explicit policy word still wins.
+_RECON_QUERY = re.compile(
+    r"(?i)\b(?:tie[sd]?\s+(?:out|to)|reconcil\w+|"
+    r"land(?:ed)?\s+in|reach(?:ed)?\s+(?:ap|ar|gl)\b|"
+    r"match(?:ed)?\s+(?:to|against)|make\s+it\s+(?:in)?to)")
+_EXPLICIT_POLICY_WORD = re.compile(
+    r"(?i)\b(?:polic(?:y|ies)|procedure|rule|guideline|threshold|"
+    r"checklist|complian\w+)\b")
+
+
 def evidence_intent(question: str) -> str:
     """Classify a question for deterministic evidence routing.
 
@@ -329,6 +346,8 @@ def evidence_intent(question: str) -> str:
     figure such an answer states.
     """
     text = question or ""
+    if _RECON_QUERY.search(text) and not _EXPLICIT_POLICY_WORD.search(text):
+        return "data"
     policy = bool(_POLICY_QUERY.search(text))
     data = bool(_DATA_QUERY.search(text))
     technical = bool(_TECHNICAL_QUERY.search(text))

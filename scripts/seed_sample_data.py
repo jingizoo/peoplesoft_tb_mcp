@@ -523,6 +523,30 @@ def main() -> None:
         (BU, "VCHR90004", "V1003", "INV-9004", "2026-07-20", "2026-08-19",
          5_150.00, "R", "O", "U", CURR),         # recycle + unposted
     ]
+    # A staged duplicate pair (same vendor + invoice number vouchered
+    # twice) and a same-amount near-pair — closed, dated MARCH so the AP
+    # tie's 90-day window and open payables are untouched. The duplicate-
+    # payments audit needs something real to find.
+    _vouchers += [
+        (BU, "VCHR80001", "V1001", "INV-DUP01", "2026-03-12", "2026-04-11",
+         7_800.00, "P", "C", "P", CURR),
+        (BU, "VCHR80002", "V1001", "INV-DUP01", "2026-03-14", "2026-04-13",
+         7_800.00, "P", "C", "P", CURR),
+        (BU, "VCHR80003", "V1002", "INV-8003", "2026-03-20", "2026-04-19",
+         12_400.00, "P", "C", "P", CURR),
+        (BU, "VCHR80004", "V1002", "INV-8004", "2026-03-23", "2026-04-22",
+         12_400.00, "P", "C", "P", CURR),
+    ]
+    # Xref rows for the staged duplicates — the close-status FALLBACK
+    # decides paid-ness purely from xref EXISTENCE, so these keep a site
+    # missing CLOSE_STATUS from seeing four staged duplicates as open
+    # payables. Deliberately NO PS_PAYMENT_TBL rows: payment rankings and
+    # totals must not move for rows staged only to be found by an audit.
+    for i, (vid, amt) in enumerate([("VCHR80001", 7_800.00),
+                                    ("VCHR80002", 7_800.00),
+                                    ("VCHR80003", 12_400.00),
+                                    ("VCHR80004", 12_400.00)], start=1):
+        _xref.append((BU, vid, f"PMT8000{i}", amt))
     con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     _vouchers)
     # Asset register: two categories, one retirement, one fully-in-service

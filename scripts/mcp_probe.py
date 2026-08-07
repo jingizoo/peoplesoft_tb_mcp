@@ -81,6 +81,7 @@ async def main() -> None:
                 "run_playbook", "get_ar_aging", "resolve_policy_value",
                 "list_policy_terms", "explain_query",
                 "get_open_payables", "get_vendor_payments",
+                "get_duplicate_payments",
                 "get_asset_register", "get_project_costs",
                 "get_tree_node_accounts",
             }

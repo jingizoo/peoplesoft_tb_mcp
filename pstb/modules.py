@@ -173,6 +173,105 @@ class ModulePacks:
         return out
 
     # ---- AP: whom did we pay ---------------------------------------------
+    def duplicate_payments(self, business_unit: str = "",
+                           months: int = 12, tolerance_days: int = 7,
+                           as_of_date: str = "") -> dict:
+        """Possible duplicate vouchers — the AP audit question every close
+        asks and nobody enjoys checking by hand.
+
+        Two mechanical checks, disclosed separately because they carry
+        different confidence: the SAME invoice number vouchered twice for
+        one vendor (near-certain duplicate), and the same vendor billed the
+        SAME amount within a few days under different invoice numbers
+        (worth eyes — recurring charges legitimately look like this, so it
+        is a review list, never an accusation).
+        """
+        bu = self._bu(business_unit)
+        asof = self._asof(as_of_date)
+        since = (_iso(asof) - dt.timedelta(
+            days=max(int(months or 12), 1) * 30)).isoformat()
+        self._need("PS_VOUCHER", ["BUSINESS_UNIT", "VOUCHER_ID", "VENDOR_ID",
+                                  "INVOICE_ID", "INVOICE_DT", "GROSS_AMT"])
+        p = self.db.prefix
+        # Near-certain: one vendor, one invoice number, several vouchers.
+        rows, _ = self.db.query(
+            f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
+            f"V.INVOICE_ID AS invoice_id, COUNT(*) AS n, "
+            f"SUM(V.GROSS_AMT) AS total "
+            f"FROM {p}PS_VOUCHER V LEFT JOIN {p}PS_VENDOR N "
+            f"ON N.VENDOR_ID = V.VENDOR_ID "
+            f"WHERE V.BUSINESS_UNIT = :bu "
+            f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
+            f"GROUP BY V.VENDOR_ID, V.INVOICE_ID HAVING COUNT(*) > 1",
+            {"bu": bu, "since": since}, max_rows=200)
+        exact = [{"vendor_id": str(r["vendor_id"]),
+                  "vendor": str(r["vendor"] or ""),
+                  "invoice_id": str(r["invoice_id"]),
+                  "vouchers": int(r["n"] or 0),
+                  "total": r2(float(r["total"] or 0))} for r in rows]
+
+        # Worth eyes: same vendor, same amount, different invoice numbers,
+        # entered within tolerance_days of each other. Day math happens in
+        # Python — no dialect-specific date arithmetic in SQL.
+        cand, _ = self.db.query(
+            f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
+            f"V.GROSS_AMT AS amount, COUNT(*) AS n "
+            f"FROM {p}PS_VOUCHER V LEFT JOIN {p}PS_VENDOR N "
+            f"ON N.VENDOR_ID = V.VENDOR_ID "
+            f"WHERE V.BUSINESS_UNIT = :bu "
+            f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
+            f"GROUP BY V.VENDOR_ID, V.GROSS_AMT HAVING COUNT(*) > 1",
+            {"bu": bu, "since": since}, max_rows=200)
+        near = []
+        if cand:
+            detail, _ = self.db.query(
+                f"SELECT VENDOR_ID AS vendor_id, VOUCHER_ID AS voucher_id, "
+                f"INVOICE_ID AS invoice_id, INVOICE_DT AS dt, "
+                f"GROSS_AMT AS amount "
+                f"FROM {p}PS_VOUCHER WHERE BUSINESS_UNIT = :bu "
+                f"AND V0.INVOICE_DT >= {self.db.date_bind('since')}"
+                .replace("V0.", ""),
+                {"bu": bu, "since": since}, max_rows=5000)
+            wanted = {(str(c["vendor_id"]), float(c["amount"] or 0))
+                      for c in cand}
+            names = {str(c["vendor_id"]): str(c["vendor"] or "")
+                     for c in cand}
+            groups: dict = {}
+            for r in detail:
+                key = (str(r["vendor_id"]), float(r["amount"] or 0))
+                if key in wanted:
+                    groups.setdefault(key, []).append(r)
+            for (vid, amount), members in sorted(groups.items()):
+                members.sort(key=lambda r: str(r["dt"]))
+                for a, b in zip(members, members[1:]):
+                    if str(a["invoice_id"]) == str(b["invoice_id"]):
+                        continue  # already in the exact list
+                    gap = abs((_iso(str(b["dt"])) - _iso(str(a["dt"]))).days)
+                    if gap <= max(int(tolerance_days or 7), 0):
+                        near.append({
+                            "vendor_id": vid, "vendor": names.get(vid, ""),
+                            "amount": r2(amount), "days_apart": gap,
+                            "vouchers": [str(a["voucher_id"]),
+                                         str(b["voucher_id"])],
+                            "invoices": [str(a["invoice_id"]),
+                                         str(b["invoice_id"])]})
+        exact_total = r2(sum(x["total"] for x in exact))
+        return {
+            "business_unit": bu, "since": since, "as_of": asof,
+            "window_months": int(months or 12),
+            "tolerance_days": int(tolerance_days or 7),
+            "exact_invoice_duplicates": exact,
+            "same_amount_pairs": near,
+            "exact_total": exact_total,
+            "note": ("Exact list = one vendor invoice number vouchered more "
+                     "than once (near-certain duplicate). Same-amount list "
+                     "= same vendor and amount within the tolerance window "
+                     "under different invoice numbers — a REVIEW list, not "
+                     "an accusation; recurring charges look like this too. "
+                     "No duplicates found is a real answer, not a failure."
+                     ),
+        }
+
     def vendor_payments(self, business_unit: str = "", vendor: str = "",
                         months: int = 12, n: int = 20,
                         as_of_date: str = "") -> dict:

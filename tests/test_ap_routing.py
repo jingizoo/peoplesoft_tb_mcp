@@ -83,6 +83,23 @@ class RegistrationTests(unittest.TestCase):
             f"{financial_tool_domains('get_open_payables')}")
 
 
+class ReconciliationIntentTests(unittest.TestCase):
+    def test_a_tie_out_question_with_approved_is_data(self) -> None:
+        from pstb.guards import evidence_intent
+        for q in ("Did everything approved in Coupa land in AP?",
+                  "does the subledger tie out to the control account",
+                  "were the invoices matched against vouchers"):
+            self.assertEqual(evidence_intent(q), "data",
+                             f"{q!r} demanded policy evidence — a grounded "
+                             "tie-out answer would be replaced by a wiki "
+                             "refusal")
+
+    def test_an_explicit_policy_word_still_wins(self) -> None:
+        from pstb.guards import evidence_intent
+        self.assertNotEqual(
+            evidence_intent("what is our reconciliation policy?"), "data")
+
+
 class CrossBuPhrasingTests(unittest.TestCase):
     def test_across_counts_without_the_word_all(self) -> None:
         for q in ("compare revenue across business units",
