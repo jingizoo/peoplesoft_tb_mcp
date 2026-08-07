@@ -295,6 +295,23 @@ def get_top_billing_customers(
 
 
 @mcp.tool()
+def get_customer_intelligence(business_unit: str = "", n: int = 20,
+                              months: int = 12,
+                              display_currency: str = "") -> dict:
+    """Top customers WITH context: where they are based (city/state/
+    country), what they buy (top products from bill lines), and how they
+    pay (open AR, overdue, average days late, disputes) — plus computed
+    observations: concentration risk, late payers with the working capital
+    at stake, disputes, and lapsed top billers. Use for "who are my top
+    customers and where are they based / what do they buy / what can I
+    optimize". Copy observations verbatim — they are arithmetic over
+    records, and every figure is in the payload. Plain ranking with no
+    context is get_top_billing_customers."""
+    return _safe(ar.customer_intelligence, business_unit=business_unit,
+                 n=n, months=months, display_currency=display_currency)
+
+
+@mcp.tool()
 def get_invoice_totals(business_unit: str = "", fiscal_year: int = 0) -> dict:
     """Total FINALIZED invoice amount (BILL_STATUS='INV') with a population
     block naming every applied default and everything excluded — pipeline

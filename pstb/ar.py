@@ -832,6 +832,212 @@ class ARBilling:
                      "currency and never summed across."),
         }
 
+    def customer_intelligence(self, business_unit: str = "", n: int = 20,
+                              months: int = 12, display_currency: str = "",
+                              as_of_date: str = "") -> dict:
+        """Top customers enriched with WHERE they are, WHAT they buy, and
+        HOW they pay — plus computed observations, each carrying its own
+        figures so the guard can verify every claim.
+
+        The advisory rung done honestly: an "observation" is arithmetic
+        over records (terms gap, concentration, disputes, currency
+        exposure, lapsed buyers), never generated advice. Enrichments are
+        shape-tolerant — a site without PS_CUST_ADDRESS or PS_BI_LINE
+        loses that column and is told so, never crashed on.
+        """
+        bu = self._bu(business_unit)
+        base = self.e.base_currency_for(bu) or "USD"
+        disp = (display_currency or "").strip().upper() or base
+        top = self.top_billing_customers(
+            business_unit=bu, n=n, months=months, display_currency=disp,
+            as_of_date=as_of_date)
+        if top.get("mixed_currencies") and not top.get("customers"):
+            return top  # ranking impossible; pass the refusal through
+        ranked = top.get("customers") or []
+        ids = [c["cust_id"] for c in ranked]
+        notes: list = list(top.get("record_notes") or [])
+        asof = self._asof(as_of_date)
+        p = self.db.prefix
+        setid = self.e.resolve_setid(bu, "CUSTOMER")
+
+        def in_binds(prefix: str) -> tuple:
+            binds = {f"{prefix}{i}": cid for i, cid in enumerate(ids)}
+            expr = "(" + ", ".join(f":{k}" for k in binds) + ")"
+            return expr, binds
+
+        # WHERE they are: primary address per customer.
+        locations: dict = {}
+        if ids and self._cols("PS_CUST_ADDRESS"):
+            expr, binds = in_binds("a")
+            rows, _ = self.db.query(
+                f"SELECT CUST_ID AS cid, CITY AS city, STATE AS state, "
+                f"COUNTRY AS country, ADDRESS_SEQ_NUM AS seq "
+                f"FROM {p}PS_CUST_ADDRESS WHERE SETID = :setid "
+                f"AND CUST_ID IN {expr} ORDER BY ADDRESS_SEQ_NUM",
+                {"setid": setid, **binds}, max_rows=len(ids) * 5)
+            for r in rows:
+                locations.setdefault(str(r["cid"]), {
+                    "city": r.get("city"), "state": r.get("state"),
+                    "country": r.get("country")})
+        elif ids:
+            notes.append("PS_CUST_ADDRESS is not present at this site — "
+                         "customer geography is not available.")
+
+        # WHAT they buy: finalized bill lines over the same window, with
+        # the finalized statuses resolved through the concept register so
+        # a taught status override applies here too.
+        from .semantics import resolve as resolve_concept
+        sem = resolve_concept("billing_invoiced", cfg=self.cfg,
+                              memory=getattr(self.e, "_memory", None))
+        products: dict = {}
+        if ids and self._cols("PS_BI_LINE"):
+            expr, binds = in_binds("l")
+            status_binds = {f"st{i}": v for i, v in enumerate(sem.values)}
+            st_expr = "(" + ", ".join(f":{k}" for k in status_binds) + ")"
+            since = (_iso(asof) - dt.timedelta(
+                days=max(int(months or 12), 1) * 30)).isoformat()
+            rows, _ = self.db.query(
+                f"SELECT H.BILL_TO_CUST_ID AS cid, L.IDENTIFIER AS ident, "
+                f"MAX(L.DESCR) AS descr, SUM(L.NET_EXTENDED_AMT) AS amt, "
+                f"MAX(H.BI_CURRENCY_CD) AS currency "
+                f"FROM {p}PS_BI_LINE L JOIN {p}PS_BI_HDR H "
+                f"ON H.BUSINESS_UNIT = L.BUSINESS_UNIT "
+                f"AND H.INVOICE = L.INVOICE "
+                f"WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS IN {st_expr} "
+                f"AND H.INVOICE_DT >= {self.db.date_bind('since')} "
+                f"AND H.BILL_TO_CUST_ID IN {expr} "
+                f"GROUP BY H.BILL_TO_CUST_ID, L.IDENTIFIER",
+                {"bu": bu, "since": since, **binds, **status_binds},
+                max_rows=len(ids) * 50)
+            for r in rows:
+                products.setdefault(str(r["cid"]), []).append(
+                    {"identifier": str(r["ident"] or ""),
+                     "descr": str(r["descr"] or ""),
+                     "amount": r2(float(r["amt"] or 0)),
+                     "currency": str(r["currency"] or "")})
+            for cid in products:
+                products[cid].sort(key=lambda x: -x["amount"])
+        elif ids:
+            notes.append("PS_BI_LINE is not present at this site — product "
+                         "mix is not available.")
+
+        # HOW they pay: open-item behavior computed in Python (no dialect-
+        # specific date arithmetic in SQL).
+        behavior: dict = {}
+        if ids:
+            expr, binds = in_binds("b")
+            rows, _ = self.db.query(
+                f"SELECT CUST_ID AS cid, BAL_AMT AS bal, DUE_DT AS due, "
+                f"DISPUTE_STATUS AS dispute "
+                f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu "
+                f"AND ITEM_STATUS = 'O' AND CUST_ID IN {expr}",
+                {"bu": bu, **binds}, max_rows=DETAIL_ROW_CAP)
+            today = _iso(asof)
+            for r in rows:
+                b = behavior.setdefault(str(r["cid"]), {
+                    "open_ar": 0.0, "overdue_amt": 0.0,
+                    "late_weight": 0.0, "disputed_amt": 0.0})
+                bal = float(r["bal"] or 0)
+                b["open_ar"] = r2(b["open_ar"] + bal)
+                due = _iso_opt(r.get("due"))
+                if due and due < today and bal > 0:
+                    days = (today - due).days
+                    b["overdue_amt"] = r2(b["overdue_amt"] + bal)
+                    b["late_weight"] += bal * days
+                if str(r.get("dispute") or "").strip() and bal > 0:
+                    b["disputed_amt"] = r2(b["disputed_amt"] + bal)
+
+        customers = []
+        for c in ranked:
+            cid = c["cust_id"]
+            b = behavior.get(cid, {})
+            overdue = b.get("overdue_amt", 0.0)
+            entry = {
+                **c,
+                "location": locations.get(cid),
+                "top_products": (products.get(cid) or [])[:3],
+                "open_ar": r2(b.get("open_ar", 0.0)),
+                "overdue_amt": r2(overdue),
+                "overdue_share_pct": (
+                    r2(overdue / b["open_ar"] * 100.0)
+                    if b.get("open_ar") else 0.0),
+                "avg_days_late": (int(round(b["late_weight"] / overdue))
+                                  if overdue else 0),
+                "disputed_amt": r2(b.get("disputed_amt", 0.0)),
+            }
+            customers.append(entry)
+
+        # Computed observations — arithmetic, not advice. Every figure in
+        # the text also exists as a field, so the guard grounds it.
+        observations = []
+        if customers:
+            top1 = customers[0]
+            if top1.get("share_pct", 0) >= 25:
+                observations.append({
+                    "kind": "concentration",
+                    "share_pct": top1["share_pct"],
+                    "text": (f"{top1.get('name') or top1['cust_id']} is "
+                             f"{top1['share_pct']}% of billings — "
+                             "concentration risk worth a credit review.")})
+            for c in customers:
+                if c["overdue_amt"] > 0 and c["overdue_share_pct"] >= 50:
+                    observations.append({
+                        "kind": "late_payment",
+                        "cust_id": c["cust_id"],
+                        "overdue_amt": c["overdue_amt"],
+                        "avg_days_late": c["avg_days_late"],
+                        "text": (f"{c.get('name') or c['cust_id']} has "
+                                 f"{c['overdue_amt']:,.2f} overdue, on "
+                                 f"average {c['avg_days_late']} days late — "
+                                 "working capital sitting with the "
+                                 "customer; a collections touch or terms "
+                                 "conversation is the lever.")})
+                if c["disputed_amt"] > 0:
+                    observations.append({
+                        "kind": "disputes",
+                        "cust_id": c["cust_id"],
+                        "disputed_amt": c["disputed_amt"],
+                        "text": (f"{c.get('name') or c['cust_id']} is "
+                                 f"disputing {c['disputed_amt']:,.2f} — "
+                                 "resolve the dispute before it ages into "
+                                 "a write-off conversation.")})
+            lapsed = [c for c in customers
+                      if c.get("last_invoice")
+                      and (_iso(asof) - _iso(c["last_invoice"])).days > 90]
+            for c in lapsed:
+                observations.append({
+                    "kind": "lapsed",
+                    "cust_id": c["cust_id"],
+                    "last_invoice": c["last_invoice"],
+                    "text": (f"{c.get('name') or c['cust_id']} last "
+                             f"invoiced {c['last_invoice'][:10]} — a top "
+                             "biller gone quiet for 90+ days is a churn "
+                             "signal worth an account call.")})
+
+        return {
+            "business_unit": bu,
+            "as_of": asof,
+            "window_months": int(months or 12),
+            "display_currency": disp,
+            "customers": customers,
+            "observations": observations,
+            "population": {
+                "concept": "customer intelligence over finalized billing",
+                "applied": [
+                    {"predicate": sem.predicate, "source": sem.source,
+                     "meaning": sem.concept.meaning},
+                    {"predicate": f"trailing {int(months or 12)} months",
+                     "source": "tool default",
+                     "meaning": "billing ranked over this window"},
+                ],
+            },
+            **({"record_notes": notes} if notes else {}),
+            "note": ("Observations are computed from the records above — "
+                     "concentration, overdue, disputes and lapsed activity "
+                     "— never generated advice. Billing ranked in "
+                     f"{disp}; open-AR figures are in item currency."),
+        }
+
     def top_billing_customers(self, business_unit: str = "", n: int = 10,
                               months: int = 12, as_of_date: str = "",
                               display_currency: str = "",
