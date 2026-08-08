@@ -90,21 +90,15 @@ def get_trial_balance(
     include_adjustments: bool = False,
     max_rows: int = 0,
 ) -> dict:
-    """Trial balance by account: beginning balance, period activity, ending balance, DR/CR.
-
-    fiscal_year: LEAVE AS 0 unless the user named a year. 0 means the current
-    fiscal year. Guessing a year (e.g. 2023) queries a year with no data and
-    returns a false "nothing found" — never invent one.
-    business_unit / ledger: leave empty unless the user named one.
-    period: a regular fiscal period (commonly 1-12, sometimes 1-13); 0 means
-    current. Pass a configured adjustment period such as 998 for the
-    post-adjustment year-end TB.
-    group_by: extra chartfields, comma-separated (e.g. "DEPTID" or "DEPTID,PROJECT_ID").
-    account: exact "1000", range "6000-6999", list "1000,1100", or prefix "60%".
-    currency: filter to one currency code, or "detail" to break out by currency.
-    include_adjustments: add adjustment-period (998) amounts into ending balances.
+    """    Trial balance by account: beginning balance, period activity, ending balance, DR/CR.
     Amounts are signed: debits positive, credits negative.
-    """
+
+    fiscal_year / period: 0 = current. business_unit / ledger: empty = the
+    default. Leave them alone unless the user named one — never invent a year.
+    account: exact "1000", range "6000-6999", list "1000,1100", or prefix "60%".
+    group_by: extra chartfields, comma-separated (e.g. "DEPTID" or "DEPTID,PROJECT_ID").
+    currency: filter to one currency code, or "detail" to break out by currency.
+    include_adjustments: fold adjustment-period (998) amounts into ending balances."""
     return _safe(
         engine.trial_balance,
         business_unit=business_unit, fiscal_year=fiscal_year, period=period,
@@ -171,24 +165,17 @@ def explain_balance_change(
     min_abs_contribution: float = 0.0,
     top: int = 10,
 ) -> dict:
-    """WHY DID IT CHANGE / WHAT DROVE IT / BREAK DOWN THE MOVEMENT / WHICH
-    DEPARTMENT CAUSED IT / EXPLAIN THE VARIANCE. Call this instead of writing
-    SQL whenever the question asks why a balance moved.
+    """    WHY DID IT CHANGE / WHAT DROVE IT / BREAK DOWN THE MOVEMENT / WHICH
+    DEPARTMENT CAUSED IT / EXPLAIN THE VARIANCE. Returns an exact additive
+    BRIDGE of the movement across one dimension, with per-member
+    contribution and share, plus the unexplained residual. Quote that
+    residual — it is the point.
 
-    It returns an exact additive BRIDGE of the change across one dimension,
-    with the unexplained residual printed.
-
-    compare_trial_balance tells you WHICH accounts moved; this explains ONE of
-    them and proves the split adds up. Returns per-member prior, current,
-    contribution, share of gross movement, and whether the member entered or
-    exited, plus a reconciliation block whose residual is 0.00 when the bridge
-    ties. Quote that residual — it is the point.
-
-    Requires an account filter: the whole trial balance nets to zero, so "the
-    total change" has no subject. One dimension per call — by=ACCOUNT for a
-    range, or a chartfield such as DEPTID. Defaults are disclosed in by_source.
-    There is no price/volume/mix here: PS_LEDGER carries no quantity column, so
-    a mix effect would be invented rather than measured. Chartable."""
+    Requires an account filter: the whole trial balance nets to zero, so
+    "the total change" has no subject. One dimension per call — by=ACCOUNT
+    for a range, or a chartfield such as DEPTID. Defaults are disclosed in
+    by_source. No price/volume/mix: PS_LEDGER has no quantity column.
+    Chartable."""
     return _safe(
         engine.explain_balance_change,
         account=account, by=by, business_unit=business_unit,
@@ -274,16 +261,15 @@ def tb_integrity_check(
     period: int = 0,
     ledger: str = "",
 ) -> dict:
-    """Trial-balance health check through a period: does the TB net to zero, plus
-    total debits and credits, suspense account balances, accounts missing chartfield
-    definitions, inactive accounts with balances, unposted journals, posted journals
-    that don't balance, and whether beginning balances roll correctly from the
-    prior-year close (retained earnings).
-
-    fiscal_year: LEAVE AS 0 unless the user named a year — never guess one.
-    Read "balanced" for whether the books balance and "control_status" for whether
-    exceptions were found; they are different verdicts. If scope_status is not "ok",
-    no data was found — retry with a fiscal year from fiscal_years_with_data."""
+    """    Trial-balance health check through a period: does the TB net to zero,
+    plus total debits and credits, suspense account balances, accounts
+    missing chartfield definitions, inactive accounts with balances,
+    unposted journals, posted journals that don't balance, and whether
+    beginning balances roll correctly from the prior-year close (retained
+    earnings). Use for "does it balance / is it clean / out of balance / TB
+    does not match / ready to close".
+    Read "balanced" for whether the books balance and "control_status" for
+    whether exceptions were found; they are different verdicts."""
     return _safe(
         engine.tb_integrity_check,
         business_unit=business_unit, fiscal_year=fiscal_year, period=period, ledger=ledger,
@@ -348,21 +334,16 @@ def get_top_billing_customers(
     display_currency: str = "",
     active_within_months: int = 0,
 ) -> dict:
-    """Top customers by FINALIZED billing volume (PS_BI_HDR, status INV) over a
+    """    Top customers by FINALIZED billing volume (PS_BI_HDR, status INV) over a
     trailing window, with invoice counts and share of total. Use for "top N
-    billing customers / who do we bill the most". Mixed currencies are never
-    summed — pass display_currency to rank on converted totals (rates applied
-    server-side). This is billing volume; open balances are get_ar_aging.
-    business_unit="ALL" ranks across EVERY business unit in ONE call — use it
-    whenever the user says "across all BUs / company-wide"; NEVER loop this
-    tool per business unit, that burns a model round per unit and never
-    finishes. Cross-BU rankings should pass display_currency, since units
-    bill in different currencies.
+    billing customers / who do we bill the most". This is billing volume;
+    open balances are get_ar_aging.
+
+    business_unit="ALL" ranks across EVERY business unit in ONE call.
     active_within_months=N keeps only customers with an invoice in the last
-    N months — the tool-level meaning of "still buying / active customers"
-    (each row carries last_invoice_dt as evidence). A compound ask like
-    "top 20 customers across all BUs still buying" is exactly ONE call:
-    business_unit="ALL", n=20, active_within_months=3."""
+    N months — the tool-level meaning of "still buying / active".
+    Mixed currencies are never summed — pass display_currency to rank on
+    converted totals."""
     return _safe(
         ar.top_billing_customers, business_unit=business_unit, n=n,
         months=months, as_of_date=as_of_date, display_currency=display_currency,
@@ -434,14 +415,11 @@ def get_customer_intelligence(business_unit: str = "", n: int = 20,
 
 @mcp.tool()
 def get_invoice_totals(business_unit: str = "", fiscal_year: int = 0) -> dict:
-    """Total FINALIZED invoice amount (BILL_STATUS='INV') with a population
-    block naming every applied default and everything excluded — pipeline
-    bills (could still become revenue) separated from cancelled (never
-    will). Use for "total invoice amount / how much have we invoiced /
-    total billed". Totals are per currency, never summed across. When the
-    finalized-only default empties the result it says so instead of
-    answering 0.00. Pipeline detail by status is get_billing_workbench;
-    open balances are get_ar_aging."""
+    """    Total FINALIZED invoice amount (BILL_STATUS='INV'), with a population
+    block naming every applied default and everything excluded. Use for
+    "total invoice amount / how much have we invoiced / total billed".
+    Totals are per currency, never summed across. Pipeline detail by status
+    is get_billing_workbench; open balances are get_ar_aging."""
     return _safe(ar.invoice_totals, business_unit=business_unit,
                  fiscal_year=fiscal_year)
 
@@ -454,20 +432,16 @@ def get_ar_aging(
     detail: bool = False,
     display_currency: str = "",
 ) -> dict:
-    """AR aging by customer: current / 1-30 / 31-60 / 61-90 / over-90 buckets from
-    open items (PS_ITEM), with credits and disputes broken out, PLUS a tie-out of
-    the subledger total to the GL AR control account. Use for "aging", "overdue",
-    "who owes us", "collections", "does AR tie to the GL".
+    """    AR aging by customer — "who owes us", "overdue", "collections", "aging",
+    "does AR tie to the GL": current / 1-30 / 31-60 / 61-90 / over-90 buckets
+    from open items (PS_ITEM), credits and disputes broken out, PLUS a tie-out
+    of the subledger total to the GL AR control account.
+    Positive = owed by customer; negative = credit memo / on-account receipt.
+
     as_of_date: YYYY-MM-DD, empty = today. detail=true adds item-level rows.
-    display_currency: ISO code ("USD", "INR"...) — every item is converted
-    server-side at the effective PS_RT_RATE_TBL rate before bucketing and
-    ranking, so use this (never convert amounts yourself) when the user wants
-    figures "in USD terms" etc. Empty = the BU's base currency. fx_applied in
-    the result lists the conversions performed.
-    The PS_ITEM record shape is introspected at runtime (some sites have
-    ACCTG_DT, some ASOF_DT; DISPUTE_STATUS/BAL_CURRENCY may be absent) —
-    record_notes in the result lists any adaptations; relay them.
-    Positive = owed by customer; negative = credit memo / on-account receipt."""
+    display_currency: ISO code ("USD", "INR"...) — items are converted
+    server-side at the effective rate before bucketing and ranking; empty =
+    the BU's base currency. Never convert amounts yourself."""
     return _safe(
         ar.aging, business_unit=business_unit, as_of_date=as_of_date,
         customer_id=customer_id, detail=detail, display_currency=display_currency,
@@ -622,47 +596,39 @@ def recall_site_facts() -> dict:
 
 @mcp.tool()
 def remember_site_fact(fact: str, kind: str = "context") -> dict:
-    """PROPOSE a durable fact about this installation for operator approval.
-
-    Use when the USER TEACHES you something that will still be true next
-    week — "in our system TU_FILE_INTFC is the file interface", "our fiscal
-    year runs July to June", "exclude intercompany from revenue totals".
-    Do NOT use it for the answer to a question, for anything you inferred
-    rather than were told, or for one-off context.
+    """    PROPOSE a durable fact about this INSTALLATION for operator approval —
+    a naming alias, a calendar convention, a standing exclusion ("exclude
+    intercompany from revenue totals"). One table's purpose goes to
+    remember_record_fact instead.
     kind: alias | convention | exclusion | context.
-    The fact is stored as PENDING and does nothing until a human approves it,
-    so tell the user it was noted for review — never that you have learned
-    it."""
+    Stored PENDING until a human approves it, so say it was noted for
+    review — never that you have learned it."""
     return _safe(memory.propose, text=fact, kind=kind, source="conversation")
 
 
 @mcp.tool()
 def list_playbooks() -> dict:
-    """Named multi-step review workflows that run SERVER-SIDE and return one
-    verdict — close readiness, receivables health. Use for a broad readiness
-    question ("are we ready to close?", "how healthy is AR?") rather than one
-    specific figure. Never run the steps yourself: the sequence is fixed so it
-    cannot be reordered or forgotten."""
+    """    The playbooks run_playbook can execute — close_readiness,
+    receivables_health, daily_brief, post_close_watch, ap_completeness —
+    with their steps. Lists only; the verdict comes from run_playbook."""
     return _safe(playbooks.list_playbooks)
 
 
 @mcp.tool()
 def run_playbook(playbook: str = "", business_unit: str = "", ledger: str = "",
                  fiscal_year: int = 0, period: int = 0) -> dict:
-    """Run a review workflow end to end and return a composed verdict.
+    """    Run a review workflow end to end and return a composed verdict.
 
     playbook: close_readiness (default), receivables_health,
     daily_brief ("what needs my attention today" — exceptions only:
     billing errors, orphans, duplicates, stuck vouchers, late posts,
-    two-week cash pressure), post_close_watch, or ap_completeness ("is AP complete for month-end / did everything
-    approved reach AP / what should we accrue" as ONE composed check) — see
-    list_playbooks. Each step calls the same curated tool the individual
-    question would, so the numbers cannot disagree.
+    two-week cash pressure), post_close_watch, or ap_completeness ("is AP
+    complete for month-end / did everything approved reach AP / what should
+    we accrue" as ONE composed check) — see list_playbooks.
     Read "verdict": passed = every step ran and found nothing;
     exceptions_found = every step ran and some found something;
     incomplete = a step COULD NOT RUN and must never be reported as a pass.
-    Report the verdict and the steps needing attention; the card beside your
-    reply already lists every step."""
+    Report the verdict and the steps needing attention."""
     return _safe(playbooks.run, playbook=playbook, business_unit=business_unit,
                  ledger=ledger, fiscal_year=fiscal_year, period=period)
 
@@ -685,59 +651,40 @@ if cfg.tools.allow_raw_sql:
                 list_binds: Optional[dict] = None,
                 partition: Optional[dict] = None) -> dict:
         """Run a read-only SQL SELECT against the PeopleSoft database — including
-        CUSTOM and site-specific records. Guarded: single SELECT/WITH statement
-        only, DML/DDL rejected, rows capped at 500, every table validated against
-        the catalog before execution, and unqualified names are schema-qualified
-        automatically (write OTHER_OWNER.TBL to reach another schema).
-        NEVER invent a table name. For a custom or unfamiliar record call
-        search_records FIRST — it searches PeopleTools record descriptions and
-        field names — then describe_record/describe_table for its columns.
-        get_record_map covers the core GL/AR records (billing = PS_BI_HDR,
-        journal lines = PS_JRNL_LN not PS_JRNL_LINE).
-        business_unit: the active scope, used only to report whether the query
-        was actually restricted to it (scope_filtered / scope_note) — the SQL
-        is never rewritten. Relay scope_note when it says NOT restricted.
-        PS_ tables use signed amounts (credits negative).
-        policy_binds: when the question refers to a POLICY figure ("above the
-        capitalization threshold", "over the approval limit"), do NOT type the
-        number. Write the bind in the SQL and name the policy here — e.g.
-        sql="... WHERE COST >= :threshold", policy_binds={"threshold":
-        "capitalization_threshold"}. The value is looked up in the wiki and
-        bound server-side, and the result carries policy_basis with the exact
-        sentence and page it came from — quote that when you answer. Call
-        list_policy_terms for the available names.
-        pivot: USE THIS for any "trend", "by month", "over the last N periods",
-        "compare X across Y" question. Write ONE query returning three columns
-        — the row label, the column label and the numeric value, grouped by the
-        first two — then name them here:
-          sql="SELECT C.NAME1 AS customer, H.INVOICE_PERIOD AS period,
-               SUM(H.INVOICE_AMOUNT) AS amt FROM ... GROUP BY 1, 2"
-          pivot={"row_field":"customer","column_field":"period","value_field":"amt"}
-        You get back a cross-tab with the totals, the change and the percentage
-        change already computed. Quote those figures directly and NEVER
-        recompute or add them up yourself — arithmetic done in prose cannot be
-        checked, and the answer guard will reject figures no tool produced.
-        Do not run one query per month and add them up; one grouped query is
-        both faster and correct.
-        partition: BREAK a slow grouped aggregate into indexed slices and
-        merge — the fix for a query that TIMES OUT. Write the query for ONE
-        slice with a :partition bind (e.g. AND BUSINESS_UNIT = :partition)
-        and pass partition={"values": "business_units"} (or an explicit
-        list, or a from_result reference). Slices run concurrently; SUM/
-        COUNT/MIN/MAX partials merge with the right combiner; ORDER BY /
-        FETCH FIRST apply ONCE after the merge, so a top-20 is the top-20 of
-        the WHOLE, not of each slice. AVG must be rewritten as SUM + COUNT.
-        Partition on an INDEXED column (business unit is the usual one) —
-        explain_query on one slice confirms; slicing an unindexed column is
-        N full scans and worse than the direct query.
-        list_binds: CHAIN a set produced by an earlier tool into this query
-        WITHOUT retyping the values. Write `IN (:accts)` in the SQL and pass
-        list_binds={"accts": {"from_result": "r2", "field": "accounts"}} —
-        r2 is the result_id of the earlier result, field is a dot path into
-        it ("accounts", "rows[].account", "customers[].cust_id"). The values
-        are substituted mechanically from that stored result; produce the
-        set in one round, reference it in the next. Never copy a list of
-        ids/accounts by hand into SQL text."""
+                CUSTOM and site-specific records. Guarded: one SELECT/WITH statement, no
+                DML/DDL, rows capped at 500, every table validated against the catalog
+                and unqualified names schema-qualified automatically (write
+                OTHER_OWNER.TBL to reach another schema). NEVER invent a table name.
+                PS_ tables use signed amounts (credits negative).
+                business_unit: reported back as scope_filtered / scope_note — the SQL is
+                never rewritten. Relay scope_note when it says NOT restricted.
+                policy_binds: when the question refers to a POLICY figure ("above the
+                capitalization threshold", "over the approval limit"), do NOT type the
+                number. Write the bind in the SQL and name the policy here — e.g.
+                sql="... WHERE COST >= :threshold", policy_binds={"threshold":
+                "capitalization_threshold"}. The value is looked up in the wiki and
+                bound server-side, and the result carries policy_basis with the exact
+                sentence and page it came from — quote that when you answer. Call
+                list_policy_terms for the available names.
+                pivot: USE THIS for any "trend", "by month", "over the last N periods",
+                "compare X across Y" question. Return three columns — row label, column
+                label, value — grouped by the first two, and name them:
+                pivot={"row_field":"customer","column_field":"period","value_field":"amt"}.
+                Totals, change and percentage change come back computed — quote them,
+                never recompute.
+                partition: BREAK a slow grouped aggregate into indexed slices and
+                merge — the fix for a query that TIMES OUT. Write the query for ONE
+                slice with a :partition bind (e.g. AND BUSINESS_UNIT = :partition) and
+                pass partition={"values": "business_units"}. ORDER BY / FETCH FIRST
+                apply ONCE after the merge, so a top-20 is the top-20 of the WHOLE, not
+                of each slice. AVG must be rewritten as SUM + COUNT. Partition on an
+                INDEXED column; slicing an unindexed column is N full scans and worse
+                than the direct query.
+                list_binds: CHAIN a set produced by an earlier tool into this query
+                WITHOUT retyping the values. Write `IN (:accts)` in the SQL and pass
+                list_binds={"accts": {"from_result": "r2", "field": "accounts"}} — r2
+                is the result_id of the earlier result, field is a dot path into it
+                ("accounts", "rows[].account", "customers[].cust_id")."""
         return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
                      business_unit=business_unit, policy_binds=policy_binds,
                      pivot=pivot, list_binds=list_binds, partition=partition)
@@ -746,27 +693,22 @@ if cfg.tools.allow_raw_sql:
     @mcp.tool()
     def explain_query(sql: str, source: str = "") -> dict:
         """Ask the optimizer how it WOULD run a SELECT — WITHOUT running it.
-        USE THIS BEFORE any join or aggregate over large tables (PS_LEDGER,
-        PS_JRNL_LN, PS_ITEM, custom transaction tables), and IMMEDIATELY
-        after any query times out. Returns the plan, each referenced table's
-        approximate row count and its INDEXES with their column order, plus
-        concrete advice: which full scans are planned and which index's
-        leading columns your WHERE/JOIN must include to avoid them. Rewrite,
-        re-explain if unsure, then run_sql. An index helps only when its
-        LEADING columns appear in your predicates."""
+                USE THIS BEFORE any join or aggregate over large tables (PS_LEDGER,
+                PS_JRNL_LN, PS_ITEM, custom transaction tables), and IMMEDIATELY after
+                a query times out. Returns row counts, each table's INDEXES with their
+                column order, which full scans are planned, and the leading columns
+                your WHERE/JOIN must include."""
         return _safe(engine.for_source(source).explain_query, sql=sql)
 
     @mcp.tool()
     def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
         """Find the right PeopleSoft record for a question by searching
-        PeopleTools metadata — record DESCRIPTIONS and field names, not just
-        table names. Use this whenever the question names a module, a document,
-        or a custom record you have not seen ("file interface", "voucher",
-        "asset profile", "TU_FILE"): searching descriptions finds records whose
-        table name gives no clue. Returns the PeopleTools record name, the
-        physical table to query (honoring a site's SQLTABLENAME override),
-        the description, and approximate row counts, most-populated first.
-        Follow with describe_record then run_sql."""
+                PeopleTools metadata — record DESCRIPTIONS and field names, not just
+                table names. Use whenever the question names a module, a document, or
+                a custom record you have not seen ("file interface", "voucher",
+                "asset profile", "TU_FILE"). Returns the PeopleTools record name, the
+                physical table to query, the description, and approximate row counts,
+                most-populated first."""
         return _safe(engine.for_source(source).search_records, query=query, limit=limit)
 
     @mcp.tool()
@@ -779,34 +721,29 @@ if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
     def profile_record(table: str, sample_rows: int = -1, source: str = "") -> dict:
-        """See what a record actually CONTAINS before querying it: every
-        column, how many sampled rows populate each one, the real codes held
-        by its status/type columns, and a few sample rows.
-        Use this when more than one record could answer a question, when a
-        record is custom or unfamiliar, or when a query returned nothing and
-        you need to know whether the record is empty or your predicate was
-        wrong. value_counts is the strongest signal — seeing ITEM_STATUS holds
-        'O' and 'C' turns a guessed predicate into a correct one, and
-        always_null names columns this site never populates whatever the
-        catalog claims.
-        Personal columns (names, addresses, tax and bank identifiers) are
-        masked to a shape-preserving placeholder before they leave the
-        database; fill_percent and value_counts are measured over the rows
-        sampled, so never report them as totals."""
+        """See what a record actually CONTAINS before querying it: every column,
+                how many sampled rows populate each, and a few sample rows. Use it when
+                more than one record could answer a question, when a record is custom or
+                unfamiliar, or when a query returned nothing and you need to know
+                whether the record is empty or your predicate was wrong. value_counts is
+                the strongest signal — seeing ITEM_STATUS holds 'O' and 'C' turns a
+                guessed predicate into a correct one; always_null names columns this
+                site never populates whatever the catalog claims.
+                Personal columns (names, addresses, tax and bank identifiers) are
+                masked to a shape-preserving placeholder. fill_percent and value_counts
+                are measured over the rows sampled, so never report them as totals."""
         return _safe(engine.for_source(source).profile_record,
                      table=table, sample_rows=sample_rows)
 
     @mcp.tool()
     def compare_records(tables: list, sample_rows: int = -1,
                         source: str = "") -> dict:
-        """Profile up to 6 candidate records side by side and pick between
-        them on evidence instead of on their names. The intended sequence for
-        any unfamiliar question is search_records -> compare_records -> run_sql:
-        search_records proposes candidates by description, this shows which of
-        them are readable, populated, and carry the columns and status codes
-        the question implies. PeopleSoft ships many near-identically named
-        records and sites add more (live vs history vs staging vs custom);
-        names cannot separate those and contents can."""
+        """Profile up to 6 candidate records side by side. The intended sequence
+                for any unfamiliar question is search_records -> compare_records ->
+                run_sql: search_records proposes candidates by description, this shows
+                which are readable, populated, and carry the columns and status codes
+                the question implies. Sites keep live vs history vs staging vs custom
+                copies of one record; names cannot separate those and contents can."""
         return _safe(engine.for_source(source).compare_records,
                      tables=tables, sample_rows=sample_rows)
 
@@ -823,17 +760,16 @@ if cfg.tools.allow_raw_sql:
 
 @mcp.tool()
 def remember_record_fact(table: str, fact: str) -> dict:
-    """REMEMBER what the user tells you about a table, so it is found next
-    time. Use this the moment someone explains what a record holds — "the
-    interface file info is in TU_FILE_INTFC", "PS_XX_REBATE is our custom
-    rebate accrual table". A client-specific record has no PeopleTools
-    description and a name that gives nothing away, so no metadata search will
-    ever surface it; being told once is the only way it becomes findable.
-    Afterwards search_records('interface file') returns it, ranked first.
+    """    Record what the user tells you a table HOLDS, so the next question finds
+    it — "the interface file info is in TU_FILE_INTFC", "PS_XX_REBATE is our
+    custom rebate accrual table". Table-scoped; installation-wide facts go to
+    remember_site_fact.
     table: the record or table name exactly as it exists (TU_FILE_INTFC).
     fact: what it holds, in one sentence, in the user's own words.
-    Confirm to the user that you have noted it. Do NOT use this for figures,
-    policies or rules — those belong in the wiki, via resolve_policy_value."""
+    Both are required. This proposes the fact for approval — say it was NOTED
+    FOR REVIEW; never say you have learned or will remember it. Do NOT use
+    this for figures, policies or rules — those belong in the wiki, via
+    resolve_policy_value."""
     name = (table or "").strip().upper()
     body = (fact or "").strip()
     if not name or not body:
@@ -887,15 +823,14 @@ def resolve_policy_value(policy: str) -> dict:
 @mcp.tool()
 def get_tree_node_accounts(node: str, tree_name: str = "",
                            business_unit: str = "") -> dict:
-    """Flatten a PeopleSoft TREE NODE into its concrete account list — the
-    SET PRODUCER for cross-module chains. Trees attach account RANGES to
-    nodes, so "the accounts in node X" cannot be answered by a join; this
-    resolves the ranges against the account master. For a trial balance BY
-    node use rollup_trial_balance directly (one call, no chain needed). Use
-    THIS when the account set feeds something else: journals for those
-    accounts, budget rows, any run_sql — then reference the result via
-    list_binds={"accts": {"from_result": "<result_id>", "field":
-    "accounts"}} instead of retyping account numbers."""
+    """    Flatten a PeopleSoft TREE NODE into its concrete account list — the SET
+    PRODUCER for cross-module chains. Trees attach account RANGES to nodes,
+    so "the accounts in node X" cannot be answered by a join; this resolves
+    the ranges against the account master. Use THIS when the account set
+    feeds something else: journals for those accounts, budget rows, any
+    run_sql — pass its result_id into run_sql's list_binds instead of
+    retyping account numbers. For a trial balance BY node use
+    rollup_trial_balance."""
     return _safe(report_runner.node_accounts, business_unit=business_unit,
                  tree_name=tree_name, node=node)
 
@@ -1051,14 +986,11 @@ def run_ps_query(query: str, prompts: Optional[dict] = None,
 @mcp.tool()
 def search_ps_queries(text: str = "", record: str = "",
                       include_private: bool = False, limit: int = 25) -> dict:
-    """Find EXISTING PeopleSoft queries (PSQuery) this site already built.
-    Use BEFORE writing new SQL for a reporting question: "is there already
-    a query for AP aging?", "what queries read PS_VOUCHER?" (pass
-    record=). Returns names, descriptions, public/private, and RUN COUNTS
-    — what the business actually uses. Reusing a validated query and
-    citing its name is stronger provenance than SQL we invent. Reading
-    this catalog is plain SQL; running a query needs the Query Access
-    Service."""
+    """    Find EXISTING PeopleSoft queries (PSQuery) this site already built:
+    "is there already a query for AP aging?", "what queries read
+    PS_VOUCHER?" (pass record=). Returns names, descriptions,
+    public/private, and run counts. Catalog read only — run_ps_query
+    executes."""
     return _safe(query_catalog.search_queries, text=text, record=record,
                  include_private=include_private, limit=limit)
 
@@ -1117,11 +1049,9 @@ if wiki is not None:
     def wiki_lookup(question: str, max_pages: int = 3,
                     max_passages: int = 6) -> dict:
         """READ the wiki: searches, fetches the top pages, and returns the actual
-        PASSAGES that answer the question, each with page title, section, URL and
-        version. USE THIS for any policy/process/threshold/"why" question —
-        wiki_search alone returns links, and an answer built from titles is a
-        guess. Quote the sentence you rely on and name its page. If the passages
-        do not contain the answer, say so."""
+                PASSAGES that answer the question. USE THIS for any
+                policy/process/threshold/"why" question — wiki_search alone returns
+                links, and an answer built from titles is a guess."""
         try:
             return wiki_mod.lookup(wiki, question, max_pages=max_pages,
                                    max_passages=max_passages)
@@ -1155,18 +1085,12 @@ if wiki is not None:
 
     @mcp.tool()
     def wiki_get_page(page_id: str, offset: int = 0, max_chars: int = 0) -> dict:
-        """READ a whole wiki page — the tool for TECHNICAL specs and KB
-        articles. wiki_lookup returns a handful of ranked passages, which
-        answers a policy question but is a keyhole view of an integration
-        spec: the record layouts, job names and run controls that make a spec
-        actionable rarely share vocabulary with the question, so passage
-        ranking drops them. For "how does X work" / "how do I" questions,
-        find the page (wiki_search or wiki_lookup sources), then read it ALL
-        with this tool before acting.
-        Long pages arrive in slices: when the result carries next_offset,
-        call again with offset=next_offset until it is absent. Do not act on
-        a spec you have only partly read.
-        page_id: the id from wiki_search results or wiki_lookup sources."""
+        """READ a whole wiki page — the tool for TECHNICAL specs and KB articles.
+                For "how does X work" / "how do I" questions, find the page
+                (wiki_search or wiki_lookup sources) and read it ALL before acting.
+                page_id: the id from wiki_search results or wiki_lookup sources.
+                Long pages arrive in slices: when the result carries next_offset, call
+                again with offset=next_offset until it is absent."""
         try:
             page = wiki.get_page(page_id)
         except Exception as e:
