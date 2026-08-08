@@ -713,6 +713,21 @@ _TOOL_SOURCE = {tool: label
                 for label, tools in _SOURCE_OF_TOOL.items()
                 for tool in tools}
 
+# Which SYSTEM each source belongs to. Rule B fires across this boundary
+# and never inside it, and that restraint was bought with a false positive:
+# get_dso_trend correctly noted "DSO is computed from the ledger only", the
+# word "ledger" read as a general-ledger claim, and every DSO figure was
+# caveated as "receivables, not the ledger". Both are PeopleSoft. The
+# sub-ledger/GL line is blurry in prose and a controller does not care
+# where inside PeopleSoft a PeopleSoft number came from — what they cannot
+# afford to miss is a Coupa commitment or a wiki page wearing the ledger's
+# authority.
+_SYSTEM_OF = {
+    "peoplesoft_gl": "peoplesoft", "peoplesoft_ar": "peoplesoft",
+    "peoplesoft_ap": "peoplesoft", "peoplesoft_query": "peoplesoft",
+    "coupa": "coupa", "wiki": "wiki",
+}
+
 # How each source reads in an answer, for the caveat text.
 SOURCE_LABELS = {
     "peoplesoft_gl": "the PeopleSoft general ledger",
@@ -1031,11 +1046,12 @@ def misattributed_figures(answer: str, payloads, intent: str = "") -> list:
                 findings.append({"figure": text, "rule": "untrusted_source",
                                  "actual": sorted(labels), "claimed": ""})
                 continue
-            # Rule B — the sentence named one source, the figure came from
-            # another.
+            # Rule B — the sentence named one system, the figure came from
+            # another. Across systems only: see _SYSTEM_OF.
             if len(claimed) == 1:
                 (claim,) = tuple(claimed)
-                if claim not in labels:
+                produced = {_SYSTEM_OF.get(l, l) for l in labels}
+                if _SYSTEM_OF.get(claim, claim) not in produced:
                     seen.add(text)
                     findings.append({"figure": text, "rule": "cross_source",
                                      "actual": sorted(labels),
@@ -1068,10 +1084,21 @@ def attribution_caveat(findings) -> str:
             + " text from a policy wiki page, which colleagues can edit — "
               "not a figure any PeopleSoft query returned. Wiki pages carry "
               "policy and thresholds; balances come from the ledger.")
-    for finding in [f for f in findings if f["rule"] == "cross_source"][:3]:
+    # Group by (what was claimed, what produced it) so five figures from one
+    # mix-up read as one sentence. Repeating the same clause per figure was
+    # a wall of text that said one thing.
+    grouped: dict = {}
+    for finding in findings:
+        if finding["rule"] != "cross_source":
+            continue
+        key = (finding["claimed"], tuple(finding["actual"]))
+        grouped.setdefault(key, []).append(finding["figure"])
+    for (claimed, actual), figures in grouped.items():
+        listed = ", ".join(figures[:3])
+        more = f" and {len(figures) - 3} more" if len(figures) > 3 else ""
         parts.append(
-            f"{finding['figure']} came from {phrase(finding['actual'])}, "
-            f"not from {SOURCE_LABELS.get(finding['claimed'], finding['claimed'])}.")
+            f"{listed}{more} came from {phrase(actual)}, not from "
+            f"{SOURCE_LABELS.get(claimed, claimed)}.")
     return "[Attribution: " + " ".join(parts) + "]"
 
 

@@ -91,6 +91,16 @@ class SourceTaggingTests(unittest.TestCase):
     def test_an_unknown_tool_is_unlabelled_not_guessed(self) -> None:
         self.assertEqual(source_of_tool("some_future_tool"), "")
 
+    def test_every_evidence_tool_is_classified(self) -> None:
+        # A tool that produces figures but carries no source label is
+        # invisible to attribution — it would ground anything and be
+        # blamed for nothing. Adding a tool must mean classifying it.
+        from pstb.guards import FINANCIAL_EVIDENCE_TOOLS
+        unlabelled = sorted(t for t in FINANCIAL_EVIDENCE_TOOLS
+                            if not source_of_tool(t))
+        self.assertEqual(unlabelled, [],
+                         "add these to _SOURCE_OF_TOOL in guards.py")
+
     def test_a_shared_value_carries_both_sources(self) -> None:
         both = tagged_payload_numbers([
             ("get_open_payables", json.dumps({"total": 115200.0})),
@@ -122,6 +132,27 @@ class CrossSourceTests(unittest.TestCase):
         self.assertEqual(
             caveat("Coupa and the ledger agree at 115,200.00.", shared), "",
             "two named sources in one sentence is not a single claim")
+
+    def test_a_claim_inside_one_system_never_fires(self) -> None:
+        """Bought with a real false positive. get_dso_trend correctly noted
+        "DSO is computed from the ledger only"; "ledger" read as a GL claim
+        and every DSO figure was caveated as receivables-not-ledger. Both
+        are PeopleSoft. A controller cannot act on where inside PeopleSoft
+        a PeopleSoft number came from — only on Coupa or a wiki page
+        wearing the ledger's authority."""
+        dso = ("get_dso_trend", json.dumps({"periods": [
+            {"period": 4, "dso": 41.76}, {"period": 5, "dso": 47.34}]}))
+        self.assertEqual(
+            caveat("Period 4: 41.76 days. Period 5: 47.34 days. Note that "
+                   "DSO is computed from the ledger only.", [dso]), "")
+
+    def test_many_figures_from_one_mixup_are_one_sentence(self) -> None:
+        spend = ("get_coupa_supplier_spend", json.dumps(
+            {"a": 11100.0, "b": 22200.0, "c": 33300.0, "d": 44400.0}))
+        out = caveat("The ledger shows 11,100.00, 22,200.00, 33,300.00 and "
+                     "44,400.00.", [spend], "data")
+        self.assertEqual(out.count("came from"), 1)
+        self.assertIn("and 1 more", out)
 
     def test_an_unlabelled_figure_is_never_a_finding(self) -> None:
         self.assertEqual(
