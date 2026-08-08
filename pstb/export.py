@@ -206,6 +206,8 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
             engine.rollup_trial_balance, a, {})
         reg["compare_trial_balance"] = lambda a, cap: _call_filtered(
             engine.compare_trial_balance, a, {"top": cap})
+        reg["explain_balance_change"] = lambda a, cap: _call_filtered(
+            engine.explain_balance_change, a, {"top": cap})
         reg["search_accounts"] = lambda a, cap: _call_filtered(
             engine.search_accounts, a, {"max_rows": cap})
     if ar is not None:

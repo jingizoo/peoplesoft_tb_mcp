@@ -20,6 +20,9 @@ from .config import Config
 from .db import Database, DbError
 
 BALANCE_EPS = 0.005
+# Period 999 is where PeopleSoft's Close Ledger writes the year-end
+# closing entries. It is an event, not a point in time.
+CLOSE_PERIOD = 999
 INTERNAL_ROW_CAP = 100_000
 SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
 SCOPE_PROBE_CAP = 250          # max existence probes when filtering the catalog
@@ -46,6 +49,17 @@ JRNL_STATUS = {
 
 class EngineError(RuntimeError):
     pass
+
+
+def z2(x: float) -> float:
+    """r2, with negative zero normalised away.
+
+    round() preserves the sign of -0.0 and json.dumps emits it verbatim. A
+    reconciliation block whose whole purpose is to assert the bridge is clean
+    must not print "residual: -0.0" — a reader stops and asks what it means.
+    """
+    v = r2(x)
+    return 0.0 if v == 0 else v
 
 
 def r2(x: float) -> float:
@@ -1143,6 +1157,372 @@ class TBEngine:
             "accounts_changed": len(rows),
             "shown": len(capped),
             "total_change": r2(sum(r["change"] for r in rows)),
+        }, scope_notes)
+
+    # Chartfields the deployed Oracle view actually projects. The other
+    # GROUPABLE_CHARTFIELDS collapse away in XX_TB_BAL_VW's GROUP BY, so
+    # splitting by one would fail with ORA-00904 rather than a sentence.
+    VIEW_CHARTFIELDS = {"DEPTID", "OPERATING_UNIT", "PRODUCT", "PROJECT_ID",
+                        "CURRENCY_CD"}
+
+    def explain_balance_change(
+        self,
+        account: str,
+        by: str = "",
+        business_unit: str = "",
+        fiscal_year: int = 0,
+        period: int = 0,
+        vs_fiscal_year: int = 0,
+        vs_period: int = 0,
+        ledger: str = "",
+        dept: str = "",
+        min_abs_contribution: float = 0.0,
+        top: int = 10,
+    ) -> dict:
+        """An exact additive BRIDGE of one balance change across one dimension.
+
+        compare_trial_balance answers which accounts moved. This answers why
+        one balance moved, and proves the split adds up: members sum to the
+        total change, and any gap is printed rather than absorbed.
+
+        The decomposition is exact by construction, not by approximation. For
+        a sum-aggregated amount, the change distributes over the union of
+        members with absent members zero-filled — summation is linear. So a
+        nonzero residual is never a property of the data; it is a bug, and
+        past the repo's balance epsilon this refuses rather than presenting a
+        confident bridge that misses part of the move.
+        """
+        scope_notes: list = []
+        bu, fy, per, led = self._defaults(business_unit, fiscal_year, period,
+                                          ledger, notes=scope_notes)
+        acct = (account or "").strip()
+        if not acct:
+            raise EngineError(
+                "Name the accounts to explain, e.g. account='6000-6999' or "
+                "account='1100'. The whole trial balance nets to zero by "
+                "construction, so 'the total change' has no subject. Call "
+                "compare_trial_balance first to see which accounts moved, "
+                "then bring one back here.")
+
+        vfy = int(vs_fiscal_year or 0) or fy
+        vper = int(vs_period or 0)
+        # _max_regular_period is NOT served by the cached period list, so each
+        # call is a round trip. Memoise it: the period-1 rollback and the
+        # post-adjustment rule both want the same answer for the same year.
+        _last: dict = {}
+
+        def last_regular(year: int) -> int:
+            if year not in _last:
+                _last[year] = self._max_regular_period(year, bu, led)
+            return _last[year]
+
+        if vper == 0:
+            if vfy == fy:
+                vper = per - 1 if per > 1 else per
+                if per == 1:
+                    # compare_trial_balance hardcodes 12 here. A 4-4-5 retail
+                    # or public-sector calendar has 13 regular periods, so 12
+                    # both omits P13 and lands on the wrong side of the
+                    # post-adjustment rule. This branch is already the
+                    # prior-year path, which pays the lookup anyway.
+                    vfy = fy - 1
+                    vper = last_regular(vfy)
+            else:
+                vper = per
+
+        adj = set(self._adj_periods())
+        for label, value in (("period", per), ("vs_period", vper)):
+            if value in adj:
+                raise EngineError(
+                    f"Period {value} is an adjustment bucket, not a point in "
+                    f"time, so it cannot be the {label} anchor of a bridge. "
+                    "Ask for period 12 instead: when the comparison crosses a "
+                    "fiscal year, the prior side is already put on the "
+                    "post-adjustment basis and the adjustments are folded in.")
+            if value == CLOSE_PERIOD:
+                raise EngineError(
+                    f"Period {CLOSE_PERIOD} holds the year-end CLOSING "
+                    f"entries, not a balance at a point in time, so anchoring "
+                    f"the {label} on it reports the close itself as the "
+                    "change — every revenue and expense account rolling into "
+                    "retained earnings. Ask for the last regular period.")
+
+        by_source = "explicit"
+        dim = (by or "").strip().upper()
+        if not dim:
+            # Splitting a single account BY account is a no-op, so the default
+            # depends on what the filter can match. Disclosed either way.
+            multi = bool(re.fullmatch(r"[\w]+\s*-\s*[\w]+", acct)
+                         or "," in acct or acct.endswith("%"))
+            dim = "ACCOUNT" if multi else "DEPTID"
+            by_source = ("defaulted: the account filter can match several "
+                         "accounts" if multi else
+                         "defaulted: the account filter names one account, so "
+                         "ACCOUNT cannot split it")
+        if dim != "ACCOUNT":
+            extras = self._parse_group_by(dim)
+            if len(extras) != 1:
+                raise EngineError(
+                    "Split by ONE dimension at a time — call twice, e.g. "
+                    "by='DEPTID' then by='PRODUCT'. Cross-dimensional "
+                    "attribution is a search problem, not arithmetic; a "
+                    "single-dimension bridge is exact. Allowed: "
+                    f"{sorted(q.GROUPABLE_CHARTFIELDS)}, or ACCOUNT.")
+            dim = extras[0]
+            table = "XX_TB_BAL_VW" if self.cfg.db.use_views else "PS_LEDGER"
+            if not self.db.has_column(table, dim):
+                raise EngineError(
+                    f"{table} at this site carries no {dim} column, so the "
+                    "split cannot be computed — the query would fail rather "
+                    f"than return a wrong number. Call describe_record on "
+                    f"{table} to see which chartfields this ledger has.")
+            if self.cfg.db.use_views and dim not in self.VIEW_CHARTFIELDS:
+                raise EngineError(
+                    f"This deployment reads XX_TB_BAL_VW, which projects only "
+                    f"{', '.join(sorted(self.VIEW_CHARTFIELDS))} — {dim} is "
+                    "collapsed away by the view's GROUP BY. Split by one of "
+                    "those, or have the DBA add the column to the view.")
+        extras = [] if dim == "ACCOUNT" else [dim]
+
+        cur_rows = self._period_sums(bu, led, fy, per, extras=extras,
+                                     dept=dept, account=acct)
+        # THE basis rule, matched to compare_trial_balance:engine.py:1096.
+        # A prior-YEAR ending must be the POST-adjustment basis, because the
+        # current year's period-0 opening was written by year-end close and
+        # already includes those adjustments. `and` short-circuits, so a
+        # same-year comparison never pays _max_regular_period's round trip —
+        # keep the order or the query budget becomes a constant 3.
+        prior_year = vfy < fy
+        prior_adj = prior_year and vper >= last_regular(vfy)
+        pri_rows = self._period_sums(bu, led, vfy, vper, extras=extras,
+                                     dept=dept, account=acct,
+                                     include_adj=prior_adj)
+        if not cur_rows and not pri_rows:
+            return self._with_scope_notes({
+                "scope_status": "no_ledger_rows", "no_data": True,
+                "business_unit": bu, "ledger": led,
+                "current": {"fiscal_year": fy, "period": per},
+                "comparison": {"fiscal_year": vfy, "period": vper},
+                "account_filter": acct,
+                "detail": (f"NO DATA — this is not a zero change. No "
+                           f"{led} rows matched {acct} in {bu} for either "
+                           f"FY{fy} P{per} or FY{vfy} P{vper}."),
+            }, scope_notes)
+        # One empty side is a comparison against a period the ledger does not
+        # have. The arithmetic still ties perfectly, which is exactly why it
+        # must be flagged: "the balance grew by its entire value" reads as a
+        # finding rather than as a missing baseline.
+        one_side_empty = ("current" if not cur_rows else
+                          "comparison" if not pri_rows else "")
+
+        key = ["account"] + [dim.lower()] * bool(extras)
+        cur_a = self._pivot(cur_rows, ["account"], per, False)
+        pri_a = self._pivot(pri_rows, ["account"], vper, prior_adj)
+        cur_b = self._pivot(cur_rows, key, per, False)
+        pri_b = self._pivot(pri_rows, key, vper, prior_adj)
+
+        types = {(m or {}).get("meta", {}).get("acct_type")
+                 for m in list(cur_a.values()) + list(pri_a.values())}
+        known = {t for t in types if t}
+        if len(known) > 1:
+            raise EngineError(
+                f"Accounts {acct} span account types "
+                f"{', '.join(sorted(known))}. Ledger amounts are signed, so "
+                "revenue is negative and expense positive — one total across "
+                "both types is a number with no meaning. Pick a range inside "
+                "one type, such as 1000-1999 (assets) or 6000-6999 (expense).")
+        acct_type = next(iter(known), None)
+
+        # An income-statement ending balance is YEAR-TO-DATE activity, not a
+        # position. Across fiscal years the two anchors must therefore cover
+        # the same number of periods, or the bridge compares half a year to a
+        # full one — and it ties, and it names a direction, and the direction
+        # is backwards. Measured on the sample: 6000-6999 FY2026 P6 vs FY2025
+        # P12 reports -860,604.80 "decrease"; the like-for-like P6 vs P6 is
+        # +116,695.20 "increase".
+        #
+        # Same-YEAR is deliberately allowed: FY2026 P6 vs P5 on an expense
+        # account is one more month of spend, which is a real quantity, and
+        # the note says that is what it is.
+        if acct_type in ("R", "E") and vfy != fy and vper != per:
+            raise EngineError(
+                f"Accounts {acct} are "
+                f"{'revenue' if acct_type == 'R' else 'expense'} (type "
+                f"{acct_type}), so their balance is YEAR-TO-DATE activity "
+                f"rather than a position. FY{fy} period {per} covers {per} "
+                f"periods and FY{vfy} period {vper} covers {vper} — comparing "
+                "them measures the length of the window, not performance. Ask "
+                f"for vs_period={per} for a like-for-like year-over-year "
+                "comparison, or compare within one fiscal year.")
+
+        # The residual is only worth printing if it CAN be nonzero. Re-summing
+        # the same _pivot output under a different key is algebraically
+        # identical for any input, so a tie computed that way certifies
+        # nothing. This walks the raw fetched rows instead, applying the
+        # period classification inline — so a defect in _pivot, or a member
+        # silently dropped by the key collapse, actually moves the number.
+        def ending_from_rows(rows, anchor, include_adj) -> float:
+            total = 0.0
+            for r in rows:
+                p_ = int(r["period"])
+                if p_ in adj and p_ != anchor:
+                    if include_adj:
+                        total += float(r["amt"] or 0.0)
+                elif p_ <= anchor:
+                    total += float(r["amt"] or 0.0)
+            return total
+
+        total_change = (ending_from_rows(cur_rows, per, False)
+                        - ending_from_rows(pri_rows, vper, prior_adj))
+
+        members: dict = {}
+        for source, side in ((cur_b, "current"), (pri_b, "prior")):
+            for k, slot in source.items():
+                raw = k[-1] if extras else k[0]
+                # str(None) is the string 'None', so None must be handled
+                # BEFORE stringifying or an Oracle NULL becomes a member
+                # literally named "None" and the unattributed block vanishes.
+                m = None if raw is None else (str(raw).strip() or None)
+                entry = members.setdefault(
+                    m, {"prior": 0.0, "current": 0.0, "label": None})
+                entry[side] += slot["ending"]
+                if entry["label"] is None and not extras:
+                    entry["label"] = slot["meta"].get("descr")
+
+        rows = []
+        for m, e in members.items():
+            contribution = e["current"] - e["prior"]
+            rows.append({
+                "member": m, "label": e["label"],
+                "status": ("continuing"
+                           if abs(e["prior"]) > BALANCE_EPS
+                           and abs(e["current"]) > BALANCE_EPS
+                           else "entered" if abs(e["prior"]) <= BALANCE_EPS
+                           else "exited"),
+                "prior": z2(e["prior"]), "current": z2(e["current"]),
+                "contribution": z2(contribution),
+                "_raw": contribution,
+                # Declared as a percent so the rate guard stays silent on the
+                # obvious follow-on sentence. Same contract as
+                # compare_trial_balance's pct_change.
+                "change_pct": (r2(contribution / abs(e["prior"]) * 100)
+                               if abs(e["prior"]) > BALANCE_EPS else None),
+            })
+
+        gross = sum(abs(r["_raw"]) for r in rows)
+        for r in rows:
+            r["share_of_gross_pct"] = (r2(abs(r["_raw"]) / gross * 100)
+                                       if gross > BALANCE_EPS else None)
+        # Total order. Sorting on magnitude alone leaves tied members in
+        # set-iteration order, which varies with PYTHONHASHSEED — so top-N
+        # would pick a different driver on different runs.
+        rows.sort(key=lambda r: (-abs(r["_raw"]), str(r["member"] or "")))
+
+        floor = max(float(min_abs_contribution or 0.0), 0.0)
+        shown = [r for r in rows
+                 if abs(r["_raw"]) >= floor][: max(int(top or 10), 1)]
+        rolled = [r for r in rows if r not in shown]
+        other = {
+            "members": len(rolled),
+            "contribution": z2(sum(r["_raw"] for r in rolled)),
+            "share_of_gross_pct": (r2(sum(abs(r["_raw"]) for r in rolled)
+                                      / gross * 100)
+                                   if gross > BALANCE_EPS else None),
+            "reason": (f"below the top-{max(int(top or 10), 1)} cut"
+                       if not floor else
+                       f"below the top-{max(int(top or 10), 1)} cut or under "
+                       f"{floor:.2f}"),
+        } if rolled else None
+
+        residual = z2(total_change - sum(r["_raw"] for r in rows))
+        if abs(residual) >= BALANCE_EPS:
+            # A bridge that misses part of the move is a wrong answer with a
+            # confident presentation. Amounts are formatted without thousands
+            # separators so relaying this remedy does not itself trip the
+            # number guard.
+            raise EngineError(
+                f"The bridge does not tie: members sum to "
+                f"{sum(r['_raw'] for r in rows):.2f} but the change is "
+                f"{total_change:.2f}, a gap of {residual:.2f}. Returning "
+                "drivers that miss part of the move would be a wrong answer "
+                "presented confidently. Re-run with by='ACCOUNT' for the "
+                "split the ledger definitely supports, and report this — it "
+                "is a bug in the decomposition, not a property of the data.")
+
+        emitted = sum(r["contribution"] for r in shown) + (
+            other["contribution"] if other else 0.0)
+        drift = z2(z2(total_change) - emitted - residual)
+        unattributed = next((r for r in rows if r["member"] is None), None)
+        for r in rows:
+            del r["_raw"]
+
+        flip = acct_type in ("R", "L", "Q")
+        return self._with_scope_notes({
+            "business_unit": bu, "ledger": led,
+            "current": {"fiscal_year": fy, "period": per},
+            "comparison": {"fiscal_year": vfy, "period": vper},
+            "account_filter": acct, "by": dim, "by_source": by_source,
+            "account_type": acct_type,
+            "total_prior": z2(ending_from_rows(pri_rows, vper, prior_adj)),
+            "total_current": z2(ending_from_rows(cur_rows, per, False)),
+            "total_change": z2(total_change),
+            # Ledger amounts are signed; accountants read a revenue increase
+            # as positive. Both are emitted so nothing has to be re-derived.
+            "presented_change": z2(-total_change if flip else total_change),
+            "direction": (None if not acct_type else
+                          "increase" if (-total_change if flip
+                                         else total_change) > BALANCE_EPS else
+                          "decrease" if (-total_change if flip
+                                         else total_change) < -BALANCE_EPS
+                          else "flat"),
+            "total_change_pct": (
+                r2(total_change / abs(ending_from_rows(pri_rows, vper,
+                                                       prior_adj)) * 100)
+                if abs(ending_from_rows(pri_rows, vper, prior_adj))
+                > BALANCE_EPS else None),
+            "gross_absolute_movement": z2(gross),
+            "offsetting_amount": z2((gross - abs(total_change)) / 2),
+            "drivers": shown, "other": other,
+            "members_compared": len(rows),
+            "entered": sum(1 for r in rows if r["status"] == "entered"),
+            "exited": sum(1 for r in rows if r["status"] == "exited"),
+            "unattributed": ({
+                "amount": unattributed["contribution"],
+                "share_of_gross_pct": unattributed["share_of_gross_pct"],
+                "detail": f"ledger rows carrying no {dim}",
+            } if unattributed else None),
+            "reconciliation": {
+                "total_change": z2(total_change),
+                "members_sum": z2(sum(r["contribution"] for r in rows)),
+                "residual": residual,
+                "rounding_drift": drift,
+                "identity": ("drivers + other + residual + rounding_drift "
+                             "= total_change"),
+                "basis": ("compare_trial_balance's basis: the same "
+                          "tb_period_sums fetch and the same account pivot"
+                          + (", prior side on the POST-adjustment basis "
+                             "because the comparison crosses a fiscal year"
+                             if prior_adj else
+                             ", adjustments excluded on both sides")),
+            },
+            "scope_status": ("comparison_period_empty" if one_side_empty
+                             else "ok"),
+            "note": (
+                f"Every member's prior and current are cumulative ENDING "
+                f"balances on the same basis, so the contributions sum to the "
+                f"total change exactly — residual {residual:.2f}. "
+                + (f"WARNING: the {one_side_empty} side has no ledger rows at "
+                   "all, so this reads as a full-value move against a missing "
+                   "baseline rather than a real change. "
+                   if one_side_empty else "")
+                + "Members are matched by key only: a department merged into "
+                "another appears as one exit and one entry, not as a rename. "
+                + ("Member labels are not resolved for chartfields — that "
+                   "would cost a round trip per call. " if extras else "")
+                + "There is no price/volume/mix here: PS_LEDGER carries no "
+                "quantity column, so a mix effect would be invented rather "
+                "than measured."
+            ),
         }, scope_notes)
 
     def drill_to_journals(

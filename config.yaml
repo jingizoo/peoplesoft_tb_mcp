@@ -46,7 +46,7 @@ llm:
   gemini_model: gemini-2.5-pro    # gemini-2.5-flash is cheaper/faster, weaker chaining
   gemini_location: us-central1
   gemini_thinking_budget: -1      # -1 model default; >0 caps thinking tokens (latency/cost)
-  ollama_num_ctx: 16384         # measured: 8192 truncates and fails, 32768 is ~28% slower
+  ollama_num_ctx: 16384         # see docs/CONTEXT_BUDGET.md — the fixed prompt
   temperature: 0.2
   gemini_force_tool_round: true   # force a tool call on tool-needing questions
   gemini_routing_temperature: 0.0 # greedy decoding for tool selection
