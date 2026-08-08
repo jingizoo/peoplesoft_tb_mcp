@@ -162,6 +162,13 @@ _TOOL_SCOPE_ARGS = {
     "get_project_costs": {"business_unit": "business_unit"},
 }
 
+# Tools that understand business_unit="ALL" as "every unit, each row
+# labelled with its own". Only these may widen past the selected unit;
+# anywhere else "ALL" would be taken for a literal unit name and quietly
+# return nothing.
+BU_ALL_TOOLS = {"get_top_billing_customers"}
+_BU_ALL_VALUES = {"ALL", "*"}
+
 # WHICH scope fields are governance and which are convenience.
 # business_unit/ledger are HARD: answering from the wrong company or ledger is
 # the failure the scope bar exists to prevent, so the model may never change
@@ -567,6 +574,27 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
                 # and refusing it made the selected period a cage: no other
                 # period or year could be asked about without changing the
                 # scope first. The model's explicit value wins.
+                continue
+            if (field == "business_unit"
+                    and tool_name in BU_ALL_TOOLS
+                    and str(current).strip().upper() in _BU_ALL_VALUES):
+                # "ALL" is not a different company — it is a SUPERSET that
+                # contains the selected one, on a tool built to rank across
+                # units and label every row with its own. The scope lock
+                # exists to stop an answer about US200 being presented as
+                # US001; widening to every unit, with the unit visible per
+                # row, is not that failure.
+                #
+                # Refusing it was a live false positive: the tool's own
+                # docstring tells the model that business_unit="ALL" ranks
+                # across every unit, so on a larger top-N — where one unit
+                # may not hold enough customers — the model took the advice
+                # and the guard refused its own instruction.
+                # Nothing extra is injected here: `out` becomes the tool's
+                # arguments, and an unknown key would be rejected by MCP.
+                # The disclosure is the payload's own business_unit="ALL"
+                # plus the per-row unit, which the answer guards can see.
+                out[tool_arg] = "ALL"
                 continue
             if field == "business_unit" and allow_bu_override:
                 # The user's own words crossed the units ("across all
