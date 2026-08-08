@@ -132,6 +132,22 @@ class QueryBudgetTests(unittest.TestCase):
                                                 as_of_date="2026-08-06")),
             ("get_invoice_totals", 1,
              lambda: ar.invoice_totals(business_unit="US001")),
+            # Two entries, because the branches genuinely differ and one
+            # cannot cover both. Splitting by a chartfield is FREE — extras
+            # only widen the SELECT and GROUP BY of a fetch that happens
+            # anyway — so a bridge costs exactly what compare_trial_balance
+            # costs. The prior-year path pays one more for the calendar's
+            # last regular period, and `and` short-circuits so the same-year
+            # path never does. Reorder that condition and this fails.
+            ("explain_balance_change (same-year, chartfield)", 2,
+             lambda: self.engine.explain_balance_change(
+                 account="6000-6999", by="DEPTID", business_unit="US001",
+                 fiscal_year=2026, period=6, vs_period=5)),
+            ("explain_balance_change (prior-year)", 3,
+             lambda: self.engine.explain_balance_change(
+                 account="1000-1999", by="ACCOUNT", business_unit="US001",
+                 fiscal_year=2026, period=6, vs_fiscal_year=2025,
+                 vs_period=12)),
         ]:
             self._assert_budget(name, budget, fn)
 

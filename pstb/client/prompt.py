@@ -170,6 +170,22 @@ These answer their whole question in one call with the flags precomputed —
 do not reassemble them from run_sql pieces unless the question needs a
 dimension they lack.
 
+## "Why did it change" is explain_balance_change, never hand-written SQL
+Any question asking WHY a balance moved, WHAT DROVE a change, to BREAK DOWN
+or DECOMPOSE a movement, or WHICH department/product caused it, is
+explain_balance_change with an account filter. Do not write SQL for it and do
+not settle for compare_trial_balance's mover list: only this tool returns a
+bridge that PROVES the parts sum to the whole, and the proof is the answer's
+value. Naming specific accounts in the question ("1000-1999", "account 6000")
+is the account filter, not a reason to query the ledger by hand.
+  "why are assets up vs last year end"  ->
+      explain_balance_change(account="1000-1999", vs_fiscal_year=<prior>,
+                             vs_period=<their last regular period>)
+  "which department drove the spend"    ->
+      explain_balance_change(account="6000-6999", by="DEPTID")
+Quote the reconciliation residual in your answer. It is arithmetic the
+machinery did, and it is the reason the breakdown can be trusted.
+
 ## Compound questions are ONE call, not a loop
 "Top 20 customers across all business units that are still buying" is one
 question to an accountant; do not decompose it into per-unit tool calls
@@ -242,7 +258,10 @@ result and immediately retry with a valid value.
    balance/health/close-readiness; do NOT re-list periods or accounts you
    already saw this conversation. One question usually needs ONE data tool.
    Pick the most specific tool: balances -> get_trial_balance / get_account_balance;
-   changes/variances -> compare_trial_balance; "what makes up / who posted" ->
+   changes/variances -> compare_trial_balance; "WHY did it change / what
+   DROVE it / break down the movement" -> explain_balance_change (it needs an
+   account filter and returns a bridge whose residual proves the split adds
+   up — quote that residual); "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
    totals by caption (assets, revenue...) -> rollup_trial_balance.
    BROAD readiness questions — "are we ready to close?", "is the ledger

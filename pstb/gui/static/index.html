@@ -1091,6 +1091,73 @@ function renderCompare(d){
     b.append(tr);});
   t.append(b);sc.append(t);c.append(sc);return c;
 }
+function renderBridge(d){
+  const c=el('div','card');
+  const cur='FY'+d.current.fiscal_year+' P'+d.current.period;
+  const pri='FY'+d.comparison.fiscal_year+' P'+d.comparison.period;
+  c.append(el('h2',null,'Why '+esc(d.account_filter)+' moved <span class="sub">'+
+    cur+' vs '+pri+' · split by '+esc(d.by)+'</span>'));
+  if(d.no_data){c.append(el('div','empty',esc(d.detail||'No ledger rows.')));return c;}
+  if(d.scope_status==='comparison_period_empty')
+    c.append(el('div','pad','<span class="badge warn">missing baseline</span> '+
+      'The comparison period has no ledger rows, so this reads as a full-value '+
+      'move rather than a real change.'));
+
+  // Waterfall. Each bar starts where the last one ended, so the drivers
+  // visibly walk the prior balance to the current one — and the residual
+  // gets its own bar rather than being folded into anything.
+  const steps=d.drivers.map(x=>({label:x.member+(x.label?' · '+x.label:''),
+                                 v:x.contribution,status:x.status}));
+  if(d.other) steps.push({label:'Other ('+d.other.members+')',v:d.other.contribution});
+  const rec=d.reconciliation||{};
+  if(Math.abs(rec.residual||0)>0.004) steps.push({label:'Unexplained',v:rec.residual,resid:true});
+  let run=d.total_prior, lo=Math.min(d.total_prior,d.total_current,0), hi=Math.max(d.total_prior,d.total_current,0);
+  const marks=steps.map(st=>{const a=run; run+=st.v; lo=Math.min(lo,run); hi=Math.max(hi,run);
+                             return {...st,from:a,to:run};});
+  const span=(hi-lo)||1, X=v=>((v-lo)/span)*100;
+  const wf=el('div','pad');
+  // amount is passed explicitly: an endpoint row states a BALANCE, a step
+  // row states its contribution, and inferring one from the bar geometry
+  // printed 0.00 for the opening balance.
+  const row=(label,from,to,cls,amount,extra)=>{
+    const a=Math.min(X(from),X(to)),w=Math.max(0.6,Math.abs(X(to)-X(from)));
+    return '<div style="display:grid;grid-template-columns:190px 1fr 120px;gap:10px;'+
+      'align-items:center;margin:3px 0"><div style="font-size:12px;overflow:hidden;'+
+      'text-overflow:ellipsis;white-space:nowrap" title="'+esc(label)+'">'+esc(label)+
+      (extra||'')+'</div><div style="position:relative;height:15px;background:var(--accent-soft);'+
+      'border-radius:3px"><div style="position:absolute;left:'+a+'%;width:'+w+
+      '%;top:0;bottom:0;border-radius:3px;background:'+cls+'"></div></div>'+
+      '<div class="num mono" style="font-size:12px">'+money(amount)+'</div></div>';
+  };
+  // Endpoints are reference bars measured from the axis floor, so the
+  // opening and closing balances read as levels rather than as steps.
+  let html=row(pri+' balance',lo,d.total_prior,'var(--muted)',d.total_prior,'');
+  marks.forEach(m=>{
+    const col=m.resid?'#c9a227':(m.v>=0?'var(--dr)':'var(--cr)');
+    const tag=m.status==='entered'?' <span class="badge warn">new</span>':
+              m.status==='exited'?' <span class="badge dim">gone</span>':'';
+    html+=row(m.label,m.from,m.to,col,m.v,tag);
+  });
+  html+=row(cur+' balance',lo,d.total_current,'var(--muted)',d.total_current,'');
+  wf.innerHTML=html; c.append(wf);
+
+  // The reconciliation line is the product claim. Print it, do not summarise it.
+  const ties=Math.abs(rec.residual||0)<0.005;
+  const f=el('div','pad');
+  f.style.cssText='border-top:1px solid var(--line);font-size:12.5px';
+  f.innerHTML='<span class="badge '+(ties?'ok':'bad')+'">'+
+    (ties?'bridge ties':'does not tie')+'</span> '+
+    d.members_compared+' members · '+d.entered+' entered · '+d.exited+' exited · '+
+    'gross '+money(d.gross_absolute_movement)+' vs net '+money(d.total_change)+
+    ' ('+money(d.offsetting_amount)+' moved the other way)<br>'+
+    '<span class="mono">drivers + other + residual + rounding = '+
+    money(rec.total_change)+'</span> &nbsp; residual <span class="mono">'+
+    money(rec.residual)+'</span>'+
+    (d.unattributed?'<br><span class="badge warn">unattributed</span> '+
+      money(d.unattributed.amount)+' sits on '+esc(d.unattributed.detail):'');
+  c.append(f);
+  return c;
+}
 function sparkline(pts){
   if(!pts||pts.length<2) return '';
   const vals=pts.map(p=>p.ending),mn=Math.min(...vals,0),mx=Math.max(...vals,0),rng=(mx-mn)||1;
@@ -1341,6 +1408,7 @@ function renderToolResult(name,data,args){
     if(name==='tb_integrity_check') return renderIntegrity(data);
     if(name==='rollup_trial_balance') return renderRollup(data);
     if(name==='compare_trial_balance') return renderCompare(data);
+    if(name==='explain_balance_change') return renderBridge(data);
     if(name==='get_account_balance') return renderAccount(data);
     if(name==='drill_to_journals') return renderJournals(data);
     if(name==='list_financial_scopes') return renderScopes(data);

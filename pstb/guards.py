@@ -50,6 +50,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "get_trial_balance",
     "get_account_balance",
     "compare_trial_balance",
+    "explain_balance_change",
     "drill_to_journals",
     "tb_integrity_check",
     "rollup_trial_balance",
@@ -100,6 +101,10 @@ _TOOL_SCOPE_ARGS = {
         "fiscal_year": "fiscal_year", "period": "through_period",
     },
     "compare_trial_balance": {
+        "business_unit": "business_unit", "ledger": "ledger",
+        "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "explain_balance_change": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
     },
@@ -266,6 +271,9 @@ _TOOL_DOMAINS = {
     "get_trial_balance": {"balance", "report"},
     "get_account_balance": {"balance", "variance", "report"},
     "compare_trial_balance": {"balance", "variance", "report"},
+    "explain_balance_change": {"balance", "variance", "report",
+                               "ar", "ap", "am", "pc",
+                               "customer", "fx", "journal"},
     "drill_to_journals": {"journal", "balance", "variance"},
     "tb_integrity_check": {"balance", "journal"},
     "rollup_trial_balance": {"balance", "report"},
@@ -687,6 +695,7 @@ _SOURCE_OF_TOOL = {
     "peoplesoft_gl": {
         "get_trial_balance", "get_account_balance", "compare_trial_balance",
         "rollup_trial_balance", "drill_to_journals", "tb_integrity_check",
+        "explain_balance_change",
         "run_report", "get_budget_variance", "get_exchange_rate",
         "get_tree_node_accounts", "search_accounts", "run_sql",
         "run_playbook",

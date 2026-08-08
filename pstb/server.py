@@ -158,6 +158,47 @@ def compare_trial_balance(
 
 
 @mcp.tool()
+def explain_balance_change(
+    account: str,
+    by: str = "",
+    business_unit: str = "",
+    fiscal_year: int = 0,
+    period: int = 0,
+    vs_fiscal_year: int = 0,
+    vs_period: int = 0,
+    ledger: str = "",
+    dept: str = "",
+    min_abs_contribution: float = 0.0,
+    top: int = 10,
+) -> dict:
+    """WHY DID IT CHANGE / WHAT DROVE IT / BREAK DOWN THE MOVEMENT / WHICH
+    DEPARTMENT CAUSED IT / EXPLAIN THE VARIANCE. Call this instead of writing
+    SQL whenever the question asks why a balance moved.
+
+    It returns an exact additive BRIDGE of the change across one dimension,
+    with the unexplained residual printed.
+
+    compare_trial_balance tells you WHICH accounts moved; this explains ONE of
+    them and proves the split adds up. Returns per-member prior, current,
+    contribution, share of gross movement, and whether the member entered or
+    exited, plus a reconciliation block whose residual is 0.00 when the bridge
+    ties. Quote that residual — it is the point.
+
+    Requires an account filter: the whole trial balance nets to zero, so "the
+    total change" has no subject. One dimension per call — by=ACCOUNT for a
+    range, or a chartfield such as DEPTID. Defaults are disclosed in by_source.
+    There is no price/volume/mix here: PS_LEDGER carries no quantity column, so
+    a mix effect would be invented rather than measured. Chartable."""
+    return _safe(
+        engine.explain_balance_change,
+        account=account, by=by, business_unit=business_unit,
+        fiscal_year=fiscal_year, period=period,
+        vs_fiscal_year=vs_fiscal_year, vs_period=vs_period, ledger=ledger,
+        dept=dept, min_abs_contribution=min_abs_contribution, top=top,
+    )
+
+
+@mcp.tool()
 def get_budget_variance(
     business_unit: str = "", fiscal_year: int = 0, period: int = 0,
     ledger: str = "", budget_ledger: str = "", account: str = "",
