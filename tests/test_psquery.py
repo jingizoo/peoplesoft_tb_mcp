@@ -160,5 +160,55 @@ class QasConfigTests(unittest.TestCase):
         self.assertNotIn("password:", text.lower().split("ps_api")[-1][:200])
 
 
+class RealShapesOnlyTests(unittest.TestCase):
+    """The sample must carry PeopleSoft's REAL column names.
+
+    The sample database exists so code can be written against it and then
+    run unchanged on a real instance. That contract inverted once: the
+    seed invented QRYRUNCNT, BNDDESCR and a TARGETLOCATION, code was
+    written to match, and the first contact with a real Oracle instance
+    was "ORA-00904 invalid identifier" behind a splash screen that never
+    cleared. Verified against the PT 8.58 data dictionary
+    (go-faster.co.uk/peopletools): these names exist in no release, and
+    this test keeps them out of the sample for good.
+    """
+
+    FICTIONAL = {
+        "PSQRYDEFN": {"QRYRUNCNT"},          # real: PSQRYSTATS.EXECCOUNT
+        "PSQRYBIND": {"BNDDESCR", "EDITTYPE"},   # real: HEADING / EDITTABLE
+        "PSIBSVCSETUP": {"TARGETLOCATION", "TARGET_LOCATION", "URL",
+                         "IB_TARGETLOCATION"},   # real: IB_TGTLOCATION...
+        "PSOPERATION": {"SERVICE", "OPERTYPE", "IB_OPERSTATUS"},
+        "PSSERVICE": {"SERVICE", "SERVICEALIAS"},  # real: IB_SERVICENAME...
+    }
+    REQUIRED = {
+        "PSQRYSTATS": {"OPRID", "QRYNAME", "EXECCOUNT"},
+        "PSQRYBIND": {"BNDNAME", "HEADING", "FIELDTYPE"},
+        "PSIBSVCSETUP": {"IB_TGTLOCATION", "IB_RESTTGTLOC"},
+        "PSSERVICEOPR": {"IB_SERVICENAME", "IB_OPERATIONNAME"},
+        "PSOPERATION": {"IB_OPERATIONNAME", "DESCR"},
+    }
+
+    def test_no_fictional_columns_in_the_sample(self) -> None:
+        db, _ = _catalog()
+        for table, bad in self.FICTIONAL.items():
+            cols = set(db.columns(table))
+            leaked = cols & bad
+            self.assertFalse(
+                leaked,
+                f"{table} carries invented column(s) {sorted(leaked)} — "
+                "these exist in no PeopleTools release, and code written "
+                "against them fails on first contact with a real instance")
+
+    def test_real_columns_are_present(self) -> None:
+        db, _ = _catalog()
+        for table, need in self.REQUIRED.items():
+            cols = set(db.columns(table))
+            missing = need - cols
+            self.assertFalse(missing,
+                             f"{table} is missing real column(s) "
+                             f"{sorted(missing)}")
+
+
 if __name__ == "__main__":
     unittest.main()

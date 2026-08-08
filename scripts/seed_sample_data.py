@@ -331,21 +331,34 @@ CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
 -- queries is therefore plain SQL — no gateway, no credentials.
 CREATE TABLE PSQRYDEFN (
   OPRID TEXT, QRYNAME TEXT, QRYTYPE INTEGER, DESCR TEXT,
-  LASTUPDDTTM TEXT, LASTUPDOPRID TEXT, QRYRUNCNT INTEGER);
+  LASTUPDDTTM TEXT, LASTUPDOPRID TEXT);
+-- Execution statistics live in their OWN table, keyed like the query, and
+-- only for queries with statistics logging enabled. There is no QRYRUNCNT
+-- on PSQRYDEFN in any release — the sample once had one, and code written
+-- against it would have silently lost popularity ranking in production.
+CREATE TABLE PSQRYSTATS (
+  OPRID TEXT, QRYNAME TEXT, EXECCOUNT INTEGER, LASTEXECDTTM TEXT);
 CREATE TABLE PSQRYBIND (
   OPRID TEXT, QRYNAME TEXT, BNDNUM INTEGER, BNDNAME TEXT,
-  BNDDESCR TEXT, FIELDTYPE INTEGER, EDITTYPE INTEGER);
+  HEADING TEXT, FIELDTYPE INTEGER);
 CREATE TABLE PSQRYRECORD (
   OPRID TEXT, QRYNAME TEXT, SELNUM INTEGER, RECNAME TEXT, CORRNAME TEXT);
--- Integration Broker catalog: the target location a site publishes its
--- services at, plus the service operations that exist. Discovering the
--- gateway from here is what keeps a site's URL out of our config.
+-- Integration Broker catalog, REAL column names (PT 8.58 data dictionary;
+-- go-faster.co.uk/peopletools/psibsvcsetup.htm): the service target
+-- locations live on PSIBSVCSETUP as IB_TGTLOCATION (SOAP) and
+-- IB_RESTTGTLOC (REST); services and operations link through the
+-- PSSERVICEOPR bridge. The REST columns are present but blank here, so
+-- discovery exercises the fall-through to the SOAP target and the
+-- SOAP->REST derivation in connectors/psquery_api.rest_base.
 CREATE TABLE PSIBSVCSETUP (
-  IB_SERVICENAMESPC TEXT, IB_SCHEMANAMESPC TEXT, TARGETLOCATION TEXT);
-CREATE TABLE PSSERVICE (SERVICE TEXT, DESCR TEXT, SERVICEALIAS TEXT);
-CREATE TABLE PSOPERATION (
-  IB_OPERATIONNAME TEXT, SERVICE TEXT, DESCR TEXT, OPERTYPE TEXT,
-  IB_OPERSTATUS TEXT);
+  SEQNO INTEGER, IB_NAMESPACE TEXT, IB_SCHEMANAMESPACE TEXT,
+  IB_TGTLOCATION TEXT, IB_SECTGTLOCATION TEXT, IB_RESTTGTLOC TEXT,
+  IB_RESTSECTGTLOC TEXT);
+CREATE TABLE PSSERVICE (
+  IB_SERVICENAME TEXT, DESCR TEXT, IB_ALIASNAME TEXT);
+CREATE TABLE PSOPERATION (IB_OPERATIONNAME TEXT, DESCR TEXT);
+CREATE TABLE PSSERVICEOPR (
+  IB_SERVICENAME TEXT, IB_OPERATIONNAME TEXT);
 CREATE TABLE PS_LED_GRP_TBL (LEDGER_GROUP TEXT, LEDGER TEXT, DESCR TEXT);
 CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
@@ -520,33 +533,40 @@ def main() -> None:
     # discovery must label, and one high-run-count query so "what does the
     # business actually run" is answerable.
     con.executemany(
-        "INSERT INTO PSQRYDEFN VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO PSQRYDEFN VALUES (?,?,?,?,?,?)",
         [
             ("", "GL_TB_BY_DEPT", 1,
              "Trial balance by department and account",
-             "2026-05-14", "JSMITH", 412),
+             "2026-05-14", "JSMITH"),
             ("", "AP_AGING_BY_VENDOR", 1,
              "Open payables aged by vendor with due dates",
-             "2026-06-02", "MRAO", 1180),
+             "2026-06-02", "MRAO"),
             ("", "BI_INVOICE_REGISTER", 1,
              "Finalized invoice register for a period",
-             "2026-04-28", "JSMITH", 96),
+             "2026-04-28", "JSMITH"),
             ("MRAO", "MY_ADHOC_SPEND", 1,
              "Personal ad-hoc spend extract",
-             "2026-07-30", "MRAO", 3),
+             "2026-07-30", "MRAO"),
         ])
     con.executemany(
-        "INSERT INTO PSQRYBIND VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO PSQRYSTATS VALUES (?,?,?,?)",
         [
-            ("", "GL_TB_BY_DEPT", 1, "BIND1", "Business Unit", 0, 1),
-            ("", "GL_TB_BY_DEPT", 2, "BIND2", "Fiscal Year", 1, 0),
-            ("", "GL_TB_BY_DEPT", 3, "BIND3", "Accounting Period", 1, 0),
-            ("", "AP_AGING_BY_VENDOR", 1, "BIND1", "Business Unit", 0, 1),
-            ("", "AP_AGING_BY_VENDOR", 2, "BIND2", "As Of Date", 4, 0),
-            ("", "BI_INVOICE_REGISTER", 1, "BIND1", "Business Unit", 0, 1),
-            ("", "BI_INVOICE_REGISTER", 2, "BIND2", "Invoice Date From",
-             4, 0),
-            ("", "BI_INVOICE_REGISTER", 3, "BIND3", "Invoice Date To", 4, 0),
+            ("", "GL_TB_BY_DEPT", 412, "2026-08-05"),
+            ("", "AP_AGING_BY_VENDOR", 1180, "2026-08-07"),
+            ("", "BI_INVOICE_REGISTER", 96, "2026-07-31"),
+            ("MRAO", "MY_ADHOC_SPEND", 3, "2026-07-30"),
+        ])
+    con.executemany(
+        "INSERT INTO PSQRYBIND VALUES (?,?,?,?,?,?)",
+        [
+            ("", "GL_TB_BY_DEPT", 1, "BIND1", "Business Unit", 0),
+            ("", "GL_TB_BY_DEPT", 2, "BIND2", "Fiscal Year", 1),
+            ("", "GL_TB_BY_DEPT", 3, "BIND3", "Accounting Period", 1),
+            ("", "AP_AGING_BY_VENDOR", 1, "BIND1", "Business Unit", 0),
+            ("", "AP_AGING_BY_VENDOR", 2, "BIND2", "As Of Date", 4),
+            ("", "BI_INVOICE_REGISTER", 1, "BIND1", "Business Unit", 0),
+            ("", "BI_INVOICE_REGISTER", 2, "BIND2", "Invoice Date From", 4),
+            ("", "BI_INVOICE_REGISTER", 3, "BIND3", "Invoice Date To", 4),
         ])
     con.executemany(
         "INSERT INTO PSQRYRECORD VALUES (?,?,?,?,?)",
@@ -562,29 +582,31 @@ def main() -> None:
     # Integration Broker: the site's published target location and the
     # Query Access Service operations. Note the write-capable operation —
     # discovery must SEE it and invocation must still refuse it.
-    con.execute("INSERT INTO PSIBSVCSETUP VALUES (?,?,?)",
-                ("http://xmlns.oracle.com/Enterprise/Tools/services", "",
+    con.execute("INSERT INTO PSIBSVCSETUP VALUES (?,?,?,?,?,?,?)",
+                (1, "http://xmlns.oracle.com/Enterprise/Tools/services", "",
                  "http://dc15-pserp-dv-rp01.example:8016/PSIGW/"
-                 "PeopleSoftServiceListeningConnector"))
+                 "PeopleSoftServiceListeningConnector", "", "", ""))
     con.executemany(
         "INSERT INTO PSSERVICE VALUES (?,?,?)",
         [("QAS", "Query Access Service", "QAS"),
          ("PT_QRY", "Query Manager Service", "PT_QRY"),
          ("VOUCHER_BUILD", "Voucher Build Service", "VCHR")])
     con.executemany(
-        "INSERT INTO PSOPERATION VALUES (?,?,?,?,?)",
+        "INSERT INTO PSSERVICEOPR VALUES (?,?)",
+        [("QAS", "QAS_LISTQUERIES"),
+         ("QAS", "QAS_GETQUERYPROPERTIES"),
+         ("QAS", "QAS_EXECUTEQUERY"),
+         ("QAS", "QAS_EXECUTENONBLOCKING"),
+         ("VOUCHER_BUILD", "VOUCHER_LOAD")])
+    con.executemany(
+        "INSERT INTO PSOPERATION VALUES (?,?)",
         [
-            ("QAS_LISTQUERIES", "QAS", "List available queries",
-             "Synchronous", "A"),
-            ("QAS_GETQUERYPROPERTIES", "QAS",
-             "Query prompts and result fields", "Synchronous", "A"),
-            ("QAS_EXECUTEQUERY", "QAS", "Execute a query and return rows",
-             "Synchronous", "A"),
-            ("QAS_EXECUTENONBLOCKING", "QAS",
-             "Execute a long-running query asynchronously",
-             "Asynchronous", "A"),
-            ("VOUCHER_LOAD", "VOUCHER_BUILD",
-             "Create vouchers from staged data", "Asynchronous", "A"),
+            ("QAS_LISTQUERIES", "List available queries"),
+            ("QAS_GETQUERYPROPERTIES", "Query prompts and result fields"),
+            ("QAS_EXECUTEQUERY", "Execute a query and return rows"),
+            ("QAS_EXECUTENONBLOCKING",
+             "Execute a long-running query asynchronously"),
+            ("VOUCHER_LOAD", "Create vouchers from staged data"),
         ])
     con.executemany(
         "INSERT INTO PS_VENDOR VALUES (?,?,?,?)",
