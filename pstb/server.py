@@ -44,6 +44,10 @@ from .psquery import QueryCatalog
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
 query_catalog = QueryCatalog(engine)
+from .connectors import psquery_api as _qas_mod
+qas = _qas_mod.from_config(
+    cfg, (query_catalog.integration_endpoints() or {})
+    .get('target_location') or '')
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:
@@ -980,6 +984,22 @@ def get_asset_register(business_unit: str = "", months: int = 12,
     assets do we have / what was added or retired / asset register"."""
     return _safe(modules.asset_register, business_unit=business_unit,
                  months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def run_ps_query(query: str, prompts: Optional[dict] = None,
+                 private_owner: str = "", max_rows: int = 0) -> dict:
+    """EXECUTE an existing PeopleSoft query (PSQuery) through the Query
+    Access Service and return its rows. Use after search_ps_queries and
+    describe_ps_query: pass the query name and a prompts map keyed by the
+    BIND NAMES that describe_ps_query listed. Cite the query name in your
+    answer — this is logic the site built and validated, which is stronger
+    evidence than SQL we write. Results reflect the executing PeopleSoft
+    user's permission lists and may legitimately differ from the curated
+    tools, which read through a database account; say so if the figures
+    disagree rather than treating it as an error."""
+    return _safe(qas.execute, query=query, prompts=prompts or {},
+                 private_owner=private_owner, max_rows=max_rows)
 
 
 @mcp.tool()

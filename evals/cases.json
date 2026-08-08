@@ -488,6 +488,23 @@
         "not_refused": true,
         "_why": "prior art beats new SQL \u2014 the model must look for an existing validated query before writing its own."
       }
+    },
+    {
+      "id": "run-existing-query",
+      "question": "Run the AP_AGING_BY_VENDOR query for US001",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "run_ps_query",
+          "describe_ps_query",
+          "search_ps_queries"
+        ],
+        "not_refused": true,
+        "_why": "naming an existing query by name must reach the QAS execution path (optionally after reading its prompts), never a hand-written SQL substitute."
+      }
     }
   ]
 }

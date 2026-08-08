@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Recorded Query Access Service responses, keyed by URL path.",
+    "The rows deliberately mirror the AP vouchers in ps_sample.db so the",
+    "demo can show the SAME figures arriving by two different routes —",
+    "the curated tool through the database account, and the site's own",
+    "validated query through QAS. Agreement is the point: it is what",
+    "makes 'cite the existing query' a real provenance claim.",
+    "AP_AGING_BY_VENDOR here returns the three open vouchers; the",
+    "totals match get_open_payables (115,200.00 across 4, of which",
+    "27,650.00 overdue) minus the recycled voucher a query with a",
+    "posted-only criterion would not return — a legitimate difference",
+    "worth seeing in a demo."
+  ],
+  "/PSFT_FS/QAS_EXECUTEQUERY.v1/PUBLIC/AP_AGING_BY_VENDOR/JSON/NONFILE/": {
+    "status": "success",
+    "data": {
+      "rows": [
+        {"BUSINESS_UNIT": "US001", "VENDOR_ID": "V1001",
+         "NAME1": "Ridgeline Supply Co", "VOUCHER_ID": "VCHR90001",
+         "INVOICE_ID": "INV-9001", "DUE_DT": "2026-08-09",
+         "GROSS_AMT": 18400.00, "DAYS_PAST_DUE": 0},
+        {"BUSINESS_UNIT": "US001", "VENDOR_ID": "V1002",
+         "NAME1": "Cobalt IT Services", "VOUCHER_ID": "VCHR90002",
+         "INVOICE_ID": "INV-9002", "DUE_DT": "2026-07-05",
+         "GROSS_AMT": 27650.00, "DAYS_PAST_DUE": 32},
+        {"BUSINESS_UNIT": "US001", "VENDOR_ID": "V1002",
+         "NAME1": "Cobalt IT Services", "VOUCHER_ID": "VCHR90003",
+         "INVOICE_ID": "INV-9003", "DUE_DT": "2026-08-27",
+         "GROSS_AMT": 64000.00, "DAYS_PAST_DUE": 0}
+      ]
+    }
+  },
+  "/PSFT_FS/QAS_EXECUTEQUERY.v1/PUBLIC/GL_TB_BY_DEPT/JSON/NONFILE/": {
+    "status": "success",
+    "data": {
+      "rows": [
+        {"BUSINESS_UNIT": "US001", "DEPTID": "1000", "ACCOUNT": "6000",
+         "DESCR": "Salaries & Wages", "POSTED_TOTAL_AMT": 638400.00},
+        {"BUSINESS_UNIT": "US001", "DEPTID": "2000", "ACCOUNT": "6400",
+         "DESCR": "Travel & Entertainment", "POSTED_TOTAL_AMT": 89600.00}
+      ]
+    }
+  },
+  "/PSFT_FS/QAS_EXECUTEQUERY.v1/PUBLIC/UNKNOWN_SHAPE/JSON/NONFILE/": {
+    "status": "success",
+    "envelope": "<xml>this release returned something unexpected</xml>"
+  }
+}
