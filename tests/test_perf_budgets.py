@@ -29,7 +29,8 @@ from pstb.ar import ARBilling  # noqa: E402
 from pstb.config import Config  # noqa: E402
 from pstb.db import Database  # noqa: E402
 from pstb.engine import TBEngine  # noqa: E402
-from pstb.guards import payload_numbers, ungrounded_figures  # noqa: E402
+from pstb.guards import (misattributed_figures, payload_numbers,
+                         ungrounded_figures)  # noqa: E402
 
 BUDGET_MSG = (
     "\n\nThis is the speed lock-in gate: a warm {name} call now issues "
@@ -170,6 +171,27 @@ class GuardCeilingTests(unittest.TestCase):
         self.assertTrue(any("987" in f for f in invented),
                         "the ceiling test must still exercise a real "
                         "detection, not just timing")
+
+    def test_attribution_adds_one_walk_not_a_second_pass_per_figure(self):
+        """The attribution guard also runs on every answer, and it reads
+        the answer sentence by sentence. Naive nesting — every figure
+        rescanned against every payload — would be O(figures x rows) and
+        would only show up on a real trial balance."""
+        payloads = [("get_trial_balance", json.dumps({"rows": [
+            {"acct": f"{a}", "amount": a * 1013.17}
+            for a in range(i * 500, i * 500 + 500)]})) for i in range(8)]
+        answer = ". ".join(
+            f"The general ledger shows {a * 1013.17:,.2f}"
+            for a in range(40)) + "."
+        t0 = time.perf_counter()
+        findings = misattributed_figures(answer, payloads, "data")
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 2.0,
+                        f"attribution took {elapsed:.2f}s on 4k rows")
+        self.assertEqual(findings, [],
+                        "correctly attributed ledger figures must stay "
+                        "silent — a timing test that flags everything is "
+                        "not measuring the real path")
 
 
 if __name__ == "__main__":
