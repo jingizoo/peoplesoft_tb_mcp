@@ -33,6 +33,13 @@ db:
 # only for EXECUTING a query, which runs as this PeopleSoft user, so
 # results respect that user's permission lists. Credentials come from
 # .env (PSFT_QAS_USER / PSFT_QAS_PASSWORD), never from this file.
+# Executing an existing PSQuery via the Query Access Service. DISCOVERY
+# (search_ps_queries / describe_ps_query) is plain SQL and needs none of
+# this; only execution does. Credentials live in .env, never here:
+# PSFT_QAS_USER, PSFT_QAS_PASSWORD, and PSFT_QAS_NODE if your site's IB
+# node is not PSFT_FS. Check it with scripts/diagnose_psquery.py — until
+# every precondition is met, run_ps_query answers from bundled FIXTURES
+# and says mode: fixtures in the payload.
 ps_api:
   enabled: false
   target_location: ""       # blank = discover from the site's PSIBSVCSETUP
