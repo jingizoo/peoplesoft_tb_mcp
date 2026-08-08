@@ -59,7 +59,8 @@ async def main() -> None:
                             "get_record_map", "wiki_health",
                             "list_playbooks", "list_sources",
                             "recall_site_facts", "list_policy_terms",
-                            "coupa_health"}
+                            "coupa_health",
+                            "list_integration_endpoints"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
             assert not missing, f"tools resolved with empty schemas: {missing}"

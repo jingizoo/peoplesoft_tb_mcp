@@ -109,6 +109,24 @@ class ToolsCfg:
 
 
 @dataclass
+class PsApiCfg:
+    """Query Access Service credentials and limits.
+
+    Execution runs as this PeopleSoft USER, so results respect that
+    user's permission lists — a real difference from the direct database
+    account, and a governance improvement worth stating in answers. The
+    gateway URL is deliberately absent: it is discovered from the site's
+    own IB catalog (PSIBSVCSETUP) unless overridden here.
+    """
+    enabled: bool = False
+    user: str = ""          # PSFT_QAS_USER in .env, never in config.yaml
+    password: str = ""      # PSFT_QAS_PASSWORD in .env
+    target_location: str = ""   # blank = discover from PSIBSVCSETUP
+    timeout_seconds: int = 60
+    max_rows: int = 5000
+
+
+@dataclass
 class Config:
     root: Path = field(default_factory=Path.cwd)
     defaults: Defaults = field(default_factory=Defaults)
@@ -122,6 +140,7 @@ class Config:
     # e.g. semantics: {billing_invoiced: {values: [INV, PRO]}}. Approved
     # site-memory facts outrank this; the built-in seed backstops both.
     semantics: dict = field(default_factory=dict)
+    ps_api: PsApiCfg = field(default_factory=PsApiCfg)
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
@@ -204,6 +223,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.llm, data.get("llm"))
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
+        _apply_section(cfg.ps_api, data.get("ps_api"))
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]
         for name, block in (data.get("sources") or {}).items():
@@ -220,6 +240,8 @@ def load_config(path: Optional[str] = None) -> Config:
             cfg.sources[str(name)] = src
 
     d, l, w = cfg.db, cfg.llm, cfg.wiki
+    cfg.ps_api.user = _env("PSFT_QAS_USER", cfg.ps_api.user)
+    cfg.ps_api.password = _env("PSFT_QAS_PASSWORD", cfg.ps_api.password)
     d.oracle_dsn = _env("ORACLE_DSN", d.oracle_dsn)
     d.oracle_user = _env("ORACLE_USER", d.oracle_user)
     d.oracle_password = _env("ORACLE_PASSWORD", d.oracle_password)

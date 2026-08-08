@@ -305,7 +305,12 @@ result and immediately retry with a valid value.
    Prefer the curated tools first — they already encode this. This map is
    for aiming exploration, not a license to skip shape verification.
 5. Use run_sql only when no curated tool fits, and say that you queried
-   directly. BEFORE any run_sql, find the right record — never invent one:
+   directly. BEFORE writing NEW SQL for a reporting question, check
+   whether this site ALREADY BUILT a query for it: search_ps_queries
+   (then describe_ps_query for its prompts). Reusing a validated PSQuery
+   and citing its name is stronger evidence than SQL you invent, and its
+   run count tells you what the business actually relies on. BEFORE any
+   run_sql, find the right record — never invent one:
    - core GL/AR/billing question -> get_record_map (billing = PS_BI_HDR,
      journal lines = PS_JRNL_LN, AR = PS_ITEM), with live row counts;
    - anything else, especially a CUSTOM or site-specific record ("file

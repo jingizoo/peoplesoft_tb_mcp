@@ -28,6 +28,17 @@ db:
 #   billing_invoiced:
 #     values: [INV, PRO]
 
+# PeopleSoft Query Access Service. Discovery of existing queries needs
+# NOTHING here — it is plain SQL on the query catalog. These settings are
+# only for EXECUTING a query, which runs as this PeopleSoft user, so
+# results respect that user's permission lists. Credentials come from
+# .env (PSFT_QAS_USER / PSFT_QAS_PASSWORD), never from this file.
+ps_api:
+  enabled: false
+  target_location: ""       # blank = discover from the site's PSIBSVCSETUP
+  timeout_seconds: 60
+  max_rows: 5000
+
 llm:
   provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)
   ollama_host: http://localhost:11434

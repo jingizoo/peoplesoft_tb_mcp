@@ -40,8 +40,10 @@ playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
+from .psquery import QueryCatalog
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
+query_catalog = QueryCatalog(engine)
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:
@@ -978,6 +980,42 @@ def get_asset_register(business_unit: str = "", months: int = 12,
     assets do we have / what was added or retired / asset register"."""
     return _safe(modules.asset_register, business_unit=business_unit,
                  months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def search_ps_queries(text: str = "", record: str = "",
+                      include_private: bool = False, limit: int = 25) -> dict:
+    """Find EXISTING PeopleSoft queries (PSQuery) this site already built.
+    Use BEFORE writing new SQL for a reporting question: "is there already
+    a query for AP aging?", "what queries read PS_VOUCHER?" (pass
+    record=). Returns names, descriptions, public/private, and RUN COUNTS
+    — what the business actually uses. Reusing a validated query and
+    citing its name is stronger provenance than SQL we invent. Reading
+    this catalog is plain SQL; running a query needs the Query Access
+    Service."""
+    return _safe(query_catalog.search_queries, text=text, record=record,
+                 include_private=include_private, limit=limit)
+
+
+@mcp.tool()
+def describe_ps_query(query: str, owner: str = "") -> dict:
+    """One existing PSQuery in detail: its runtime PROMPTS in order with
+    their types, and the records it reads. Use after search_ps_queries to
+    judge whether a query answers the question and what values it would
+    need. This reads the catalog only — it cannot execute the query."""
+    return _safe(query_catalog.query_detail, query=query, owner=owner)
+
+
+@mcp.tool()
+def list_integration_endpoints() -> dict:
+    """Discover this site's Integration Broker target location and its
+    service operations from the IB catalog — so the gateway URL comes
+    from the database rather than from configuration. Every operation is
+    listed with whether it is CALLABLE: only read-only query operations
+    are on the invocation allowlist, because IB also carries voucher
+    builds and journal loads. Use for "what APIs does this instance
+    expose / can we call PeopleSoft directly"."""
+    return _safe(query_catalog.integration_endpoints)
 
 
 @mcp.tool()

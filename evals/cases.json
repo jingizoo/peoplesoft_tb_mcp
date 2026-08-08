@@ -472,6 +472,22 @@
         "not_refused": true,
         "_why": "budgets live in the procurement system at this deployment; the cross-system tool is the right route, and the ledger-budget tool refuses with a pointer to it."
       }
+    },
+    {
+      "id": "reuse-existing-query",
+      "question": "Is there already a PeopleSoft query for AP aging I can reuse?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "search_ps_queries",
+          "describe_ps_query"
+        ],
+        "not_refused": true,
+        "_why": "prior art beats new SQL \u2014 the model must look for an existing validated query before writing its own."
+      }
     }
   ]
 }
