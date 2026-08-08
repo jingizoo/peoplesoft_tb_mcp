@@ -84,8 +84,14 @@ class QueryCatalog:
                                "those grants; no gateway or API is "
                                "involved.")}
         p = self.db.prefix
-        cols = self.db.columns("PSQRYDEFN")
-        runcnt = "QRYRUNCNT" in cols
+        # Run counts do NOT live on PSQRYDEFN — there is no QRYRUNCNT in any
+        # documented release. They live in PSQRYSTATS (EXECCOUNT,
+        # LASTEXECDTTM, keys OPRID+QRYNAME), populated only when a query has
+        # statistics logging enabled, so COALESCE to 0 rather than dropping
+        # rows. Verified against the PT 8.58 data dictionary
+        # (go-faster.co.uk/peopletools/psqrydefn.htm, psqrystats.htm).
+        stats = (self._present("PSQRYSTATS")
+                 and self.db.has_column("PSQRYSTATS", "EXECCOUNT"))
         where = ["1=1"]
         params: dict = {}
         if not include_private:
@@ -109,13 +115,16 @@ class QueryCatalog:
                 "WHERE R.QRYNAME = Q.QRYNAME AND R.OPRID = Q.OPRID "
                 "AND UPPER(R.RECNAME) IN (:r1, :r2))")
             params.update({"r1": bare, "r2": rec})
-        order = "Q.QRYRUNCNT DESC" if runcnt else "Q.QRYNAME"
+        join = (f"LEFT JOIN {p}PSQRYSTATS S ON S.QRYNAME = Q.QRYNAME "
+                "AND TRIM(COALESCE(S.OPRID,'')) = TRIM(COALESCE(Q.OPRID,'')) "
+                if stats else "")
         rows, truncated = self.db.query(
             f"SELECT Q.QRYNAME AS name, Q.OPRID AS owner, Q.DESCR AS descr, "
-            + (f"Q.QRYRUNCNT AS runs, " if runcnt else "0 AS runs, ")
+            + ("COALESCE(S.EXECCOUNT, 0) AS runs, " if stats
+               else "0 AS runs, ")
             + "Q.LASTUPDDTTM AS updated, Q.LASTUPDOPRID AS updated_by "
-            f"FROM {p}PSQRYDEFN Q WHERE {' AND '.join(where)} "
-            f"ORDER BY {order}",
+            f"FROM {p}PSQRYDEFN Q {join}WHERE {' AND '.join(where)} "
+            f"ORDER BY {'runs DESC, Q.QRYNAME' if stats else 'Q.QRYNAME'}",
             params, max_rows=max(int(limit or 25), 1))
         out = []
         for r in rows:
@@ -167,13 +176,22 @@ class QueryCatalog:
                                "first — names are exact and case matters "
                                "at some sites.")}
         head = rows[0]
+        head_owner = str(head.get("owner") or "").strip()
         prompts = []
         if self._present("PSQRYBIND"):
+            # The prompt's label column is HEADING (no BNDDESCR exists in
+            # any documented release); '' when a site's shape lacks it.
+            # Scope to the chosen head's OPRID: a private query sharing a
+            # public one's name must not merge its binds in.
+            label = ("HEADING AS descr"
+                     if self.db.has_column("PSQRYBIND", "HEADING")
+                     else "'' AS descr")
             binds, _ = self.db.query(
-                f"SELECT BNDNUM AS n, BNDNAME AS bind, BNDDESCR AS descr, "
+                f"SELECT BNDNUM AS n, BNDNAME AS bind, {label}, "
                 f"FIELDTYPE AS ftype FROM {p}PSQRYBIND "
-                f"WHERE UPPER(QRYNAME) = :n ORDER BY BNDNUM",
-                {"n": name}, max_rows=50)
+                f"WHERE UPPER(QRYNAME) = :n "
+                f"AND TRIM(COALESCE(OPRID,'')) = :own ORDER BY BNDNUM",
+                {"n": name, "own": head_owner}, max_rows=50)
             for b in binds:
                 code = b.get("ftype")
                 prompts.append({
@@ -189,7 +207,9 @@ class QueryCatalog:
             recs, _ = self.db.query(
                 f"SELECT RECNAME AS rec, CORRNAME AS alias "
                 f"FROM {p}PSQRYRECORD WHERE UPPER(QRYNAME) = :n "
-                f"ORDER BY SELNUM", {"n": name}, max_rows=50)
+                f"AND TRIM(COALESCE(OPRID,'')) = :own "
+                f"ORDER BY SELNUM", {"n": name, "own": head_owner},
+                max_rows=50)
             records = [{"record": str(r.get("rec") or ""),
                         "alias": str(r.get("alias") or "") or None}
                        for r in recs]
@@ -219,19 +239,59 @@ class QueryCatalog:
         """
         p = self.db.prefix
         target = None
-        if self._present("PSIBSVCSETUP"):
-            rows, _ = self.db.query(
-                f"SELECT TARGETLOCATION AS loc FROM {p}PSIBSVCSETUP",
-                {}, max_rows=5)
+        # PSIBSVCSETUP's target-location columns, verified against the
+        # PT 8.58 data dictionary (go-faster.co.uk/peopletools/
+        # psibsvcsetup.htm; PT 8.52 PeopleBook tiba08 confirms the same
+        # names): IB_TGTLOCATION and IB_SECTGTLOCATION for the SOAP
+        # listening connector, IB_RESTTGTLOC and IB_RESTSECTGTLOC for the
+        # REST one. Selecting a guessed name blind raised ORA-00904 on a
+        # real instance, so each is probed against the catalog first, and
+        # REST is preferred: it is already the base QAS needs, with no
+        # SOAP-to-REST derivation. A site where none carries a value
+        # configures ps_api.target_location by hand — that is a supported
+        # posture, not an error.
+        target_column = None
+        for column in ("IB_RESTSECTGTLOC", "IB_RESTTGTLOC",
+                       "IB_SECTGTLOCATION", "IB_TGTLOCATION"):
+            if not self.db.has_column("PSIBSVCSETUP", column):
+                continue
+            try:
+                rows, _ = self.db.query(
+                    f"SELECT {column} AS loc FROM {p}PSIBSVCSETUP",
+                    {}, max_rows=5)
+            except DbError:
+                continue
             target = next((str(r["loc"]) for r in rows
                            if str(r.get("loc") or "").strip()), None)
+            if target:
+                target_column = column
+                break
         operations = []
-        if self._present("PSOPERATION"):
-            rows, _ = self.db.query(
-                f"SELECT IB_OPERATIONNAME AS op, SERVICE AS service, "
-                f"DESCR AS descr, OPERTYPE AS optype, "
-                f"IB_OPERSTATUS AS status FROM {p}PSOPERATION "
-                f"ORDER BY SERVICE, IB_OPERATIONNAME", {}, max_rows=500)
+        # PSOPERATION carries IB_OPERATIONNAME and DESCR (PT 8.58
+        # dictionary). It does NOT carry SERVICE, OPERTYPE or
+        # IB_OPERSTATUS — the service link is the PSSERVICEOPR bridge
+        # (IB_SERVICENAME + IB_OPERATIONNAME), and active/inactive is
+        # per-version in PSOPRVERDFN. Type and status are therefore not
+        # reported at all: a field this discovery cannot source honestly
+        # is omitted, not guessed.
+        if self._present("PSOPERATION") and all(
+                self.db.has_column("PSOPERATION", c) for c in
+                ("IB_OPERATIONNAME", "DESCR")):
+            svc_link = (self._present("PSSERVICEOPR") and all(
+                self.db.has_column("PSSERVICEOPR", c) for c in
+                ("IB_SERVICENAME", "IB_OPERATIONNAME")))
+            if svc_link:
+                sql = (f"SELECT O.IB_OPERATIONNAME AS op, "
+                       f"SO.IB_SERVICENAME AS service, O.DESCR AS descr "
+                       f"FROM {p}PSOPERATION O "
+                       f"LEFT JOIN {p}PSSERVICEOPR SO "
+                       f"ON SO.IB_OPERATIONNAME = O.IB_OPERATIONNAME "
+                       f"ORDER BY SO.IB_SERVICENAME, O.IB_OPERATIONNAME")
+            else:
+                sql = (f"SELECT IB_OPERATIONNAME AS op, '' AS service, "
+                       f"DESCR AS descr FROM {p}PSOPERATION "
+                       f"ORDER BY IB_OPERATIONNAME")
+            rows, _ = self.db.query(sql, {}, max_rows=500)
             for r in rows:
                 op = str(r.get("op") or "")
                 descr = str(r.get("descr") or "")
@@ -240,8 +300,6 @@ class QueryCatalog:
                     "operation": op,
                     "service": str(r.get("service") or ""),
                     "descr": descr,
-                    "type": str(r.get("optype") or ""),
-                    "active": str(r.get("status") or "") == "A",
                     "callable": callable_,
                     "why": ("read-only, on the invocation allowlist"
                             if callable_ else
@@ -250,17 +308,37 @@ class QueryCatalog:
                              else "not on the read-only allowlist — "
                                   "discovery only")),
                 })
-        qas = [o for o in operations if o["service"].upper() == "QAS"]
+        qas = [o for o in operations
+               if o["service"].upper() == "QAS"
+               or o["operation"].upper().startswith("QAS_")]
+        # Oracle raises the SAME error for a missing table and a missing
+        # SELECT grant (ORA-00942), and PSOPERATION is PeopleTools metadata
+        # a read-only reporting account often cannot see. An unreadable
+        # catalog therefore must not be reported as "QAS is not available"
+        # — that answer steers the model away from run_ps_query on exactly
+        # the sites where it would work.
+        catalog_readable = bool(operations)
         return {
             "target_location": target,
-            "target_source": ("PSIBSVCSETUP — the site's own published "
-                              "location, not configured here"),
+            "target_source": (
+                f"PSIBSVCSETUP.{target_column} — the site's own published "
+                "location, not configured here" if target_column
+                else "not discovered — set ps_api.target_location"),
             "operations": operations,
             "operation_count": len(operations),
             "callable_count": sum(1 for o in operations if o["callable"]),
-            "query_service_available": bool(qas),
+            "query_service_available": (bool(qas) if catalog_readable
+                                        else None),
+            "catalog_readable": catalog_readable,
             "note": (
-                "DISCOVERY IS NOT INVOCATION. Integration Broker carries "
+                ("" if catalog_readable else
+                 "The IB operation catalog was not readable — on Oracle a "
+                 "missing table and a missing SELECT grant raise the same "
+                 "ORA-00942, so this says nothing about whether QAS is "
+                 "configured. run_ps_query may still work; to enable "
+                 "discovery ask the DBA for SELECT on PSOPERATION and "
+                 "PSSERVICEOPR, or set ps_api.target_location by hand. ")
+                + "DISCOVERY IS NOT INVOCATION. Integration Broker carries "
                 "write-capable operations; every one found is listed so "
                 "you can see what exists, and only the read-only query "
                 "operations are on the invocation allowlist. Executing a "
