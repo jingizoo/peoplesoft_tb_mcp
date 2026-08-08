@@ -1487,16 +1487,27 @@ class ARBilling:
                 "business_unit": bu, "window_months": int(months or 12),
                 "since": since, "as_of": asof,
                 "mixed_currencies": currencies,
+                # business_unit rides along on the ALL ranking, exactly as
+                # it does on the converted path below. Without it a
+                # cross-unit ranking names customers and amounts but never
+                # says which company billed them — and the scope chip still
+                # reads one unit, so the reader has no way to tell the
+                # answer widened.
                 "by_currency": [
                     {"cust_id": r["cust_id"], "name": r.get("name"),
-                     "currency": r["currency"], "invoices": int(r["invoices"] or 0),
-                     "billed": r2(float(r["billed"] or 0))}
+                     "currency": r["currency"],
+                     "invoices": int(r["invoices"] or 0),
+                     "billed": r2(float(r["billed"] or 0)),
+                     **({"business_unit": str(r["bu"])} if bu_all else {})}
                     for r in sorted(rows, key=lambda x: -float(x["billed"] or 0))
                 ],
                 "note": (
                     "Invoices exist in multiple currencies; totals are NOT "
                     "summed across currencies. Pass display_currency (e.g. "
                     "'USD' or 'INR') to rank on converted totals."
+                    + (" Ranked across ALL business units, not only the "
+                       "selected one — every row names the unit that "
+                       "billed it." if bu_all else "")
                 ),
                 **({"record_notes": record_notes} if record_notes else {}),
             }
@@ -1523,7 +1534,10 @@ class ARBilling:
             "customer_count": len(ranked),
             "note": ("Finalized (INV) invoices only, by invoice date window. "
                      "This is BILLING volume, not open AR — see get_ar_aging "
-                     "for what is owed."),
+                     "for what is owed."
+                     + (" Ranked across ALL business units, not only the "
+                        "selected one — business_units on each row names "
+                        "which billed that customer." if bu_all else "")),
         }
         if bu_all:
             out["scope"] = ("ALL business units — cross-unit ranking was "

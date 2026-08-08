@@ -57,9 +57,40 @@ class CrossBuPhraseTests(unittest.TestCase):
 class ScopeOverrideTests(unittest.TestCase):
     SCOPE = {"business_unit": "US001", "ledger": "ACTUALS"}
 
-    def test_without_the_phrasing_a_conflicting_bu_still_refuses(self) -> None:
+    def test_all_is_a_widening_and_is_allowed_without_the_phrasing(self):
+        """Reversed deliberately, on a field report.
+
+        "ALL" is not a different company — it is a superset containing the
+        selected one, on a tool built to rank across units and label each
+        row. The scope lock exists to stop an answer about US200 being
+        presented as US001; widening to every unit, with the unit visible
+        per row, is not that failure.
+
+        It was a live false positive: the tool's own docstring tells the
+        model that business_unit="ALL" ranks across every unit, so on a
+        larger top-N the model took the advice and the guard refused its
+        own instruction.
+        """
+        out = apply_request_scope("get_top_billing_customers",
+                                  {"business_unit": "ALL", "n": 10},
+                                  self.SCOPE)
+        self.assertEqual(out["business_unit"], "ALL")
+        self.assertEqual(out["n"], 10)
+        self.assertEqual(sorted(out), ["business_unit", "n"],
+                         "no extra key may be injected — out becomes the "
+                         "MCP arguments and an unknown one is rejected")
+
+    def test_a_lateral_move_to_another_unit_still_refuses(self) -> None:
+        # This IS the failure the lock exists for: US200 presented as US001.
         with self.assertRaises(ScopeConflict):
             apply_request_scope("get_top_billing_customers",
+                                {"business_unit": "US200"}, self.SCOPE)
+
+    def test_all_is_refused_on_a_tool_that_cannot_honour_it(self) -> None:
+        # get_ar_aging would take "ALL" for a literal unit name and return
+        # nothing, which reads as "no receivables" rather than an error.
+        with self.assertRaises(ScopeConflict):
+            apply_request_scope("get_ar_aging",
                                 {"business_unit": "ALL"}, self.SCOPE)
 
     def test_with_the_phrasing_the_models_value_wins(self) -> None:
@@ -169,6 +200,51 @@ class CrossBuRankingTests(unittest.TestCase):
         out = self.ar.top_billing_customers(business_unit="US001", n=5)
         self.assertIn("by_currency", out)
         self.assertNotIn("customers", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class WideningIsDisclosedTests(unittest.TestCase):
+    """Widening past the selected unit is allowed, so it must be VISIBLE.
+
+    The scope chip still reads one business unit while the answer covers
+    every one. Without per-row attribution the reader cannot tell, and a
+    cross-unit ranking silently reads as a single-company one.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from pstb.ar import ARBilling
+        from pstb.config import Config
+        from pstb.db import Database
+        from pstb.engine import TBEngine
+        cfg = Config.sample(ROOT)
+        cls.ar = ARBilling(TBEngine(Database(cfg), cfg))
+
+    def _rows(self, out):
+        return out.get("customers") or out.get("by_currency") or []
+
+    def test_every_row_names_the_unit_that_billed_it(self) -> None:
+        out = self.ar.top_billing_customers(business_unit="ALL", n=5)
+        rows = self._rows(out)
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertTrue(r.get("business_unit") or r.get("business_units"),
+                            f"cross-unit row carries no unit: {r}")
+
+    def test_the_note_says_the_answer_widened(self) -> None:
+        out = self.ar.top_billing_customers(business_unit="ALL", n=5)
+        self.assertIn("ALL business units", out["note"])
+
+    def test_a_single_unit_ranking_says_nothing_of_the_kind(self) -> None:
+        out = self.ar.top_billing_customers(business_unit="US001", n=5)
+        self.assertNotIn("ALL business units", out["note"])
+        for r in self._rows(out):
+            self.assertNotIn("business_unit", r,
+                             "a scoped ranking must not imply it crossed "
+                             "units")
 
 
 if __name__ == "__main__":
