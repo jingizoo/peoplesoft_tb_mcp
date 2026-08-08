@@ -32,6 +32,49 @@ def call_temperature(base: float, routing: float, mode: str) -> float:
     return routing if mode == "ANY" else base
 
 
+def adc_remedy(project: str, detail: str = "") -> str:
+    """What to actually run, for THIS deployment.
+
+    Google's own message — "Your default credentials were not found, see
+    <generic doc page>" — is true and useless: it does not know this runs
+    headless over SSH, where the plain login command tries to open a
+    browser that is not there. Naming the flag is the difference between a
+    two-minute fix and an afternoon.
+    """
+    return (
+        "Gemini could not authenticate: no Google Application Default "
+        f"Credentials on this host{f' ({detail})' if detail else ''}. "
+        f"Project is {project or '(unset)'}. Pick one:\n"
+        "  1. Sign in as yourself. Over SSH the browser cannot open, so "
+        "the flag is required:\n"
+        "       gcloud auth application-default login --no-launch-browser\n"
+        "     It prints a URL — open it on your laptop, paste the code "
+        "back. Credentials land in "
+        "~/.config/gcloud/application_default_credentials.json.\n"
+        "  2. Use a service account key: put its path in .env as "
+        "GOOGLE_APPLICATION_CREDENTIALS=/path/key.json (chmod 600), then "
+        "restart.\n"
+        "  3. Keep working now on the local model — switch the provider to "
+        "ollama; it needs no cloud credentials and every curated tool "
+        "answers the same.\n"
+        "Nothing here is stored or logged by this application; the SDK "
+        "reads the credentials directly."
+    )
+
+
+def _require_adc(cfg: Config) -> None:
+    """Fail at construction with a remedy, not mid-turn with a doc link."""
+    try:
+        from google.auth import default as _default
+        from google.auth.exceptions import DefaultCredentialsError
+    except ImportError:  # google-auth ships with google-genai; be tolerant
+        return
+    try:
+        _default()
+    except DefaultCredentialsError as e:
+        raise RuntimeError(adc_remedy(cfg.llm.gemini_project, str(e)[:120]))
+
+
 class GeminiVertexProvider(LLMProvider):
     name = "gemini"
 
@@ -49,12 +92,19 @@ class GeminiVertexProvider(LLMProvider):
                 "gcloud auth application-default login)"
             )
         self.types = types
+        # Resolve credentials HERE, not on the first question. google.auth's
+        # own lookup is local — it reads a file or asks the metadata server —
+        # so this costs nothing and moves the failure from the middle of a
+        # user's turn to provider construction, where the surface can say
+        # which provider could not start.
+        _require_adc(cfg)
         self.client = genai.Client(
             vertexai=True,
             project=cfg.llm.gemini_project,
             location=cfg.llm.gemini_location,
         )
         self.model = cfg.llm.gemini_model
+        self.project = cfg.llm.gemini_project
         declarations = []
         for t in tools:
             schema = clean_schema(t.schema)
@@ -129,6 +179,15 @@ class GeminiVertexProvider(LLMProvider):
             except Exception as e:
                 code = getattr(e, "code", None) or getattr(e, "status_code", None)
                 msg = str(e)
+                # Credentials can also die MID-SESSION: a refresh token
+                # revoked, a key rotated, a session that outlived its ADC.
+                # Retrying that is pointless and the raw message is the
+                # same doc link, so translate it here too.
+                if type(e).__name__ in ("DefaultCredentialsError",
+                                        "RefreshError") or (
+                        "default credentials were not found" in msg.lower()):
+                    raise RuntimeError(
+                        adc_remedy(self.project, msg[:120])) from e
                 transient = code in (429, 500, 503) or any(
                     k in msg for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE")
                 )
