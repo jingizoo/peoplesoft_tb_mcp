@@ -46,9 +46,42 @@ from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
 query_catalog = QueryCatalog(engine)
 from .connectors import psquery_api as _qas_mod
-qas = _qas_mod.from_config(
-    cfg, (query_catalog.integration_endpoints() or {})
-    .get('target_location') or '')
+
+
+class _LazyQas:
+    """Resolve the QAS gateway on FIRST USE, never at import.
+
+    This used to call query_catalog.integration_endpoints() in module scope,
+    which put an Oracle round trip on the import path: every consumer of
+    pstb.server — the MCP server, the GUI, the probe, the eval harness —
+    paid it before doing anything, and a failure there took the whole
+    process down rather than one tool. On a real instance it did: the IB
+    catalog's gateway column is not named the same across tools releases,
+    the query raised ORA-00904, and the server never finished starting.
+
+    Discovery is also worthless to the 69 tools that never touch QAS.
+    """
+
+    def __init__(self):
+        self._real = None
+
+    def _resolve(self):
+        if self._real is None:
+            target = ""
+            try:
+                target = ((query_catalog.integration_endpoints() or {})
+                          .get("target_location") or "")
+            except Exception as e:  # discovery is optional, never fatal
+                print(f"[pstb] IB gateway discovery skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+            self._real = _qas_mod.from_config(cfg, target)
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+qas = _LazyQas()
 try:
     wiki = make_wiki(cfg)
 except WikiError as e:

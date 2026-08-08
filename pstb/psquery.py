@@ -219,14 +219,32 @@ class QueryCatalog:
         """
         p = self.db.prefix
         target = None
-        if self._present("PSIBSVCSETUP"):
-            rows, _ = self.db.query(
-                f"SELECT TARGETLOCATION AS loc FROM {p}PSIBSVCSETUP",
-                {}, max_rows=5)
+        # The column name for the gateway URL is NOT stable across tools
+        # releases, and PSIBSVCSETUP existing does not mean it carries the
+        # one we want. Selecting it blind raised ORA-00904 on a real
+        # instance. Ask the catalog which of the known spellings is there
+        # and skip the lookup entirely when none is — this is DISCOVERY,
+        # and a site without it is a site that configures the URL by hand,
+        # not an error.
+        for column in ("TARGETLOCATION", "TARGET_LOCATION", "URL",
+                       "IB_TARGETLOCATION"):
+            if not self.db.has_column("PSIBSVCSETUP", column):
+                continue
+            try:
+                rows, _ = self.db.query(
+                    f"SELECT {column} AS loc FROM {p}PSIBSVCSETUP",
+                    {}, max_rows=5)
+            except DbError:
+                continue
             target = next((str(r["loc"]) for r in rows
                            if str(r.get("loc") or "").strip()), None)
+            if target:
+                break
         operations = []
-        if self._present("PSOPERATION"):
+        if self._present("PSOPERATION") and all(
+                self.db.has_column("PSOPERATION", c) for c in
+                ("IB_OPERATIONNAME", "SERVICE", "DESCR", "OPERTYPE",
+                 "IB_OPERSTATUS")):
             rows, _ = self.db.query(
                 f"SELECT IB_OPERATIONNAME AS op, SERVICE AS service, "
                 f"DESCR AS descr, OPERTYPE AS optype, "
