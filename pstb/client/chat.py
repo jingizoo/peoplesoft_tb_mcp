@@ -27,7 +27,9 @@ from ..guards import (
     POLICY_EVIDENCE_TOOLS,
     ScopeConflict,
     apply_request_scope,
+    attribution_caveat,
     evidence_intent,
+    misattributed_figures,
     wants_all_business_units,
     financial_tool_domains,
     is_policy_tool,
@@ -581,7 +583,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                             out = json.dumps(parsed)
                     except (json.JSONDecodeError, TypeError):
                         pass
-                    turn_payloads.append(out)
+                    # Tagged with the producing tool: the number
+                    # guard asks whether a figure exists, and the
+                    # attribution guard asks which system said so.
+                    turn_payloads.append((call.name, out))
                 results_by_index[index] = ToolResult(
                     call_id=call.id, name=call.name, content=out
                 )
@@ -697,6 +702,23 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                           user_text))
         if caveat:
             answer += "\n\n" + caveat
+
+    # Every figure above is already proven to exist in a tool result. This
+    # asks the next question: WHICH tool. A Coupa commitment quoted as a
+    # ledger balance is grounded and wrong, and a balance typed into a
+    # Confluence page anyone can edit is grounded and worse — wiki passages
+    # are tool payloads like any other.
+    #
+    # A caveat, never a withhold, and not recorded in logged_calls, for the
+    # same two reasons the rate caveat is not: reading prose to decide what
+    # a sentence claimed is arguable, and a healthy turn must not be logged
+    # as a failure.
+    if not gate_replaced_answer:
+        attribution = attribution_caveat(misattributed_figures(
+            answer, list(turn_payloads) + list(prior_payloads or []),
+            intent))
+        if attribution:
+            answer += "\n\n" + attribution
 
     if qlog is not None:
         turn_id = qlog.log_turn(surface=surface, provider=provider.name,

@@ -660,41 +660,218 @@ def _numeric_key(text: str) -> str:
     return ("-" if negative and value else "") + body
 
 
-def payload_numbers(payloads) -> set:
-    """Every number appearing anywhere in this turn's tool results."""
-    found: set = set()
+# ------------------------------------------------------- source attribution
+# The number guard above asks "does this figure exist in a tool result". It
+# does not ask WHICH tool, and that gap is a real one: a Coupa commitment
+# quoted as a general-ledger balance is fully grounded today, and so is a
+# figure typed into a Confluence page an AP clerk can edit, because wiki
+# passages are tool payloads like any other.
+#
+# Both are the same defect — grounding is source-blind — so both are fixed
+# by the same thing: carry the producing tool alongside each number and let
+# a second scanner object when a sentence names one source and the figure
+# came from another.
+#
+# This is a CAVEAT layer, never a withhold. The withhold path deals in
+# figures that exist nowhere, which is unambiguous. Attribution reads
+# English prose to decide what a sentence claimed, and prose is arguable, so
+# the cost of being wrong has to stay at one bracketed clause the reader can
+# dismiss — not a blanked answer.
 
-    def walk(node):
+# Which system's authority a tool's numbers carry. This mapping is a
+# JUDGEMENT and belongs in code review, not in inference: run_sql and
+# run_playbook are peoplesoft_gl because they read the PeopleSoft database
+# THIS deployment points at, and that stops being true the day sources.py
+# aims a named source at some other system. Revisit it then.
+_SOURCE_OF_TOOL = {
+    "peoplesoft_gl": {
+        "get_trial_balance", "get_account_balance", "compare_trial_balance",
+        "rollup_trial_balance", "drill_to_journals", "tb_integrity_check",
+        "run_report", "get_budget_variance", "get_exchange_rate",
+        "get_tree_node_accounts", "search_accounts", "run_sql",
+        "run_playbook",
+    },
+    "peoplesoft_ar": {
+        "get_ar_aging", "get_customer_ar", "get_invoice_totals",
+        "get_top_billing_customers", "get_billing_workbench",
+        "get_dso_trend", "get_cash_outlook", "get_invoice_lifecycle",
+        "get_customer_intelligence", "search_customers",
+    },
+    "peoplesoft_ap": {
+        "get_open_payables", "get_duplicate_payments", "get_vendor_payments",
+        "get_vendor_intelligence", "get_asset_register", "get_project_costs",
+    },
+    "peoplesoft_query": {"run_ps_query"},
+    "coupa": {
+        "get_coupa_invoices", "get_coupa_stuck_approvals", "get_coupa_rni",
+        "get_coupa_supplier_spend", "get_coupa_budget_lines",
+        "coupa_budget_variance", "coupa_to_ap_tie",
+    },
+    "wiki": set(POLICY_EVIDENCE_TOOLS),
+}
+_TOOL_SOURCE = {tool: label
+                for label, tools in _SOURCE_OF_TOOL.items()
+                for tool in tools}
+
+# How each source reads in an answer, for the caveat text.
+SOURCE_LABELS = {
+    "peoplesoft_gl": "the PeopleSoft general ledger",
+    "peoplesoft_ar": "PeopleSoft receivables and billing",
+    "peoplesoft_ap": "PeopleSoft payables",
+    "peoplesoft_query": "an existing PeopleSoft query (QAS)",
+    "coupa": "Coupa procurement",
+    "wiki": "a policy wiki page",
+}
+
+# Prose that CLAIMS a source. Deliberately narrow: a phrase earns a place
+# here only if a finance reader would take it as naming where the number
+# came from. "the ledger shows" does; "spend" alone does not.
+#
+# There is deliberately NO wiki entry. "policy" and "threshold" are the only
+# candidate words and they are far too weak — "the balance is within policy
+# at 18,432.75" names no source at all, and reading it as a wiki claim
+# flagged a correct ledger figure. The wiki boundary is enforced by rule A
+# instead, which needs no prose.
+_SOURCE_MENTION = (
+    ("peoplesoft_gl", re.compile(
+        r"(?i)\b(?:general ledger|the ledger|trial balance|GL balance|"
+        r"in the GL|PS_LEDGER|the books|posted (?:to|in) the ledger)\b")),
+    ("coupa", re.compile(
+        r"(?i)\b(?:coupa|procurement|purchase order|requisition|"
+        r"commitment[s]?|encumbrance)\b")),
+    ("peoplesoft_query", re.compile(
+        r"(?i)\b(?:PSQuery|PS Query|Query Access Service|\bQAS\b)\b")),
+)
+
+# A source that may state a POLICY but never a ledger amount. This is the
+# trust boundary: a Confluence page is editable by anyone with the link, so
+# a balance typed into one is an assertion, not a measurement.
+UNTRUSTED_FOR_AMOUNTS = {"wiki"}
+
+# Supplying thresholds is the wiki's JOB, so rule A has to tell a policy
+# limit from a balance. It reads the words around the figure, and when they
+# are ambiguous it stays silent: a caveat on "the threshold is 5,000.00" is
+# not a smaller mistake than missing one, it is the mistake that teaches
+# people to ignore the caveat that mattered.
+_POLICY_CUE = re.compile(
+    r"(?i)\b(?:threshold|limit|maximum|minimum|cap|tolerance|materiality|"
+    r"policy|policies|allowed|permitted|exceed|exceeds|exceeding|"
+    r"requires?|required|requirement|at least|no more than|up to|"
+    r"greater than|less than|above|below|within)\b")
+_MEASURED_CUE = re.compile(
+    r"(?i)\b(?:balance|balances|total|totals|totall?ing|sum|amount|"
+    r"outstanding|owed|owe|spend|spent|actual|actuals|posted|booked|"
+    r"shows?|showing|reported|reports|stands? at|came to|"
+    r"as of)\b")
+_CUE_WINDOW = 45
+
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _nearest_cue(pattern, before: str, after: str) -> int:
+    """Characters from the figure to the closest cue on either side."""
+    best = _CUE_WINDOW + 1
+    for match in pattern.finditer(before):
+        best = min(best, len(before) - match.end())
+    for match in pattern.finditer(after):
+        best = min(best, match.start())
+    return best
+
+
+def _reads_as_policy_value(sentence: str, start: int, end: int) -> bool:
+    """Is this figure presented as a policy LIMIT rather than a measured
+    amount?
+
+    The NEAREST cue wins. A fixed window scored by presence alone cannot
+    read "the balance is 0.00, which is within the 5,000.00 threshold" —
+    one clause reaches into the other's window and both figures come out
+    the same. Distance separates them: "balance" is four characters from
+    the 0.00, "threshold" is one from the 5,000.00.
+
+    Ties and figures with no cue at all count as policy, so rule A only
+    fires on an unambiguous balance claim. A caveat on a correctly quoted
+    threshold is not a smaller mistake than missing one — it is the mistake
+    that teaches people to ignore the caveat that mattered.
+    """
+    before = sentence[max(0, start - _CUE_WINDOW):start]
+    after = sentence[end:end + _CUE_WINDOW]
+    return (_nearest_cue(_MEASURED_CUE, before, after)
+            >= _nearest_cue(_POLICY_CUE, before, after))
+
+
+def source_of_tool(tool_name: str) -> str:
+    """Which system a tool's numbers come from. "" when unclassified, and
+    unclassified numbers are never a finding."""
+    return _TOOL_SOURCE.get((tool_name or "").strip(), "")
+
+
+def untag_payload(raw) -> tuple:
+    """Split a turn payload into (tool_name, payload).
+
+    Every guard that walks payloads goes through here, because they do NOT
+    all walk alike — payload_rates looks for percent-named KEYS and would
+    silently find none inside an untupled pair, turning a declared rate into
+    a caveat. One unwrapper means adding a consumer cannot reintroduce that.
+    """
+    if isinstance(raw, tuple) and len(raw) == 2 and isinstance(raw[0], str):
+        return raw[0], raw[1]
+    return "", raw
+
+
+def tagged_payload_numbers(payloads) -> dict:
+    """Every number in this turn's results, mapped to the SOURCES that
+    produced it.
+
+    Same single traversal as the untagged form — a dict insert instead of a
+    set insert — so this costs nothing at turn time.
+
+    Accepts two element shapes on purpose. A bare payload (str or already
+    parsed) carries no source and lands under "", which every consumer
+    treats as "unknown, never a finding". A ``(tool_name, payload)`` pair
+    carries one. Both shapes have to work: the GUI holds prior payloads in
+    memory for 1800s, so a worker replaced mid-deploy will read tuples
+    written by its predecessor and bare strings written before the upgrade.
+    """
+    found: dict = {}
+
+    def add(key: str, label: str) -> None:
+        found.setdefault(key, set()).add(label)
+
+    def walk(node, label):
         if isinstance(node, dict):
             for value in node.values():
-                walk(value)
+                walk(value, label)
         elif isinstance(node, (list, tuple)):
             for value in node:
-                walk(value)
+                walk(value, label)
         elif isinstance(node, bool):
             return
         elif isinstance(node, (int, float)):
-            found.add(_numeric_key(str(node)))
+            add(_numeric_key(str(node)), label)
         elif isinstance(node, str):
             for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", node):
-                found.add(_numeric_key(match))
+                add(_numeric_key(match), label)
 
     for raw in payloads or []:
+        tool, raw = untag_payload(raw)
+        label = source_of_tool(tool)
         if isinstance(raw, str):
             try:
-                walk(json.loads(raw))
+                walk(json.loads(raw), label)
             except (json.JSONDecodeError, TypeError):
                 for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", raw):
-                    found.add(_numeric_key(match))
+                    add(_numeric_key(match), label)
         else:
-            walk(raw)
+            walk(raw, label)
     # Ground unit-scaled RESTATEMENTS of payload figures. "$4.55M" for a
     # payload 4,548,123.45 is the same fact at a coarser unit, not an
     # invented number — and withholding a correct aging answer over it
     # taught the user that nothing works. For every payload figure large
     # enough to restate, the thousand/million/billion forms at one and two
-    # decimals are grounded too.
-    for key in list(found):
+    # decimals are grounded too. The restatement inherits the SOURCES of the
+    # figure it restates, or "$4.5M" would lose the provenance of the
+    # 4,548,123.45 that justifies it.
+    for key, labels in list(found.items()):
         try:
             value = float(key)
         except ValueError:
@@ -702,8 +879,20 @@ def payload_numbers(payloads) -> set:
         for divisor in (1e3, 1e6, 1e9):
             if abs(value) >= divisor:
                 for digits in (0, 1, 2):
-                    found.add(_numeric_key(str(round(value / divisor, digits))))
+                    restated = _numeric_key(str(round(value / divisor,
+                                                      digits)))
+                    found.setdefault(restated, set()).update(labels)
     return found
+
+
+def payload_numbers(payloads) -> set:
+    """Every number appearing anywhere in this turn's tool results.
+
+    Kept as the untagged view over the same walk. Six test modules and the
+    smoke suite call this with plain lists of JSON strings and assert on the
+    set it returns; provenance is additive, not a migration.
+    """
+    return set(tagged_payload_numbers(payloads))
 
 
 def ungrounded_figures(answer: str, payloads) -> list:
@@ -756,6 +945,134 @@ def _is_number(text: str) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _labels_for(text: str, tagged: dict) -> set:
+    """Sources that produced this figure, tolerating the same rounded
+    restatement the withhold guard tolerates. Empty means the figure is not
+    in any payload — that is the withhold guard's business, not ours."""
+    key = _numeric_key(text)
+    if key in tagged:
+        return tagged[key]
+    unsigned = key.lstrip("-")
+    labels: set = set()
+    for grounded, sources in tagged.items():
+        if grounded.lstrip("-") == unsigned:
+            labels |= sources
+    if labels:
+        return labels
+    try:
+        stated = float(text.replace(",", ""))
+    except ValueError:
+        return set()
+    decimals = len(text.split(".")[1]) if "." in text else 0
+    for grounded, sources in tagged.items():
+        if not _is_number(grounded):
+            continue
+        if round(abs(float(grounded)), decimals) == round(abs(stated),
+                                                          decimals):
+            labels |= sources
+    return labels
+
+
+def misattributed_figures(answer: str, payloads, intent: str = "") -> list:
+    """Figures whose stated source is not the source that produced them.
+
+    Two rules, and the split is deliberate.
+
+    RULE A is mechanical and does not read prose at all: on a question that
+    wants data, a figure carried ONLY by a wiki passage is flagged. A
+    Confluence page is editable by anyone in the building, so a balance
+    typed into one is somebody's assertion — and today it grounds exactly
+    like a number the ledger engine computed. This rule fires on the source
+    set alone, so it is reproducible regardless of how the model phrases
+    the sentence around it.
+
+    RULE B reads prose: in a sentence that names exactly one source, a
+    figure from a different source is flagged. This one is a heuristic, so
+    it is fenced — one named source per sentence, labels are unioned so a
+    value both systems carry never fires, and an unclassified figure is
+    skipped. Its output is a caveat; being wrong costs a clause.
+    """
+    if not answer:
+        return []
+    tagged = tagged_payload_numbers(payloads)
+    if not tagged:
+        return []
+    exempt = [m.span() for m in _FIGURE_EXEMPT.finditer(answer)]
+    findings: list = []
+    seen: set = set()
+    wants_data = intent in ("data", "mixed")
+
+    offset = 0
+    for sentence in _SENTENCE.split(answer):
+        start = answer.find(sentence, offset)
+        start = offset if start < 0 else start
+        offset = start + len(sentence)
+        claimed = {label for label, pattern in _SOURCE_MENTION
+                   if pattern.search(sentence)}
+        for match in _FIGURE.finditer(sentence):
+            span = (start + match.start(), start + match.end())
+            if any(a <= span[0] and span[1] <= b for a, b in exempt):
+                continue
+            text = match.group(0)
+            if text in seen:
+                continue
+            labels = {l for l in _labels_for(text, tagged) if l}
+            if not labels:
+                continue
+            # Rule A — a BALANCE only a wiki page carries. A threshold only
+            # a wiki page carries is the wiki doing its job.
+            if wants_data and labels <= UNTRUSTED_FOR_AMOUNTS:
+                if _reads_as_policy_value(sentence, match.start(),
+                                          match.end()):
+                    continue
+                seen.add(text)
+                findings.append({"figure": text, "rule": "untrusted_source",
+                                 "actual": sorted(labels), "claimed": ""})
+                continue
+            # Rule B — the sentence named one source, the figure came from
+            # another.
+            if len(claimed) == 1:
+                (claim,) = tuple(claimed)
+                if claim not in labels:
+                    seen.add(text)
+                    findings.append({"figure": text, "rule": "cross_source",
+                                     "actual": sorted(labels),
+                                     "claimed": claim})
+    return findings
+
+
+def attribution_caveat(findings) -> str:
+    """One bracketed clause naming where the figures actually came from.
+
+    One clause, never several — the same restraint as rate_caveat, for the
+    same reason: a stack of warnings teaches the reader to skip all of them.
+    """
+    if not findings:
+        return ""
+
+    def phrase(labels) -> str:
+        named = [SOURCE_LABELS.get(l, l) for l in labels]
+        if len(named) == 1:
+            return named[0]
+        return ", ".join(named[:-1]) + " and " + named[-1]
+
+    parts: list = []
+    untrusted = [f for f in findings if f["rule"] == "untrusted_source"]
+    if untrusted:
+        listed = ", ".join(f["figure"] for f in untrusted[:3])
+        more = " and others" if len(untrusted) > 3 else ""
+        parts.append(
+            f"{listed}{more} " + ("is" if len(untrusted) == 1 else "are")
+            + " text from a policy wiki page, which colleagues can edit — "
+              "not a figure any PeopleSoft query returned. Wiki pages carry "
+              "policy and thresholds; balances come from the ledger.")
+    for finding in [f for f in findings if f["rule"] == "cross_source"][:3]:
+        parts.append(
+            f"{finding['figure']} came from {phrase(finding['actual'])}, "
+            f"not from {SOURCE_LABELS.get(finding['claimed'], finding['claimed'])}.")
+    return "[Attribution: " + " ".join(parts) + "]"
 
 
 # ------------------------------------------------------------ rate grounding
@@ -878,6 +1195,7 @@ def payload_rates(payloads, question: str = "") -> dict:
                 walk(value)
 
     for raw in payloads or []:
+        _, raw = untag_payload(raw)
         if isinstance(raw, str):
             try:
                 walk(json.loads(raw))

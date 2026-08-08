@@ -158,6 +158,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .csvbtn:hover:not(:disabled){color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
 .csvbtn:disabled{opacity:.7;cursor:default}
 .fig{border-bottom:1px dashed var(--accent);cursor:pointer;font-variant-numeric:tabular-nums}
+.fig-multi{border-bottom-style:double}
 .fig:hover{background:var(--accent-soft)}
 .trail{font-size:11px;color:var(--muted);margin:2px 0 8px}
 .msg.bot .ans-h{font-weight:700;margin:8px 0 2px}
@@ -649,12 +650,21 @@ function collectNums(o,set){
   else if(typeof o==='string'&&/^-?\d+(\.\d+)?$/.test(o)){ set.add(parseFloat(o)); }
 }
 function buildFigureIndex(cardMeta){
-  // key -> {id, tool}; first source wins, incl. K/M/B restatement keys
+  // key -> [{id, tool}, ...], incl. K/M/B restatement keys.
+  // EVERY source, not the first: when two systems carry the same value —
+  // a Coupa commitment and a ledger balance that agree — picking one
+  // arbitrarily sends the reader to a card that did not produce the number
+  // they clicked. The tooltip says so instead.
   const map=new Map();
   for(const c of cardMeta){
     const nums=new Set(); collectNums(c.result,nums);
     for(const v of nums){
-      const reg=k=>{ if(k!==null&&!map.has(k)) map.set(k,c); };
+      const reg=k=>{
+        if(k===null) return;
+        const at=map.get(k);
+        if(!at) map.set(k,[c]);
+        else if(!at.some(x=>x.id===c.id)) at.push(c);
+      };
       reg(figKey(v));
       const a=Math.abs(v);
       [[1e3,'K'],[1e6,'M'],[1e9,'B']].forEach(([div,suf])=>{
@@ -677,11 +687,15 @@ function linkFigures(html,map){
       if(!suf&&!num.includes('.')&&!num.includes(',')&&Math.abs(raw)<1000) return all;
       if(!suf&&/^\d{4}$/.test(num)&&raw>=1990&&raw<=2100) return all;
       const key=suf?figKey(raw)+suf.toUpperCase():figKey(raw);
-      const src=map.get(key);
-      if(!src) return all;
-      return pre+'<span class="fig" data-card="'+src.id+
-        '" title="from '+esc(src.tool)+' \u2014 click to open the source">'+
-        num+suf+'</span>';
+      const at=map.get(key);
+      if(!at||!at.length) return all;
+      const src=at[0];
+      const title=at.length===1
+        ? 'from '+esc(at[0].tool)+' \u2014 click to open the source'
+        : 'from '+at.length+' sources: '+at.map(x=>esc(x.tool)).join(', ')
+          +' \u2014 click to open the first';
+      return pre+'<span class="fig'+(at.length>1?' fig-multi':'')+
+        '" data-card="'+src.id+'" title="'+title+'">'+num+suf+'</span>';
     });
 }
 

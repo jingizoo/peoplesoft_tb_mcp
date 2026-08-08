@@ -145,8 +145,11 @@ class _ProviderSession:
     provider: object
     touched: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # Recent tool payloads, so a follow-up turn's restated figures ground
-    # against what this conversation already fetched.
+    # Recent tool payloads as (tool_name, payload) pairs, so a follow-up
+    # turn's restated figures ground against what this conversation already
+    # fetched — and against the SYSTEM that produced them. The guard walk
+    # also accepts a bare payload, which is what a worker replaced
+    # mid-deploy will read from its predecessor's 1800s-TTL session.
     payloads: list = field(default_factory=list)
 
 
@@ -1206,7 +1209,7 @@ async def chat(payload: dict):
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
                 if ok and isinstance(out, str):
-                    provider_entry.payloads.append(out)
+                    provider_entry.payloads.append((name, out))
                     del provider_entry.payloads[:-12]
                 observe_tool(name, args, out, ms, ok)
 
