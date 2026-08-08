@@ -34,6 +34,7 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+from .connectors import ConnectorError
 from .connectors import coupa as _coupa_mod
 coupa = _coupa_mod.from_env()
 playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
@@ -66,7 +67,11 @@ def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
-            PlaybookError, MemoryError_, ModuleError) as e:
+            PlaybookError, MemoryError_, ModuleError, ConnectorError) as e:
+        # These carry a remedy written for the reader. Passing the message
+        # through UNPREFIXED is the point: "ConnectorError: check
+        # PSFT_QAS_NODE" reads as a crash, "check PSFT_QAS_NODE" reads as
+        # an instruction.
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}

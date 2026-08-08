@@ -120,5 +120,106 @@ class GatewayDiscoveryTests(unittest.TestCase):
                          "execution must stay off until explicitly enabled")
 
 
+class FailureRemedyTests(unittest.TestCase):
+    """A failed API call must leave the operator knowing what to check and
+    the USER still able to get an answer. 'HTTP 404' satisfies neither."""
+
+    def _fail(self, status, **kw):
+        q = QasConnector("https://ps.example/PSIGW/RESTListeningConnector",
+                         user="QASUSER", password="s3cret",
+                         transport=lambda m, u, h, b=None, timeout=30:
+                             (status, ""), **kw)
+        with self.assertRaises(ConnectorError) as ctx:
+            q.execute("AP_AGING_BY_VENDOR")
+        return str(ctx.exception)
+
+    def test_401_names_the_credentials_this_connector_actually_reads(self):
+        msg = self._fail(401)
+        self.assertIn("PSFT_QAS_USER", msg)
+        self.assertIn("PSFT_QAS_PASSWORD", msg)
+        self.assertNotIn("client id", msg,
+                         "the inherited message sends an operator hunting "
+                         "for settings this connector never reads")
+        self.assertIn("permission list", msg,
+                       "right password + wrong permission list is the "
+                       "second-likeliest cause and must be named")
+
+    def test_404_names_all_three_usual_causes(self):
+        msg = self._fail(404)
+        self.assertIn("PSFT_QAS_NODE", msg)
+        self.assertIn("REST listening connector", msg)
+        self.assertIn("search_ps_queries", msg)
+
+    def test_service_down_is_distinguished_from_a_bad_request(self):
+        self.assertIn("unavailable", self._fail(503))
+
+    def test_every_failure_says_the_curated_tools_still_work(self):
+        for status in (401, 404, 503):
+            self.assertIn("curated database tools", self._fail(status),
+                          f"HTTP {status} must not read as 'the product is "
+                          "down' — the database path is independent")
+
+    def test_a_credential_never_leaks_into_a_failure_message(self):
+        for status in (401, 404, 500):
+            self.assertNotIn("s3cret", self._fail(status))
+
+    def test_the_configured_timeout_reaches_the_socket(self):
+        seen = {}
+
+        def spy(m, u, h, b=None, timeout=30):
+            seen["timeout"] = timeout
+            return (200, '{"data": {"rows": []}}')
+
+        QasConnector("https://x", user="u", timeout_seconds=120,
+                     transport=spy).execute("Q")
+        self.assertEqual(seen["timeout"], 120,
+                         "a configured timeout that never reaches the "
+                         "socket is a lie discovered only under load")
+
+    def test_unreachable_host_names_what_to_check(self):
+        def refused(m, u, h, b=None, timeout=30):
+            raise ConnectionRefusedError("refused")
+
+        q = QasConnector("https://ps.example/PSIGW/RESTListeningConnector",
+                         user="u", transport=refused)
+        with self.assertRaises(ConnectorError) as ctx:
+            q.execute("AP_AGING_BY_VENDOR")
+        msg = str(ctx.exception)
+        self.assertIn("unreachable", msg)
+        self.assertIn("network access", msg)
+
+
+class DegradedModeTests(unittest.TestCase):
+    """The REST service is the OPTIONAL path. When it is down the product
+    must degrade to the curated database tools, not fail the turn."""
+
+    def test_a_connector_failure_reaches_the_caller_as_a_remedy(self) -> None:
+        # Not as "ConnectorError: ...". The prefix reads as a crash and
+        # buries the sentence that tells the operator what to fix.
+        from pstb import server
+
+        def dead(*a, **kw):
+            raise ConnectorError("The Query Access Service is unavailable "
+                                 "(HTTP 503).")
+
+        out = server._safe(dead)
+        self.assertEqual(out["error"],
+                         "The Query Access Service is unavailable (HTTP 503).")
+        self.assertNotIn("ConnectorError", out["error"])
+
+    def test_the_database_path_does_not_share_the_rest_dependency(self) -> None:
+        # Structural, not behavioural: if a curated tool ever imported the
+        # QAS connector, a dead gateway would take the whole product down.
+        import inspect
+
+        from pstb import engine
+        for mod in (engine, ):
+            src = inspect.getsource(mod)
+            self.assertNotIn("psquery_api", src,
+                             f"{mod.__name__} must not depend on the REST "
+                             "connector — the database answer has to survive "
+                             "a dead gateway")
+
+
 if __name__ == "__main__":
     unittest.main()
