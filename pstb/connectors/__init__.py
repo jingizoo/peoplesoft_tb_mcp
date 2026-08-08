@@ -70,11 +70,12 @@ class FixtureTransport:
 
 
 def _urllib_transport(method: str, url: str, headers: dict,
-                      body: Optional[bytes] = None) -> tuple[int, str]:
+                      body: Optional[bytes] = None,
+                      timeout: int = 30) -> tuple[int, str]:
     req = urllib.request.Request(url, data=body, method=method,
                                  headers=headers)
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         return resp.status, resp.read().decode("utf-8", "replace")
 
 
@@ -96,6 +97,10 @@ class RestConnector:
         self._token_path = token_path
         self._scope = scope
         self.cache_ttl = cache_ttl
+        # A configured timeout that never reaches the socket is a lie the
+        # operator only discovers under load: a site setting 120s for a
+        # heavy query was still cut off at the transport default.
+        self.timeout_seconds = 30
         self.transport = transport or _urllib_transport
         self.mode = "fixtures" if isinstance(transport, FixtureTransport) \
             else "live"
@@ -138,7 +143,13 @@ class RestConnector:
             if auth:
                 hdr.update(auth)
         try:
-            status, text = self.transport(method, url, hdr, body)
+            try:
+                status, text = self.transport(
+                    method, url, hdr, body,
+                    timeout=int(getattr(self, "timeout_seconds", 30) or 30))
+            except TypeError:
+                # Fixture and test transports take four arguments.
+                status, text = self.transport(method, url, hdr, body)
         except ConnectorError:
             raise
         except Exception as e:  # timeouts, DNS, TLS — name the remedy
@@ -147,19 +158,14 @@ class RestConnector:
                 'URL configured)'}: {type(e).__name__}. Check the URL, "
                 "network access from this host, and the service status.")
         if status in (401, 403):
-            raise ConnectorError(
-                f"{self.name} rejected the credentials (HTTP {status}). "
-                "Check the client id/secret or API key in .env — values are "
-                "never logged, so re-enter them rather than hunting logs.")
+            raise ConnectorError(self.auth_failure_remedy(status))
         if status == 429:
             raise ConnectorError(
                 f"{self.name} rate-limited this client (HTTP 429). The "
                 "connector caches for {ttl}s — retry shortly."
                 .replace("{ttl}", str(self.cache_ttl)))
         if status >= 400:
-            raise ConnectorError(
-                f"{self.name} returned HTTP {status} for "
-                f"{url.split('?')[0]}.")
+            raise ConnectorError(self.http_failure_remedy(status, url))
         return status, text
 
     def _auth_header(self) -> dict:
@@ -190,6 +196,17 @@ class RestConnector:
                 "client-credentials grant.")
         self._token = (time.monotonic() + max(ttl - 60, 60), tok)
         return {"Authorization": f"Bearer {tok}"}
+
+    # A generic HTTP code is not a remedy. Connectors override these to
+    # say what to check AT THIS SERVICE, because "HTTP 404" sends an
+    # operator hunting while the real cause has a name.
+    def auth_failure_remedy(self, status: int) -> str:
+        return (f"{self.name} rejected the credentials (HTTP {status}). "
+                "Check the client id/secret or API key in .env — values are "
+                "never logged, so re-enter them rather than hunting logs.")
+
+    def http_failure_remedy(self, status: int, url: str) -> str:
+        return f"{self.name} returned HTTP {status} for {url.split('?')[0]}."
 
     # ---------------------------------------------------------------- health
     def health(self) -> dict:

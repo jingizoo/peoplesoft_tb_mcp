@@ -75,6 +75,47 @@ class QasConnector(RestConnector):
         self.timeout_seconds = int(timeout_seconds or 60)
         self.max_rows = int(max_rows or 5000)
 
+    def auth_failure_remedy(self, status: int) -> str:
+        """Name the RIGHT credentials. The inherited message talks about
+        client ids and API keys, which do not exist here — an operator
+        following it would search .env for settings this connector never
+        reads."""
+        return (
+            f"PeopleSoft rejected the Query Access Service credentials "
+            f"(HTTP {status}) for user "
+            f"{self._user or '(none configured)'!r}. Check PSFT_QAS_USER "
+            "and PSFT_QAS_PASSWORD in .env (values are never logged — "
+            "re-enter rather than hunting them). If the credentials are "
+            "right, the user may lack the QAS web-service permission list "
+            "or access to this query: both are PeopleSoft security "
+            "settings, not settings here. The curated database tools are "
+            "unaffected and still answer.")
+
+    def http_failure_remedy(self, status: int, url: str) -> str:
+        """404 is the likeliest first-connection failure, and 'HTTP 404'
+        alone tells an operator nothing about which of three causes it
+        is."""
+        if status == 404:
+            return (
+                f"The Query Access Service returned HTTP 404 at "
+                f"{url.split('?')[0]}. Three usual causes, in order: the "
+                f"node name is wrong (this call used {self.node!r} — sites "
+                "commonly use PSFT_FS, PSFT_HR or a custom node; set "
+                "PSFT_QAS_NODE in .env); the REST listening connector is "
+                "not enabled on the gateway; or the query name does not "
+                "exist as a PUBLIC query — confirm it with "
+                "search_ps_queries. The curated database tools are "
+                "unaffected and still answer.")
+        if status in (500, 502, 503, 504):
+            return (
+                f"The Query Access Service is unavailable (HTTP {status}). "
+                "The gateway answered but the service did not — usually "
+                "the app server or the IB domain is down or recycling. "
+                "This does not affect the curated database tools, which "
+                "read the database directly.")
+        return (f"The Query Access Service returned HTTP {status} for "
+                f"{url.split('?')[0]}.")
+
     def _auth_header(self) -> dict:
         """PeopleSoft REST uses basic auth. Built here rather than stored,
         so the credential never sits on the instance as a header string."""
