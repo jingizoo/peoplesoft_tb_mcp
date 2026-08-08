@@ -185,7 +185,7 @@ def _call_filtered(fn: Callable, args: dict, extra: dict) -> Any:
 
 
 def build_registry(engine=None, ar=None, modules=None, report_runner=None,
-                   coupa=None) -> dict[str, Callable]:
+                   coupa=None, qas=None) -> dict[str, Callable]:
     """tool name -> (args, row_cap) -> full payload.
 
     Only tools that can return MORE rows when asked need an entry; the
@@ -243,6 +243,9 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
     if report_runner is not None:
         reg["run_report"] = lambda a, cap: _call_filtered(
             report_runner.run, a, {})
+    if qas is not None:
+        reg["run_ps_query"] = lambda a, cap: _call_filtered(
+            qas.execute, a, {"max_rows": cap})
     if coupa is not None:
         reg["get_coupa_invoices"] = lambda a, cap: _call_filtered(
             coupa.invoices, a, {"max_rows": cap})

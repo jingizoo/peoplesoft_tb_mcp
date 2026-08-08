@@ -63,6 +63,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "run_sql",
     "run_playbook",
     "get_budget_variance",
+    "run_ps_query",
     "coupa_budget_variance",
     "get_coupa_budget_lines",
     "get_invoice_lifecycle",
@@ -283,6 +284,8 @@ _TOOL_DOMAINS = {
     # safety net — a false refusal costs the user the answer a tool just
     # produced; a false accept only means the model routed oddly and the
     # number guard still checks every figure.
+    "run_ps_query": {"balance", "report", "ar", "ap", "billing",
+                     "journal", "variance", "customer"},
     "get_budget_variance": {"balance", "report", "variance"},
     "coupa_budget_variance": {"balance", "report", "variance", "ap"},
     "get_coupa_budget_lines": {"report", "ap"},

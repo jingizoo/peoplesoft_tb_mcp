@@ -803,6 +803,17 @@ def export_csv(payload: dict):
     """
     from .. import export as _export
     from ..connectors import coupa as _coupa_mod
+    from ..connectors import psquery_api as _qas_mod
+    from ..psquery import QueryCatalog
+
+    def _qas_from_config():
+        try:
+            target = (QueryCatalog(engine).integration_endpoints()
+                      or {}).get("target_location") or ""
+        except Exception:
+            target = ""
+        return _qas_mod.from_config(cfg, target)
+
     from ..modules import ModulePacks
 
     body = payload or {}
@@ -811,7 +822,8 @@ def export_csv(payload: dict):
         raise HTTPException(status_code=400, detail="tool is required")
     registry = _export.build_registry(
         engine=engine, ar=ar, modules=ModulePacks(engine),
-        report_runner=report_runner, coupa=_coupa_mod.from_env())
+        report_runner=report_runner, coupa=_coupa_mod.from_env(),
+        qas=_qas_from_config())
     out = _guard(_export.export, tool=tool, args=body.get("args") or {},
                  registry=registry, payload=body.get("result"))
     return Response(
