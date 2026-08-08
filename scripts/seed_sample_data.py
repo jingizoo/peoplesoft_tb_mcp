@@ -325,6 +325,27 @@ CREATE TABLE PS_PYMNT_VCHR_XREF (
 CREATE TABLE PSRECDEFN (
   RECNAME TEXT, RECDESCR TEXT, RECTYPE INTEGER, SQLTABLENAME TEXT);
 CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
+-- PeopleTools QUERY catalog. Real shape (abridged): PSQRYDEFN holds the
+-- definition and its owner (OPRID blank = public), PSQRYBIND the runtime
+-- prompts, PSQRYRECORD which records it reads. Discovery of existing
+-- queries is therefore plain SQL — no gateway, no credentials.
+CREATE TABLE PSQRYDEFN (
+  OPRID TEXT, QRYNAME TEXT, QRYTYPE INTEGER, DESCR TEXT,
+  LASTUPDDTTM TEXT, LASTUPDOPRID TEXT, QRYRUNCNT INTEGER);
+CREATE TABLE PSQRYBIND (
+  OPRID TEXT, QRYNAME TEXT, BNDNUM INTEGER, BNDNAME TEXT,
+  BNDDESCR TEXT, FIELDTYPE INTEGER, EDITTYPE INTEGER);
+CREATE TABLE PSQRYRECORD (
+  OPRID TEXT, QRYNAME TEXT, SELNUM INTEGER, RECNAME TEXT, CORRNAME TEXT);
+-- Integration Broker catalog: the target location a site publishes its
+-- services at, plus the service operations that exist. Discovering the
+-- gateway from here is what keeps a site's URL out of our config.
+CREATE TABLE PSIBSVCSETUP (
+  IB_SERVICENAMESPC TEXT, IB_SCHEMANAMESPC TEXT, TARGETLOCATION TEXT);
+CREATE TABLE PSSERVICE (SERVICE TEXT, DESCR TEXT, SERVICEALIAS TEXT);
+CREATE TABLE PSOPERATION (
+  IB_OPERATIONNAME TEXT, SERVICE TEXT, DESCR TEXT, OPERTYPE TEXT,
+  IB_OPERSTATUS TEXT);
 CREATE TABLE PS_LED_GRP_TBL (LEDGER_GROUP TEXT, LEDGER TEXT, DESCR TEXT);
 CREATE TABLE PS_SET_CNTRL_REC (SETCNTRLVALUE TEXT, RECNAME TEXT, SETID TEXT);
 CREATE TABLE PS_CAL_DETP_TBL (
@@ -493,6 +514,78 @@ def main() -> None:
         ("PROJ_RESOURCE", "Project Cost Transactions", 0, ""),
     ]
     con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
+
+    # Existing PSQueries — the institutional knowledge worth reusing. Two
+    # public finance queries with prompts, one private (OPRID set) that
+    # discovery must label, and one high-run-count query so "what does the
+    # business actually run" is answerable.
+    con.executemany(
+        "INSERT INTO PSQRYDEFN VALUES (?,?,?,?,?,?,?)",
+        [
+            ("", "GL_TB_BY_DEPT", 1,
+             "Trial balance by department and account",
+             "2026-05-14", "JSMITH", 412),
+            ("", "AP_AGING_BY_VENDOR", 1,
+             "Open payables aged by vendor with due dates",
+             "2026-06-02", "MRAO", 1180),
+            ("", "BI_INVOICE_REGISTER", 1,
+             "Finalized invoice register for a period",
+             "2026-04-28", "JSMITH", 96),
+            ("MRAO", "MY_ADHOC_SPEND", 1,
+             "Personal ad-hoc spend extract",
+             "2026-07-30", "MRAO", 3),
+        ])
+    con.executemany(
+        "INSERT INTO PSQRYBIND VALUES (?,?,?,?,?,?,?)",
+        [
+            ("", "GL_TB_BY_DEPT", 1, "BIND1", "Business Unit", 0, 1),
+            ("", "GL_TB_BY_DEPT", 2, "BIND2", "Fiscal Year", 1, 0),
+            ("", "GL_TB_BY_DEPT", 3, "BIND3", "Accounting Period", 1, 0),
+            ("", "AP_AGING_BY_VENDOR", 1, "BIND1", "Business Unit", 0, 1),
+            ("", "AP_AGING_BY_VENDOR", 2, "BIND2", "As Of Date", 4, 0),
+            ("", "BI_INVOICE_REGISTER", 1, "BIND1", "Business Unit", 0, 1),
+            ("", "BI_INVOICE_REGISTER", 2, "BIND2", "Invoice Date From",
+             4, 0),
+            ("", "BI_INVOICE_REGISTER", 3, "BIND3", "Invoice Date To", 4, 0),
+        ])
+    con.executemany(
+        "INSERT INTO PSQRYRECORD VALUES (?,?,?,?,?)",
+        [
+            ("", "GL_TB_BY_DEPT", 1, "LEDGER", "A"),
+            ("", "GL_TB_BY_DEPT", 2, "GL_ACCOUNT_TBL", "B"),
+            ("", "AP_AGING_BY_VENDOR", 1, "VOUCHER", "A"),
+            ("", "AP_AGING_BY_VENDOR", 2, "VENDOR", "B"),
+            ("", "BI_INVOICE_REGISTER", 1, "BI_HDR", "A"),
+            ("MRAO", "MY_ADHOC_SPEND", 1, "VOUCHER", "A"),
+        ])
+
+    # Integration Broker: the site's published target location and the
+    # Query Access Service operations. Note the write-capable operation —
+    # discovery must SEE it and invocation must still refuse it.
+    con.execute("INSERT INTO PSIBSVCSETUP VALUES (?,?,?)",
+                ("http://xmlns.oracle.com/Enterprise/Tools/services", "",
+                 "http://dc15-pserp-dv-rp01.example:8016/PSIGW/"
+                 "PeopleSoftServiceListeningConnector"))
+    con.executemany(
+        "INSERT INTO PSSERVICE VALUES (?,?,?)",
+        [("QAS", "Query Access Service", "QAS"),
+         ("PT_QRY", "Query Manager Service", "PT_QRY"),
+         ("VOUCHER_BUILD", "Voucher Build Service", "VCHR")])
+    con.executemany(
+        "INSERT INTO PSOPERATION VALUES (?,?,?,?,?)",
+        [
+            ("QAS_LISTQUERIES", "QAS", "List available queries",
+             "Synchronous", "A"),
+            ("QAS_GETQUERYPROPERTIES", "QAS",
+             "Query prompts and result fields", "Synchronous", "A"),
+            ("QAS_EXECUTEQUERY", "QAS", "Execute a query and return rows",
+             "Synchronous", "A"),
+            ("QAS_EXECUTENONBLOCKING", "QAS",
+             "Execute a long-running query asynchronously",
+             "Asynchronous", "A"),
+            ("VOUCHER_LOAD", "VOUCHER_BUILD",
+             "Create vouchers from staged data", "Asynchronous", "A"),
+        ])
     con.executemany(
         "INSERT INTO PS_VENDOR VALUES (?,?,?,?)",
         [(SETID, "V1001", "Ridgeline Supply Co", "A"),
