@@ -130,6 +130,7 @@ def register(app, get_cfg, on_reload) -> None:
                               "server answers only to a caller on this "
                               "machine.")},
             "settings": st.current(cfg),
+            "env_settings": st.read_env_values(env_path),
             "secrets": st.which_secrets_are_set(env_path),
             "env_private": st.file_is_private(env_path),
             "overlay": {"path": st.OVERLAY_NAME, "exists": overlay.exists()},
@@ -231,6 +232,20 @@ def register(app, get_cfg, on_reload) -> None:
         cfg = get_cfg()
         env_path = Path(cfg.root) / ".env"
         updates, deletes = {}, []
+
+        # Non-secret .env values (the QAS user and node) travel the same
+        # write path as the password they belong beside — one save, one
+        # atomic rewrite of .env — but they are readable, so they are set
+        # plainly rather than through the confirm-to-clear dance.
+        for key, value in ((payload or {}).get("env") or {}).items():
+            if key not in st.ENV_KEYS:
+                return _refuse(400, f"{key} is not a value this console sets.")
+            text = str(value).strip()
+            if text:
+                updates[key] = text
+            else:
+                deletes.append(key)
+
         for key, entry in ((payload or {}).get("secrets") or {}).items():
             if key not in st.SECRET_KEYS:
                 return _refuse(400, f"{key} is not a secret this console sets.")
@@ -260,6 +275,8 @@ def register(app, get_cfg, on_reload) -> None:
         except st.SettingsError as e:
             return _refuse(400, str(e))
         # Deliberately no echo of any value, not even a length.
+        # Names only. A value is never echoed, and a secret's name being
+        # listed says it was written, not what it holds.
         return {
             "ok": True,
             "set": sorted(updates), "cleared": sorted(deletes),

@@ -76,6 +76,16 @@ code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--ac
   </div>
 
   <div class="card">
+    <h2>PeopleSoft connection</h2>
+    <p class="sub" style="margin:4px 0 0">Stored in <code>.env</code>
+       alongside the password below. The user is shown on purpose — it is
+       what explains whose permission lists shaped a query's rows.</p>
+    <div id="envset"></div>
+    <div style="margin-top:14px"><button id="saveenv">Save connection</button></div>
+    <div id="emsg" class="msg"></div>
+  </div>
+
+  <div class="card">
     <h2>Secrets</h2>
     <p class="sub" style="margin:4px 0 0">Write-only. This page can set or
        clear a value and can never read one back — not even its length.</p>
@@ -140,6 +150,19 @@ function renderSettings(s){
     }).join("");
 }
 
+function renderEnv(s){
+  document.getElementById("envset").innerHTML =
+    Object.entries(s.env_settings || {}).map(([key, f]) => `
+      <div class="row"><div>
+        <label for="e_${esc(key)}">${esc(f.label)}</label>
+        <div class="hint">${esc(f.help)}
+          <span class="pill warn">restart to apply</span>
+          <code>${esc(key)}</code></div>
+      </div><div>
+        <input id="e_${esc(key)}" value="${esc(f.value)}" autocomplete="off">
+      </div></div>`).join("");
+}
+
 function renderSecrets(s){
   document.getElementById("secrets").innerHTML =
     Object.entries(s.secrets).map(([key, f]) => `
@@ -178,7 +201,8 @@ async function load(){
   const {data} = await api("/api/console/status");
   STATE = data;
   document.getElementById("hint").textContent = data.auth.hint;
-  renderSettings(data); renderSecrets(data); renderRestart(data);
+  renderSettings(data); renderEnv(data);
+  renderSecrets(data); renderRestart(data);
 }
 
 document.getElementById("go").onclick = async () => {
@@ -210,6 +234,20 @@ document.getElementById("save").onclick = async () => {
     text += " Needs a restart: " + r.data.restart_required.join(", ") +
             ". " + r.data.restart_note;
   say(msg, text, true);
+  await load();
+};
+
+document.getElementById("saveenv").onclick = async () => {
+  const env = {}, msg = document.getElementById("emsg");
+  for (const [key, f] of Object.entries(STATE.env_settings || {})){
+    const el = document.getElementById("e_" + key);
+    if (el && el.value.trim() !== String(f.value)) env[key] = el.value.trim();
+  }
+  if (!Object.keys(env).length) return say(msg, "Nothing changed.", true);
+  const r = await api("/api/console/secrets", {env});
+  if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
+  const changed = [...(r.data.set||[]), ...(r.data.cleared||[])];
+  say(msg, "Saved " + changed.join(", ") + ". " + r.data.restart_note, true);
   await load();
 };
 

@@ -105,6 +105,25 @@ SETTINGS: tuple = (
 
 BY_KEY = {s.key: s for s in SETTINGS}
 
+# NON-SECRET .env values the console may read AND write.
+#
+# These live in .env rather than config.yaml because they belong beside the
+# credential they go with, and because config.py reads them from the
+# environment last — writing them to the overlay would appear to work and
+# change nothing. A username is not a secret: this one is deliberately
+# disclosed everywhere it appears, because it explains whose permission
+# lists shaped the rows a query returned.
+ENV_SETTINGS: tuple = (
+    ("PSFT_QAS_USER", "PeopleSoft QAS user",
+     "A PeopleSoft user, not a database account. Queries run AS this user "
+     "and return what their permission lists allow."),
+    ("PSFT_QAS_NODE", "PeopleSoft IB node",
+     "The node fronting the Query Access Service. A wrong node is the "
+     "usual first 404; sites use PSFT_FS, PSFT_HR, or a custom one. "
+     "Blank means PSFT_FS."),
+)
+ENV_KEYS = frozenset(k for k, _, _ in ENV_SETTINGS)
+
 # Secrets the console may SET. Never read back, never returned, never
 # logged. Anything not here is refused by the writer itself, so a bug in a
 # handler cannot widen the set.
@@ -116,6 +135,28 @@ SECRET_LABELS = {
     "ORACLE_PASSWORD": "Oracle database password",
     "CONFLUENCE_API_TOKEN": "Confluence API token",
 }
+
+
+def _label(key: str) -> str:
+    if key in SECRET_LABELS:
+        return SECRET_LABELS[key]
+    return next((lab for k, lab, _ in ENV_SETTINGS if k == key), key)
+
+
+def read_env_values(env_path: Path) -> dict:
+    """Current value of each non-secret .env setting, from the FILE.
+
+    os.environ is a startup snapshot and would report a value that has
+    since been changed or cleared on disk.
+    """
+    found = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            name, sep, value = line.partition("=")
+            if sep and name.strip() in ENV_KEYS:
+                found[name.strip()] = value.strip().strip("'\"")
+    return {k: {"value": found.get(k, ""), "label": lab, "help": help_}
+            for k, lab, help_ in ENV_SETTINGS}
 
 
 def validate(key: str, raw: Any) -> Any:
@@ -251,19 +292,20 @@ def write_env_keys(env_path: Path, updates: dict, deletes=()) -> None:
     refused because python-dotenv would expand them on the next read and
     the stored secret would not be the one that was typed.
     """
+    allowed = SECRET_KEYS | ENV_KEYS
     for key in list(updates) + list(deletes):
-        if key not in SECRET_KEYS:
-            raise SettingsError(f"{key} is not a secret this console sets")
+        if key not in allowed:
+            raise SettingsError(f"{key} is not a value this console sets")
     for key, value in updates.items():
         if "${" in str(value):
             raise SettingsError(
-                f"{SECRET_LABELS.get(key, key)} contains '${{', which .env "
+                f"{_label(key)} contains '${{', which .env "
                 "expands on the next read — the stored value would not be "
                 "the one you typed. Rotate to a value without it, or set "
                 "this key by hand in .env.")
         if str(value) != str(value).strip():
             raise SettingsError(
-                f"{SECRET_LABELS.get(key, key)} has leading or trailing "
+                f"{_label(key)} has leading or trailing "
                 "whitespace; that is almost never intended and is invisible "
                 "in the file.")
     existing = env_path.read_text(encoding="utf-8").splitlines() \
