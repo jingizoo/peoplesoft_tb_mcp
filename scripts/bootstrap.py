@@ -4,7 +4,7 @@
 Works on Windows, macOS, and Linux with nothing but a Python 3.10+ interpreter.
 
     python scripts/bootstrap.py                # full setup
-    python scripts/bootstrap.py --no-llm       # skip ollama/google-genai
+    python scripts/bootstrap.py --no-llm       # skip the LLM client packages
     python scripts/bootstrap.py --oracle       # also install the Oracle driver
 
 Safe to re-run: an existing virtualenv is reused and the sample ledger is
@@ -59,7 +59,7 @@ def run(cmd: list, what: str, quiet: bool = True) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set up the PeopleSoft TB agent")
     ap.add_argument("--no-llm", action="store_true",
-                    help="skip the ollama and google-genai clients")
+                    help="skip the ollama, google-genai and anthropic clients")
     ap.add_argument("--no-gui", action="store_true",
                     help="skip the web UI dependencies")
     ap.add_argument("--oracle", action="store_true",
@@ -128,8 +128,9 @@ def main() -> int:
     print("  2. Or install a local model and use the terminal chat:")
     print("       ollama pull llama3.1:8b")
     print(f"       {rel} -m pstb.client.chat")
-    print("     (or use Gemini: set GOOGLE_CLOUD_PROJECT in .env, then")
-    print(f"       {rel} -m pstb.client.chat --provider gemini)")
+    print("     (or a hosted model — set GOOGLE_CLOUD_PROJECT or")
+    print("      ANTHROPIC_API_KEY in .env, then")
+    print(f"       {rel} -m pstb.client.chat --provider gemini|claude)")
     print("  3. Ask something from the terminal:")
     print(f"       {rel} -m pstb.client.chat --ask \"Does the trial balance balance?\"")
     print("\nEverything above runs on the bundled sample ledger — no PeopleSoft")

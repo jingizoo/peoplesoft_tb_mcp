@@ -11,6 +11,27 @@ from typing import Any
 
 SCHEMA_DROP_KEYS = {"title", "default", "$schema", "$defs", "additionalProperties", "examples"}
 
+# The providers this build can talk to, and where each keeps its model
+# name. They live in this module — which imports nothing but the standard
+# library — so the GUI, the console and the eval harness can all ask the
+# same question without pulling in the MCP client. Adding a provider means
+# adding it here; a provider missing from this tuple is unreachable from
+# every surface a user actually touches, whatever build_provider says.
+PROVIDERS: tuple = ("ollama", "gemini", "claude")
+
+MODEL_FIELD = {
+    "ollama": "ollama_model",
+    "gemini": "gemini_model",
+    "claude": "claude_model",
+}
+
+
+def provider_model(cfg, name: str = "") -> str:
+    """The model name in force for a provider — the configured one when the
+    caller does not name one."""
+    provider = (name or getattr(cfg.llm, "provider", "") or "").strip().lower()
+    return getattr(cfg.llm, MODEL_FIELD.get(provider, "ollama_model"), "")
+
 
 @dataclass
 class ToolSpec:

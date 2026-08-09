@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..client.llm_base import PROVIDERS, provider_model
 from ..config import load_config
 from ..version import build_info as _build_info
 from ..db import Database, DbError
@@ -661,8 +662,7 @@ def meta():
             and (wiki.health() or {}).get("is_bundled_demo_content")
         ),
         "llm": {"provider": cfg.llm.provider,
-                "model": cfg.llm.ollama_model if cfg.llm.provider == "ollama"
-                else cfg.llm.gemini_model},
+                "model": provider_model(cfg)},
         "raw_sql": cfg.tools.allow_raw_sql,
     }
     # PS_LEDGER is the authority for selectable financial scopes.  The GL
@@ -1055,8 +1055,10 @@ async def chat(payload: dict):
     provider_name = str(
         (payload or {}).get("provider") or cfg.llm.provider
     ).strip().lower()
-    if provider_name not in {"gemini", "ollama"}:
-        raise HTTPException(status_code=400, detail="provider must be gemini or ollama")
+    if provider_name not in PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider must be one of {', '.join(PROVIDERS)}")
 
     try:
         # This async route must not perform synchronous Oracle/SQL Server I/O
@@ -1188,6 +1190,8 @@ async def chat(payload: dict):
                 )
             if provider_name == "gemini":
                 from ..client.llm_gemini import GeminiVertexProvider as P
+            elif provider_name == "claude":
+                from ..client.llm_claude import ClaudeProvider as P
             else:
                 from ..client.llm_ollama import OllamaProvider as P
             return P(cfg, prompt, tools)

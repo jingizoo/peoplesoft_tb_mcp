@@ -5,6 +5,7 @@
     .venv/bin/python scripts/eval.py --case ar-aging  # one case
     .venv/bin/python scripts/eval.py --from-qlog      # seed cases from failures
     .venv/bin/python scripts/eval.py --provider gemini
+    .venv/bin/python scripts/eval.py --provider claude
 
 Why this exists: the suites pin SQL and engine behavior, but MODEL behavior —
 which tool it picks, whether it refuses, whether it answers from the wiki when
@@ -150,6 +151,8 @@ async def _run_case(session, cfg, provider_name: str, case: dict,
         )
     if provider_name == "gemini":
         from pstb.client.llm_gemini import GeminiVertexProvider as P
+    elif provider_name == "claude":
+        from pstb.client.llm_claude import ClaudeProvider as P
     else:
         from pstb.client.llm_ollama import OllamaProvider as P
     provider = P(cfg, prompt, tools)
@@ -281,7 +284,8 @@ def _seed_from_qlog(path: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Graded evals for the finance agent")
     ap.add_argument("--case", default="", help="run a single case by id")
-    ap.add_argument("--provider", default="", help="ollama | gemini")
+    ap.add_argument("--provider", default="",
+                    help="ollama | gemini | claude")
     ap.add_argument("--json", default="", help="write detailed results here")
     ap.add_argument("--no-skills", action="store_true",
                     help="drop the provider's worked-example block, so the "

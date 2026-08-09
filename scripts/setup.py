@@ -393,6 +393,7 @@ def _read_config_values():
             put("provider", llm.get("provider"))
             put("ollama_model", llm.get("ollama_model"))
             put("gemini_model", llm.get("gemini_model"))
+            put("claude_model", llm.get("claude_model"))
             put("wiki_provider", wiki.get("provider"))
             put("wiki_space", wiki.get("confluence_space"))
             put("max_rows", tools.get("max_rows"))
@@ -512,6 +513,8 @@ llm:
   gemini_model: {gemini_model}
   gemini_location: "us-central1"
   gemini_thinking_budget: -1
+  claude_model: {claude_model}
+  claude_effort: "high"
   temperature: 0.2
   max_tool_result_chars: 0
 
@@ -545,6 +548,7 @@ tools:
         provider=_y(str(state.get("provider", "ollama"))),
         ollama_model=_y(str(state.get("ollama_model", "llama3.1:8b"))),
         gemini_model=_y(str(state.get("gemini_model", "gemini-2.5-pro"))),
+        claude_model=_y(str(state.get("claude_model", "claude-opus-5"))),
         wiki_provider=_y(str(state.get("wiki_provider", "localdocs"))),
         wiki_space=_y(str(state.get("wiki_space", ""))),
         allow_sql=str(bool(state.get("allow_sql", True))).lower(),
@@ -921,8 +925,10 @@ def step_llm(p, state):
     step("Language model")
     current = state.get("provider", "ollama")
     options = [("ollama", "Ollama - runs locally, no data leaves this host"),
-               ("gemini", "Gemini on Vertex AI - tool results go to Google Cloud")]
-    default_index = 0 if current != "gemini" else 1
+               ("gemini", "Gemini on Vertex AI - tool results go to Google Cloud"),
+               ("claude", "Claude on the Anthropic API - tool results go to Anthropic")]
+    order = [o[0] for o in options]
+    default_index = order.index(current) if current in order else 0
     state["provider"] = p.choose("Which provider?", options, default_index)
     if state["provider"] == "ollama":
         host = p.ask("Ollama host", state.get("OLLAMA_HOST",
@@ -952,6 +958,19 @@ def step_llm(p, state):
             warn("Ollama not reachable at {0}".format(host))
             info("ollama serve   (then: ollama pull {0})".format(
                 state["ollama_model"]))
+    elif state["provider"] == "claude":
+        state["claude_model"] = p.ask("Model",
+                                      state.get("claude_model",
+                                                "claude-opus-5"))
+        # Deliberately not asked for here. The wizard prints what it
+        # collects and writes state to disk between steps; a key typed at
+        # this prompt would land in both. .env and the console are the two
+        # paths that never echo a secret.
+        warn("tool results - including ledger figures - are sent to Anthropic")
+        info("confirm this is acceptable under your data-governance policy")
+        info("set the key in .env as ANTHROPIC_API_KEY=..., or from the "
+             "configuration console at /console - this wizard never asks "
+             "for a secret it would then print")
     else:
         state["GOOGLE_CLOUD_PROJECT"] = p.ask(
             "GOOGLE_CLOUD_PROJECT",

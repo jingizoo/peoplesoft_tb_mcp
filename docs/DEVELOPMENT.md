@@ -23,13 +23,14 @@ python scripts/diagnose_db.py                  # time each DB step (find slow qu
 python scripts/diagnose_wiki.py                # prove the wiki is connected and real
 python -m pstb.client.chat                     # chat REPL
 python -m pstb.client.chat --provider gemini   # chat via Gemini on Vertex AI
+python -m pstb.client.chat --provider claude   # chat via Claude on the Anthropic API
 python -m pstb.client.chat --ask "..."         # one-shot question
 python -m pstb.server                          # run the server standalone
 python -m pstb.gui --open                      # web UI on 127.0.0.1:8000
 ```
 
 macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
-`make chat`, `make chat-gemini`.
+`make chat`, `make chat-gemini`, `make chat-claude`.
 
 ## Architecture
 
@@ -67,9 +68,14 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   reorder or forget a step; it triggers and narrates only.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
   PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
-- `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py` and
+- `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py`,
   `llm_gemini.py` (google-genai with `vertexai=True`; the older
-  `vertexai.generative_models` module was retired in June 2026).
+  `vertexai.generative_models` module was retired in June 2026) and
+  `llm_claude.py` (the anthropic SDK; note it ignores `llm.temperature`,
+  which Opus 5 rejects, and keeps a stricter transcript than the other two —
+  every tool_use must be answered). `llm_base.py` owns the PROVIDERS tuple
+  that every surface reads, so a new provider is reachable everywhere or
+  nowhere.
 - `scripts/seed_sample_data.py` — builds `PS_LEDGER` *from* generated balanced
   journals, so drill-downs tie to the penny. FY2025 closes into FY2026 period 0.
 

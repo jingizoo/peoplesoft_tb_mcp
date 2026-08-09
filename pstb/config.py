@@ -50,7 +50,7 @@ class DbCfg:
 
 @dataclass
 class LlmCfg:
-    provider: str = "ollama"  # ollama | gemini
+    provider: str = "ollama"  # ollama | gemini | claude
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
     # Ollama defaults to a 2048-token context. This system prompt alone is
@@ -76,7 +76,25 @@ class LlmCfg:
     # decision, not a writing task. Chained/prose turns keep `temperature`.
     gemini_force_tool_round: bool = True
     gemini_routing_temperature: float = 0.0
-    # 0 = auto: 24k chars for local models, 120k for Gemini (1M-token context).
+    # Claude on the Anthropic API. The credential is never a config value:
+    # the SDK reads ANTHROPIC_API_KEY from .env, or a signed-in CLI
+    # profile, on its own.
+    claude_model: str = "claude-opus-5"
+    # Thinking and answer text share this budget, and thinking is on by
+    # default on Opus 5 — a cap sized for the answer alone truncates.
+    claude_max_tokens: int = 32000
+    # low | medium | high | xhigh | max. `high` is the API default and a
+    # deliberate starting point, not a measured one: run
+    # scripts/eval.py --provider claude at two levels before changing it.
+    claude_effort: str = "high"
+    # The same routing discipline as gemini_force_tool_round, by the only
+    # mechanism this API has: Opus 5 rejects temperature outright, so a
+    # forced tool_choice replaces greedy decoding rather than joining it.
+    claude_force_tool_round: bool = True
+    # Re-run a request Anthropic's safety classifiers decline on the
+    # recommended substitute model, instead of returning nothing.
+    claude_fallbacks: bool = True
+    # 0 = auto: 24k chars for local models, 120k for the 1M-token models.
     max_tool_result_chars: int = 0
 
 

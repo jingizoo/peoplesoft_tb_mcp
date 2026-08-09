@@ -3,7 +3,7 @@ setup:
 
 PY := .venv/bin/python
 
-.PHONY: venv seed unittest smoke probe qa chat chat-gemini server clean
+.PHONY: venv seed unittest smoke probe qa chat chat-gemini chat-claude server clean
 
 venv:            ## create venv and install package + LLM clients + web UI
 	python3 -m venv .venv
@@ -29,6 +29,9 @@ chat:            ## chat REPL (provider from config.yaml, default ollama)
 
 chat-gemini:     ## chat REPL with Gemini on Vertex AI
 	$(PY) -m pstb.client.chat --provider gemini
+
+chat-claude:     ## chat REPL with Claude on the Anthropic API
+	$(PY) -m pstb.client.chat --provider claude
 
 server:          ## run the MCP server standalone (for MCP Inspector etc.)
 	$(PY) -m pstb.server
