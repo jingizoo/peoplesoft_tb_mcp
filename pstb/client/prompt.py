@@ -4,6 +4,86 @@ from __future__ import annotations
 from ..config import Config
 
 
+# WORKED EXAMPLES, shown only to models with room for them.
+#
+# The rest of this prompt is TERMS — what must and must not happen. Terms
+# are what a guard can enforce, so they earn their tokens on every model.
+# What terms cannot convey is PROCEDURE: the shape of a good turn, which
+# call comes first, what a finished answer sounds like. That is better
+# shown than described, and showing costs about 2,300 tokens.
+#
+# Gemini has a million-token window and pays this happily. The local 8B
+# does not: measured, its fixed prompt is already ~19k tokens against a
+# 16,384 window (docs/CONTEXT_BUDGET.md), and adding to it would push more
+# of the TOOL LIST out of the window — trading routing accuracy for
+# routing advice. So this block is provider-conditional, and the condition
+# is capacity, not favouritism.
+#
+# Every example below is a REAL call against the real tools with the real
+# argument names. An example that drifts from the tool signatures teaches
+# the model to make invalid calls, so these are covered by a test.
+SKILLS = """## How a good turn actually goes
+
+These are worked examples, not rules. The rules are below; this is what
+following them looks like.
+
+### "Why is cash up versus last year end?"
+One call. The account filter IS the subject — do not go to run_sql because
+the question named account numbers.
+    explain_balance_change(account="1000-1999", vs_fiscal_year=2025,
+                           vs_period=12)
+Then quote the bridge and the residual, because the residual is the reason
+the split can be trusted:
+    "Assets rose 779,956.53 between FY2025 P12 and FY2026 P6. Cash carried
+     487,747.10 of it, receivables 246,317.05. The bridge ties — residual
+     0.00 — and suspense is new this year at -15,000.00."
+
+### "Is our suspense balance within policy?"
+Mixed: it needs a FIGURE and a RULE, in that order, and the wiki is only
+reachable once the ledger call has succeeded.
+    get_account_balance(account="1999")     then     wiki_lookup(...)
+Cite both, and keep them apart:
+    "Suspense is 18,432.75. The close policy sets the threshold at
+     5,000.00 (Suspense and Adjustment Periods), so this is outside it."
+The page supplies the THRESHOLD. It never supplies the balance, even when
+it states one — pages are edited by people, ledgers are not.
+
+### "Journal activity for every account in the EXPENSES node"
+Two rounds, and the values never pass through your hands:
+    get_tree_node_accounts(tree_name="...", node="EXPENSES")   -> r1
+    run_sql(sql="... WHERE ACCOUNT IN (:accts) ...",
+            list_binds={"accts": {"from_result": "r1",
+                                  "field": "accounts"}})
+Retyping the account list is how a wrong account gets into a query.
+
+### "How does marketing spend compare to budget?"
+The budget lives in Coupa, not PeopleSoft, so the answer names both
+systems and never blends them into one unlabelled figure:
+    "Coupa shows 1,284,300.00 committed against a 1,500,000.00 budget."
+Saying "the ledger shows" about a Coupa figure is wrong even when the
+number is right, and it will be flagged.
+
+### "What is our total invoice amount?"
+Answer it, then say what it counted:
+    get_invoice_totals(...)
+    "Finalized invoices total 908,846.06 across 22 invoices. Drafts and
+     cancelled invoices are excluded — that is what 'invoiced' means here."
+A total whose population is unstated is a number the reader cannot use.
+
+### When you cannot answer well
+Refusing with a next step is a good turn. Guessing is not.
+    "Accounts 1000-9999 span assets, revenue and expense. Ledger amounts
+     are signed, so one total across them has no meaning — ask for a range
+     inside one type, such as 6000-6999."
+Name what you checked, name what would unblock it, and stop.
+"""
+
+
+# Providers whose context window has room for the worked examples.
+# Ollama is deliberately absent: its fixed prompt already exceeds the
+# configured window, and more prose would evict more tool list.
+ROOMY_PROVIDERS = frozenset({"gemini"})
+
 TERMINAL_STYLE = """## Output style
 - Format money with thousands separators and 2 decimals (1,234,567.89).
 - Small result sets: markdown table. Trial balances: Account | Description |
@@ -29,9 +109,18 @@ reply, rendered as a table, chart, or status card.
 
 
 def system_prompt(cfg: Config, surface: str = "terminal",
-                  memory=None) -> str:
+                  memory=None, provider: str = "") -> str:
+    """The system prompt, sized to the model that will read it.
+
+    provider selects whether the worked-example block is included. It is
+    OPT-IN by name rather than by a capability flag, so a new provider gets
+    the small prompt until someone has checked it has room — the failure
+    mode of silently overflowing a context window is invisible, and this
+    codebase has now hit it twice.
+    """
     d = cfg.defaults
     output_style = GUI_STYLE if surface == "gui" else TERMINAL_STYLE
+    skills = SKILLS if provider.strip().lower() in ROOMY_PROVIDERS else ""
     memory_block = ""
     if memory is not None:
         try:
@@ -419,4 +508,4 @@ Q: "Are we ready to close the period?"
 -> run_playbook("close_readiness") — the composed checklist, not a series
    of ad-hoc queries.
 
-{output_style}{memory_block}"""
+{skills}{output_style}{memory_block}"""
