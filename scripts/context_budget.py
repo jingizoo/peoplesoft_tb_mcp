@@ -59,7 +59,7 @@ async def measure(provider: str) -> dict:
             await session.initialize()
             tools = tool_specs(await session.list_tools())
 
-    prompt = system_prompt(cfg, surface="gui")
+    prompt = system_prompt(cfg, surface="gui", provider=provider)
     descs = sum(len(t.description) for t in tools)
     schemas = sum(len(json.dumps(t.schema)) for t in tools)
     result_cap = tool_result_limit(cfg, provider)

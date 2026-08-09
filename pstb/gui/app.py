@@ -1153,7 +1153,9 @@ async def chat(payload: dict):
             tools = tool_specs(await session.list_tools())
 
         def make_provider():
-            prompt = system_prompt(cfg, surface="gui", memory=_site_memory())
+            prompt = system_prompt(cfg, surface="gui",
+                                   memory=_site_memory(),
+                                   provider=provider_name)
             if active_scope:
                 prompt += (
                     "\n\n## Active scope selected by the user and verified "

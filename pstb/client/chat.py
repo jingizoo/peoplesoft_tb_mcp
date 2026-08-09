@@ -77,7 +77,8 @@ def _repo_root() -> Path:
 def build_provider(name: str, cfg: Config, tools: list[ToolSpec]) -> LLMProvider:
     from ..memory import SiteMemory
     prompt = system_prompt(cfg, memory=SiteMemory(cfg.resolve_path(
-        getattr(cfg.tools, "site_memory", "site_memory.json"))))
+        getattr(cfg.tools, "site_memory", "site_memory.json"))),
+        provider=name)
     if name == "gemini":
         from .llm_gemini import GeminiVertexProvider
 
