@@ -15,3 +15,7 @@ config.yaml.bak-*
 .setup-probe-config.yaml
 BUILD_INFO.json
 site_memory.json
+
+# Written by the configuration console; per-deployment, never shared.
+config.local.yaml
+config.local.yaml.bak-*
