@@ -1,0 +1,239 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Configuration — PeopleSoft Finance</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#272e38;--ink:#e6edf3;--muted:#8b949e;
+      --accent:#6aa2ff;--accent-soft:#16213a;--warn:#c9a227;--bad:#f0616d;--ok:#3fb950}
+@media (prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--line:#d8dee4;
+      --ink:#1f2328;--muted:#59636e;--accent-soft:#eaf1ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,
+     BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+.wrap{max-width:820px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:15px;margin:0;font-weight:650}
+.sub{color:var(--muted);font-size:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+      padding:18px;margin:16px 0}
+.row{display:grid;grid-template-columns:1fr 210px;gap:14px;align-items:start;
+     padding:12px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+label{font-weight:600;font-size:14px}
+.hint{color:var(--muted);font-size:12.5px;margin-top:2px}
+input,select{width:100%;padding:8px 10px;background:var(--bg);color:var(--ink);
+     border:1px solid var(--line);border-radius:7px;font:inherit;font-size:14px}
+input:disabled{opacity:.55}
+button{padding:9px 16px;border-radius:7px;border:1px solid var(--accent);
+     background:var(--accent);color:#08131f;font:inherit;font-weight:650;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.pill{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:20px;
+      border:1px solid var(--line);color:var(--muted)}
+.pill.warn{color:var(--warn);border-color:var(--warn)}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.note{border-left:3px solid var(--accent);padding:10px 12px;background:var(--accent-soft);
+      border-radius:0 7px 7px 0;font-size:13.5px}
+.note.warn{border-left-color:var(--warn);background:transparent;
+      border:1px solid var(--line);border-left:3px solid var(--warn)}
+.msg{margin-top:14px;font-size:13.5px;padding:10px 12px;border-radius:7px;display:none}
+.msg.show{display:block}
+.msg.good{background:var(--accent-soft);border-left:3px solid var(--ok)}
+.msg.bad{border:1px solid var(--bad);color:var(--bad)}
+.gate{max-width:430px;margin:14vh auto}
+code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--accent-soft);
+     padding:1px 5px;border-radius:4px}
+</style>
+
+<div class="wrap">
+<div id="gate" class="gate" style="display:none">
+  <div class="card">
+    <h1>Configuration</h1>
+    <p class="sub" id="hint"></p>
+    <div class="note warn" style="margin:14px 0">
+      <b>This code is a confirmation step, not a password.</b> Anyone can work
+      out the hour in India. What protects this page is that the server answers
+      only to a caller on this machine — you reached it through your own SSH
+      tunnel. The code is here so a change is deliberate, not accidental.
+    </div>
+    <input id="code" placeholder="YYYYMMDD-HH" autocomplete="off" autofocus>
+    <div style="margin-top:12px"><button id="go">Continue</button></div>
+    <div id="gmsg" class="msg bad"></div>
+  </div>
+</div>
+
+<div id="main" style="display:none">
+  <h1>Configuration</h1>
+  <p class="sub">Changes are written to <code>config.local.yaml</code>, which
+     overrides <code>config.yaml</code> and leaves it exactly as you maintain
+     it. Delete that file to revert everything here.</p>
+
+  <div class="card">
+    <h2>Settings</h2>
+    <div id="settings"></div>
+    <div style="margin-top:16px"><button id="save">Save settings</button></div>
+    <div id="smsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Secrets</h2>
+    <p class="sub" style="margin:4px 0 0">Write-only. This page can set or
+       clear a value and can never read one back — not even its length.</p>
+    <div id="secrets"></div>
+    <div id="kmsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Restarting</h2>
+    <div id="restart" class="sub"></div>
+  </div>
+</div>
+</div>
+
+<script>
+const H = {"Content-Type":"application/json","X-PSTB-Console":"1"};
+let STATE = null;
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function api(path, body){
+  const r = await fetch(path, body
+    ? {method:"POST", headers:H, body:JSON.stringify(body)}
+    : {headers:{"X-PSTB-Console":"1"}});
+  let data = {};
+  try { data = await r.json(); } catch(e){}
+  return {ok:r.ok, status:r.status, data};
+}
+
+function say(el, text, good){
+  el.className = "msg show " + (good ? "good" : "bad");
+  el.textContent = text;
+}
+
+function renderSettings(s){
+  document.getElementById("settings").innerHTML =
+    Object.entries(s.settings).map(([key, f]) => {
+      const id = "f_" + key.replace(/\./g,"_");
+      let input;
+      if (f.kind === "bool")
+        input = `<select id="${id}" ${f.shadowed_by?"disabled":""}>
+                   <option value="true"  ${f.value?"selected":""}>on</option>
+                   <option value="false" ${f.value?"":"selected"}>off</option>
+                 </select>`;
+      else if (f.kind === "choice")
+        input = `<select id="${id}" ${f.shadowed_by?"disabled":""}>` +
+          f.choices.map(c => `<option ${c===f.value?"selected":""}>${esc(c)}</option>`)
+          .join("") + `</select>`;
+      else
+        input = `<input id="${id}" value="${esc(f.value)}"
+                   ${f.shadowed_by?"disabled":""}>`;
+      const tags = [
+        f.restart ? '<span class="pill warn">restart to apply</span>' : "",
+        f.shadowed_by
+          ? `<span class="pill">set by ${esc(f.shadowed_by)} in .env</span>` : "",
+      ].join(" ");
+      return `<div class="row"><div>
+                <label for="${id}">${esc(f.label)}</label>
+                <div class="hint">${esc(f.help)} ${tags}</div>
+              </div><div>${input}</div></div>`;
+    }).join("");
+}
+
+function renderSecrets(s){
+  document.getElementById("secrets").innerHTML =
+    Object.entries(s.secrets).map(([key, f]) => `
+      <div class="row"><div>
+        <label>${esc(f.label)}</label>
+        <div class="hint">
+          ${f.set ? '<span class="pill ok">set</span>' : '<span class="pill">not set</span>'}
+          <code>${esc(key)}</code>
+        </div>
+      </div><div>
+        <input id="s_${esc(key)}" type="password" placeholder="new value"
+               autocomplete="new-password">
+        <div style="margin-top:6px;display:flex;gap:6px">
+          <button class="ghost" data-set="${esc(key)}">Set</button>
+          ${f.set ? `<button class="ghost" data-clear="${esc(key)}">Clear</button>` : ""}
+        </div>
+      </div></div>`).join("") +
+    (s.env_private ? "" :
+      `<div class="note warn" style="margin-top:12px">Your <code>.env</code> is
+       readable by other accounts on this host. It is tightened automatically
+       the next time the service starts.</div>`);
+}
+
+function renderRestart(s){
+  document.getElementById("restart").innerHTML =
+    `<div class="note warn">${esc(s.restart.why)}</div>
+     <p style="margin:12px 0 4px">To restart:</p>
+     <p><code>${esc(s.restart.how)}</code></p>
+     <p class="sub">A restart button belongs with a supervisor that can bring
+        the service back, a health check that proves it did, and a rollback
+        when it did not. Until then this page will not offer one it cannot
+        honour.</p>`;
+}
+
+async function load(){
+  const {data} = await api("/api/console/status");
+  STATE = data;
+  document.getElementById("hint").textContent = data.auth.hint;
+  renderSettings(data); renderSecrets(data); renderRestart(data);
+}
+
+document.getElementById("go").onclick = async () => {
+  const r = await api("/api/console/unlock",
+                      {code: document.getElementById("code").value});
+  if (!r.ok) return say(document.getElementById("gmsg"),
+                        (r.data.error||"") + " " + (r.data.remedy||""), false);
+  document.getElementById("gate").style.display = "none";
+  document.getElementById("main").style.display = "";
+};
+
+document.getElementById("save").onclick = async () => {
+  const changes = {};
+  for (const [key, f] of Object.entries(STATE.settings)){
+    if (f.shadowed_by) continue;
+    const el = document.getElementById("f_" + key.replace(/\./g,"_"));
+    if (!el) continue;
+    let v = el.value;
+    if (f.kind === "bool") v = (v === "true");
+    if (String(v) !== String(f.value)) changes[key] = v;
+  }
+  const msg = document.getElementById("smsg");
+  if (!Object.keys(changes).length) return say(msg, "Nothing changed.", true);
+  const r = await api("/api/console/settings", {changes});
+  if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
+  let text = "Saved " + r.data.saved.join(", ") + ".";
+  if (r.data.reloaded?.length) text += " Applied now: " + r.data.reloaded.join(", ") + ".";
+  if (r.data.restart_required?.length)
+    text += " Needs a restart: " + r.data.restart_required.join(", ") +
+            ". " + r.data.restart_note;
+  say(msg, text, true);
+  await load();
+};
+
+document.getElementById("secrets").onclick = async (e) => {
+  const setKey = e.target.dataset?.set, clearKey = e.target.dataset?.clear;
+  const msg = document.getElementById("kmsg");
+  if (setKey){
+    const field = document.getElementById("s_" + setKey);
+    const r = await api("/api/console/secrets",
+      {secrets:{[setKey]:{action:"set", value: field.value}}});
+    field.value = "";
+    if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
+    say(msg, "Stored. " + r.data.restart_note, true);
+    await load();
+  } else if (clearKey){
+    if (!confirm("Clear " + clearKey + "? There is no backup of .env — you " +
+                 "will need the value again from wherever it is kept.")) return;
+    const r = await api("/api/console/secrets",
+      {secrets:{[clearKey]:{action:"clear", confirm: clearKey}}});
+    if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
+    say(msg, "Cleared. " + r.data.restart_note, true);
+    await load();
+  }
+};
+
+load().then(() => { document.getElementById("gate").style.display = ""; });
+</script>

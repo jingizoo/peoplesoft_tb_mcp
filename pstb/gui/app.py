@@ -30,7 +30,7 @@ from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
-from . import localguard
+from . import console, localguard
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -1272,6 +1272,51 @@ async def chat(payload: dict):
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
             "scope": active_scope,
             "turn_id": getattr(agent_turn, "last_turn_id", None)}
+
+
+def _console_reload() -> dict:
+    """Rebuild what THIS process can rebuild, and be precise about the rest.
+
+    The GUI resolves cfg/db/engine as module globals at call time, so
+    swapping them genuinely reaches every /api/* handler. What cannot be
+    swapped is the answer engine: pstb/server.py binds its whole object
+    graph at import inside a separate stdio subprocess, and that
+    subprocess's session was entered by the lifespan task — anyio cancel
+    scopes must be exited by the task that entered them, so no request
+    handler can respawn it.
+
+    Rebuilding only the GUI half would leave /api/trial-balance answering
+    from the new configuration while /api/chat still answered from the
+    old: two live surfaces disagreeing about the same question, which is
+    worse than not reloading. So this reloads the read-only views and says
+    plainly that the chat path needs a restart.
+    """
+    global cfg, db, engine, ar, report_runner
+    reloaded: list = []
+    try:
+        # Same resolution the process booted with (app.py:47), so a
+        # reload cannot quietly adopt a different config file.
+        fresh = load_config(os.environ.get("PSTB_CONFIG"))
+    except Exception as e:
+        return {"reloaded": [], "error": f"{type(e).__name__}: {e}"}
+    try:
+        new_db = Database(fresh)
+        new_engine = TBEngine(new_db, fresh)
+        new_ar = ARBilling(new_engine)
+        new_report = ReportRunner(new_engine)
+    except Exception as e:
+        # The old objects are still live and serving; say so.
+        return {"reloaded": [],
+                "error": f"kept the running configuration: {e}"}
+    cfg, db, engine, ar, report_runner = (fresh, new_db, new_engine,
+                                          new_ar, new_report)
+    reloaded = ["trial balance", "AR and billing", "reports", "diagnostics"]
+    _scope_cache.update({"value": None, "expires": 0.0})
+    reloaded.append("scope catalog")
+    return {"reloaded": reloaded}
+
+
+console.register(app, lambda: cfg, _console_reload)
 
 
 @app.post("/api/feedback")

@@ -255,6 +255,29 @@ def load_config(path: Optional[str] = None) -> Config:
                 "PyYAML is required to read config.yaml — install with: pip install -e ."
             ) from e
         data = yaml.safe_load(cfg_path.read_text()) or {}
+        # The configuration console writes config.local.yaml rather than
+        # editing config.yaml, whose comments carry the reasoning for values
+        # that took measurement to find. Merged one section deep: the
+        # overlay names individual keys, never whole blocks, so an entry
+        # here replaces one setting and leaves the rest of its section
+        # alone. Malformed overlay is reported, never silently ignored —
+        # a console save that appears to work and changes nothing is worse
+        # than an error.
+        overlay_path = cfg_path.parent / "config.local.yaml"
+        if overlay_path.exists():
+            try:
+                overlay = yaml.safe_load(overlay_path.read_text()) or {}
+            except yaml.YAMLError as e:
+                raise RuntimeError(
+                    f"{overlay_path.name} is not valid YAML ({e}). It is "
+                    "written by the configuration console and is safe to "
+                    "delete — doing so reverts to config.yaml.") from e
+            for section, block in (overlay or {}).items():
+                if isinstance(block, dict) and isinstance(
+                        data.get(section), dict):
+                    data[section] = {**data[section], **block}
+                elif isinstance(block, dict):
+                    data[section] = block
         _apply_section(cfg.defaults, data.get("defaults"))
         _apply_section(cfg.db, data.get("db"))
         _apply_section(cfg.llm, data.get("llm"))
