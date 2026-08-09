@@ -124,12 +124,21 @@ def _grade(case: dict, answer: str, calls: list) -> list:
     return problems
 
 
-async def _run_case(session, cfg, provider_name: str, case: dict) -> dict:
+async def _run_case(session, cfg, provider_name: str, case: dict,
+                    skills: bool = True) -> dict:
     from pstb.client.chat import agent_turn, tool_specs
     from pstb.client.prompt import system_prompt
 
     tools = tool_specs(await session.list_tools())
-    prompt = system_prompt(cfg, surface="gui")
+    # The PROVIDER decides what the prompt contains — Gemini gets the
+    # worked-example block, the local model does not. Building the prompt
+    # without it measured the small prompt against whichever model was
+    # asked, so "--provider gemini" was never testing what Gemini is
+    # actually sent. A harness that exercises a different code path than
+    # the product gives false assurance; that is the whole reason this
+    # file exists.
+    prompt = system_prompt(cfg, surface="gui",
+                           provider=provider_name if skills else "")
     scope = case.get("scope") or {}
     if scope:
         prompt += (
@@ -195,15 +204,19 @@ async def _main(args) -> int:
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "pstb.server"], env=env)
 
+    # Name which prompt was measured, so a pasted result is self-describing
+    # and an A/B pair cannot be mixed up after the fact.
+    skills = "off" if args.no_skills else "on"
     print(f"eval: {len(cases)} case(s) · provider={provider_name} · "
-          f"backend={cfg.db.backend}\n")
+          f"skills={skills} · backend={cfg.db.backend}\n")
     results = []
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             for case in cases:
                 try:
-                    res = await _run_case(session, cfg, provider_name, case)
+                    res = await _run_case(session, cfg, provider_name,
+                                         case, skills=not args.no_skills)
                 except Exception as e:  # a crash is a failure, not a stop
                     res = {"id": case["id"], "answer": "", "calls": [],
                            "seconds": 0, "problems": [f"raised {type(e).__name__}: {e}"]}
@@ -270,6 +283,9 @@ def main() -> int:
     ap.add_argument("--case", default="", help="run a single case by id")
     ap.add_argument("--provider", default="", help="ollama | gemini")
     ap.add_argument("--json", default="", help="write detailed results here")
+    ap.add_argument("--no-skills", action="store_true",
+                    help="drop the provider's worked-example block, so the "
+                         "same suite can be run with and without it")
     ap.add_argument("--from-qlog", nargs="?", const="logs/questions.jsonl",
                     default="", help="seed pending cases from the failure log")
     args = ap.parse_args()
