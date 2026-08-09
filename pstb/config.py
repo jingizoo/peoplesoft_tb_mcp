@@ -188,6 +188,35 @@ def resolve_config_path(path: Optional[str] = None) -> Path:
     return cfg_path
 
 
+def _tighten(path) -> None:
+    """Repair a secret file that is already group- or world-readable.
+
+    setup.py creates .env at 0600, but a file written before that rule — or
+    copied, or restored from a backup — keeps its old mode forever, because
+    creating at 0600 does nothing to a file that already exists. Checking on
+    every load is cheap and is the only moment we reliably touch it.
+
+    Repair is announced rather than silent: a mode that changed under an
+    operator without a word is its own small surprise.
+    """
+    import os
+    import stat as _stat
+    import sys as _sys
+    try:
+        mode = _stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return
+    if mode & 0o077:
+        try:
+            os.chmod(path, 0o600)
+            print(f"[pstb] tightened {path} from {mode:04o} to 0600 — it "
+                  "holds credentials", file=_sys.stderr)
+        except OSError:
+            print(f"[pstb] WARNING: {path} is mode {mode:04o} and readable "
+                  "by other accounts on this host; could not chmod it",
+                  file=_sys.stderr)
+
+
 def load_config(path: Optional[str] = None) -> Config:
     """Load config.yaml, searched as: path arg > $PSTB_CONFIG > ./config.yaml
     > <package root>/config.yaml. Then overlay env vars.
@@ -206,7 +235,15 @@ def load_config(path: Optional[str] = None) -> Config:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv(cfg.root / ".env")
+        # interpolate=False, and it is not cosmetic: dotenv expands ${...}
+        # in BOTH quote styles, so an Oracle or QAS password containing a
+        # literal ${ is silently rewritten before anything sees it.
+        # Measured: ORACLE_PASSWORD='Pa${ss}w0rd!2026' reads back as
+        # 'Paw0rd!2026' and authentication fails with a correct password in
+        # the file. Nothing in this deployment substitutes variables into
+        # .env, so the expansion has no upside to trade against.
+        _tighten(cfg.root / ".env")
+        load_dotenv(cfg.root / ".env", interpolate=False)
     except ImportError:
         pass
 

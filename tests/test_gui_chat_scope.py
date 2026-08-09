@@ -308,7 +308,7 @@ class McpSessionDiagnosisTests(unittest.TestCase):
     def test_meta_reports_session_state(self):
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp
-        with TestClient(gapp.app) as client:
+        with TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as client:
             body = client.get("/api/meta").json()
             self.assertIn("mcp_session", body)
             self.assertIn("shared", body["mcp_session"])

@@ -197,7 +197,7 @@ class EndpointTests(unittest.TestCase):
     def test_export_endpoint_streams_csv_with_honest_headers(self) -> None:
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp
-        with TestClient(gapp.app) as client:
+        with TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as client:
             r = client.post("/api/export", json={
                 "tool": "run_sql",
                 "args": {"sql": "SELECT ACCOUNT AS a, POSTED_TOTAL_AMT AS amt "
@@ -217,7 +217,7 @@ class EndpointTests(unittest.TestCase):
         # real CSV, and the header says no re-run happened.
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp
-        with TestClient(gapp.app) as client:
+        with TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as client:
             r = client.post("/api/export", json={
                 "tool": "coupa_to_ap_tie",
                 "result": {"amount_breaks": [
@@ -229,7 +229,7 @@ class EndpointTests(unittest.TestCase):
     def test_nothing_exportable_is_a_400_with_the_reason(self) -> None:
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp
-        with TestClient(gapp.app) as client:
+        with TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as client:
             r = client.post("/api/export", json={
                 "tool": "coupa_health", "result": {"ok": True}})
             self.assertEqual(r.status_code, 400)

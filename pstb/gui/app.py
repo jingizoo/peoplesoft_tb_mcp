@@ -30,6 +30,7 @@ from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
+from . import localguard
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -136,6 +137,24 @@ async def _lifespan(_app):
 
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
               redoc_url=None, lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _loopback_only(request, call_next):
+    """Every route, not just the sensitive-looking ones.
+
+    A DNS-rebound page reads the general ledger from /api/trial-balance as
+    readily as it would read an admin page, so the check cannot be scoped
+    to one prefix. See pstb/gui/localguard.py for what each rule stops.
+    """
+    status, reason = localguard.rejection(request.scope)
+    if status:
+        response = JSONResponse(status_code=status,
+                                content={"error": reason})
+    else:
+        response = await call_next(request)
+    localguard.apply_security_headers(response.headers)
+    return response
 
 
 @dataclass
@@ -1297,6 +1316,19 @@ def main() -> None:
     ap.add_argument("--open", action="store_true", help="open a browser window")
     args = ap.parse_args()
 
+    # A non-loopback bind is refused HERE, not warned about. Everything this
+    # app serves — every balance, every customer, the ad-hoc SQL tool — is
+    # unauthenticated, so the bind is the whole access-control story and a
+    # flag must not be able to hand it to the network.
+    if not localguard.peer_is_loopback((args.host, args.port)):
+        raise SystemExit(
+            f"\n  Refusing to bind {args.host}: this app has no "
+            "authentication, so every balance and the ad-hoc SQL tool would "
+            "be reachable by anyone who can route to this host.\n"
+            "  Reach it from your laptop through the tunnel instead:\n"
+            f"      ssh -L {args.port}:localhost:{args.port} <this-host>\n"
+            f"  then open http://localhost:{args.port}\n")
+
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
     print(f"  data: {cfg.db.backend}{' (views)' if cfg.db.use_views else ''} | "
@@ -1307,7 +1339,8 @@ def main() -> None:
         import webbrowser
 
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port,
+                log_level="warning", proxy_headers=False)
 
 
 if __name__ == "__main__":
