@@ -171,6 +171,20 @@ if __name__ == "__main__":
 
 
 class DailyBriefTests(Base):
+    # The brief's windows are relative to TODAY, and the bundled sample's
+    # dates are fixed, so "quiet check stays quiet" silently becomes a
+    # calendar assertion: cash_squeeze flipped to attention on 2026-08-09
+    # once the real date walked past the sample's due dates. Pin the clock
+    # so the test measures the rule and not the day it ran.
+    AS_OF = "2026-08-06"
+
+    def setUp(self) -> None:
+        from unittest.mock import patch
+        self._clock = patch.object(type(self.ar), "_asof",
+                                   lambda _self, given="": given or self.AS_OF)
+        self._clock.start()
+        self.addCleanup(self._clock.stop)
+
     def test_the_staged_exceptions_surface_and_quiet_checks_stay_quiet(self):
         runner = PlaybookRunner(self.engine, self.ar)
         out = runner.run("daily_brief")

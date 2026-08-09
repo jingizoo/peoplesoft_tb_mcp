@@ -219,8 +219,23 @@ A ~50-question catalog is in [QUESTIONS.md](QUESTIONS.md).
 ```
 
 Windows: `.venv\Scripts\python -m pstb.gui --open`. Opens
-http://127.0.0.1:8000 (add `--port 8777` to change it, `--host 0.0.0.0` to
-expose it on the network — see the security note below).
+http://127.0.0.1:8000 (add `--port 8777` to change it).
+
+**It will refuse a non-loopback bind, and that is deliberate.** Nothing
+this app serves is authenticated — every balance, every customer, the
+ad-hoc SQL tool — so the loopback bind is the whole access-control story.
+To reach it from your laptop, forward the port instead of widening the
+bind:
+
+```bash
+ssh -L 8000:localhost:8000 <this-host>
+```
+
+then open http://localhost:8000 on your laptop. Requests carrying an
+unexpected `Host` header, or a proxy's `X-Forwarded-For`, are refused too:
+a page on the open web can otherwise resolve its own hostname to
+127.0.0.1 and read your ledger through the browser you left the tunnel
+open in.
 
 Five views sharing one scope bar (business unit, ledger, fiscal year, period):
 

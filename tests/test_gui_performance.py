@@ -29,12 +29,12 @@ class AsyncDiscoveryTests(unittest.TestCase):
         # The page must paint before discovery runs: building the catalog in
         # /api/meta held the first paint for as long as a WAN round trip took
         # (a minute on the real instance) with nothing on screen to explain it.
-        meta = self.TestClient(self.gapp.app).get("/api/meta").json()
+        meta = self.TestClient(self.gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)).get("/api/meta").json()
         self.assertFalse(meta.get("scopes_ready"))
         self.assertEqual(meta.get("financial_scopes"), [])
 
     def test_scopes_endpoint_builds_on_demand_and_then_meta_serves_it(self) -> None:
-        client = self.TestClient(self.gapp.app)
+        client = self.TestClient(self.gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000))
         scopes = client.get("/api/scopes").json()
         self.assertTrue(scopes.get("ready"))
         self.assertGreaterEqual(len(scopes.get("scopes") or []), 1)
@@ -46,7 +46,7 @@ class AsyncDiscoveryTests(unittest.TestCase):
         # One server for the process, not one per chat turn: the spawn plus
         # handshake measured ~320ms, paid on EVERY question, and discarded
         # every engine cache with it.
-        with self.TestClient(self.gapp.app) as live:
+        with self.TestClient(self.gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as live:
             live.get("/api/meta")
             self.assertIsNotNone(self.gapp._MCP.get("session"),
                                  msg=str(self.gapp._MCP.get("error")))
@@ -65,7 +65,7 @@ class AsyncDiscoveryTests(unittest.TestCase):
         saved = self.gapp._MCP.get("session")
         self.gapp._MCP["session"] = None
         try:
-            with self.TestClient(self.gapp.app) as live:
+            with self.TestClient(self.gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as live:
                 r = live.post("/api/chat", json={
                     "message": "What is our capitalization threshold?",
                     "scope": {}, "session_id": "fallbacksess01"})
@@ -136,7 +136,7 @@ class BusinessUnitNameTests(unittest.TestCase):
         from pstb.gui import app as gapp
 
         gapp._scope_cache.update({"value": None, "expires": 0.0})
-        self.client = TestClient(gapp.app)
+        self.client = TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000))
 
     def test_the_scope_catalog_carries_a_real_description(self) -> None:
         scopes = self.client.get("/api/scopes").json().get("scopes") or []
@@ -193,7 +193,7 @@ class StaleWhileRevalidateTests(unittest.TestCase):
 
         self.gapp = gapp
         self.time = _t
-        self.client = TestClient(gapp.app)
+        self.client = TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000))
         self.original = gapp.engine.list_financial_scopes
         # A deterministic base: force builds the VERIFIED catalog
         # synchronously and spawns no background thread.
@@ -286,7 +286,7 @@ class FirstBuildCannotTimeOutTests(unittest.TestCase):
 
         self.gapp = gapp
         self.time = _t
-        self.client = TestClient(gapp.app)
+        self.client = TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000))
         self.orig_probe = gapp.engine._with_ledger_data
 
     def tearDown(self) -> None:

@@ -97,7 +97,7 @@ class EndpointTests(unittest.TestCase):
     def test_endpoint_serves_quick_diagnostics(self) -> None:
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp
-        with TestClient(gapp.app) as client:
+        with TestClient(gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as client:
             r = client.get("/api/diagnostics")
             self.assertEqual(r.status_code, 200)
             body = r.json()

@@ -25,7 +25,9 @@ llm = [
     "google-genai>=1.16.0,<3.0",
 ]
 gui = [
-    "fastapi>=0.110,<1.0",
+    # 0.140 enforces request Content-Type, which is what stops a
+    # cross-origin page POSTing JSON to a local endpoint.
+    "fastapi>=0.140,<1.0",
     "uvicorn>=0.27,<1.0",
 ]
 oracle = ["oracledb>=2.4,<4.0"]
