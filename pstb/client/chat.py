@@ -1,9 +1,11 @@
 """Terminal chat client: connects to the TB MCP server over stdio, exposes its
-tools to the chosen LLM (Ollama or Gemini on Vertex AI), and runs the agent loop.
+tools to the chosen LLM (Ollama, Gemini on Vertex AI, or Claude on the
+Anthropic API), and runs the agent loop.
 
 Usage:
     python -m pstb.client.chat                       # REPL, provider from config
     python -m pstb.client.chat --provider gemini
+    python -m pstb.client.chat --provider claude
     python -m pstb.client.chat --ask "Does the trial balance balance for period 6?"
 """
 from __future__ import annotations
@@ -43,7 +45,13 @@ from ..guards import (
     unevidenced_verdict,
 )
 from ..qlog import QuestionLog
-from .llm_base import LLMProvider, LLMResponse, ToolResult, ToolSpec
+from .llm_base import (
+    PROVIDERS,
+    LLMProvider,
+    LLMResponse,
+    ToolResult,
+    ToolSpec,
+)
 from .prompt import system_prompt
 
 MAX_TOOL_ROUNDS = 10
@@ -53,12 +61,20 @@ MAX_TOOL_RESULT_CHARS = 24_000  # mutable via set_tool_result_limit()
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 
 
+# Providers whose context window is measured in hundreds of thousands of
+# tokens, so a whole tool result fits and truncating one only loses rows
+# the answer might need.
+WIDE_WINDOW_PROVIDERS = frozenset({"gemini", "claude"})
+
+
 def tool_result_limit(cfg: Config, provider_name: str) -> int:
     """Size tool results to the model. Local 8B models drown past ~24k chars;
-    Gemini 2.5 Pro has a 1M-token window and chains better when it sees whole
-    results instead of truncated rows."""
+    Gemini 2.5 Pro and Claude Opus 5 both have 1M-token windows and chain
+    better when they see whole results instead of truncated rows."""
     explicit = int(getattr(cfg.llm, "max_tool_result_chars", 0) or 0)
-    return explicit or (120_000 if provider_name == "gemini" else 24_000)
+    if explicit:
+        return explicit
+    return 120_000 if provider_name in WIDE_WINDOW_PROVIDERS else 24_000
 
 
 def set_tool_result_limit(cfg: Config, provider_name: str) -> None:
@@ -83,11 +99,16 @@ def build_provider(name: str, cfg: Config, tools: list[ToolSpec]) -> LLMProvider
         from .llm_gemini import GeminiVertexProvider
 
         return GeminiVertexProvider(cfg, prompt, tools)
+    if name == "claude":
+        from .llm_claude import ClaudeProvider
+
+        return ClaudeProvider(cfg, prompt, tools)
     if name == "ollama":
         from .llm_ollama import OllamaProvider
 
         return OllamaProvider(cfg, prompt, tools)
-    raise SystemExit(f"Unknown provider {name!r} — use 'ollama' or 'gemini'")
+    raise SystemExit(
+        f"Unknown provider {name!r} — use 'ollama', 'gemini' or 'claude'")
 
 
 def _field(obj, *names, default=None):
@@ -753,10 +774,8 @@ async def run(args: argparse.Namespace) -> int:
     cfg = load_config(cfg_path)
     provider_name = (args.provider or cfg.llm.provider).lower()
     if args.model:
-        if provider_name == "ollama":
-            cfg.llm.ollama_model = args.model
-        else:
-            cfg.llm.gemini_model = args.model
+        setattr(cfg.llm, {"ollama": "ollama_model", "claude": "claude_model"}
+                .get(provider_name, "gemini_model"), args.model)
 
     env = dict(os.environ)
     env["PSTB_CONFIG"] = str(Path(cfg_path).resolve())
@@ -808,7 +827,8 @@ async def run(args: argparse.Namespace) -> int:
                 print(f"\n{answer}")
                 return 0
 
-            print("Type a question ( /tools /reset /provider ollama|gemini /quit )")
+            print("Type a question "
+                  "( /tools /reset /provider ollama|gemini|claude /quit )")
             while True:
                 try:
                     q = (await asyncio.to_thread(input, f"\n{BOLD}you>{RESET} ")).strip()
@@ -829,19 +849,19 @@ async def run(args: argparse.Namespace) -> int:
                     continue
                 if q.startswith("/provider"):
                     parts = q.split()
-                    if len(parts) == 2 and parts[1] in ("ollama", "gemini"):
+                    if len(parts) == 2 and parts[1] in PROVIDERS:
                         try:
                             provider = build_provider(parts[1], cfg, tools)
                             # Re-size tool results for the NEW provider: an 8B
                             # local model drowns past ~24k chars, and Gemini
-                            # can take 120k — keeping the old limit gives the
-                            # wrong behavior in both directions.
+                            # or Claude can take 120k — keeping the old limit
+                            # gives the wrong behavior in both directions.
                             set_tool_result_limit(cfg, parts[1])
                             print(f"(switched to {provider.name}:{provider.model} — history reset)")
                         except (RuntimeError, SystemExit) as e:
                             print(f"(cannot switch: {e})")
                     else:
-                        print("usage: /provider ollama|gemini")
+                        print(f"usage: /provider {'|'.join(PROVIDERS)}")
                     continue
                 try:
                     answer = await agent_turn(provider, session, q,
@@ -855,7 +875,8 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="PeopleSoft TB chat agent")
-    ap.add_argument("--provider", choices=["ollama", "gemini"], help="override config.llm.provider")
+    ap.add_argument("--provider", choices=sorted(PROVIDERS),
+                    help="override config.llm.provider")
     ap.add_argument("--model", help="override the model name for the chosen provider")
     ap.add_argument("--config", help="path to config.yaml")
     ap.add_argument("--ask", help="ask one question and exit")

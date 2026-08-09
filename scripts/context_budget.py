@@ -115,8 +115,8 @@ def report(m: dict) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--provider", default="ollama",
-                    choices=["ollama", "gemini"])
+    from pstb.client.llm_base import PROVIDERS
+    ap.add_argument("--provider", default="ollama", choices=sorted(PROVIDERS))
     args = ap.parse_args()
     sys.exit(report(asyncio.run(measure(args.provider))))
 

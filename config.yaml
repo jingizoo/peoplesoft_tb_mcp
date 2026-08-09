@@ -47,7 +47,7 @@ ps_api:
   max_rows: 5000
 
 llm:
-  provider: ollama        # ollama | gemini  (override per run: --provider, or PSTB_LLM_PROVIDER)
+  provider: ollama        # ollama | gemini | claude  (override per run: --provider, or PSTB_LLM_PROVIDER)
   ollama_host: http://localhost:11434
   ollama_model: llama3.1:8b
   gemini_model: gemini-2.5-pro    # gemini-2.5-flash is cheaper/faster, weaker chaining
@@ -57,7 +57,17 @@ llm:
   temperature: 0.2
   gemini_force_tool_round: true   # force a tool call on tool-needing questions
   gemini_routing_temperature: 0.0 # greedy decoding for tool selection
-  max_tool_result_chars: 0        # 0 = auto (24k local models, 120k gemini)
+  # Claude on the Anthropic API. The key is NEVER here — it lives in .env as
+  # ANTHROPIC_API_KEY (the console writes it), or comes from a signed-in
+  # `ant auth login` profile, and the SDK reads it directly.
+  claude_model: claude-opus-5
+  claude_max_tokens: 32000        # thinking and answer share this budget
+  claude_effort: high             # low | medium | high | xhigh | max
+  claude_force_tool_round: true   # Claude rejects temperature; this is the
+                                  # only routing lever the API offers
+  claude_fallbacks: true          # retry a safety refusal on the recommended
+                                  # substitute model rather than answering nothing
+  max_tool_result_chars: 0        # 0 = auto (24k local models, 120k gemini/claude)
 
 wiki:
   provider: auto          # confluence | localdocs | auto (confluence when configured, else local docs)

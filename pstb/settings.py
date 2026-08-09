@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .client.llm_base import PROVIDERS
+
 OVERLAY_NAME = "config.local.yaml"
 
 
@@ -74,8 +76,9 @@ SETTINGS: tuple = (
             "Usually ACTUALS.", "str"),
     Setting("llm.provider", "Model provider",
             "ollama runs locally and needs no cloud credentials; gemini "
-            "needs Application Default Credentials.",
-            "choice", choices=("ollama", "gemini"),
+            "needs Application Default Credentials; claude needs an "
+            "Anthropic API key, which you can set below.",
+            "choice", choices=PROVIDERS,
             restart=True, env_var="PSTB_LLM_PROVIDER"),
     Setting("llm.ollama_model", "Ollama model", "e.g. llama3.1:8b",
             "str", restart=True),
@@ -85,8 +88,17 @@ SETTINGS: tuple = (
             "int", minimum=2048, maximum=131072, restart=True),
     Setting("llm.gemini_model", "Gemini model", "e.g. gemini-2.5-pro",
             "str", restart=True),
+    Setting("llm.claude_model", "Claude model", "e.g. claude-opus-5",
+            "str", restart=True),
+    Setting("llm.claude_effort", "Claude effort",
+            "How hard the model works before answering. Higher costs more "
+            "and takes longer; measure with scripts/eval.py before moving "
+            "it.",
+            "choice", choices=("low", "medium", "high", "xhigh", "max"),
+            restart=True),
     Setting("llm.temperature", "Temperature",
-            "0 is greedy. Routing already forces 0 where it matters.",
+            "0 is greedy. Routing already forces 0 where it matters. "
+            "Ignored by Claude, which does not accept it.",
             "int", minimum=0, maximum=2, restart=True),
     Setting("ps_api.enabled", "Run PSQuery through QAS",
             "Off means run_ps_query answers from bundled fixtures. Needs "
@@ -128,12 +140,13 @@ ENV_KEYS = frozenset(k for k, _, _ in ENV_SETTINGS)
 # logged. Anything not here is refused by the writer itself, so a bug in a
 # handler cannot widen the set.
 SECRET_KEYS = frozenset({"PSFT_QAS_PASSWORD", "ORACLE_PASSWORD",
-                         "CONFLUENCE_API_TOKEN"})
+                         "CONFLUENCE_API_TOKEN", "ANTHROPIC_API_KEY"})
 
 SECRET_LABELS = {
     "PSFT_QAS_PASSWORD": "PeopleSoft QAS password",
     "ORACLE_PASSWORD": "Oracle database password",
     "CONFLUENCE_API_TOKEN": "Confluence API token",
+    "ANTHROPIC_API_KEY": "Anthropic API key",
 }
 
 

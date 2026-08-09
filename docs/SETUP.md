@@ -87,7 +87,7 @@ MCP server and chat client need installed packages.
 
 ## 4. Pick an LLM provider
 
-Both are supported and switchable per run.
+All three are supported and switchable per run.
 
 ### Option A — Ollama (local, nothing leaves the machine)
 
@@ -188,13 +188,91 @@ journal descriptions — are sent to Google Cloud. Ollama keeps everything local
 Confirm this against your data-handling policy before pointing Gemini at
 production financials.
 
-`profile_record` and `compare_records` add row-level samples to that path.
+The same applies to Claude below, with Anthropic in place of Google Cloud.
+
+`profile_record` and `compare_records` add row-level samples to that path
+whichever cloud provider is selected.
 Personal columns (names, contacts, addresses, tax and bank identifiers) are
 masked to a shape-preserving placeholder before they leave the database, and
 identifiers, codes, dates and amounts are not — see
 [RECORD_SELECTION.md](RECORD_SELECTION.md). Set `tools.sample_rows: 0` in
 `config.yaml` to send no rows at all; record selection still works from shape,
 fill rates and status-code counts.
+
+### Option C — Claude on the Anthropic API
+
+Two things and no CLI required: the package (already installed by
+`pip install -e ".[llm]"`) and a credential.
+
+**1. Give it a credential — one of two ways**
+
+Put the key in `.env`:
+
+```
+ANTHROPIC_API_KEY=...
+```
+
+`.env` is mode 600 and is never committed. If you would rather not edit a
+file on the box, the configuration console does it for you: open `/console`
+over the tunnel, enter the confirmation code, and set **Anthropic API key**.
+Nothing echoes the value back, there or in the logs.
+
+Or sign in as yourself, if the Anthropic CLI is installed. Over SSH the
+browser cannot open, so the flag is required:
+
+```bash
+ant auth login --no-launch-browser
+```
+
+That writes a profile under `~/.config/anthropic/` which the SDK reads on its
+own — no environment variable at all.
+
+**2. Run it**
+
+```bash
+.venv/bin/python -m pstb.client.chat --provider claude
+```
+
+To make it the permanent default, set `llm.provider: claude` in `config.yaml`
+(or from the console). `/provider claude` switches mid-session in the REPL,
+and `PSTB_LLM_PROVIDER` overrides per run.
+
+**What is tuned, and what is deliberately ignored.** `llm.temperature` does
+not apply — Claude Opus 5 rejects it outright — so tool selection is made
+firm by *forcing* a call on the first turn of a question that needs one,
+which is the same discipline Gemini gets from mode ANY. Depth is
+`llm.claude_effort` (`low`, `medium`, `high`, `xhigh`, `max`; `high` is the
+default and a starting point, not a measured one). `llm.claude_max_tokens`
+covers thinking **and** the answer together, because thinking is on by
+default on this model family. Tool results are sized to 120k characters as
+they are for Gemini, the system prompt and tool list are cached so repeat
+turns bill a fraction of the input, and a request the safety classifiers
+decline is retried once on Anthropic's recommended substitute model rather
+than coming back empty.
+
+If the credential is missing the provider refuses to start and prints the
+three ways to fix it — it does not fail on the first question.
+
+**Choosing a model.** `config.yaml` ships `claude-opus-5`. Override without
+editing it:
+
+```bash
+.venv/bin/python -m pstb.client.chat --provider claude --model claude-sonnet-5
+```
+
+**Data note:** with Claude, tool results — ledger amounts, operator IDs, and
+journal descriptions — are sent to Anthropic. This is a separate vendor
+decision from the Gemini one above, not covered by it; confirm it against
+your data-handling policy before pointing Claude at production financials.
+Ollama keeps everything local.
+
+**Which one is better here?** Measure rather than assume — the eval harness
+replays the same graded questions through whichever provider you name:
+
+```bash
+.venv/bin/python scripts/eval.py --provider claude
+.venv/bin/python scripts/eval.py --provider gemini
+```
 
 ## 5. Verify it works
 

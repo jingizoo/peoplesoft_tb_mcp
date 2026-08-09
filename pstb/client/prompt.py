@@ -12,8 +12,8 @@ from ..config import Config
 # call comes first, what a finished answer sounds like. That is better
 # shown than described, and showing costs about 2,300 tokens.
 #
-# Gemini has a million-token window and pays this happily. The local 8B
-# does not: measured, its fixed prompt is already ~19k tokens against a
+# Gemini and Claude both have million-token windows and pay this happily.
+# The local 8B does not: measured, its fixed prompt is already ~19k tokens against a
 # 16,384 window (docs/CONTEXT_BUDGET.md), and adding to it would push more
 # of the TOOL LIST out of the window — trading routing accuracy for
 # routing advice. So this block is provider-conditional, and the condition
@@ -82,7 +82,7 @@ Name what you checked, name what would unblock it, and stop.
 # Providers whose context window has room for the worked examples.
 # Ollama is deliberately absent: its fixed prompt already exceeds the
 # configured window, and more prose would evict more tool list.
-ROOMY_PROVIDERS = frozenset({"gemini"})
+ROOMY_PROVIDERS = frozenset({"gemini", "claude"})
 
 TERMINAL_STYLE = """## Output style
 - Format money with thousands separators and 2 decimals (1,234,567.89).

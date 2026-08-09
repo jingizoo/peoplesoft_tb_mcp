@@ -1,10 +1,11 @@
 # PeopleSoft Trial Balance MCP Agent
 
 An MCP server + chat client that answers trial-balance questions against
-PeopleSoft Finance (GL), using **Ollama** (local) or **Gemini on Vertex AI** —
-switchable per run. It ships with a realistic SQLite sample GL so everything
-works before you connect a real database, and it enriches answers with company
-documentation from **Confluence** (or a local docs folder).
+PeopleSoft Finance (GL), using **Ollama** (local), **Gemini on Vertex AI**, or
+**Claude on the Anthropic API** — switchable per run. It ships with a realistic
+SQLite sample GL so everything works before you connect a real database, and it
+enriches answers with company documentation from **Confluence** (or a local docs
+folder).
 
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
@@ -14,7 +15,8 @@ documentation from **Confluence** (or a local docs folder).
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
 │   • Gemini (Vertex)  │              Oracle / SQLite      Confluence /
-└──────────────────────┘              (PS_LEDGER, PS_JRNL_*) local docs
+│   • Claude (API)     │              (PS_LEDGER, PS_JRNL_*) local docs
+└──────────────────────┘
 ```
 
 The server speaks standard MCP over stdio — the bundled chat client is one
@@ -117,11 +119,11 @@ example.
 
 ## LLM providers
 
-| | Ollama | Gemini on Vertex AI |
-|---|---|---|
-| Setup | `ollama pull llama3.1:8b` (or qwen3 etc.) | GCP project + `gcloud auth application-default login` |
-| Data | stays on your machine | tool results are sent to Google Cloud — check data governance before pointing at production |
-| Select | `make chat` / `--provider ollama` | `make chat-gemini` / `--provider gemini` |
+| | Ollama | Gemini on Vertex AI | Claude (Anthropic API) |
+|---|---|---|---|
+| Setup | `ollama pull llama3.1:8b` (or qwen3 etc.) | GCP project + `gcloud auth application-default login` | `ANTHROPIC_API_KEY` in `.env`, or `ant auth login` |
+| Data | stays on your machine | tool results are sent to Google Cloud — check data governance before pointing at production | tool results are sent to Anthropic — the same check applies, and it is a separate vendor decision |
+| Select | `make chat` / `--provider ollama` | `make chat-gemini` / `--provider gemini` | `make chat-claude` / `--provider claude` |
 
 Gemini uses the **google-genai** SDK with `vertexai=True` (Google retired the
 old `vertexai.generative_models` module in June 2026 — google-genai *is* the
@@ -132,9 +134,24 @@ gcloud CLI if you don't have it (`brew install google-cloud-sdk`), then:
 gcloud auth application-default login
 ```
 
+Claude uses the official **anthropic** SDK. The key is never a config value:
+put `ANTHROPIC_API_KEY` in `.env`, set it from the configuration console at
+`/console`, or sign in with `ant auth login --no-launch-browser` and let the
+SDK read the profile. Two things differ from the other providers and are
+deliberate — `llm.temperature` is ignored (Opus 5 rejects it, so routing is
+tightened by forcing a tool call instead), and depth is set by
+`llm.claude_effort` (`low`…`max`).
+
 Models are set in `config.yaml` (`gemini-2.5-pro` default, with thinking-budget
-and retry tuning built in — `gemini-2.5-flash` is the cheaper/faster option; `llama3.1:8b` default for Ollama, with
+and retry tuning built in — `gemini-2.5-flash` is the cheaper/faster option;
+`claude-opus-5` default for Claude; `llama3.1:8b` default for Ollama, with
 `qwen3` / larger llama models giving better tool use).
+
+Whichever you pick, measure it rather than assuming:
+
+```bash
+.venv/bin/python scripts/eval.py --provider claude
+```
 
 ## Connecting your real PeopleSoft database (Oracle)
 

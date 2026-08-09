@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "peoplesoft-tb-mcp"
 version = "0.1.0"
-description = "MCP server + LLM chat client for querying a PeopleSoft trial balance (Ollama or Gemini on Vertex AI)"
+description = "MCP server + LLM chat client for querying a PeopleSoft trial balance (Ollama, Gemini on Vertex AI, or Claude)"
 requires-python = ">=3.10"
 # Upper bounds are deliberate. The MCP SDK renamed tool/result fields between
 # 1.x and 2.x; the code handles both, but an unbounded install would silently
@@ -23,6 +23,10 @@ dependencies = [
 llm = [
     "ollama>=0.4.7,<1.0",
     "google-genai>=1.16.0,<3.0",
+    # 0.121 is what the Claude provider was written and tested against.
+    # The floor matters: output_config.effort, adaptive thinking and the
+    # fallbacks parameter are all newer than the 0.x series suggests.
+    "anthropic>=0.121.0,<1.0",
 ]
 gui = [
     # 0.140 enforces request Content-Type, which is what stops a
