@@ -183,6 +183,72 @@ class OverlayTests(unittest.TestCase):
         self.assertIn("safe to delete", str(ctx.exception))
 
 
+class QasSetupIsCompleteTests(unittest.TestCase):
+    """Every value QAS needs must be settable here.
+
+    The console shipped with the PASSWORD only, which left the one job it
+    was asked for — configure PSQuery without an admin — impossible: the
+    user and node still needed an SSH session, so the console saved
+    nothing and the operator did the whole thing by hand anyway.
+    """
+
+    def test_every_qas_value_is_reachable_from_the_console(self) -> None:
+        reachable = st.ENV_KEYS | st.SECRET_KEYS
+        for key in ("PSFT_QAS_USER", "PSFT_QAS_PASSWORD", "PSFT_QAS_NODE"):
+            self.assertIn(key, reachable,
+                          f"{key} is read at runtime but cannot be set here")
+        self.assertIn("ps_api.enabled", st.BY_KEY)
+
+    def test_the_user_is_readable_and_the_password_is_not(self) -> None:
+        # Not an oversight in either direction: the user is disclosed
+        # everywhere because it explains whose permission lists shaped the
+        # rows; the password is never returned at all.
+        self.assertIn("PSFT_QAS_USER", st.ENV_KEYS)
+        self.assertNotIn("PSFT_QAS_USER", st.SECRET_KEYS)
+        self.assertIn("PSFT_QAS_PASSWORD", st.SECRET_KEYS)
+        self.assertNotIn("PSFT_QAS_PASSWORD", st.ENV_KEYS)
+
+    def test_values_are_read_from_the_file_not_the_environment(self) -> None:
+        import os
+        import tempfile
+        env = Path(tempfile.mkdtemp()) / ".env"
+        env.write_text("PSFT_QAS_USER='FROMFILE'\n")
+        os.environ["PSFT_QAS_USER"] = "STALE"
+        try:
+            got = st.read_env_values(env)["PSFT_QAS_USER"]["value"]
+            self.assertEqual(got, "FROMFILE")
+        finally:
+            os.environ.pop("PSFT_QAS_USER", None)
+
+    def test_setting_them_leaves_unrelated_lines_alone(self) -> None:
+        import tempfile
+        env = Path(tempfile.mkdtemp()) / ".env"
+        env.write_text("ORACLE_USER='rpt'\nCONFLUENCE_EMAIL='a@b.c'\n")
+        st.write_env_keys(env, {"PSFT_QAS_USER": "QASRPT",
+                                "PSFT_QAS_NODE": "PSFT_HR"})
+        text = env.read_text()
+        self.assertIn("ORACLE_USER='rpt'", text)
+        self.assertIn("CONFLUENCE_EMAIL='a@b.c'", text)
+        self.assertIn("PSFT_QAS_USER='QASRPT'", text)
+
+    def test_a_blank_value_clears_rather_than_storing_emptiness(self) -> None:
+        import tempfile
+        env = Path(tempfile.mkdtemp()) / ".env"
+        st.write_env_keys(env, {"PSFT_QAS_NODE": "PSFT_HR"})
+        st.write_env_keys(env, {}, ["PSFT_QAS_NODE"])
+        self.assertEqual(
+            st.read_env_values(env)["PSFT_QAS_NODE"]["value"], "",
+            "clearing the node must fall back to the PSFT_FS default, not "
+            "pin it to an empty string")
+
+    def test_the_writer_still_refuses_anything_outside_both_lists(self):
+        import tempfile
+        env = Path(tempfile.mkdtemp()) / ".env"
+        for key in ("ORACLE_DSN", "PSTB_CONFIG", "PATH"):
+            with self.assertRaises(st.SettingsError, msg=key):
+                st.write_env_keys(env, {key: "x"})
+
+
 class RestartHonestyTests(unittest.TestCase):
     def test_the_console_does_not_offer_a_restart_it_cannot_do(self) -> None:
         body = _client().get("/api/console/status", headers=H).json()
