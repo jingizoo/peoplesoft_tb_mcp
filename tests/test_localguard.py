@@ -125,22 +125,212 @@ class WholeAppTests(unittest.TestCase):
                          "DENY")
 
 
+class PolicyTests(unittest.TestCase):
+    """Shared mode: a routable bind is allowed, but only WITH a token.
+
+    Refusing the bind outright made one control do two jobs — the access
+    story and the answer to "three of us need this page" — and a team given
+    only those two options deletes the control. These tests pin the shape of
+    the replacement: the bind can widen, the authentication cannot vanish.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(setattr, localguard, "POLICY", localguard.POLICY)
+
+    def test_the_default_is_still_loopback_only_and_open(self) -> None:
+        self.assertFalse(localguard.POLICY.shared)
+        self.assertEqual(localguard.POLICY.token, "")
+        self.assertEqual(localguard.rejection(_scope()), (0, ""))
+
+    def test_a_routable_bind_without_a_token_is_a_programming_error(self) -> None:
+        with self.assertRaises(ValueError):
+            localguard.configure("0.0.0.0", "")
+
+    def test_shared_mode_admits_a_routable_peer_carrying_the_token(self) -> None:
+        localguard.configure("0.0.0.0", "s3cret")
+        status, _ = localguard.rejection(
+            _scope(host="finhost:8016", client=("10.0.0.5", 1),
+                   extra={"Authorization": "Bearer s3cret"}))
+        self.assertEqual(status, 0)
+
+    def test_shared_mode_refuses_a_routable_peer_without_the_token(self) -> None:
+        localguard.configure("0.0.0.0", "s3cret")
+        status, why = localguard.rejection(
+            _scope(host="finhost:8016", client=("10.0.0.5", 1)))
+        self.assertEqual(status, 401)
+        self.assertIn("token", why)
+
+    def test_shared_mode_refuses_a_WRONG_token(self) -> None:
+        localguard.configure("0.0.0.0", "s3cret")
+        for wrong in ("", "s3cre", "S3CRET", "s3cretx", "s3 cret"):
+            status, _ = localguard.rejection(
+                _scope(host="finhost", client=("10.0.0.5", 1),
+                       extra={"X-PSTB-Token": wrong}))
+            self.assertEqual(status, 401, wrong)
+
+    def test_a_pasted_token_may_carry_stray_whitespace(self) -> None:
+        # Generated tokens are urlsafe base64 and never contain a space, so
+        # trimming one cannot admit a different token — and a copy-paste
+        # that picks up a trailing space is otherwise a mystery failure.
+        localguard.configure("0.0.0.0", "s3cret")
+        status, _ = localguard.rejection(
+            _scope(host="finhost", client=("10.0.0.5", 1),
+                   extra={"X-PSTB-Token": " s3cret "}))
+        self.assertEqual(status, 0)
+
+    def test_loopback_needs_the_token_too_in_shared_mode(self) -> None:
+        # Otherwise any proxy or script ON the server is an unauthenticated
+        # way in for the whole network, which is the hole the token closes.
+        localguard.configure("0.0.0.0", "s3cret")
+        status, _ = localguard.rejection(_scope(client=("127.0.0.1", 1)))
+        self.assertEqual(status, 401)
+
+    def test_the_token_may_arrive_in_the_url_or_a_cookie(self) -> None:
+        localguard.configure("0.0.0.0", "s3cret")
+        by_query = _scope(host="finhost", client=("10.0.0.5", 1))
+        by_query["query_string"] = b"token=s3cret"
+        self.assertEqual(localguard.rejection(by_query)[0], 0)
+        self.assertTrue(localguard.token_in_query(by_query))
+        by_cookie = _scope(host="finhost", client=("10.0.0.5", 1),
+                           extra={"Cookie": "theme=dark; pstb_token=s3cret"})
+        self.assertEqual(localguard.rejection(by_cookie)[0], 0)
+        self.assertFalse(localguard.token_in_query(by_cookie))
+
+    def test_shared_mode_accepts_any_host_until_one_is_named(self) -> None:
+        # The Host check exists to stop DNS rebinding, and a rebound page is
+        # same-origin with the ATTACKER's name — so it never receives our
+        # cookie and cannot pass the token check anyway. Guessing which name
+        # colleagues will type, and refusing the rest, would only reproduce
+        # the lockout this mode exists to end.
+        localguard.configure("0.0.0.0", "s3cret")
+        self.assertTrue(localguard.host_matches("finance.corp.example"))
+        localguard.configure("0.0.0.0", "s3cret", ["finance.corp.example"])
+        self.assertTrue(localguard.host_matches("finance.corp.example:8016"))
+        self.assertFalse(localguard.host_matches("evil.example"))
+        self.assertTrue(localguard.host_matches("localhost"),
+                        "the operator's own tunnel must keep working")
+
+    def test_a_forged_peer_header_is_still_refused_in_shared_mode(self) -> None:
+        localguard.configure("0.0.0.0", "s3cret")
+        status, why = localguard.rejection(
+            _scope(host="finhost", client=("10.0.0.5", 1),
+                   extra={"X-Forwarded-For": "127.0.0.1",
+                          "Authorization": "Bearer s3cret"}))
+        self.assertEqual(status, 400)
+        self.assertIn("forged", why)
+
+
 class BindTests(unittest.TestCase):
-    def test_main_refuses_a_non_loopback_bind(self) -> None:
-        # A flag must not be able to hand an unauthenticated ledger to the
-        # network. docs used to advise exactly this.
+    def setUp(self) -> None:
+        self.addCleanup(setattr, localguard, "POLICY", localguard.POLICY)
+
+    @staticmethod
+    def _run_main(**overrides):
         import argparse
         from unittest.mock import patch
 
         from pstb.gui import app as gapp
-        args = argparse.Namespace(host="0.0.0.0", port=8000, open=False)
+        args = argparse.Namespace(host="0.0.0.0", port=8000, open=False,
+                                  share=False, allow_host=[])
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return gapp, args, patch
+
+    def test_main_refuses_a_non_loopback_bind_with_no_authentication(self) -> None:
+        # A flag must not be able to hand an UNAUTHENTICATED ledger to the
+        # network. docs used to advise exactly this.
+        gapp, args, patch = self._run_main()
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
             with self.assertRaises(SystemExit) as ctx:
                 gapp.main()
         message = str(ctx.exception)
-        self.assertIn("no authentication", message)
+        self.assertIn("without authentication", message)
         self.assertIn("ssh -L", message, "refusing without the alternative "
                                          "just moves the problem")
+        self.assertIn("--share", message, "the refusal has to name the "
+                                          "supported way to do this, or the "
+                                          "next person deletes the check")
+
+    def test_share_binds_the_network_and_mints_a_token(self) -> None:
+        import os
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main(share=True)
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with _patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PSTB_AUTH_TOKEN", None)
+                with _patch("uvicorn.run") as served:
+                    gapp.main()
+        served.assert_called_once()
+        self.assertEqual(served.call_args.kwargs["host"], "0.0.0.0")
+        self.assertFalse(served.call_args.kwargs["proxy_headers"],
+                         "a forwarded header must never rewrite the peer")
+        self.assertTrue(localguard.POLICY.shared)
+        self.assertGreaterEqual(len(localguard.POLICY.token), 16)
+
+    def test_share_reuses_a_configured_token_across_restarts(self) -> None:
+        import os
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main(share=True)
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with _patch.dict(os.environ, {"PSTB_AUTH_TOKEN": "team-token-1"}):
+                with _patch("uvicorn.run"):
+                    gapp.main()
+        self.assertEqual(localguard.POLICY.token, "team-token-1")
+
+    def test_a_loopback_bind_never_asks_for_a_token(self) -> None:
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main(host="127.0.0.1")
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with _patch("uvicorn.run"):
+                gapp.main()
+        self.assertEqual(localguard.POLICY.token, "")
+        self.assertFalse(localguard.POLICY.shared)
+        self.assertEqual(localguard.rejection(_scope()), (0, ""))
+
+
+class SharedModeAppTests(unittest.TestCase):
+    """The whole app under a token, not just the pure function."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from starlette.testclient import TestClient
+        from pstb.gui import app as gapp
+        cls.TestClient, cls.gapp = TestClient, gapp
+
+    def setUp(self) -> None:
+        self.addCleanup(setattr, localguard, "POLICY", localguard.POLICY)
+        localguard.configure("0.0.0.0", "s3cret")
+
+    def _client(self, peer=("10.0.0.5", 51000)):
+        return self.TestClient(self.gapp.app, base_url="http://finhost:8016",
+                               client=peer)
+
+    def test_the_ledger_is_behind_the_token(self) -> None:
+        anon = self._client()
+        for path in ("/api/trial-balance", "/api/scopes", "/api/meta", "/"):
+            self.assertEqual(anon.get(path).status_code, 401, path)
+
+    def test_one_pasted_url_authenticates_the_whole_session(self) -> None:
+        browser = self._client()
+        first = browser.get("/?token=s3cret")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.cookies.get(localguard.TOKEN_COOKIE), "s3cret")
+        # The page's own fetches carry no query string; the cookie carries them.
+        self.assertEqual(browser.get("/api/meta").status_code, 200)
+
+    def test_a_wrong_token_is_never_stored_as_a_cookie(self) -> None:
+        # Otherwise a typo becomes a cookie that is then re-sent forever and
+        # the retry that would have worked keeps failing.
+        r = self._client().get("/?token=nope")
+        self.assertEqual(r.status_code, 401)
+        self.assertIsNone(r.cookies.get(localguard.TOKEN_COOKIE))
+
+    def test_a_refusal_is_still_unframeable(self) -> None:
+        r = self._client().get("/api/meta")
+        self.assertEqual(r.headers.get("x-frame-options"), "DENY")
 
 
 if __name__ == "__main__":

@@ -299,21 +299,94 @@ A ~50-question catalog is in [QUESTIONS.md](QUESTIONS.md).
 Windows: `.venv\Scripts\python -m pstb.gui --open`. Opens
 http://127.0.0.1:8000 (add `--port 8777` to change it).
 
-**It will refuse a non-loopback bind, and that is deliberate.** Nothing
-this app serves is authenticated — every balance, every customer, the
-ad-hoc SQL tool — so the loopback bind is the whole access-control story.
-To reach it from your laptop, forward the port instead of widening the
-bind:
+### Letting other people reach it
+
+By default the app binds 127.0.0.1 and answers only a caller on that
+machine. `--host 0.0.0.0` on its own is refused, and that is deliberate:
+nothing this app serves is authenticated — every balance, every customer,
+the ad-hoc SQL tool — so with no other control the bind is the whole access
+story. There are two supported ways to widen it.
+
+**One person, from their own laptop — forward the port.** Nothing to
+configure, and the ledger never leaves loopback:
 
 ```bash
 ssh -L 8000:localhost:8000 <this-host>
 ```
 
-then open http://localhost:8000 on your laptop. Requests carrying an
-unexpected `Host` header, or a proxy's `X-Forwarded-For`, are refused too:
-a page on the open web can otherwise resolve its own hostname to
-127.0.0.1 and read your ledger through the browser you left the tunnel
-open in.
+then open http://localhost:8000 on your laptop.
+
+**A team, from the network — `--share`.** This binds the routable address
+AND requires an access token on every request, including requests from
+127.0.0.1:
+
+```bash
+.venv/bin/python -m pstb.gui --host 0.0.0.0 --port 8016 --share
+```
+
+It prints a URL with the token in it. Send that link to whoever needs
+access; opening it once stores the token in a cookie and the rest of the
+session works normally. Anyone holding the link has full read access to
+the ledger, so treat it as the password it is.
+
+- Set `PSTB_AUTH_TOKEN` to pin the token, so a restart does not invalidate
+  the link everyone has already bookmarked. Without it, one is generated
+  per run.
+- `--allow-host <name>` (repeatable) restricts which `Host` names are
+  accepted. Without it any name is accepted and the token is the only
+  control — which is why `--share` refuses to run without one.
+
+Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
+and in loopback mode an unexpected `Host` header is refused as well: a page
+on the open web can otherwise resolve its own hostname to 127.0.0.1 and
+read your ledger through the browser you left the tunnel open in.
+
+### Why a question times out at 180s
+
+The browser gives up on a chat request after 180 seconds. Everything the
+turn does has to fit inside that, and the defaults do not add up on a slow
+instance — this is arithmetic worth doing before blaming the model:
+
+| Budget | Default | Where |
+|---|---|---|
+| Browser request | 180s | `REQ_TIMEOUT_MS`, `pstb/gui/static/index.html` |
+| One SQL query | 120s | `db.query_timeout_seconds`, `config.yaml` |
+| One Query Access Service call | 60s | `ps_api.timeout_seconds`, `config.yaml` |
+
+A turn makes **several** tool calls. Two slow queries, or one slow query
+plus one QAS call to a gateway that is not answering, already exceed the
+browser's patience — and the turn keeps running server-side after the
+browser has stopped listening. If PeopleSoft Query Access Services is
+configured but its REST listening connector is down, every turn that
+touches it spends 60s per call finding that out; `ps_api.enabled: false`
+in `config.yaml` removes that cost entirely, and the curated database tools
+are unaffected because they read the database directly.
+
+A question asked while a previous one is still running is refused with an
+explanation rather than queued into its own timeout, and **Clear** starts a
+fresh conversation without waiting for the stuck query. Tune the two
+thresholds with `PSTB_TURN_ABANDONED_SECONDS` (default 180, match it to the
+browser) and `PSTB_QUEUE_WAIT_SECONDS` (default 45).
+
+When a query is genuinely the problem, **Close & controls → diagnostics**
+with timings measures the real inputs, and `scripts/diagnose_db.py` breaks
+one playbook down to individual statements with their plans.
+
+### While it is starting
+
+Opening the page reports what the server is doing — connecting the answer
+engine, reading ledger defaults, finding the last posted period,
+discovering business units — with the elapsed time of the step in flight.
+A slow instance genuinely takes a while at "Finding the last posted
+period"; what that screen tells you is that it is working rather than
+hung, and if a step fails it shows the database's own error (`ORA-…`) with
+a retry button instead of sitting there.
+
+The web server now accepts connections before the answer engine has
+finished connecting, so the URL in the terminal is live immediately.
+Questions asked in that first moment fall back to a per-question server,
+which is slower but works; the page says so only if the shared engine
+actually fails.
 
 Five views sharing one scope bar (business unit, ledger, fiscal year, period):
 
@@ -348,6 +421,40 @@ authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
    ORACLE_USER=readonly_user
    ORACLE_PASSWORD=...
    ```
+
+   **Where the password lives, and the one way it bites.** It is read from
+   `ORACLE_PASSWORD` in the `.env` file that sits beside `config.yaml`,
+   falling back to `db.oracle_password` in `config.yaml` itself. The
+   environment variable wins, so a value exported in the shell or set by a
+   systemd unit silently overrides the file. `.env` is kept at mode 600 and
+   is repaired to 600 on every load; it is git-ignored. The configuration
+   console writes secrets to that same `.env` and nowhere else. The password
+   is never logged and never appears in an error message.
+
+   Setting it outside `.env` is fine — but it cannot be set *wrong* outside
+   `.env` without consequences, because Oracle counts every rejected logon
+   against `FAILED_LOGIN_ATTEMPTS` in the account's profile (10 in the
+   shipped `DEFAULT` profile). This app connects lazily, per query, so a
+   rejected password would be re-offered on every query and could lock a
+   shared service account within a few minutes of ordinary use. It no longer
+   does: the first `ORA-01017` (or `ORA-28000`/`ORA-28001`) latches, and no
+   further connection is attempted until the process restarts or you use the
+   console's reload. Transient failures — `ORA-12541`, `ORA-12170`, a
+   dropped session — still retry normally; they cost the account nothing.
+
+   Two ways a *correct* password arrives wrong, both of which used to look
+   identical to a typo:
+
+   - **`$` or `{}` in a shell.** `export ORACLE_PASSWORD=Pa$sword` gives
+     Oracle `Pa` — the shell ate the rest. Single-quote it:
+     `export ORACLE_PASSWORD='Pa$sword'`.
+   - **`$` or `{}` in `.env`.** The loader runs with `interpolate=False`
+     specifically so `${...}` survives, and the console refuses to write a
+     value containing `${` rather than mangle it. If you hand-edit, quote
+     it.
+
+   If the account does lock, `ORA-28000` is what you will see; a DBA
+   clears it with `ALTER USER <user> ACCOUNT UNLOCK`.
 4. In `config.yaml`, switch the backend and set your real conventions:
    ```yaml
    db:

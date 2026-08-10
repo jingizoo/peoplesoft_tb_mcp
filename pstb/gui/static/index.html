@@ -152,6 +152,26 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 @media (prefers-reduced-motion:reduce){
   #splash .sb,#splash .sl{animation:none;stroke-dashoffset:0}
 }
+.boot{display:flex;flex-direction:column;align-items:center;gap:14px;width:min(430px,88vw);text-align:center}
+.bootbar{width:100%;height:5px;border-radius:3px;background:var(--line);overflow:hidden}
+.bootbar i{display:block;height:100%;width:6%;border-radius:3px;background:var(--accent);
+  transition:width .45s cubic-bezier(.4,0,.2,1)}
+.bootnow{font-size:13.5px;color:var(--ink);font-weight:600;min-height:18px}
+.bootnow .el{color:var(--muted);font-weight:400;font-variant-numeric:tabular-nums}
+.bootsteps{list-style:none;margin:0;padding:0;width:100%;display:flex;flex-direction:column;gap:5px}
+.bootsteps li{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--muted);text-align:left}
+.bootsteps li .bi{flex:none;width:13px;text-align:center;font-size:11px;color:var(--line)}
+.bootsteps li .bt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bootsteps li .bm{font-variant-numeric:tabular-nums;opacity:.75}
+.bootsteps li.run{color:var(--ink)}
+.bootsteps li.run .bi{color:var(--accent)}
+.bootsteps li.done .bi{color:var(--ok)}
+.bootsteps li.fail{color:var(--bad)}
+.bootsteps li.fail .bi{color:var(--bad)}
+.boothint{font-size:11.5px;color:var(--muted);line-height:1.5}
+.booterr{font-size:12.5px;color:var(--bad);background:var(--bad-soft);border:1px solid var(--bad);
+  border-radius:8px;padding:10px 12px;text-align:left;width:100%;line-height:1.5;
+  word-break:break-word;max-height:34vh;overflow:auto}
 .tool-card>.inline{margin-top:6px}
 .csvbtn{margin-left:auto;background:transparent;color:var(--muted);border:1px solid var(--line);
   border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
@@ -217,6 +237,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .x:hover{color:var(--ink)}
 
 .empty{padding:44px 18px;text-align:center;color:var(--muted)}
+.empty .el{font-variant-numeric:tabular-nums;opacity:.75}
+.empty .busy-note{margin:10px auto 0;max-width:46ch;font-size:11.5px;line-height:1.5;opacity:.85}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -229,13 +251,24 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 </style>
 </head>
 <body>
-<div id="splash" aria-hidden="true">
-  <svg viewBox="0 0 120 84" width="132" height="92">
-    <rect class="sb b1" x="10" y="24" width="18" height="50" rx="4"/>
-    <rect class="sb b2" x="40" y="10" width="18" height="64" rx="4"/>
-    <rect class="sb b3" x="70" y="34" width="18" height="40" rx="4"/>
-    <path class="sl" d="M8 58 L49 26 L79 44 L112 12" fill="none"/>
-  </svg>
+<div id="splash">
+  <div class="boot">
+    <svg viewBox="0 0 120 84" width="132" height="92" aria-hidden="true">
+      <rect class="sb b1" x="10" y="24" width="18" height="50" rx="4"/>
+      <rect class="sb b2" x="40" y="10" width="18" height="64" rx="4"/>
+      <rect class="sb b3" x="70" y="34" width="18" height="40" rx="4"/>
+      <path class="sl" d="M8 58 L49 26 L79 44 L112 12" fill="none"/>
+    </svg>
+    <div class="bootbar" aria-hidden="true"><i id="bootfill"></i></div>
+    <!-- The live region is this ONE line. The list below repaints twice a
+         second to keep its elapsed times honest, and announcing all of that
+         each time would make a screen reader useless for the whole wait. -->
+    <div class="bootnow" id="bootnow" role="status" aria-live="polite">Starting…</div>
+    <ol class="bootsteps" id="bootsteps" aria-hidden="true"></ol>
+    <div class="boothint hide" id="boothint"></div>
+    <div class="booterr hide" id="booterr"></div>
+    <button class="btn hide" id="bootretry" type="button">Try again</button>
+  </div>
 </div>
 <div class="app">
   <nav>
@@ -334,8 +367,31 @@ async function api(path,opts){
 }
 const scope=()=>({bu:$('#f-bu').value,ledger:$('#f-ledger').value,fy:$('#f-fy').value||0,per:$('#f-per').value||0});
 const qs=o=>Object.entries(o).filter(([,v])=>v!==''&&v!==undefined).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
-const busy=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','empty','<span class="spin"></span> '+m));};
-const oops=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(m)+'</div>'));};
+// A dashboard spinner that never changed said nothing about whether the
+// query was working or wedged, and every view sat behind one. The label
+// now counts, and says out loud what it is waiting on once the wait is
+// long enough that someone has started to wonder.
+let BUSY_TICK=0;
+const busy=m=>{
+  clearInterval(BUSY_TICK);
+  const started=Date.now();
+  const box=el('div','empty','<span class="spin"></span> '+esc(m)+
+    ' <span class="el"></span><div class="busy-note"></div>');
+  $('#wrap').innerHTML=''; $('#wrap').append(box);
+  const paint=()=>{
+    if(!box.isConnected){ clearInterval(BUSY_TICK); return; }
+    const secs=Math.round((Date.now()-started)/1000);
+    box.querySelector('.el').textContent=secs>1?(secs+'s'):'';
+    box.querySelector('.busy-note').textContent=(secs<10?''
+      :(secs<45
+        ? 'Waiting on the database. Narrowing the account filter or the '
+          +'period makes this cheaper.'
+        : 'Still waiting. This query is genuinely slow — Close & controls '
+          +'→ diagnostics reports which input is the cost.'));
+  };
+  paint(); BUSY_TICK=setInterval(paint,1000);
+};
+const oops=m=>{clearInterval(BUSY_TICK);$('#wrap').innerHTML='';$('#wrap').append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(m)+'</div>'));};
 function rebuildPeriodOptions(maxRegular,selected){
   const per=$('#f-per');
   const maximum=Math.max(12,Number(maxRegular)||12);
@@ -1778,10 +1834,120 @@ async function viewAR(){
   }catch(e){ oops(e.message); }
 }
 
+/* ---------- boot progress ----------
+   The first paint waits on /api/meta, and /api/meta waits on a database that
+   can be a WAN round trip away. That wait is legitimate; showing a looping
+   logo animation for the whole of it was not — it is indistinguishable from
+   a hang, and it was read as one. The server now declares its startup steps
+   (pstb/gui/progress.py) and this polls them, so the wait says which step it
+   is on and how long that step has been running.
+
+   The old splash also had a worse failure: on an /api/meta error it returned
+   BEFORE the code that removes the splash, leaving the animation on screen
+   forever with the real error rendered underneath where nobody could see it.
+   Every exit from the boot now goes through bootFail or bootFinish. */
+const BOOT={t0:Date.now(),poll:0,tick:0,steps:[],client:'',done:false,failed:false};
+// One client-side step appended to the server's list: the browser's own work
+// after the payload lands is a real part of the wait the reader is watching.
+const BOOT_RENDER_STEP={key:'render',label:'Drawing the workspace',
+                        status:'pending',ms:0,note:''};
+const bootSecs=ms=>(ms<950?'':(ms<60000?(Math.round(ms/1000)+'s')
+  :(Math.floor(ms/60000)+'m '+Math.round((ms%60000)/1000)+'s')));
+function bootPaint(){
+  const sp=$('#splash'); if(!sp||BOOT.done) return;
+  const all=BOOT.steps.concat([BOOT_RENDER_STEP]);
+  const settled=all.filter(s=>s.status==='done'||s.status==='failed'||s.status==='skipped');
+  const fill=$('#bootfill');
+  if(fill) fill.style.width=Math.max(6,Math.round(settled.length/all.length*100))+'%';
+  const list=$('#bootsteps');
+  if(list){
+    list.innerHTML='';
+    all.forEach(s=>{
+      const li=el('li',{done:'done',running:'run',failed:'fail'}[s.status]||'');
+      const mark={done:'✓',failed:'✕',running:'●',skipped:'–'}[s.status]||'○';
+      li.append(el('span','bi',mark));
+      li.append(el('span','bt',esc(s.label)));
+      const t=bootSecs(s.ms);
+      if(t) li.append(el('span','bm',t));
+      list.append(li);
+    });
+  }
+  const running=all.find(s=>s.status==='running');
+  const now=$('#bootnow');
+  if(now&&!BOOT.failed){
+    const label=BOOT.client||(running?running.label:'Starting…');
+    const el0=running?bootSecs(running.ms):'';
+    now.innerHTML=esc(label)+(el0?' <span class="el">'+esc(el0)+'</span>':'');
+  }
+  // Reassurance only once the wait is long enough to worry someone. A hint
+  // shown at second one is noise; at second twelve it is the answer to the
+  // question they have just started asking.
+  const hint=$('#boothint'), waited=Date.now()-BOOT.t0;
+  if(hint&&!BOOT.failed){
+    const slow=running&&running.ms>12000||waited>15000;
+    hint.classList.toggle('hide',!slow);
+    if(slow) hint.textContent=(waited>60000
+      ? 'Still waiting on the database. If this never finishes, check the '
+        +'VPN and that the listener is reachable from this host.'
+      : 'The database is answering. Nothing is stuck — the page fills in as '
+        +'soon as it replies.');
+  }
+}
+async function bootPollOnce(){
+  try{
+    const r=await fetch('/api/boot',{cache:'no-store'});
+    if(!r.ok) return;                       // guard refusal: /api/meta says why
+    const d=await r.json();
+    if(Array.isArray(d.steps)) BOOT.steps=d.steps;
+  }catch(e){ /* the poll must never be the thing that breaks the boot */ }
+  bootPaint();
+}
+function bootStart(){
+  BOOT.poll=setInterval(bootPollOnce,900);
+  BOOT.tick=setInterval(bootPaint,500);     // keeps the elapsed time honest
+  bootPollOnce();
+}
+function bootSay(text){ BOOT.client=text; bootPaint(); }
+function bootStop(){ clearInterval(BOOT.poll); clearInterval(BOOT.tick); }
+function bootFinish(){
+  if(BOOT.done) return;
+  BOOT.done=true; bootStop();
+  BOOT_RENDER_STEP.status='done';
+  const sp=$('#splash'); if(!sp) return;
+  sp.classList.add('done'); setTimeout(()=>sp.remove(),400);
+}
+function bootFail(message,detail){
+  // The error belongs ON the splash. Rendering it into #wrap underneath —
+  // which is what this used to do — put the only explanation behind an
+  // opaque overlay that then never went away.
+  BOOT.failed=true; bootStop();
+  const sp=$('#splash'); if(!sp){ oops(message); return; }
+  const now=$('#bootnow'); if(now) now.textContent=message;
+  $('#boothint').classList.add('hide');
+  const box=$('#booterr');
+  if(box){ box.classList.remove('hide'); box.textContent=detail||message; }
+  const again=$('#bootretry');
+  if(again){ again.classList.remove('hide'); again.onclick=()=>location.reload(); }
+  const failed=BOOT.steps.find(s=>s.status==='failed');
+  if(failed&&failed.note&&box) box.textContent+='\n\n'+failed.label+': '+failed.note;
+  bootPaint();
+}
+
 /* ---------- boot ---------- */
 (async function(){
-  try{ META=await api('/api/meta'); }catch(e){ oops('Cannot reach the server: '+e.message); return; }
-  if(META.mcp_session&&!META.mcp_session.shared){
+  bootStart();
+  try{ META=await api('/api/meta'); }
+  catch(e){
+    bootFail('Could not load the workspace.',
+      'The server did not answer /api/meta: '+e.message);
+    return;
+  }
+  bootSay('Drawing the workspace');
+  // 'degraded' specifically, NOT "not shared yet". The shared engine now
+  // starts in the background so the page can paint first, so at first paint
+  // it is normally still 'starting' — banner-on-absence would cry wolf on
+  // every single boot and teach people to ignore the one that matters.
+  if(META.mcp_session&&META.mcp_session.state==='degraded'){
     // The engine fell back to one server per question. If the cause is
     // fatal (a database logon, a broken install) every question will fail
     // the same way — say WHY at the top of the page, not in a terminal
@@ -1808,7 +1974,12 @@ async function viewAR(){
   $('#f-fy').value=sc0.fiscal_year||META.current.fiscal_year;
   per.value=sc0.period||META.last_period_with_data||META.current.period;
   applyScopeCatalog();          // instant when the server cache was warm
-  if(!META.scopes_ready) loadScopesInBackground();
+  // Fetch in the background when the catalog is absent OR unverified. The
+  // boot prime warms the cheap unverified catalog so the bar is populated
+  // immediately; this call is what confirms the pairs against ledger data,
+  // and it runs while the person already has a usable screen rather than
+  // competing with their first dashboard.
+  if(!META.scopes_ready||META.scopes_verified===false) loadScopesInBackground();
   async function rescope(keepLedger){
     try{
       const d=await api('/api/scope?'+qs({business_unit:bu.value,
@@ -1840,17 +2011,12 @@ async function viewAR(){
   $('#dclose').onclick=closeDrawer; $('#scrim').onclick=closeDrawer;
   document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});
   render();
-  // Splash: a beat of motion while the first paint settles, never a wait —
-  // the app is already interactive underneath; hard-remove keeps it from
-  // ever masking the page if anything above threw.
-  (function(){
-    const sp=document.getElementById('splash');
-    if(!sp) return;
-    const done=()=>{ sp.classList.add('done'); setTimeout(()=>sp.remove(),400); };
-    setTimeout(done, 900);
-    window.addEventListener('error', done, {once:true});
-  })();
+  bootFinish();
 })();
+// Last resort: an exception anywhere above must not leave the overlay
+// covering a page that is otherwise fine underneath it. Not after a
+// bootFail — there the overlay is carrying the only copy of the error.
+window.addEventListener('error',()=>{ if(!BOOT.failed) bootFinish(); },{once:true});
 
 function chrome(){
   const isTB=VIEW==='tb', isChat=VIEW==='chat', isRpt=VIEW==='reports';
@@ -2208,18 +2374,29 @@ async function send(messageOverride,appendUser){
   // 40-second query reads as "running get_trial_balance — 38s", not a
   // spinner asking for faith.
   const tStart=Date.now();
+  // One token per question. Without it the poll returned whatever was last
+  // in the session's slot, so during the seconds before this turn reached
+  // its first tool the spinner showed the PREVIOUS question's steps — an
+  // AR aging that announced it was running close_readiness. The server
+  // answers stale:true for a token that no longer owns the slot.
+  const turnToken=makeSessionId();
   const poll=setInterval(async()=>{
     try{
       const a=await (await fetch('/api/activity?session_id='+
-        encodeURIComponent(CHAT_SESSION_ID))).json();
-      const ev=a.events||[];
+        encodeURIComponent(CHAT_SESSION_ID)+'&turn='+
+        encodeURIComponent(turnToken))).json();
+      const secs=Math.round((Date.now()-tStart)/1000);
+      const ev=(a.stale?[]:(a.events||[]));
       const running=[...ev].reverse().find(e=>e.status==='running');
       const done=ev.filter(e=>e.status==='done').length;
-      const secs=Math.round((Date.now()-tStart)/1000);
       let line='Working… '+secs+'s';
       if(running) line='<b>'+esc(running.tool)+'</b> '+esc(running.args||'')+
         ' — running, '+secs+'s'+(done?' · '+done+' step'+(done===1?'':'s')+' done':'');
       else if(done) line='thinking over '+done+' result'+(done===1?'':'s')+'… '+secs+'s';
+      // Before the first tool runs there is still real work — scope
+      // validation, a queued turn, spawning an engine — and naming it is
+      // the difference between a slow answer and an apparently dead one.
+      else if(!a.stale&&a.phase) line=esc(a.phase)+'… '+secs+'s';
       think.innerHTML='<span class="spin"></span> '+line;
     }catch(e){}
   },700);
@@ -2230,7 +2407,8 @@ async function send(messageOverride,appendUser){
     try{
       r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
-          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{}
+          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{},
+          turn_token:turnToken
         }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
     const j=await r.json();

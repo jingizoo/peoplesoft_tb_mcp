@@ -42,15 +42,33 @@ class AsyncDiscoveryTests(unittest.TestCase):
         self.assertTrue(warm.get("scopes_ready"))
         self.assertTrue(warm.get("financial_scopes"))
 
-    def test_mcp_session_is_established_once_at_startup(self) -> None:
+    def test_mcp_session_is_established_once_per_process_not_per_turn(self) -> None:
         # One server for the process, not one per chat turn: the spawn plus
         # handshake measured ~320ms, paid on EVERY question, and discarded
         # every engine cache with it.
+        #
+        # It is established in the BACKGROUND now, so this waits for it
+        # rather than expecting it the instant startup returns. That is the
+        # point: awaiting the handshake in the lifespan put a Python start
+        # and a database logon in front of the first connection uvicorn
+        # would accept, so the terminal printed a URL that then refused to
+        # load — see test_boot_progress.NonBlockingStartupTests.
+        import time
+
         with self.TestClient(self.gapp.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000)) as live:
             live.get("/api/meta")
+            deadline = time.monotonic() + 60
+            while (self.gapp._MCP.get("state") not in ("ready", "degraded")
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
             self.assertIsNotNone(self.gapp._MCP.get("session"),
                                  msg=str(self.gapp._MCP.get("error")))
             self.assertGreater(len(self.gapp._MCP.get("tools") or []), 20)
+            # Same session object on the next request — a per-turn spawn
+            # would replace it.
+            session = self.gapp._MCP["session"]
+            live.get("/api/meta")
+            self.assertIs(self.gapp._MCP["session"], session)
 
     def test_chat_survives_when_the_shared_session_is_unavailable(self) -> None:
         """With no shared session, chat must still reach a per-turn server.

@@ -31,7 +31,7 @@ from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
-from . import console, localguard
+from . import console, localguard, progress
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -62,14 +62,25 @@ except WikiError:
 # cold caches on every question (~390ms of pure overhead locally, worse over a
 # corporate network) with zero cache reuse between questions.
 #
-# The session is owned by the app LIFESPAN, not by a request. MCP's stdio
-# client uses anyio cancel scopes, and a cancel scope must be exited by the
-# same task that entered it — holding the stack inside a request handler and
-# closing it from another raises "attempted to exit cancel scope in a
-# different task". Entering at startup and exiting at shutdown keeps both ends
-# in the lifespan task; individual tool calls are safe from request tasks
-# because they only move messages over memory streams.
-_MCP: dict = {"session": None, "tools": None, "error": None}
+# The session is owned by a task that lives as long as the app, not by a
+# request. MCP's stdio client uses anyio cancel scopes, and a cancel scope
+# must be exited by the same task that entered it — holding the stack inside
+# a request handler and closing it from another raises "attempted to exit
+# cancel scope in a different task". One background task enters the stack,
+# parks on a shutdown event and closes the stack itself, so both ends stay in
+# the same task; individual tool calls are safe from request tasks because
+# they only move messages over memory streams.
+#
+# That task is STARTED, not awaited, by the lifespan. Uvicorn does not accept
+# a single connection until lifespan startup returns, so awaiting it here put
+# a Python start, an MCP handshake and an Oracle logon in front of the first
+# byte the browser could receive: the terminal printed a URL that then
+# refused to load for as long as the database took, which is the worst
+# possible place to spend that time. Chat degrades to a per-turn server while
+# the shared one is still coming up, which is exactly what it already does
+# when the shared one fails outright.
+_MCP: dict = {"session": None, "tools": None, "error": None,
+              "state": "starting"}
 
 
 def _server_import_check() -> str:
@@ -98,41 +109,87 @@ def _server_import_check() -> str:
     return f"server failed to start: {tail[-600:]}"
 
 
+async def _mcp_worker(stop: asyncio.Event) -> None:
+    """Own the shared MCP session for the life of the process.
+
+    Enter, publish, park, close — all in this one task, because anyio
+    requires the cancel scopes inside stdio_client to be exited by the task
+    that entered them.
+    """
+    stack = contextlib.AsyncExitStack()
+    # Not just the initial value: a process that has already run a lifespan
+    # (a test, a reload) left 'stopped' behind, and a stale terminal state
+    # would tell the page the engine had given up before it had tried.
+    _MCP.update({"state": "starting", "error": None})
+    try:
+        try:
+            with progress.step("engine"):
+                from mcp import ClientSession, StdioServerParameters
+                from mcp.client.stdio import stdio_client
+                from ..client.chat import tool_specs
+
+                env = dict(os.environ)
+                env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
+                                     + os.pathsep + env.get("PYTHONPATH", ""))
+                params = StdioServerParameters(
+                    command=sys.executable, args=["-m", "pstb.server"],
+                    env=env)
+                read, write = await stack.enter_async_context(
+                    stdio_client(params))
+                session = await stack.enter_async_context(
+                    ClientSession(read, write))
+                await session.initialize()
+                _MCP["session"] = session
+                _MCP["tools"] = tool_specs(await session.list_tools())
+                _MCP["state"] = "ready"
+        except Exception as e:                  # degrade, never fail to boot
+            # The exception from a dead stdio subprocess is usually noise
+            # ("unhandled errors in a TaskGroup") while the REAL reason — an
+            # Oracle logon rejection, a config error, a broken pull — died
+            # with the subprocess's stderr. Re-run the import in a subprocess
+            # that captures stderr, so the user sees ORA-01017 instead of a
+            # shrug. Off the event loop: it runs a whole Python start with a
+            # 90s ceiling, and every request would queue behind it here.
+            detail = await asyncio.to_thread(_server_import_check)
+            _MCP["error"] = str(e) + (f" | {detail}" if detail else "")
+            _MCP["state"] = "degraded"
+            progress.end("engine", ok=False, note=_MCP["error"][:300])
+            print(f"[pstb] shared MCP session unavailable ({_MCP['error']}); "
+                  "falling back to one server per turn", file=sys.stderr)
+        await stop.wait()
+    finally:
+        # One finally over BOTH the startup and the park, because a cancel
+        # during startup is not an Exception and would otherwise skip the
+        # close and leak the half-started subprocess.
+        with contextlib.suppress(Exception):
+            await stack.aclose()
+        _MCP.update({"session": None, "tools": None, "state": "stopped"})
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
-    stack = contextlib.AsyncExitStack()
-    try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from ..client.chat import tool_specs
-
-        env = dict(os.environ)
-        env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
-                             + os.pathsep + env.get("PYTHONPATH", ""))
-        params = StdioServerParameters(
-            command=sys.executable, args=["-m", "pstb.server"], env=env)
-        read, write = await stack.enter_async_context(stdio_client(params))
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        _MCP["session"] = session
-        _MCP["tools"] = tool_specs(await session.list_tools())
-    except Exception as e:                      # degrade, never fail to boot
-        # The exception from a dead stdio subprocess is usually noise
-        # ("unhandled errors in a TaskGroup") while the REAL reason — an
-        # Oracle logon rejection, a config error, a broken pull — died with
-        # the subprocess's stderr. Re-run the import in a subprocess that
-        # captures stderr, so the user sees ORA-01017 instead of a shrug.
-        detail = _server_import_check()
-        _MCP["error"] = str(e) + (f" | {detail}" if detail else "")
-        print(f"[pstb] shared MCP session unavailable ({_MCP['error']}); "
-              "falling back to one server per turn", file=sys.stderr)
+    progress.end("server")
+    stop = asyncio.Event()
+    worker = asyncio.create_task(_mcp_worker(stop), name="pstb-mcp-session")
+    # Discovery is the longest step on a real instance and nothing about the
+    # first paint depends on it, so start it at boot rather than on the first
+    # visitor's request. Serves from the persisted catalog meanwhile.
+    _prime_scope_catalog()
     try:
         yield
     finally:
-        try:
-            await stack.aclose()
-        except Exception:
-            pass
+        stop.set()
+        # A live subprocess is worth a graceful close. One that never
+        # finished starting has nothing to close gracefully, and waiting on
+        # it would hold Ctrl+C hostage to the same hang that made the
+        # startup asynchronous in the first place.
+        if _MCP.get("state") == "ready":
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(worker), timeout=10)
+        if not worker.done():
+            worker.cancel()             # cancelling exits the scopes in-task
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await worker
         _MCP.update({"session": None, "tools": None})
 
 
@@ -141,7 +198,7 @@ app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
 
 
 @app.middleware("http")
-async def _loopback_only(request, call_next):
+async def _access_guard(request, call_next):
     """Every route, not just the sensitive-looking ones.
 
     A DNS-rebound page reads the general ledger from /api/trial-balance as
@@ -154,8 +211,30 @@ async def _loopback_only(request, call_next):
                                 content={"error": reason})
     else:
         response = await call_next(request)
+    # A token that arrived in the URL becomes a cookie, so the page's own
+    # fetches — which carry no query string — are authenticated too. Set only
+    # after the request was ACCEPTED, so a wrong token never gets stored and
+    # then silently re-sent forever.
+    if not status and localguard.POLICY.token and localguard.token_in_query(
+            request.scope):
+        response.set_cookie(
+            localguard.TOKEN_COOKIE, localguard.POLICY.token,
+            httponly=True, samesite="strict", path="/")
     localguard.apply_security_headers(response.headers)
     return response
+
+
+# How long a turn may hold its conversation before a NEW question stops
+# queueing behind it and says so instead. The browser gives up on its own
+# request at 180s; a turn still holding the lock past that has no client left
+# to answer, so queueing behind it only spends the next question's 180s too.
+# That is the cascade in the report: three questions in a row, each dying at
+# 180s, because the first one's query was still running against the database.
+_ABANDONED_AFTER = float(os.environ.get("PSTB_TURN_ABANDONED_SECONDS", "180"))
+# A queued question waits this long for a turn that is still within its
+# budget. Bounded so the wait plus the answer still fits inside the browser's
+# patience rather than consuming all of it before work starts.
+_QUEUE_WAIT = float(os.environ.get("PSTB_QUEUE_WAIT_SECONDS", "45"))
 
 
 @dataclass
@@ -165,12 +244,25 @@ class _ProviderSession:
     provider: object
     touched: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # What the turn holding this conversation is doing, so a question that
+    # cannot get in can say WHY instead of timing out silently.
+    busy_since: float = 0.0
+    busy_tool: str = ""
     # Recent tool payloads as (tool_name, payload) pairs, so a follow-up
     # turn's restated figures ground against what this conversation already
     # fetched — and against the SYSTEM that produced them. The guard walk
     # also accepts a bare payload, which is what a worker replaced
     # mid-deploy will read from its predecessor's 1800s-TTL session.
     payloads: list = field(default_factory=list)
+
+    def busy_for(self) -> float:
+        return (time.monotonic() - self.busy_since) if self.busy_since else 0.0
+
+    def describe_busy(self) -> str:
+        held = int(self.busy_for())
+        if self.busy_tool:
+            return f"{self.busy_tool} has been running for {held}s"
+        return f"it has been running for {held}s"
 
 
 class _ProviderSessionStore:
@@ -223,18 +315,31 @@ class _ProviderSessionStore:
             return entry
 
     async def reset_session(self, session_id: str) -> int:
-        """Remove only one browser session; never clear another user's history."""
+        """Remove only one browser session; never clear another user's history.
+
+        Detaching comes FIRST and is what Clear actually promises: the next
+        question builds a fresh conversation with a fresh lock and does not
+        queue behind whatever is still running. Resetting the old provider
+        afterwards is hygiene on an object nobody can reach any more, so it
+        is bounded — waiting on it unbounded meant Clear itself hung behind
+        the stuck query, leaving no way out of a wedged conversation at all.
+        """
         with self._lock:
             keys = [key for key in self._entries if key[0] == session_id]
             entries = [self._entries.pop(key) for key in keys]
-        for entry in entries:
+
+        async def _release(entry) -> None:
             # A reset can arrive while a provider call is running in a worker
             # thread. Wait for that scoped turn before mutating its history.
             async with entry.lock:
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.to_thread(entry.provider.reset)
-                except Exception:
-                    pass
+
+        for entry in entries:
+            try:
+                await asyncio.wait_for(_release(entry), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass          # detached already; its history dies with it
         return len(entries)
 
     def __len__(self) -> int:
@@ -252,28 +357,61 @@ _activity_lock = threading.Lock()
 _ACTIVITY_MAX_EVENTS = 60
 
 
-def _activity_reset(session_id: str) -> None:
+def _activity_begin(session_id: str, turn: str, phase: str = "") -> None:
+    """Claim the session's activity slot for ONE turn.
+
+    Keyed by a turn token the browser mints per question, because keying it
+    by session alone leaked the previous question's steps into the next
+    one's spinner. Someone asked for an AR aging and watched it report
+    "run_playbook playbook=close_readiness — running": that was the
+    PREVIOUS turn's dangling event, still in the slot because the new turn
+    had not reached the point where the slot was cleared. Anything that
+    outlives its turn now writes into a slot that no longer belongs to it
+    and is dropped.
+    """
     with _activity_lock:
-        _activity[session_id] = {"active": True, "events": []}
+        _activity[session_id] = {"turn": turn, "active": True, "events": [],
+                                 "phase": phase, "started": time.time()}
         if len(_activity) > 200:            # forgotten sessions, bounded
             for key in list(_activity)[:-100]:
                 _activity.pop(key, None)
 
 
-def _activity_add(session_id: str, event: dict) -> None:
+def _activity_phase(session_id: str, turn: str, phase: str) -> None:
+    """What the turn is doing BEFORE any tool runs.
+
+    Scope validation, a queued turn ahead of this one, spawning a private
+    answer engine, waiting on the model — all of it used to be a bare
+    "Working…" because only tool calls were reported, and it is exactly the
+    stretch where a slow turn looks stuck.
+    """
     with _activity_lock:
         slot = _activity.get(session_id)
-        if slot is None:
+        if slot is not None and slot["turn"] == turn:
+            slot["phase"] = phase
+
+
+def _activity_add(session_id: str, turn: str, event: dict) -> None:
+    with _activity_lock:
+        slot = _activity.get(session_id)
+        if slot is None or slot["turn"] != turn:
             return
         slot["events"].append({**event, "t": time.time()})
         del slot["events"][:-_ACTIVITY_MAX_EVENTS]
 
 
-def _activity_done(session_id: str) -> None:
+def _activity_done(session_id: str, turn: str) -> None:
     with _activity_lock:
         slot = _activity.get(session_id)
-        if slot is not None:
-            slot["active"] = False
+        if slot is None or slot["turn"] != turn:
+            return
+        slot["active"] = False
+        slot["phase"] = ""
+        # A turn that died between "running" and its result would otherwise
+        # leave an event that claims to be running forever.
+        for event in slot["events"]:
+            if event.get("status") == "running":
+                event["status"] = "failed"
 
 
 _scope_cache: dict = {"expires": 0.0, "value": None, "refreshing": False}
@@ -334,6 +472,7 @@ def _refresh_scope_catalog_async() -> None:
                   f"{type(e).__name__}: {e}", file=sys.stderr)
             with _scope_cache_lock:
                 _scope_cache["refreshing"] = False
+            progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
             return
         elapsed_ms = int((time.monotonic() - started) * 1000)
         with _scope_cache_lock:
@@ -343,11 +482,60 @@ def _refresh_scope_catalog_async() -> None:
                 "refreshing": False,
             })
         _persist_scope_catalog(value)
+        progress.end("scopes")
         print(f"[pstb] scope catalog refreshed in {elapsed_ms} ms",
               file=sys.stderr)
 
     threading.Thread(target=work, daemon=True,
                      name="scope-catalog-refresh").start()
+
+
+def _prime_scope_catalog() -> None:
+    """Warm the CHEAP catalog at boot. Only the cheap one.
+
+    Discovery has two halves with wildly different costs. The setup reads
+    are hundreds of rows and build in milliseconds anywhere; the ledger
+    existence probes are batched DISTINCTs over the balance table, each
+    able to eat the whole query timeout when the optimizer picks a bad
+    plan. Priming BOTH at startup put that heavy half in direct
+    competition with the first dashboard someone opened — same database,
+    same Oracle session pool — and made every view slow for the first
+    minutes of a restart, with nothing on screen to say why.
+
+    So boot warms the unverified catalog and stops. Verification stays
+    where it was: triggered by the page's own background /api/scopes call,
+    once the person already has a usable screen.
+    """
+    def work() -> None:
+        with _scope_cache_lock:
+            if _scope_cache["value"] is not None:
+                progress.end("scopes", note="served from the last run")
+                return
+        try:
+            built = engine.list_financial_scopes(include_activity=False,
+                                                 verify_pairs=False)
+        except Exception as e:                    # noqa: BLE001
+            print(f"[pstb] scope catalog prime failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
+            return
+        built["verified"] = False
+        built["note"] = ((built.get("note") or "") +
+                         " Scope pairs not yet verified against ledger "
+                         "data; opening the page confirms them.").strip()
+        with _scope_cache_lock:
+            if _scope_cache["value"] is None:
+                # expires=0.0 on purpose: unverified is stale the moment it
+                # exists, so the first /api/scopes call replaces it.
+                _scope_cache.update({"value": built, "expires": 0.0})
+        _persist_scope_catalog(built)
+        progress.end("scopes")
+
+    progress.begin("scopes")
+    threading.Thread(target=work, daemon=True,
+                     name="scope-catalog-prime").start()
+
+
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 _SCOPE_DISCOVERY_RE = re.compile(
     r"\b(list|what|which|available|all|exist)\b.*"
@@ -651,6 +839,7 @@ def meta():
         },
         "build": _build_info(),
         "mcp_session": {"shared": _MCP["session"] is not None,
+                        "state": _MCP.get("state", "starting"),
                         **({"error": _MCP["error"]} if _MCP["error"]
                            else {})},
         "backend": cfg.db.backend,
@@ -686,15 +875,29 @@ def meta():
             for item in out["financial_scopes"]
         ]
         out["scopes_ready"] = True
+        # The boot prime warms an UNVERIFIED catalog — instant everywhere,
+        # but it may offer a unit that setup knows and the ledger has never
+        # been posted to. The page still fetches /api/scopes in the
+        # background on this flag, which is what triggers verification; it
+        # just does so with a populated bar rather than an empty one.
+        out["scopes_verified"] = bool(warm.get("verified", True))
     else:
         out["financial_scopes"] = []
         out["business_units"] = []
         out["scopes_ready"] = False
+        out["scopes_verified"] = False
     # Scope comes from the DATABASE, validated against config — not raw config.
     # On a real instance the config defaults are often the sample values.
     try:
-        eff = engine.effective_defaults()
-        fy0, per0 = engine.last_posted_period(eff["business_unit"], eff["ledger"])
+        with progress.step("defaults"):
+            eff = engine.effective_defaults()
+        # One step covering all three period lookups below rather than three
+        # steps that each blink past: to the person waiting they are one
+        # question — "which period does this open on?" — and naming them
+        # separately would make the bar jump without telling them more.
+        progress.begin("period")
+        fy0, per0 = engine.last_posted_period(eff["business_unit"],
+                                              eff["ledger"])
         out["scope"] = {
             "business_unit": eff["business_unit"],
             "ledger": eff["ledger"],
@@ -711,6 +914,7 @@ def meta():
             out["business_units"].append(
                 {"business_unit": eff["business_unit"], "descr": "(discovered)"})
     except Exception as e:
+        progress.end("period", ok=False, note=f"{type(e).__name__}: {e}")
         out["scope"] = {"business_unit": d.business_unit, "ledger": d.ledger,
                         "ledgers": [d.ledger], "fiscal_year": 0, "period": 0,
                         "max_regular_period": 12,
@@ -737,7 +941,27 @@ def meta():
         out["last_period_with_data"] = int(p) if p is not None else out["current"]["period"]
     except Exception:
         out["last_period_with_data"] = out["current"]["period"]
+    progress.end("period")          # no-op if the failure path already did
     return out
+
+
+@app.get("/api/boot")
+def boot_progress():
+    """Which startup step the server is on RIGHT NOW.
+
+    Polled by the page while its own /api/meta call is in flight, so a
+    forty-second wait reads as "Finding the last posted period — 38s"
+    instead of a logo animation that is indistinguishable from a hang.
+
+    Deliberately touches nothing but an in-memory snapshot: an endpoint
+    whose job is to explain a slow database must not be able to block on
+    one. /api/meta is a sync def and therefore runs in FastAPI's
+    threadpool, so this answers while that is still running.
+    """
+    snap = progress.snapshot()
+    snap["mcp_session"] = {"state": _MCP.get("state", "starting"),
+                           "shared": _MCP["session"] is not None}
+    return snap
 
 
 @app.get("/api/trial-balance")
@@ -924,15 +1148,18 @@ def scope_for(business_unit: str = "", ledger: str = ""):
         fy, per = engine.last_posted_period(bu, led)
         # Fiscal years that actually hold data, so the scope editor offers
         # real choices instead of only the latest one.
+        #
+        # For THIS pair, by name. It used to build the activity catalog for
+        # the WHOLE installation and then filter down to the one row it
+        # wanted — and activity costs two MIN/MAX queries against PS_LEDGER
+        # per pair, the slow query class here. On a site with a few hundred
+        # BU/ledger pairs that is several hundred ledger queries to answer a
+        # question about one of them, issued every time the scope bar
+        # changed, all of it competing for the same eight-session Oracle
+        # pool. Reported as "many queuing up in ledger". Two queries now.
         try:
-            years = []
-            for sc in engine.list_financial_scopes(
-                    include_activity=True).get("scopes") or []:
-                if sc.get("business_unit") != bu:
-                    continue
-                for lg in sc.get("ledgers") or []:
-                    if lg.get("ledger") == led:
-                        years = [int(y) for y in (lg.get("fiscal_years") or [])]
+            bounds, _ = engine._scope_period_details(bu, led)
+            years = [int(y) for y in bounds]
         except Exception:
             years = []
         if fy and fy not in years:
@@ -1060,11 +1287,20 @@ async def chat(payload: dict):
             status_code=400,
             detail=f"provider must be one of {', '.join(PROVIDERS)}")
 
+    # Claim the activity slot HERE, at the top of the request, not deep
+    # inside after the scope lookup, the engine setup and the queue wait.
+    # Everything before this point used to be reported as the previous
+    # turn's steps, because the previous turn's steps were still what was
+    # in the slot.
+    turn_token = str((payload or {}).get("turn_token") or "")[:64] or "-"
+    _activity_begin(session_id, turn_token, "Checking the financial scope")
+
     try:
         # This async route must not perform synchronous Oracle/SQL Server I/O
         # on FastAPI's event loop.
         catalog = await asyncio.to_thread(_financial_scope_catalog)
     except Exception as e:
+        _activity_done(session_id, turn_token)
         raise HTTPException(
             status_code=503, detail=f"Financial scope discovery failed: {e}"
         ) from e
@@ -1074,6 +1310,7 @@ async def chat(payload: dict):
     # hatch from a bad configured default.
     if _is_scope_catalog_question(message):
         options = _scope_options(catalog)
+        _activity_done(session_id, turn_token)
         return {
             "answer": (
                 "These business-unit and ledger combinations come directly "
@@ -1107,10 +1344,13 @@ async def chat(payload: dict):
         try:
             # Validation can fall back to a latest-posted-period lookup when a
             # catalog record has no activity metadata, so it is also offloaded.
+            _activity_phase(session_id, turn_token,
+                            "Validating the scope against PS_LEDGER")
             active_scope = await asyncio.to_thread(
                 _validated_scope, requested_scope, catalog
             )
         except _ScopeRequired as e:
+            _activity_done(session_id, turn_token)
             return {
                 "scope_required": True,
                 "error": e.detail,
@@ -1138,6 +1378,11 @@ async def chat(payload: dict):
             session, tools = _MCP["session"], _MCP["tools"]
             per_turn = contextlib.AsyncExitStack()
         else:
+            # The slow path, and the one worth naming: a whole Python start
+            # and database logon before the question is even asked.
+            _activity_phase(session_id, turn_token,
+                            "Starting a private answer engine for this "
+                            "question (the shared one is not up)")
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
             from ..client.chat import tool_specs
@@ -1217,20 +1462,67 @@ async def chat(payload: dict):
                 "result": data,
             })
 
-        async with provider_entry.lock:
+        # One question at a time per browser tab and scope. Getting in is
+        # now BOUNDED, because an unbounded wait is what turned one slow
+        # query into three dead questions: the browser abandons its request
+        # at 180s but the turn keeps running, so every question behind it
+        # spent its own 180s in a queue and died the same way, with nothing
+        # on screen to connect the second failure to the first.
+        held = provider_entry.busy_for()
+        if provider_entry.lock.locked() and held > _ABANDONED_AFTER:
+            _activity_done(session_id, turn_token)
+            return JSONResponse(status_code=409, content={
+                "error": (
+                    "The previous question in this conversation is still "
+                    f"running against the database — {provider_entry.describe_busy()}, "
+                    "past the point where its own browser request gave up. "
+                    "Queueing behind it would only spend this question's "
+                    "time too.\n\nPress Clear to start a fresh conversation "
+                    "(it does not wait for the stuck query), or narrow the "
+                    "scope — a business unit, a fiscal year, a period — "
+                    "before asking again."),
+                "tool_calls": []})
+        if provider_entry.lock.locked():
+            _activity_phase(session_id, turn_token,
+                            "Waiting for the previous question in this tab "
+                            "to finish")
+        try:
+            await asyncio.wait_for(provider_entry.lock.acquire(),
+                                   timeout=_QUEUE_WAIT)
+        except asyncio.TimeoutError:
+            _activity_done(session_id, turn_token)
+            return JSONResponse(status_code=409, content={
+                "error": (
+                    "Still waiting on the previous question in this "
+                    f"conversation after {int(_QUEUE_WAIT)}s — "
+                    f"{provider_entry.describe_busy()}. Ask again once it "
+                    "finishes, or press Clear to start a fresh conversation "
+                    "that does not wait for it."),
+                "tool_calls": []})
+        try:
             result_limit = tool_result_limit(cfg, provider_name)
-            _activity_reset(session_id)
+            _activity_phase(session_id, turn_token,
+                            f"Asking {provider_name}")
+            provider_entry.busy_since = time.monotonic()
+            provider_entry.busy_tool = ""
 
             def _on_started(tool: str, args_preview: str,
                             blocked: bool) -> None:
-                _activity_add(session_id, {
+                if not blocked:
+                    # Named here so a question that cannot get in can say
+                    # WHICH query is holding the conversation, not just that
+                    # something is.
+                    provider_entry.busy_tool = tool
+                    provider_entry.busy_since = time.monotonic()
+                _activity_add(session_id, turn_token, {
                     "status": "blocked" if blocked else "running",
                     "tool": tool, "args": args_preview})
 
             prior_payloads = list(provider_entry.payloads)
 
             def _observe_and_record(name, args, out, ms, ok):
-                _activity_add(session_id, {
+                provider_entry.busy_tool = ""
+                _activity_add(session_id, turn_token, {
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
                 if ok and isinstance(out, str):
@@ -1252,7 +1544,11 @@ async def chat(payload: dict):
                     result_limit=result_limit,
                 )
             finally:
-                _activity_done(session_id)
+                _activity_done(session_id, turn_token)
+        finally:
+            provider_entry.busy_since = 0.0
+            provider_entry.busy_tool = ""
+            provider_entry.lock.release()
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup
@@ -1272,6 +1568,11 @@ async def chat(payload: dict):
             content={"error": f"{type(root).__name__}: {root}", "tool_calls": calls},
         )
     finally:
+        # Also here, not only around agent_turn: a turn that died while
+        # spawning the engine or building the provider never reached that
+        # finally, and left an "active" slot the next poll would read as
+        # live work.
+        _activity_done(session_id, turn_token)
         if per_turn is not None:
             with contextlib.suppress(Exception):
                 await per_turn.aclose()
@@ -1336,17 +1637,29 @@ def feedback(payload: dict):
 
 
 @app.get("/api/activity")
-def activity(session_id: str = ""):
-    """What the current turn is doing RIGHT NOW — polled by the page while
-    its /api/chat request is in flight, so 'Working…' can say which tool is
-    running instead of leaving a spinner to speak for a 40-second query."""
+def activity(session_id: str = "", turn: str = ""):
+    """What THIS turn is doing right now — polled by the page while its
+    /api/chat request is in flight, so 'Working…' can say which tool is
+    running instead of leaving a spinner to speak for a 40-second query.
+
+    ``turn`` is the token the browser minted for the question it is waiting
+    on. Without it the poll answered with whatever was last in the slot,
+    which during the opening seconds of a new question is the PREVIOUS
+    question's steps — reported to us as an AR aging that claimed to be
+    running close_readiness. A token that does not match the slot returns
+    empty and says so, rather than returning someone else's turn.
+    """
     if not _SESSION_ID_RE.match(session_id or ""):
-        return {"active": False, "events": []}
+        return {"active": False, "events": [], "phase": "", "stale": False}
     with _activity_lock:
         slot = _activity.get(session_id)
         if slot is None:
-            return {"active": False, "events": []}
-        return {"active": slot["active"], "events": list(slot["events"])}
+            return {"active": False, "events": [], "phase": "", "stale": False}
+        if turn and slot["turn"] != turn:
+            return {"active": False, "events": [], "phase": "", "stale": True}
+        return {"active": slot["active"], "events": list(slot["events"]),
+                "phase": slot.get("phase", ""), "turn": slot["turn"],
+                "stale": False}
 
 
 @app.post("/api/chat/reset")
@@ -1358,6 +1671,7 @@ async def chat_reset(payload: dict):
 
 def main() -> None:
     import argparse
+    import secrets
 
     import uvicorn
 
@@ -1365,31 +1679,71 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--open", action="store_true", help="open a browser window")
+    ap.add_argument(
+        "--share", action="store_true",
+        help="allow a routable bind by requiring an access token on every "
+             "request (generated and printed unless PSTB_AUTH_TOKEN is set)")
+    ap.add_argument(
+        "--allow-host", action="append", default=[], metavar="NAME",
+        help="with --share, the only Host names accepted (repeatable). "
+             "Omit to accept any name and rely on the token alone.")
     args = ap.parse_args()
 
-    # A non-loopback bind is refused HERE, not warned about. Everything this
-    # app serves — every balance, every customer, the ad-hoc SQL tool — is
-    # unauthenticated, so the bind is the whole access-control story and a
-    # flag must not be able to hand it to the network.
-    if not localguard.peer_is_loopback((args.host, args.port)):
+    loopback = localguard.peer_is_loopback((args.host, args.port))
+    # A routable bind is not refused any more — it is CONDITIONAL. Refusing
+    # it outright made one control do two jobs: it was the access story and
+    # also the answer to "three of us need this page", and a team given only
+    # those two options deletes the check. What it must never be is
+    # unauthenticated, so --share turns on a token instead of turning off a
+    # guard, and the bind alone still cannot hand the ledger to the network.
+    if not loopback and not args.share:
         raise SystemExit(
-            f"\n  Refusing to bind {args.host}: this app has no "
-            "authentication, so every balance and the ad-hoc SQL tool would "
-            "be reachable by anyone who can route to this host.\n"
-            "  Reach it from your laptop through the tunnel instead:\n"
-            f"      ssh -L {args.port}:localhost:{args.port} <this-host>\n"
-            f"  then open http://localhost:{args.port}\n")
+            f"\n  Refusing to bind {args.host} without authentication: every "
+            "balance, every customer and the ad-hoc SQL tool would be "
+            "reachable by anyone who can route to this host.\n"
+            "  Two supported ways to widen access:\n"
+            f"      1. Keep it local and forward the port:\n"
+            f"           ssh -L {args.port}:localhost:{args.port} <this-host>\n"
+            f"         then open http://localhost:{args.port}\n"
+            f"      2. Serve the network WITH a token:\n"
+            f"           python -m pstb.gui --host {args.host} "
+            f"--port {args.port} --share\n"
+            "         which prints a URL your colleagues paste once.\n")
+
+    token, generated = "", False
+    if not loopback:
+        token = (os.environ.get("PSTB_AUTH_TOKEN") or "").strip()
+        generated = not token
+        if generated:
+            token = secrets.token_urlsafe(24)
+    localguard.configure(args.host, token, args.allow_host)
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
     print(f"  data: {cfg.db.backend}{' (views)' if cfg.db.use_views else ''} | "
           f"llm: {cfg.llm.provider} | wiki: {getattr(wiki, 'provider_name', 'off')}")
-    print("  Ctrl+C to stop\n")
+    if token:
+        # The token is the whole access story in this mode, so it is printed
+        # once, here, in the terminal of the person who started the process —
+        # and printed INSIDE a URL, because a token someone has to assemble
+        # by hand is a token someone emails around in plain text instead.
+        reachable = (f"http://<this-host>:{args.port}"
+                     if args.host in ("0.0.0.0", "::", "*") else url)
+        print(f"\n  Shared mode: every request needs this token"
+              f"{' (generated for this run)' if generated else ''}.")
+        print(f"      {reachable}/?token={token}")
+        print("  Anyone with that link has full read access to the ledger. "
+              "Set PSTB_AUTH_TOKEN to keep the same token across restarts.")
+        if not args.allow_host:
+            print("  Accepting any Host header; pass --allow-host <name> to "
+                  "narrow it.")
+    print("\n  Ctrl+C to stop\n")
     if args.open:
         import threading
         import webbrowser
 
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        opening = f"{url}/?token={token}" if token else url
+        threading.Timer(1.0, lambda: webbrowser.open(opening)).start()
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level="warning", proxy_headers=False)
 
