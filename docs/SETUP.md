@@ -390,6 +390,40 @@ authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
    ORACLE_USER=readonly_user
    ORACLE_PASSWORD=...
    ```
+
+   **Where the password lives, and the one way it bites.** It is read from
+   `ORACLE_PASSWORD` in the `.env` file that sits beside `config.yaml`,
+   falling back to `db.oracle_password` in `config.yaml` itself. The
+   environment variable wins, so a value exported in the shell or set by a
+   systemd unit silently overrides the file. `.env` is kept at mode 600 and
+   is repaired to 600 on every load; it is git-ignored. The configuration
+   console writes secrets to that same `.env` and nowhere else. The password
+   is never logged and never appears in an error message.
+
+   Setting it outside `.env` is fine — but it cannot be set *wrong* outside
+   `.env` without consequences, because Oracle counts every rejected logon
+   against `FAILED_LOGIN_ATTEMPTS` in the account's profile (10 in the
+   shipped `DEFAULT` profile). This app connects lazily, per query, so a
+   rejected password would be re-offered on every query and could lock a
+   shared service account within a few minutes of ordinary use. It no longer
+   does: the first `ORA-01017` (or `ORA-28000`/`ORA-28001`) latches, and no
+   further connection is attempted until the process restarts or you use the
+   console's reload. Transient failures — `ORA-12541`, `ORA-12170`, a
+   dropped session — still retry normally; they cost the account nothing.
+
+   Two ways a *correct* password arrives wrong, both of which used to look
+   identical to a typo:
+
+   - **`$` or `{}` in a shell.** `export ORACLE_PASSWORD=Pa$sword` gives
+     Oracle `Pa` — the shell ate the rest. Single-quote it:
+     `export ORACLE_PASSWORD='Pa$sword'`.
+   - **`$` or `{}` in `.env`.** The loader runs with `interpolate=False`
+     specifically so `${...}` survives, and the console refuses to write a
+     value containing `${` rather than mangle it. If you hand-edit, quote
+     it.
+
+   If the account does lock, `ORA-28000` is what you will see; a DBA
+   clears it with `ALTER USER <user> ACCOUNT UNLOCK`.
 4. In `config.yaml`, switch the backend and set your real conventions:
    ```yaml
    db:

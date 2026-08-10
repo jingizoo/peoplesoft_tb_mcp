@@ -224,6 +224,19 @@ async def _access_guard(request, call_next):
     return response
 
 
+# How long a turn may hold its conversation before a NEW question stops
+# queueing behind it and says so instead. The browser gives up on its own
+# request at 180s; a turn still holding the lock past that has no client left
+# to answer, so queueing behind it only spends the next question's 180s too.
+# That is the cascade in the report: three questions in a row, each dying at
+# 180s, because the first one's query was still running against the database.
+_ABANDONED_AFTER = float(os.environ.get("PSTB_TURN_ABANDONED_SECONDS", "180"))
+# A queued question waits this long for a turn that is still within its
+# budget. Bounded so the wait plus the answer still fits inside the browser's
+# patience rather than consuming all of it before work starts.
+_QUEUE_WAIT = float(os.environ.get("PSTB_QUEUE_WAIT_SECONDS", "45"))
+
+
 @dataclass
 class _ProviderSession:
     """One provider history, scoped to one browser session and DB scope."""
@@ -231,12 +244,25 @@ class _ProviderSession:
     provider: object
     touched: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # What the turn holding this conversation is doing, so a question that
+    # cannot get in can say WHY instead of timing out silently.
+    busy_since: float = 0.0
+    busy_tool: str = ""
     # Recent tool payloads as (tool_name, payload) pairs, so a follow-up
     # turn's restated figures ground against what this conversation already
     # fetched — and against the SYSTEM that produced them. The guard walk
     # also accepts a bare payload, which is what a worker replaced
     # mid-deploy will read from its predecessor's 1800s-TTL session.
     payloads: list = field(default_factory=list)
+
+    def busy_for(self) -> float:
+        return (time.monotonic() - self.busy_since) if self.busy_since else 0.0
+
+    def describe_busy(self) -> str:
+        held = int(self.busy_for())
+        if self.busy_tool:
+            return f"{self.busy_tool} has been running for {held}s"
+        return f"it has been running for {held}s"
 
 
 class _ProviderSessionStore:
@@ -289,18 +315,31 @@ class _ProviderSessionStore:
             return entry
 
     async def reset_session(self, session_id: str) -> int:
-        """Remove only one browser session; never clear another user's history."""
+        """Remove only one browser session; never clear another user's history.
+
+        Detaching comes FIRST and is what Clear actually promises: the next
+        question builds a fresh conversation with a fresh lock and does not
+        queue behind whatever is still running. Resetting the old provider
+        afterwards is hygiene on an object nobody can reach any more, so it
+        is bounded — waiting on it unbounded meant Clear itself hung behind
+        the stuck query, leaving no way out of a wedged conversation at all.
+        """
         with self._lock:
             keys = [key for key in self._entries if key[0] == session_id]
             entries = [self._entries.pop(key) for key in keys]
-        for entry in entries:
+
+        async def _release(entry) -> None:
             # A reset can arrive while a provider call is running in a worker
             # thread. Wait for that scoped turn before mutating its history.
             async with entry.lock:
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.to_thread(entry.provider.reset)
-                except Exception:
-                    pass
+
+        for entry in entries:
+            try:
+                await asyncio.wait_for(_release(entry), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass          # detached already; its history dies with it
         return len(entries)
 
     def __len__(self) -> int:
@@ -1420,21 +1459,58 @@ async def chat(payload: dict):
                 "result": data,
             })
 
-        # One question at a time per browser tab and scope. Say so while
-        # waiting — a queued turn is otherwise indistinguishable from a
-        # slow one, and the previous question's steps were what filled the
-        # silence before the slot became per-turn.
+        # One question at a time per browser tab and scope. Getting in is
+        # now BOUNDED, because an unbounded wait is what turned one slow
+        # query into three dead questions: the browser abandons its request
+        # at 180s but the turn keeps running, so every question behind it
+        # spent its own 180s in a queue and died the same way, with nothing
+        # on screen to connect the second failure to the first.
+        held = provider_entry.busy_for()
+        if provider_entry.lock.locked() and held > _ABANDONED_AFTER:
+            _activity_done(session_id, turn_token)
+            return JSONResponse(status_code=409, content={
+                "error": (
+                    "The previous question in this conversation is still "
+                    f"running against the database — {provider_entry.describe_busy()}, "
+                    "past the point where its own browser request gave up. "
+                    "Queueing behind it would only spend this question's "
+                    "time too.\n\nPress Clear to start a fresh conversation "
+                    "(it does not wait for the stuck query), or narrow the "
+                    "scope — a business unit, a fiscal year, a period — "
+                    "before asking again."),
+                "tool_calls": []})
         if provider_entry.lock.locked():
             _activity_phase(session_id, turn_token,
                             "Waiting for the previous question in this tab "
                             "to finish")
-        async with provider_entry.lock:
+        try:
+            await asyncio.wait_for(provider_entry.lock.acquire(),
+                                   timeout=_QUEUE_WAIT)
+        except asyncio.TimeoutError:
+            _activity_done(session_id, turn_token)
+            return JSONResponse(status_code=409, content={
+                "error": (
+                    "Still waiting on the previous question in this "
+                    f"conversation after {int(_QUEUE_WAIT)}s — "
+                    f"{provider_entry.describe_busy()}. Ask again once it "
+                    "finishes, or press Clear to start a fresh conversation "
+                    "that does not wait for it."),
+                "tool_calls": []})
+        try:
             result_limit = tool_result_limit(cfg, provider_name)
             _activity_phase(session_id, turn_token,
                             f"Asking {provider_name}")
+            provider_entry.busy_since = time.monotonic()
+            provider_entry.busy_tool = ""
 
             def _on_started(tool: str, args_preview: str,
                             blocked: bool) -> None:
+                if not blocked:
+                    # Named here so a question that cannot get in can say
+                    # WHICH query is holding the conversation, not just that
+                    # something is.
+                    provider_entry.busy_tool = tool
+                    provider_entry.busy_since = time.monotonic()
                 _activity_add(session_id, turn_token, {
                     "status": "blocked" if blocked else "running",
                     "tool": tool, "args": args_preview})
@@ -1442,6 +1518,7 @@ async def chat(payload: dict):
             prior_payloads = list(provider_entry.payloads)
 
             def _observe_and_record(name, args, out, ms, ok):
+                provider_entry.busy_tool = ""
                 _activity_add(session_id, turn_token, {
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
@@ -1465,6 +1542,10 @@ async def chat(payload: dict):
                 )
             finally:
                 _activity_done(session_id, turn_token)
+        finally:
+            provider_entry.busy_since = 0.0
+            provider_entry.busy_tool = ""
+            provider_entry.lock.release()
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup

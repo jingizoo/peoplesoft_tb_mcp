@@ -116,6 +116,45 @@ def _is_dead_connection(msg: str) -> bool:
     return any(m in low for m in _DEAD_CONN_MARKERS)
 
 
+# Errors where trying again is not merely useless but HARMFUL. Oracle counts a
+# rejected logon against FAILED_LOGIN_ATTEMPTS in the account's profile — 10 in
+# the shipped DEFAULT profile — and connecting here is lazy and per-query, so a
+# wrong password would otherwise be re-offered on every single query until the
+# service account locks. That is a few minutes of ordinary clicking, and it
+# locks the account for everything else that uses it, not just this app.
+#
+# ORA-28002 is deliberately absent: "the password will expire within N days"
+# accompanies a SUCCESSFUL logon and must not block anything.
+_CREDENTIAL_MARKERS = (
+    "ora-01017",     # invalid username/password; logon denied
+    "ora-01005",     # null password given
+    "ora-28000",     # the account is locked -- already too late; stop here
+    "ora-28001",     # the password has expired
+    "ora-01045",     # user lacks CREATE SESSION
+    "login failed for user",          # SQL Server
+)
+
+
+def _is_credential_failure(msg: str) -> bool:
+    low = msg.lower()
+    return any(m in low for m in _CREDENTIAL_MARKERS)
+
+
+_CREDENTIAL_REMEDY = (
+    "Not retrying: every rejected logon counts against the account's "
+    "FAILED_LOGIN_ATTEMPTS profile limit, and this app connects lazily per "
+    "query — retrying would lock the service account for every other consumer "
+    "within a few clicks. Correct the credentials and reload.\n"
+    "  - The password is read from ORACLE_PASSWORD in the .env file beside "
+    "config.yaml, falling back to db.oracle_password in config.yaml. The "
+    "environment variable wins.\n"
+    "  - A password containing $ or {} must be single-quoted in .env, and must "
+    "NOT be exported from a shell that expands it — a shell-mangled password "
+    "is indistinguishable from a wrong one here.\n"
+    "  - After fixing it: restart, or use the configuration console's reload."
+)
+
+
 class Database:
     """Connection manager sized for MULTIPLE CONCURRENT CHAT CHANNELS.
 
@@ -136,6 +175,11 @@ class Database:
         self._local = threading.local()        # per-thread sqlite connections
         self._catalog: dict = {}               # table -> real column names
         self._catalog_lock = threading.Lock()
+        # Set once the database has REJECTED these credentials. Every later
+        # connection attempt is refused from here instead of being offered to
+        # the server again. Cleared only by building a new Database, which is
+        # what a restart and the console's reload both do.
+        self._credentials_refused = ""
 
     # ---- dialect helpers -------------------------------------------------
     @property
@@ -288,9 +332,13 @@ class Database:
         """Session pool so concurrent chat channels do not serialize."""
         if self._pool is not None:
             return self._pool
+        if self._credentials_refused:
+            raise DbError(self._credentials_refused)
         with self._lock:
             if self._pool is not None:
                 return self._pool
+            if self._credentials_refused:
+                raise DbError(self._credentials_refused)
             try:
                 import oracledb
             except ImportError as e:
@@ -324,6 +372,12 @@ class Database:
             try:
                 self._pool = oracledb.create_pool(**kw)
             except Exception as e:
+                if _is_credential_failure(str(e)):
+                    self._credentials_refused = (
+                        f"Oracle refused these credentials for "
+                        f"{c.oracle_user}@{c.oracle_dsn}: {e}\n"
+                        f"{_CREDENTIAL_REMEDY}")
+                    raise DbError(self._credentials_refused) from e
                 raise DbError(f"Oracle connection failed: {e}") from e
             return self._pool
 
@@ -346,6 +400,8 @@ class Database:
     def _sqlserver_conn(self):
         if self._conn is not None:
             return self._conn
+        if self._credentials_refused:
+            raise DbError(self._credentials_refused)
         with self._lock:
             if self._conn is not None:
                 return self._conn
@@ -355,7 +411,16 @@ class Database:
                 raise DbError("pyodbc not installed — pip install -e '.[sqlserver]'") from e
             if not self.cfg.db.mssql_conn_str:
                 raise DbError("Set MSSQL_CONN_STR in .env")
-            self._conn = pyodbc.connect(self.cfg.db.mssql_conn_str)
+            try:
+                self._conn = pyodbc.connect(self.cfg.db.mssql_conn_str)
+            except Exception as e:
+                # SQL Server logins lock out too, on the same principle.
+                if _is_credential_failure(str(e)):
+                    self._credentials_refused = (
+                        f"SQL Server refused these credentials: {e}\n"
+                        f"{_CREDENTIAL_REMEDY}")
+                    raise DbError(self._credentials_refused) from e
+                raise DbError(f"SQL Server connection failed: {e}") from e
             if self._timeout_ms > 0:
                 self._conn.timeout = self._timeout_ms // 1000
             return self._conn
