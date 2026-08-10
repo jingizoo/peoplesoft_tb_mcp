@@ -317,34 +317,38 @@ ssh -L 8000:localhost:8000 <this-host>
 then open http://localhost:8000 on your laptop.
 
 **A team, from the network — `--share`.** This binds the routable address
-AND requires an access token on every request, including requests from
-127.0.0.1:
+and serves the page at a plain URL:
 
 ```bash
 .venv/bin/python -m pstb.gui --host 0.0.0.0 --port 8016 --share
 ```
 
-It prints a URL with the token in it. Send that link to whoever needs
-access; opening it once stores the token in a cookie and the rest of the
-session works normally. Anyone holding the link has full read access to
-the ledger, so treat it as the password it is.
+Colleagues just open `http://<this-host>:8016`. **No token, no link to
+paste** — the flag is there so binding the network is a deliberate act, not
+so the app can demand a credential. It prints what that exposes: anyone who
+can route to the host can read every balance, every customer and use the
+ad-hoc SQL tool, over cleartext HTTP. Keep it inside the VPN.
 
-- Set `PSTB_AUTH_TOKEN` to pin the token, so a restart does not invalidate
-  the link everyone has already bookmarked. Without it, one is generated
-  per run. A pinned token must be 16–128 characters of `A–Z a–z 0–9 - _`:
-  it travels inside a URL and a cookie, where anything else gets split or
-  re-encoded and locks out the people it was minted for. (A restart that
-  changes the token does not strand old cookies — the fresh link wins over
-  a stale cookie and quietly replaces it.)
-- `--allow-host <name>` (repeatable) restricts which `Host` names are
-  accepted. Without it any name is accepted and the token is the only
-  control — which is why `--share` refuses to run without one.
-- **The configuration console stays machine-local.** The token grants
-  colleagues *read* access to the dashboards; `/console` — which can
-  change settings and rotate credentials — answers only from the machine
-  itself (SSH tunnel), token or not.
-- This is cleartext HTTP. Keep it inside the VPN, or front it with a TLS
-  proxy if the network between colleagues and the box is not trusted.
+Two things stay true whatever you choose:
+
+- **The configuration console is never shared.** `/console` — which changes
+  settings and rotates credentials — answers only from the machine itself
+  (SSH tunnel). Letting colleagues read the dashboards must not also let
+  them rotate the Oracle password.
+- **A routable bind without `--share` is still refused**, because that one
+  is almost always a typo rather than a decision. The refusal names both
+  the flag and the tunnel.
+
+**If you do want a token**, set `PSTB_AUTH_TOKEN` and restart; every request
+then needs it, including from `127.0.0.1`, and the startup banner prints a
+URL with the token in it to paste once. It must be 16–128 characters of
+`A–Z a–z 0–9 - _` (it travels inside a URL and a cookie), and the console
+can generate and store one for you. Changing it invalidates every link
+already handed out — but a stale cookie never locks anyone out: the fresh
+link wins and quietly replaces it.
+
+`--allow-host <name>` (repeatable) restricts which `Host` names are
+accepted. Without it any name is accepted.
 
 Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
 and in loopback mode an unexpected `Host` header is refused as well: a page

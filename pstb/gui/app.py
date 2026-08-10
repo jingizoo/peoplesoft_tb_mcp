@@ -1907,7 +1907,6 @@ async def chat_reset(payload: dict):
 
 def main() -> None:
     import argparse
-    import secrets
 
     import uvicorn
 
@@ -1917,8 +1916,8 @@ def main() -> None:
     ap.add_argument("--open", action="store_true", help="open a browser window")
     ap.add_argument(
         "--share", action="store_true",
-        help="allow a routable bind by requiring an access token on every "
-             "request (generated and printed unless PSTB_AUTH_TOKEN is set)")
+        help="serve a routable address so colleagues can open the URL. No "
+             "token unless PSTB_AUTH_TOKEN is set; prints what is exposed")
     ap.add_argument(
         "--allow-host", action="append", default=[], metavar="NAME",
         help="with --share, the only Host names accepted (repeatable). "
@@ -1934,17 +1933,15 @@ def main() -> None:
     # guard, and the bind alone still cannot hand the ledger to the network.
     if not loopback and not args.share:
         raise SystemExit(
-            f"\n  Refusing to bind {args.host} without authentication: every "
-            "balance, every customer and the ad-hoc SQL tool would be "
-            "reachable by anyone who can route to this host.\n"
-            "  Two supported ways to widen access:\n"
-            f"      1. Keep it local and forward the port:\n"
-            f"           ssh -L {args.port}:localhost:{args.port} <this-host>\n"
-            f"         then open http://localhost:{args.port}\n"
-            f"      2. Serve the network WITH a token:\n"
-            f"           python -m pstb.gui --host {args.host} "
+            f"\n  Refusing to bind {args.host} by accident: every balance, "
+            "every customer and the ad-hoc SQL tool would be reachable by "
+            "anyone who can route to this host.\n"
+            "  If that is what you want, say so:\n"
+            f"      python -m pstb.gui --host {args.host} "
             f"--port {args.port} --share\n"
-            "         which prints a URL your colleagues paste once.\n")
+            "  If you would rather keep it local, forward the port:\n"
+            f"      ssh -L {args.port}:localhost:{args.port} <this-host>\n"
+            f"      then open http://localhost:{args.port}\n")
 
     if loopback and args.share:
         # Silently ignoring the flag taught the operator the wrong lesson —
@@ -1954,13 +1951,14 @@ def main() -> None:
               "required. Bind a routable address (--host 0.0.0.0) to "
               "actually share it.", file=sys.stderr)
 
-    token, generated = "", False
+    token = ""
     if not loopback:
+        # OPTIONAL. A token is on only when the operator set one; --share
+        # alone serves a plain URL. Minting one nobody asked for meant a
+        # link that had to be pasted around and that every restart
+        # invalidated — friction this app decided on its owner's behalf.
         token = (os.environ.get("PSTB_AUTH_TOKEN") or "").strip()
-        generated = not token
-        if generated:
-            token = secrets.token_urlsafe(24)
-        elif not re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", token):
+        if token and not re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", token):
             # The token travels in a URL, a cookie and a header. A value
             # with '&', '#', spaces or quotes would be silently split by
             # the first of those and the operator would be debugging a
@@ -1972,31 +1970,42 @@ def main() -> None:
                 "locks out the people it was minted for.\n  Generate one: "
                 "python3 -c \"import secrets; "
                 "print(secrets.token_urlsafe(24))\"\n")
-    localguard.configure(args.host, token, args.allow_host)
+    localguard.configure(args.host, token, args.allow_host,
+                         unauthenticated=not loopback and not token)
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
     print(f"  data: {cfg.db.backend}{' (views)' if cfg.db.use_views else ''} | "
           f"llm: {cfg.llm.provider} | wiki: {getattr(wiki, 'provider_name', 'off')}")
-    if token:
-        # The token is the whole access story in this mode, so it is printed
-        # once, here, in the terminal of the person who started the process —
-        # and printed INSIDE a URL, because a token someone has to assemble
-        # by hand is a token someone emails around in plain text instead.
-        reachable = (f"http://<this-host>:{args.port}"
-                     if args.host in ("0.0.0.0", "::", "*") else url)
-        print(f"\n  Shared mode: every request needs this token"
-              f"{' (generated for this run)' if generated else ''}.")
+    reachable = (f"http://<this-host>:{args.port}"
+                 if args.host in ("0.0.0.0", "::", "*") else url)
+    if not loopback and not token:
+        # The plain URL, which is what people want to type. Said plainly
+        # rather than prevented: whether this network is trusted is the
+        # operator's call, and an app that refuses the answer just gets its
+        # guard edited out — which turns off more than it turns on.
+        print(f"\n  Open on the network — no token. Share this URL:")
+        print(f"      {reachable}")
+        print("  Anyone who can route to this host can read every balance, "
+              "every customer and use the ad-hoc SQL tool. Keep it inside "
+              "the VPN; this is cleartext HTTP.")
+        print("  To require a token instead, set PSTB_AUTH_TOKEN and "
+              "restart.")
+        print("  The configuration console is not shared either way: "
+              "/console answers only from this machine (SSH tunnel).")
+    elif token:
+        # Printed INSIDE a URL, because a token someone has to assemble by
+        # hand is a token someone emails around in plain text instead.
+        print(f"\n  Shared mode: every request needs this token.")
         print(f"      {reachable}/?token={token}")
-        print("  Anyone with that link has full read access to the ledger. "
-              "Set PSTB_AUTH_TOKEN to keep the same token across restarts.")
+        print("  Anyone with that link has full read access to the ledger.")
         print("  The configuration console stays machine-local: /console "
               "answers only from this host (SSH tunnel), token or not.")
         print("  This is cleartext HTTP — keep it inside the VPN, or put a "
               "TLS proxy in front if the network is not trusted.")
-        if not args.allow_host:
-            print("  Accepting any Host header; pass --allow-host <name> to "
-                  "narrow it.")
+    if not loopback and not args.allow_host:
+        print("  Accepting any Host header; pass --allow-host <name> to "
+              "narrow it.")
     print("\n  Ctrl+C to stop\n")
     if args.open:
         import threading

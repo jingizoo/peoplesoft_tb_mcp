@@ -22,12 +22,24 @@ control; X-Frame-Options is the older spelling and both are sent.
 SHARED MODE. Refusing a routable bind outright was one control doing two
 jobs: it was the access story AND the only answer to "several of us need
 this page". Given only those two options a team removes the check, which is
-how an unauthenticated ledger ends up on a corporate network. So a routable
-bind is now allowed on ONE condition — a shared bearer token, generated for
-the operator if they do not supply one. The token replaces the peer address
-as the control, and it replaces it everywhere: in shared mode a request
-from 127.0.0.1 needs the token too, because a proxy running on the server
-itself would otherwise be an unauthenticated way in for the whole network.
+how an unauthenticated ledger ends up on a corporate network.
+
+So a routable bind is allowed with `--share`, and a token is OPTIONAL.
+Requiring one was a decision this app made for its owner and then made
+awkward — a link nobody asked for, pasted around, invalidated by every
+restart. The owner is the person who knows whether their network is
+trusted; on an internal VPN with a routable bind the honest answer is
+usually that it is. So `--share` alone serves the page at a plain URL and
+says clearly what that exposes, and setting PSTB_AUTH_TOKEN turns the
+token on for anyone who wants it. When a token IS set it replaces the peer
+address as the control everywhere, including for 127.0.0.1, because a
+proxy on the server itself would otherwise be a free way in.
+
+What is NOT optional: the configuration console. It writes credentials
+behind a confirmation code anyone can compute, so it answers only from
+this machine whatever the network policy is. "Let colleagues read the
+dashboards" must never silently mean "let colleagues rotate the Oracle
+password".
 
 Not defaults, not advice: every request passes through here.
 """
@@ -77,18 +89,19 @@ _SECURITY_HEADERS = {
 # turns every check in this module off at once. An error that does not say
 # what to do instead is a design that chooses its own bypass.
 _NEEDS_TOKEN = (
-    "A routable bind requires an access token — without one, every balance, "
-    "every customer, the ad-hoc SQL tool and the configuration console are "
-    "readable by anyone who can route to this host.\n"
-    "  Supported ways to run this:\n"
+    "This Policy is shared (routable) with no token and without "
+    "unauthenticated=True, which is almost always a mistake rather than a "
+    "decision — it turns off the peer check, the Host check and the token "
+    "check at once.\n"
+    "  Say which one you mean:\n"
     "    python -m pstb.gui --host 0.0.0.0 --port 8016 --share\n"
-    "        mints a token, prints it inside a URL to paste once.\n"
+    "        open on the network, no token. Anyone who can route to this "
+    "host reads the ledger.\n"
     "    PSTB_AUTH_TOKEN=<shared secret> python -m pstb.gui "
     "--host 0.0.0.0 --port 8016 --share\n"
-    "        same, with a token that survives restarts.\n"
-    "  Setting shared=True with no token is not a lighter version of this. "
-    "It disables the peer check, the Host check and the token check together "
-    "— strictly more open than the loopback default this replaced."
+    "        same bind, but every request must carry that token.\n"
+    "  In code: Policy(..., shared=True, unauthenticated=True) to be open "
+    "on purpose."
 )
 
 
@@ -112,11 +125,17 @@ class Policy:
     hosts: Optional[frozenset] = field(default=ALLOWED_HOSTS)
     token: str = ""
     shared: bool = False
+    # "Open on the network, and I mean it." Not a synonym for "no token
+    # yet": the flag exists so a routable bind with no authentication is
+    # always something somebody TYPED, never something a half-built Policy
+    # fell into. That is the distinction #108 was reaching for; requiring a
+    # token was the wrong way to enforce it.
+    unauthenticated: bool = False
 
     def __post_init__(self) -> None:
-        if self.shared and not self.token:
+        if self.shared and not self.token and not self.unauthenticated:
             raise ValueError(_NEEDS_TOKEN)
-        if self.hosts is None and not (self.shared and self.token):
+        if self.hosts is None and not self.shared:
             # hosts=None means "accept any Host name", which is only safe
             # when a token is the control in its place. Outside shared
             # mode it is a hand-edit spelling that switches the DNS-
@@ -132,20 +151,27 @@ POLICY = Policy()
 
 
 def configure(host: str, token: str = "",
-              allowed_hosts: Iterable[str] = ()) -> Policy:
-    """Install the policy for this process and return it."""
+              allowed_hosts: Iterable[str] = (),
+              unauthenticated: bool = False) -> Policy:
+    """Install the policy for this process and return it.
+
+    A routable bind needs either a token or an explicit
+    ``unauthenticated=True``; main() passes the latter for --share without
+    PSTB_AUTH_TOKEN, which is the ordinary "share it on our VPN" case.
+    """
     global POLICY
     extra = {h.strip().lower() for h in (allowed_hosts or ()) if h and h.strip()}
     shared = not peer_is_loopback((host, 0))
-    if shared and not token:
+    if shared and not token and not unauthenticated:
         raise ValueError(_NEEDS_TOKEN)
     if not shared:
         hosts: Optional[frozenset] = frozenset(ALLOWED_HOSTS | extra)
     elif extra:
         hosts = frozenset(ALLOWED_HOSTS | extra)
     else:
-        hosts = None                      # any name; the token is the control
-    POLICY = Policy(hosts=hosts, token=token, shared=shared)
+        hosts = None      # any name — we do not know what colleagues type
+    POLICY = Policy(hosts=hosts, token=token, shared=shared,
+                    unauthenticated=bool(shared and not token))
     return POLICY
 
 
