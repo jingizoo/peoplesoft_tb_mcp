@@ -122,6 +122,74 @@ class BootEndpointTests(unittest.TestCase):
                       {"starting", "ready", "degraded", "stopped"})
 
 
+class PrimeCostTests(unittest.TestCase):
+    """Warming the catalog at boot must not race the first dashboard.
+
+    Discovery has two halves. The setup reads are hundreds of rows and cost
+    milliseconds anywhere. The ledger existence probes are batched DISTINCTs
+    over the balance table and can each eat the whole query timeout on a bad
+    plan. Priming both at startup put the heavy half in direct competition
+    with whatever view the person opened first — same database, same Oracle
+    session pool — and made every dashboard slow for the first minutes after
+    a restart. Reported as "it became very slow, all dashboards, not sure
+    what it is attempting".
+    """
+
+    def setUp(self) -> None:
+        from pstb.gui import app as gapp
+        self.gapp = gapp
+        self.saved = dict(gapp._scope_cache)
+        self.addCleanup(lambda: gapp._scope_cache.update(self.saved))
+        gapp._scope_cache.update({"value": None, "expires": 0.0,
+                                  "refreshing": False})
+
+    def test_the_boot_prime_never_verifies_pairs(self) -> None:
+        import threading
+
+        seen: list = []
+        done = threading.Event()
+
+        def record(include_activity=True, verify_pairs=True):
+            seen.append({"include_activity": include_activity,
+                         "verify_pairs": verify_pairs})
+            done.set()
+            return {"scopes": []}
+
+        with patch.object(self.gapp.engine, "list_financial_scopes", record):
+            self.gapp._prime_scope_catalog()
+            self.assertTrue(done.wait(10), "the prime thread never ran")
+        self.assertEqual(seen, [{"include_activity": False,
+                                 "verify_pairs": False}])
+
+    def test_the_prime_does_not_rebuild_a_catalog_it_already_has(self) -> None:
+        # A persisted catalog from the last run is seeded at import. Paying
+        # for discovery anyway would be the same competition by another name.
+        import threading
+
+        called = threading.Event()
+
+        def refuse(*_a, **_k):
+            called.set()
+            return {"scopes": []}
+
+        self.gapp._scope_cache.update({"value": {"scopes": [{"x": 1}]}})
+        with patch.object(self.gapp.engine, "list_financial_scopes", refuse):
+            self.gapp._prime_scope_catalog()
+            self.assertFalse(called.wait(2))
+
+    def test_meta_flags_the_primed_catalog_as_unverified(self) -> None:
+        # Otherwise the page treats it as final, never calls /api/scopes,
+        # and the pairs are never confirmed against ledger data at all.
+        from starlette.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        gapp._scope_cache.update(
+            {"value": {"scopes": [], "verified": False}, "expires": 0.0})
+        meta = TestClient(gapp.app, **LOOP).get("/api/meta").json()
+        self.assertTrue(meta["scopes_ready"])
+        self.assertFalse(meta["scopes_verified"])
+
+
 class NonBlockingStartupTests(unittest.TestCase):
     """Uvicorn serves nothing until lifespan startup returns."""
 

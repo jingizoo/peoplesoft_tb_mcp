@@ -237,6 +237,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .x:hover{color:var(--ink)}
 
 .empty{padding:44px 18px;text-align:center;color:var(--muted)}
+.empty .el{font-variant-numeric:tabular-nums;opacity:.75}
+.empty .busy-note{margin:10px auto 0;max-width:46ch;font-size:11.5px;line-height:1.5;opacity:.85}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -365,8 +367,31 @@ async function api(path,opts){
 }
 const scope=()=>({bu:$('#f-bu').value,ledger:$('#f-ledger').value,fy:$('#f-fy').value||0,per:$('#f-per').value||0});
 const qs=o=>Object.entries(o).filter(([,v])=>v!==''&&v!==undefined).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
-const busy=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','empty','<span class="spin"></span> '+m));};
-const oops=m=>{$('#wrap').innerHTML='';$('#wrap').append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(m)+'</div>'));};
+// A dashboard spinner that never changed said nothing about whether the
+// query was working or wedged, and every view sat behind one. The label
+// now counts, and says out loud what it is waiting on once the wait is
+// long enough that someone has started to wonder.
+let BUSY_TICK=0;
+const busy=m=>{
+  clearInterval(BUSY_TICK);
+  const started=Date.now();
+  const box=el('div','empty','<span class="spin"></span> '+esc(m)+
+    ' <span class="el"></span><div class="busy-note"></div>');
+  $('#wrap').innerHTML=''; $('#wrap').append(box);
+  const paint=()=>{
+    if(!box.isConnected){ clearInterval(BUSY_TICK); return; }
+    const secs=Math.round((Date.now()-started)/1000);
+    box.querySelector('.el').textContent=secs>1?(secs+'s'):'';
+    box.querySelector('.busy-note').textContent=(secs<10?''
+      :(secs<45
+        ? 'Waiting on the database. Narrowing the account filter or the '
+          +'period makes this cheaper.'
+        : 'Still waiting. This query is genuinely slow — Close & controls '
+          +'→ diagnostics reports which input is the cost.'));
+  };
+  paint(); BUSY_TICK=setInterval(paint,1000);
+};
+const oops=m=>{clearInterval(BUSY_TICK);$('#wrap').innerHTML='';$('#wrap').append(el('div','card','<div class="empty" style="color:var(--bad)">'+esc(m)+'</div>'));};
 function rebuildPeriodOptions(maxRegular,selected){
   const per=$('#f-per');
   const maximum=Math.max(12,Number(maxRegular)||12);
@@ -1949,7 +1974,12 @@ function bootFail(message,detail){
   $('#f-fy').value=sc0.fiscal_year||META.current.fiscal_year;
   per.value=sc0.period||META.last_period_with_data||META.current.period;
   applyScopeCatalog();          // instant when the server cache was warm
-  if(!META.scopes_ready) loadScopesInBackground();
+  // Fetch in the background when the catalog is absent OR unverified. The
+  // boot prime warms the cheap unverified catalog so the bar is populated
+  // immediately; this call is what confirms the pairs against ledger data,
+  // and it runs while the person already has a usable screen rather than
+  // competing with their first dashboard.
+  if(!META.scopes_ready||META.scopes_verified===false) loadScopesInBackground();
   async function rescope(keepLedger){
     try{
       const d=await api('/api/scope?'+qs({business_unit:bu.value,
@@ -2344,18 +2374,29 @@ async function send(messageOverride,appendUser){
   // 40-second query reads as "running get_trial_balance — 38s", not a
   // spinner asking for faith.
   const tStart=Date.now();
+  // One token per question. Without it the poll returned whatever was last
+  // in the session's slot, so during the seconds before this turn reached
+  // its first tool the spinner showed the PREVIOUS question's steps — an
+  // AR aging that announced it was running close_readiness. The server
+  // answers stale:true for a token that no longer owns the slot.
+  const turnToken=makeSessionId();
   const poll=setInterval(async()=>{
     try{
       const a=await (await fetch('/api/activity?session_id='+
-        encodeURIComponent(CHAT_SESSION_ID))).json();
-      const ev=a.events||[];
+        encodeURIComponent(CHAT_SESSION_ID)+'&turn='+
+        encodeURIComponent(turnToken))).json();
+      const secs=Math.round((Date.now()-tStart)/1000);
+      const ev=(a.stale?[]:(a.events||[]));
       const running=[...ev].reverse().find(e=>e.status==='running');
       const done=ev.filter(e=>e.status==='done').length;
-      const secs=Math.round((Date.now()-tStart)/1000);
       let line='Working… '+secs+'s';
       if(running) line='<b>'+esc(running.tool)+'</b> '+esc(running.args||'')+
         ' — running, '+secs+'s'+(done?' · '+done+' step'+(done===1?'':'s')+' done':'');
       else if(done) line='thinking over '+done+' result'+(done===1?'':'s')+'… '+secs+'s';
+      // Before the first tool runs there is still real work — scope
+      // validation, a queued turn, spawning an engine — and naming it is
+      // the difference between a slow answer and an apparently dead one.
+      else if(!a.stale&&a.phase) line=esc(a.phase)+'… '+secs+'s';
       think.innerHTML='<span class="spin"></span> '+line;
     }catch(e){}
   },700);
@@ -2366,7 +2407,8 @@ async function send(messageOverride,appendUser){
     try{
       r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
-          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{}
+          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{},
+          turn_token:turnToken
         }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
     const j=await r.json();

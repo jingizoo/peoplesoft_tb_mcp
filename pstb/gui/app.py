@@ -318,28 +318,61 @@ _activity_lock = threading.Lock()
 _ACTIVITY_MAX_EVENTS = 60
 
 
-def _activity_reset(session_id: str) -> None:
+def _activity_begin(session_id: str, turn: str, phase: str = "") -> None:
+    """Claim the session's activity slot for ONE turn.
+
+    Keyed by a turn token the browser mints per question, because keying it
+    by session alone leaked the previous question's steps into the next
+    one's spinner. Someone asked for an AR aging and watched it report
+    "run_playbook playbook=close_readiness — running": that was the
+    PREVIOUS turn's dangling event, still in the slot because the new turn
+    had not reached the point where the slot was cleared. Anything that
+    outlives its turn now writes into a slot that no longer belongs to it
+    and is dropped.
+    """
     with _activity_lock:
-        _activity[session_id] = {"active": True, "events": []}
+        _activity[session_id] = {"turn": turn, "active": True, "events": [],
+                                 "phase": phase, "started": time.time()}
         if len(_activity) > 200:            # forgotten sessions, bounded
             for key in list(_activity)[:-100]:
                 _activity.pop(key, None)
 
 
-def _activity_add(session_id: str, event: dict) -> None:
+def _activity_phase(session_id: str, turn: str, phase: str) -> None:
+    """What the turn is doing BEFORE any tool runs.
+
+    Scope validation, a queued turn ahead of this one, spawning a private
+    answer engine, waiting on the model — all of it used to be a bare
+    "Working…" because only tool calls were reported, and it is exactly the
+    stretch where a slow turn looks stuck.
+    """
     with _activity_lock:
         slot = _activity.get(session_id)
-        if slot is None:
+        if slot is not None and slot["turn"] == turn:
+            slot["phase"] = phase
+
+
+def _activity_add(session_id: str, turn: str, event: dict) -> None:
+    with _activity_lock:
+        slot = _activity.get(session_id)
+        if slot is None or slot["turn"] != turn:
             return
         slot["events"].append({**event, "t": time.time()})
         del slot["events"][:-_ACTIVITY_MAX_EVENTS]
 
 
-def _activity_done(session_id: str) -> None:
+def _activity_done(session_id: str, turn: str) -> None:
     with _activity_lock:
         slot = _activity.get(session_id)
-        if slot is not None:
-            slot["active"] = False
+        if slot is None or slot["turn"] != turn:
+            return
+        slot["active"] = False
+        slot["phase"] = ""
+        # A turn that died between "running" and its result would otherwise
+        # leave an event that claims to be running forever.
+        for event in slot["events"]:
+            if event.get("status") == "running":
+                event["status"] = "failed"
 
 
 _scope_cache: dict = {"expires": 0.0, "value": None, "refreshing": False}
@@ -419,20 +452,49 @@ def _refresh_scope_catalog_async() -> None:
 
 
 def _prime_scope_catalog() -> None:
-    """Start discovery when the process starts, not when someone visits.
+    """Warm the CHEAP catalog at boot. Only the cheap one.
 
-    Discovery is the longest thing this app does and no part of the first
-    paint depends on it, so the previous arrangement — build it lazily on
-    the first request that needed it — spent the whole of it in front of a
-    person who was already waiting. Started here it usually lands before
-    anyone opens the page at all, and the persisted catalog covers the gap.
+    Discovery has two halves with wildly different costs. The setup reads
+    are hundreds of rows and build in milliseconds anywhere; the ledger
+    existence probes are batched DISTINCTs over the balance table, each
+    able to eat the whole query timeout when the optimizer picks a bad
+    plan. Priming BOTH at startup put that heavy half in direct
+    competition with the first dashboard someone opened — same database,
+    same Oracle session pool — and made every view slow for the first
+    minutes of a restart, with nothing on screen to say why.
+
+    So boot warms the unverified catalog and stops. Verification stays
+    where it was: triggered by the page's own background /api/scopes call,
+    once the person already has a usable screen.
     """
-    with _scope_cache_lock:
-        if _scope_cache["refreshing"]:
+    def work() -> None:
+        with _scope_cache_lock:
+            if _scope_cache["value"] is not None:
+                progress.end("scopes", note="served from the last run")
+                return
+        try:
+            built = engine.list_financial_scopes(include_activity=False,
+                                                 verify_pairs=False)
+        except Exception as e:                    # noqa: BLE001
+            print(f"[pstb] scope catalog prime failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
             return
-        _scope_cache["refreshing"] = True
+        built["verified"] = False
+        built["note"] = ((built.get("note") or "") +
+                         " Scope pairs not yet verified against ledger "
+                         "data; opening the page confirms them.").strip()
+        with _scope_cache_lock:
+            if _scope_cache["value"] is None:
+                # expires=0.0 on purpose: unverified is stale the moment it
+                # exists, so the first /api/scopes call replaces it.
+                _scope_cache.update({"value": built, "expires": 0.0})
+        _persist_scope_catalog(built)
+        progress.end("scopes")
+
     progress.begin("scopes")
-    _refresh_scope_catalog_async()
+    threading.Thread(target=work, daemon=True,
+                     name="scope-catalog-prime").start()
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
@@ -774,10 +836,17 @@ def meta():
             for item in out["financial_scopes"]
         ]
         out["scopes_ready"] = True
+        # The boot prime warms an UNVERIFIED catalog — instant everywhere,
+        # but it may offer a unit that setup knows and the ledger has never
+        # been posted to. The page still fetches /api/scopes in the
+        # background on this flag, which is what triggers verification; it
+        # just does so with a populated bar rather than an empty one.
+        out["scopes_verified"] = bool(warm.get("verified", True))
     else:
         out["financial_scopes"] = []
         out["business_units"] = []
         out["scopes_ready"] = False
+        out["scopes_verified"] = False
     # Scope comes from the DATABASE, validated against config — not raw config.
     # On a real instance the config defaults are often the sample values.
     try:
@@ -1176,11 +1245,20 @@ async def chat(payload: dict):
             status_code=400,
             detail=f"provider must be one of {', '.join(PROVIDERS)}")
 
+    # Claim the activity slot HERE, at the top of the request, not deep
+    # inside after the scope lookup, the engine setup and the queue wait.
+    # Everything before this point used to be reported as the previous
+    # turn's steps, because the previous turn's steps were still what was
+    # in the slot.
+    turn_token = str((payload or {}).get("turn_token") or "")[:64] or "-"
+    _activity_begin(session_id, turn_token, "Checking the financial scope")
+
     try:
         # This async route must not perform synchronous Oracle/SQL Server I/O
         # on FastAPI's event loop.
         catalog = await asyncio.to_thread(_financial_scope_catalog)
     except Exception as e:
+        _activity_done(session_id, turn_token)
         raise HTTPException(
             status_code=503, detail=f"Financial scope discovery failed: {e}"
         ) from e
@@ -1190,6 +1268,7 @@ async def chat(payload: dict):
     # hatch from a bad configured default.
     if _is_scope_catalog_question(message):
         options = _scope_options(catalog)
+        _activity_done(session_id, turn_token)
         return {
             "answer": (
                 "These business-unit and ledger combinations come directly "
@@ -1223,10 +1302,13 @@ async def chat(payload: dict):
         try:
             # Validation can fall back to a latest-posted-period lookup when a
             # catalog record has no activity metadata, so it is also offloaded.
+            _activity_phase(session_id, turn_token,
+                            "Validating the scope against PS_LEDGER")
             active_scope = await asyncio.to_thread(
                 _validated_scope, requested_scope, catalog
             )
         except _ScopeRequired as e:
+            _activity_done(session_id, turn_token)
             return {
                 "scope_required": True,
                 "error": e.detail,
@@ -1254,6 +1336,11 @@ async def chat(payload: dict):
             session, tools = _MCP["session"], _MCP["tools"]
             per_turn = contextlib.AsyncExitStack()
         else:
+            # The slow path, and the one worth naming: a whole Python start
+            # and database logon before the question is even asked.
+            _activity_phase(session_id, turn_token,
+                            "Starting a private answer engine for this "
+                            "question (the shared one is not up)")
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
             from ..client.chat import tool_specs
@@ -1333,20 +1420,29 @@ async def chat(payload: dict):
                 "result": data,
             })
 
+        # One question at a time per browser tab and scope. Say so while
+        # waiting — a queued turn is otherwise indistinguishable from a
+        # slow one, and the previous question's steps were what filled the
+        # silence before the slot became per-turn.
+        if provider_entry.lock.locked():
+            _activity_phase(session_id, turn_token,
+                            "Waiting for the previous question in this tab "
+                            "to finish")
         async with provider_entry.lock:
             result_limit = tool_result_limit(cfg, provider_name)
-            _activity_reset(session_id)
+            _activity_phase(session_id, turn_token,
+                            f"Asking {provider_name}")
 
             def _on_started(tool: str, args_preview: str,
                             blocked: bool) -> None:
-                _activity_add(session_id, {
+                _activity_add(session_id, turn_token, {
                     "status": "blocked" if blocked else "running",
                     "tool": tool, "args": args_preview})
 
             prior_payloads = list(provider_entry.payloads)
 
             def _observe_and_record(name, args, out, ms, ok):
-                _activity_add(session_id, {
+                _activity_add(session_id, turn_token, {
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
                 if ok and isinstance(out, str):
@@ -1368,7 +1464,7 @@ async def chat(payload: dict):
                     result_limit=result_limit,
                 )
             finally:
-                _activity_done(session_id)
+                _activity_done(session_id, turn_token)
     except RuntimeError as e:
         return JSONResponse(status_code=400, content={"error": str(e), "tool_calls": calls})
     except BaseException as e:  # noqa: BLE001 - includes ExceptionGroup
@@ -1388,6 +1484,11 @@ async def chat(payload: dict):
             content={"error": f"{type(root).__name__}: {root}", "tool_calls": calls},
         )
     finally:
+        # Also here, not only around agent_turn: a turn that died while
+        # spawning the engine or building the provider never reached that
+        # finally, and left an "active" slot the next poll would read as
+        # live work.
+        _activity_done(session_id, turn_token)
         if per_turn is not None:
             with contextlib.suppress(Exception):
                 await per_turn.aclose()
@@ -1452,17 +1553,29 @@ def feedback(payload: dict):
 
 
 @app.get("/api/activity")
-def activity(session_id: str = ""):
-    """What the current turn is doing RIGHT NOW — polled by the page while
-    its /api/chat request is in flight, so 'Working…' can say which tool is
-    running instead of leaving a spinner to speak for a 40-second query."""
+def activity(session_id: str = "", turn: str = ""):
+    """What THIS turn is doing right now — polled by the page while its
+    /api/chat request is in flight, so 'Working…' can say which tool is
+    running instead of leaving a spinner to speak for a 40-second query.
+
+    ``turn`` is the token the browser minted for the question it is waiting
+    on. Without it the poll answered with whatever was last in the slot,
+    which during the opening seconds of a new question is the PREVIOUS
+    question's steps — reported to us as an AR aging that claimed to be
+    running close_readiness. A token that does not match the slot returns
+    empty and says so, rather than returning someone else's turn.
+    """
     if not _SESSION_ID_RE.match(session_id or ""):
-        return {"active": False, "events": []}
+        return {"active": False, "events": [], "phase": "", "stale": False}
     with _activity_lock:
         slot = _activity.get(session_id)
         if slot is None:
-            return {"active": False, "events": []}
-        return {"active": slot["active"], "events": list(slot["events"])}
+            return {"active": False, "events": [], "phase": "", "stale": False}
+        if turn and slot["turn"] != turn:
+            return {"active": False, "events": [], "phase": "", "stale": True}
+        return {"active": slot["active"], "events": list(slot["events"]),
+                "phase": slot.get("phase", ""), "turn": slot["turn"],
+                "stale": False}
 
 
 @app.post("/api/chat/reset")
