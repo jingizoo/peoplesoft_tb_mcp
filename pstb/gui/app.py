@@ -1148,15 +1148,18 @@ def scope_for(business_unit: str = "", ledger: str = ""):
         fy, per = engine.last_posted_period(bu, led)
         # Fiscal years that actually hold data, so the scope editor offers
         # real choices instead of only the latest one.
+        #
+        # For THIS pair, by name. It used to build the activity catalog for
+        # the WHOLE installation and then filter down to the one row it
+        # wanted — and activity costs two MIN/MAX queries against PS_LEDGER
+        # per pair, the slow query class here. On a site with a few hundred
+        # BU/ledger pairs that is several hundred ledger queries to answer a
+        # question about one of them, issued every time the scope bar
+        # changed, all of it competing for the same eight-session Oracle
+        # pool. Reported as "many queuing up in ledger". Two queries now.
         try:
-            years = []
-            for sc in engine.list_financial_scopes(
-                    include_activity=True).get("scopes") or []:
-                if sc.get("business_unit") != bu:
-                    continue
-                for lg in sc.get("ledgers") or []:
-                    if lg.get("ledger") == led:
-                        years = [int(y) for y in (lg.get("fiscal_years") or [])]
+            bounds, _ = engine._scope_period_details(bu, led)
+            years = [int(y) for y in bounds]
         except Exception:
             years = []
         if fy and fy not in years:

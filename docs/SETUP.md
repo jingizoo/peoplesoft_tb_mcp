@@ -341,6 +341,37 @@ and in loopback mode an unexpected `Host` header is refused as well: a page
 on the open web can otherwise resolve its own hostname to 127.0.0.1 and
 read your ledger through the browser you left the tunnel open in.
 
+### Why a question times out at 180s
+
+The browser gives up on a chat request after 180 seconds. Everything the
+turn does has to fit inside that, and the defaults do not add up on a slow
+instance — this is arithmetic worth doing before blaming the model:
+
+| Budget | Default | Where |
+|---|---|---|
+| Browser request | 180s | `REQ_TIMEOUT_MS`, `pstb/gui/static/index.html` |
+| One SQL query | 120s | `db.query_timeout_seconds`, `config.yaml` |
+| One Query Access Service call | 60s | `ps_api.timeout_seconds`, `config.yaml` |
+
+A turn makes **several** tool calls. Two slow queries, or one slow query
+plus one QAS call to a gateway that is not answering, already exceed the
+browser's patience — and the turn keeps running server-side after the
+browser has stopped listening. If PeopleSoft Query Access Services is
+configured but its REST listening connector is down, every turn that
+touches it spends 60s per call finding that out; `ps_api.enabled: false`
+in `config.yaml` removes that cost entirely, and the curated database tools
+are unaffected because they read the database directly.
+
+A question asked while a previous one is still running is refused with an
+explanation rather than queued into its own timeout, and **Clear** starts a
+fresh conversation without waiting for the stuck query. Tune the two
+thresholds with `PSTB_TURN_ABANDONED_SECONDS` (default 180, match it to the
+browser) and `PSTB_QUEUE_WAIT_SECONDS` (default 45).
+
+When a query is genuinely the problem, **Close & controls → diagnostics**
+with timings measures the real inputs, and `scripts/diagnose_db.py` breaks
+one playbook down to individual statements with their plans.
+
 ### While it is starting
 
 Opening the page reports what the server is doing — connecting the answer
