@@ -332,6 +332,33 @@ class TBEngine:
             self._effective_defaults_from_pairs(pairs)
         )
 
+    def warm_effective_defaults(self) -> Optional[dict]:
+        """The discovered defaults IF they are already known, else None.
+
+        Never queries. Something that has to paint a page cannot afford to
+        be what pays for discovery: effective_defaults() falls through to
+        _ledger_scope_pairs(), whose verification probes PS_LEDGER, and that
+        ran on every cold page load while the person watched a blank screen.
+        Callers that genuinely need the answer still ask for it and wait.
+        """
+        if (self._eff_defaults is not None
+                and time.monotonic() < self._eff_defaults_expires_at):
+            return self._eff_defaults
+        return None
+
+    def warm_last_posted_period(self, bu: str,
+                                ledger: str) -> Optional[tuple]:
+        """The last posted period IF it is already cached, else None.
+
+        Never queries — same reason. These are MIN/MAX aggregates over the
+        ledger, which is the slow query class on a real instance.
+        """
+        cached = self._posted_cache.get(((bu or "").strip(),
+                                         (ledger or "").strip()))
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        return None
+
     def resolve_tree_ctl(self, setid: str, tree: str, business_unit: str) -> str:
         """SETCNTRLVALUE for a tree: the business unit when the tree is
         BU-controlled, otherwise the blank SetID-controlled value. Without it
