@@ -13,7 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pstb.guards import payload_numbers, ungrounded_figures  # noqa: E402
+from pstb.guards import (payload_numbers,  # noqa: E402
+                         tagged_payload_numbers, ungrounded_figures)
 from pstb.gui import localguard, progress  # noqa: E402
 
 
@@ -60,6 +61,51 @@ class ComputedTotalGroundingTests(unittest.TestCase):
             [("run_sql", '{"rows": [{"amt": 41.00}]}')])
         self.assertIn("41", grounded)
         self.assertNotIn("82", grounded)
+
+
+class SummedTotalProvenanceTests(unittest.TestCase):
+    """Grounding a computed total must not lend it a SOURCE.
+
+    A sum is arithmetic this code did, not a value a system reported. The
+    first cut let one widen the source set of a figure another system
+    really produced — swept against the real sample ledger, that made nine
+    figures vouch for systems they never came from, and the attribution
+    guard would then accept "per the general ledger" for an AP-only
+    number. Sums may create a key; only real figures may own one.
+    """
+
+    AP = ("get_vendor_intelligence",
+          '{"vendors": [{"paid": 600.0}, {"paid": 400.0}]}')     # sums 1000
+    GL = ("get_trial_balance",
+          '{"rows": [{"ending": 1000.0}, {"ending": 25.0}]}')    # states 1000
+
+    def test_a_sum_does_not_widen_a_real_figures_sources(self) -> None:
+        tagged = tagged_payload_numbers([self.GL, self.AP])
+        self.assertEqual(tagged["1000"], {"peoplesoft_gl"},
+                         "a computed AP total must not make 1000 look like "
+                         "it came from the general ledger too")
+
+    def test_a_real_figure_takes_over_a_key_a_sum_created(self) -> None:
+        # Same two payloads, other order: the sum lands first. The real
+        # figure must still own the attribution when it arrives.
+        tagged = tagged_payload_numbers([self.AP, self.GL])
+        self.assertEqual(tagged["1000"], {"peoplesoft_gl"})
+
+    def test_the_total_is_still_grounded_either_way(self) -> None:
+        for order in ([self.AP, self.GL], [self.GL, self.AP], [self.AP]):
+            self.assertEqual(ungrounded_figures("that is 1,000.00", order),
+                             [], f"order {[t for t, _ in order]}")
+
+    def test_non_additive_columns_are_not_summed(self) -> None:
+        # Nobody reports "total days late". Summing them grounded nothing a
+        # real answer says and only widened the collision surface.
+        grounded = payload_numbers(
+            [("get_ar_aging",
+              '{"rows": [{"days_late": 30, "pct_of_total": 25},'
+              ' {"days_late": 61, "pct_of_total": 75}]}')])
+        self.assertNotIn("91", grounded)     # 30 + 61
+        self.assertNotIn("100", grounded)    # 25 + 75
+        self.assertIn("30", grounded)        # the real values still are
 
 
 class StaleCookieTests(unittest.TestCase):

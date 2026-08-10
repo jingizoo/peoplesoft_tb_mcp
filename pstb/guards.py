@@ -885,8 +885,19 @@ def tagged_payload_numbers(payloads) -> dict:
     written by its predecessor and bare strings written before the upgrade.
     """
     found: dict = {}
+    # Keys that exist ONLY because this code summed a column. A real figure
+    # landing on one later takes it over outright — see add_sum.
+    sum_only: set = set()
 
     def add(key: str, label: str) -> None:
+        if key in sum_only:
+            # A figure a tool actually printed outranks arithmetic that
+            # happened to reach the same value. Without this the phantom
+            # label survived alongside the real one and vouched for a
+            # figure its system never produced.
+            sum_only.discard(key)
+            found[key] = {label}
+            return
         found.setdefault(key, set()).add(label)
 
     def walk(node, label):
@@ -903,6 +914,33 @@ def tagged_payload_numbers(payloads) -> dict:
         elif isinstance(node, str):
             for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", node):
                 add(_numeric_key(match), label)
+
+    def add_sum(key: str, label: str) -> None:
+        """Ground a COMPUTED total without widening anyone's attribution.
+
+        A synthetic sum is weaker evidence than a figure a tool actually
+        printed: it is arithmetic this code did, not a value the source
+        system reported. Grounding it is right — the model computed it from
+        real rows. Letting it add a SOURCE to a number some other system
+        already produced is not, because the attribution guard would then
+        accept "per the general ledger" for a figure only AP ever returned.
+
+        Measured on the real sample: summing every numeric column made nine
+        figures gain a source they had not earned, all of them small
+        integers where a day-count total collided with a period number. So
+        a sum may create a key, never widen one.
+        """
+        if key not in found:
+            found[key] = {label}
+            sum_only.add(key)
+
+    # Columns whose sum is not a figure anybody reports. Adding them
+    # grounded nothing a real answer would say and only widened the
+    # collision surface — a "days late" column totalling 91 is how AR
+    # ended up vouching for an AP number.
+    non_additive = re.compile(
+        r"pct|percent|rate|ratio|avg|average|median|days|age|score|"
+        r"year|period|month|fiscal|_dt$|date", re.IGNORECASE)
 
     def walk_sums(node, label):
         """Ground whole-column TOTALS over row sets.
@@ -929,6 +967,8 @@ def tagged_payload_numbers(payloads) -> dict:
             for field_name, value in item.items():
                 if isinstance(value, bool):
                     continue
+                if non_additive.search(str(field_name)):
+                    continue
                 if isinstance(value, (int, float)):
                     by_field.setdefault(field_name, []).append(float(value))
                 elif isinstance(value, str):
@@ -939,8 +979,8 @@ def tagged_payload_numbers(payloads) -> dict:
         for values in by_field.values():
             if len(values) >= 2:        # a single row's value is already in
                 total = sum(values)
-                add(_numeric_key(str(total)), label)
-                add(_numeric_key(str(round(total, 2))), label)
+                add_sum(_numeric_key(str(total)), label)
+                add_sum(_numeric_key(str(round(total, 2))), label)
         for item in node:               # nested row sets ground too
             walk_sums(item, label)
 
@@ -972,12 +1012,24 @@ def tagged_payload_numbers(payloads) -> dict:
             value = float(key)
         except ValueError:
             continue
+        # A restatement of a COMPUTED sum is doubly derived: "$91.3K" for a
+        # column this code added up. Still worth grounding — a person may
+        # legitimately say it — but it must not lend its source to a "91.3"
+        # some other system really reported. That is how a day-count total
+        # from AR ended up vouching for an AP figure, which the real-payload
+        # sweep caught after the first cut of this shipped.
+        derived = key in sum_only
         for divisor in (1e3, 1e6, 1e9):
             if abs(value) >= divisor:
                 for digits in (0, 1, 2):
                     restated = _numeric_key(str(round(value / divisor,
                                                       digits)))
-                    found.setdefault(restated, set()).update(labels)
+                    if derived:
+                        if restated not in found:
+                            found[restated] = set(labels)
+                            sum_only.add(restated)
+                    else:
+                        found.setdefault(restated, set()).update(labels)
     return found
 
 
