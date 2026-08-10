@@ -31,7 +31,7 @@ from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..wiki import WikiError, make_wiki
-from . import console, localguard
+from . import console, localguard, progress
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -62,14 +62,25 @@ except WikiError:
 # cold caches on every question (~390ms of pure overhead locally, worse over a
 # corporate network) with zero cache reuse between questions.
 #
-# The session is owned by the app LIFESPAN, not by a request. MCP's stdio
-# client uses anyio cancel scopes, and a cancel scope must be exited by the
-# same task that entered it — holding the stack inside a request handler and
-# closing it from another raises "attempted to exit cancel scope in a
-# different task". Entering at startup and exiting at shutdown keeps both ends
-# in the lifespan task; individual tool calls are safe from request tasks
-# because they only move messages over memory streams.
-_MCP: dict = {"session": None, "tools": None, "error": None}
+# The session is owned by a task that lives as long as the app, not by a
+# request. MCP's stdio client uses anyio cancel scopes, and a cancel scope
+# must be exited by the same task that entered it — holding the stack inside
+# a request handler and closing it from another raises "attempted to exit
+# cancel scope in a different task". One background task enters the stack,
+# parks on a shutdown event and closes the stack itself, so both ends stay in
+# the same task; individual tool calls are safe from request tasks because
+# they only move messages over memory streams.
+#
+# That task is STARTED, not awaited, by the lifespan. Uvicorn does not accept
+# a single connection until lifespan startup returns, so awaiting it here put
+# a Python start, an MCP handshake and an Oracle logon in front of the first
+# byte the browser could receive: the terminal printed a URL that then
+# refused to load for as long as the database took, which is the worst
+# possible place to spend that time. Chat degrades to a per-turn server while
+# the shared one is still coming up, which is exactly what it already does
+# when the shared one fails outright.
+_MCP: dict = {"session": None, "tools": None, "error": None,
+              "state": "starting"}
 
 
 def _server_import_check() -> str:
@@ -98,41 +109,87 @@ def _server_import_check() -> str:
     return f"server failed to start: {tail[-600:]}"
 
 
+async def _mcp_worker(stop: asyncio.Event) -> None:
+    """Own the shared MCP session for the life of the process.
+
+    Enter, publish, park, close — all in this one task, because anyio
+    requires the cancel scopes inside stdio_client to be exited by the task
+    that entered them.
+    """
+    stack = contextlib.AsyncExitStack()
+    # Not just the initial value: a process that has already run a lifespan
+    # (a test, a reload) left 'stopped' behind, and a stale terminal state
+    # would tell the page the engine had given up before it had tried.
+    _MCP.update({"state": "starting", "error": None})
+    try:
+        try:
+            with progress.step("engine"):
+                from mcp import ClientSession, StdioServerParameters
+                from mcp.client.stdio import stdio_client
+                from ..client.chat import tool_specs
+
+                env = dict(os.environ)
+                env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
+                                     + os.pathsep + env.get("PYTHONPATH", ""))
+                params = StdioServerParameters(
+                    command=sys.executable, args=["-m", "pstb.server"],
+                    env=env)
+                read, write = await stack.enter_async_context(
+                    stdio_client(params))
+                session = await stack.enter_async_context(
+                    ClientSession(read, write))
+                await session.initialize()
+                _MCP["session"] = session
+                _MCP["tools"] = tool_specs(await session.list_tools())
+                _MCP["state"] = "ready"
+        except Exception as e:                  # degrade, never fail to boot
+            # The exception from a dead stdio subprocess is usually noise
+            # ("unhandled errors in a TaskGroup") while the REAL reason — an
+            # Oracle logon rejection, a config error, a broken pull — died
+            # with the subprocess's stderr. Re-run the import in a subprocess
+            # that captures stderr, so the user sees ORA-01017 instead of a
+            # shrug. Off the event loop: it runs a whole Python start with a
+            # 90s ceiling, and every request would queue behind it here.
+            detail = await asyncio.to_thread(_server_import_check)
+            _MCP["error"] = str(e) + (f" | {detail}" if detail else "")
+            _MCP["state"] = "degraded"
+            progress.end("engine", ok=False, note=_MCP["error"][:300])
+            print(f"[pstb] shared MCP session unavailable ({_MCP['error']}); "
+                  "falling back to one server per turn", file=sys.stderr)
+        await stop.wait()
+    finally:
+        # One finally over BOTH the startup and the park, because a cancel
+        # during startup is not an Exception and would otherwise skip the
+        # close and leak the half-started subprocess.
+        with contextlib.suppress(Exception):
+            await stack.aclose()
+        _MCP.update({"session": None, "tools": None, "state": "stopped"})
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
-    stack = contextlib.AsyncExitStack()
-    try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from ..client.chat import tool_specs
-
-        env = dict(os.environ)
-        env["PYTHONPATH"] = (str(Path(__file__).resolve().parents[2])
-                             + os.pathsep + env.get("PYTHONPATH", ""))
-        params = StdioServerParameters(
-            command=sys.executable, args=["-m", "pstb.server"], env=env)
-        read, write = await stack.enter_async_context(stdio_client(params))
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        _MCP["session"] = session
-        _MCP["tools"] = tool_specs(await session.list_tools())
-    except Exception as e:                      # degrade, never fail to boot
-        # The exception from a dead stdio subprocess is usually noise
-        # ("unhandled errors in a TaskGroup") while the REAL reason — an
-        # Oracle logon rejection, a config error, a broken pull — died with
-        # the subprocess's stderr. Re-run the import in a subprocess that
-        # captures stderr, so the user sees ORA-01017 instead of a shrug.
-        detail = _server_import_check()
-        _MCP["error"] = str(e) + (f" | {detail}" if detail else "")
-        print(f"[pstb] shared MCP session unavailable ({_MCP['error']}); "
-              "falling back to one server per turn", file=sys.stderr)
+    progress.end("server")
+    stop = asyncio.Event()
+    worker = asyncio.create_task(_mcp_worker(stop), name="pstb-mcp-session")
+    # Discovery is the longest step on a real instance and nothing about the
+    # first paint depends on it, so start it at boot rather than on the first
+    # visitor's request. Serves from the persisted catalog meanwhile.
+    _prime_scope_catalog()
     try:
         yield
     finally:
-        try:
-            await stack.aclose()
-        except Exception:
-            pass
+        stop.set()
+        # A live subprocess is worth a graceful close. One that never
+        # finished starting has nothing to close gracefully, and waiting on
+        # it would hold Ctrl+C hostage to the same hang that made the
+        # startup asynchronous in the first place.
+        if _MCP.get("state") == "ready":
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(worker), timeout=10)
+        if not worker.done():
+            worker.cancel()             # cancelling exits the scopes in-task
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await worker
         _MCP.update({"session": None, "tools": None})
 
 
@@ -141,7 +198,7 @@ app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
 
 
 @app.middleware("http")
-async def _loopback_only(request, call_next):
+async def _access_guard(request, call_next):
     """Every route, not just the sensitive-looking ones.
 
     A DNS-rebound page reads the general ledger from /api/trial-balance as
@@ -154,6 +211,15 @@ async def _loopback_only(request, call_next):
                                 content={"error": reason})
     else:
         response = await call_next(request)
+    # A token that arrived in the URL becomes a cookie, so the page's own
+    # fetches — which carry no query string — are authenticated too. Set only
+    # after the request was ACCEPTED, so a wrong token never gets stored and
+    # then silently re-sent forever.
+    if not status and localguard.POLICY.token and localguard.token_in_query(
+            request.scope):
+        response.set_cookie(
+            localguard.TOKEN_COOKIE, localguard.POLICY.token,
+            httponly=True, samesite="strict", path="/")
     localguard.apply_security_headers(response.headers)
     return response
 
@@ -334,6 +400,7 @@ def _refresh_scope_catalog_async() -> None:
                   f"{type(e).__name__}: {e}", file=sys.stderr)
             with _scope_cache_lock:
                 _scope_cache["refreshing"] = False
+            progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
             return
         elapsed_ms = int((time.monotonic() - started) * 1000)
         with _scope_cache_lock:
@@ -343,11 +410,31 @@ def _refresh_scope_catalog_async() -> None:
                 "refreshing": False,
             })
         _persist_scope_catalog(value)
+        progress.end("scopes")
         print(f"[pstb] scope catalog refreshed in {elapsed_ms} ms",
               file=sys.stderr)
 
     threading.Thread(target=work, daemon=True,
                      name="scope-catalog-refresh").start()
+
+
+def _prime_scope_catalog() -> None:
+    """Start discovery when the process starts, not when someone visits.
+
+    Discovery is the longest thing this app does and no part of the first
+    paint depends on it, so the previous arrangement — build it lazily on
+    the first request that needed it — spent the whole of it in front of a
+    person who was already waiting. Started here it usually lands before
+    anyone opens the page at all, and the persisted catalog covers the gap.
+    """
+    with _scope_cache_lock:
+        if _scope_cache["refreshing"]:
+            return
+        _scope_cache["refreshing"] = True
+    progress.begin("scopes")
+    _refresh_scope_catalog_async()
+
+
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 _SCOPE_DISCOVERY_RE = re.compile(
     r"\b(list|what|which|available|all|exist)\b.*"
@@ -651,6 +738,7 @@ def meta():
         },
         "build": _build_info(),
         "mcp_session": {"shared": _MCP["session"] is not None,
+                        "state": _MCP.get("state", "starting"),
                         **({"error": _MCP["error"]} if _MCP["error"]
                            else {})},
         "backend": cfg.db.backend,
@@ -693,8 +781,15 @@ def meta():
     # Scope comes from the DATABASE, validated against config — not raw config.
     # On a real instance the config defaults are often the sample values.
     try:
-        eff = engine.effective_defaults()
-        fy0, per0 = engine.last_posted_period(eff["business_unit"], eff["ledger"])
+        with progress.step("defaults"):
+            eff = engine.effective_defaults()
+        # One step covering all three period lookups below rather than three
+        # steps that each blink past: to the person waiting they are one
+        # question — "which period does this open on?" — and naming them
+        # separately would make the bar jump without telling them more.
+        progress.begin("period")
+        fy0, per0 = engine.last_posted_period(eff["business_unit"],
+                                              eff["ledger"])
         out["scope"] = {
             "business_unit": eff["business_unit"],
             "ledger": eff["ledger"],
@@ -711,6 +806,7 @@ def meta():
             out["business_units"].append(
                 {"business_unit": eff["business_unit"], "descr": "(discovered)"})
     except Exception as e:
+        progress.end("period", ok=False, note=f"{type(e).__name__}: {e}")
         out["scope"] = {"business_unit": d.business_unit, "ledger": d.ledger,
                         "ledgers": [d.ledger], "fiscal_year": 0, "period": 0,
                         "max_regular_period": 12,
@@ -737,7 +833,27 @@ def meta():
         out["last_period_with_data"] = int(p) if p is not None else out["current"]["period"]
     except Exception:
         out["last_period_with_data"] = out["current"]["period"]
+    progress.end("period")          # no-op if the failure path already did
     return out
+
+
+@app.get("/api/boot")
+def boot_progress():
+    """Which startup step the server is on RIGHT NOW.
+
+    Polled by the page while its own /api/meta call is in flight, so a
+    forty-second wait reads as "Finding the last posted period — 38s"
+    instead of a logo animation that is indistinguishable from a hang.
+
+    Deliberately touches nothing but an in-memory snapshot: an endpoint
+    whose job is to explain a slow database must not be able to block on
+    one. /api/meta is a sync def and therefore runs in FastAPI's
+    threadpool, so this answers while that is still running.
+    """
+    snap = progress.snapshot()
+    snap["mcp_session"] = {"state": _MCP.get("state", "starting"),
+                           "shared": _MCP["session"] is not None}
+    return snap
 
 
 @app.get("/api/trial-balance")
@@ -1358,6 +1474,7 @@ async def chat_reset(payload: dict):
 
 def main() -> None:
     import argparse
+    import secrets
 
     import uvicorn
 
@@ -1365,31 +1482,71 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--open", action="store_true", help="open a browser window")
+    ap.add_argument(
+        "--share", action="store_true",
+        help="allow a routable bind by requiring an access token on every "
+             "request (generated and printed unless PSTB_AUTH_TOKEN is set)")
+    ap.add_argument(
+        "--allow-host", action="append", default=[], metavar="NAME",
+        help="with --share, the only Host names accepted (repeatable). "
+             "Omit to accept any name and rely on the token alone.")
     args = ap.parse_args()
 
-    # A non-loopback bind is refused HERE, not warned about. Everything this
-    # app serves — every balance, every customer, the ad-hoc SQL tool — is
-    # unauthenticated, so the bind is the whole access-control story and a
-    # flag must not be able to hand it to the network.
-    if not localguard.peer_is_loopback((args.host, args.port)):
+    loopback = localguard.peer_is_loopback((args.host, args.port))
+    # A routable bind is not refused any more — it is CONDITIONAL. Refusing
+    # it outright made one control do two jobs: it was the access story and
+    # also the answer to "three of us need this page", and a team given only
+    # those two options deletes the check. What it must never be is
+    # unauthenticated, so --share turns on a token instead of turning off a
+    # guard, and the bind alone still cannot hand the ledger to the network.
+    if not loopback and not args.share:
         raise SystemExit(
-            f"\n  Refusing to bind {args.host}: this app has no "
-            "authentication, so every balance and the ad-hoc SQL tool would "
-            "be reachable by anyone who can route to this host.\n"
-            "  Reach it from your laptop through the tunnel instead:\n"
-            f"      ssh -L {args.port}:localhost:{args.port} <this-host>\n"
-            f"  then open http://localhost:{args.port}\n")
+            f"\n  Refusing to bind {args.host} without authentication: every "
+            "balance, every customer and the ad-hoc SQL tool would be "
+            "reachable by anyone who can route to this host.\n"
+            "  Two supported ways to widen access:\n"
+            f"      1. Keep it local and forward the port:\n"
+            f"           ssh -L {args.port}:localhost:{args.port} <this-host>\n"
+            f"         then open http://localhost:{args.port}\n"
+            f"      2. Serve the network WITH a token:\n"
+            f"           python -m pstb.gui --host {args.host} "
+            f"--port {args.port} --share\n"
+            "         which prints a URL your colleagues paste once.\n")
+
+    token, generated = "", False
+    if not loopback:
+        token = (os.environ.get("PSTB_AUTH_TOKEN") or "").strip()
+        generated = not token
+        if generated:
+            token = secrets.token_urlsafe(24)
+    localguard.configure(args.host, token, args.allow_host)
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
     print(f"  data: {cfg.db.backend}{' (views)' if cfg.db.use_views else ''} | "
           f"llm: {cfg.llm.provider} | wiki: {getattr(wiki, 'provider_name', 'off')}")
-    print("  Ctrl+C to stop\n")
+    if token:
+        # The token is the whole access story in this mode, so it is printed
+        # once, here, in the terminal of the person who started the process —
+        # and printed INSIDE a URL, because a token someone has to assemble
+        # by hand is a token someone emails around in plain text instead.
+        reachable = (f"http://<this-host>:{args.port}"
+                     if args.host in ("0.0.0.0", "::", "*") else url)
+        print(f"\n  Shared mode: every request needs this token"
+              f"{' (generated for this run)' if generated else ''}.")
+        print(f"      {reachable}/?token={token}")
+        print("  Anyone with that link has full read access to the ledger. "
+              "Set PSTB_AUTH_TOKEN to keep the same token across restarts.")
+        if not args.allow_host:
+            print("  Accepting any Host header; pass --allow-host <name> to "
+                  "narrow it.")
+    print("\n  Ctrl+C to stop\n")
     if args.open:
         import threading
         import webbrowser
 
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        opening = f"{url}/?token={token}" if token else url
+        threading.Timer(1.0, lambda: webbrowser.open(opening)).start()
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level="warning", proxy_headers=False)
 

@@ -299,21 +299,63 @@ A ~50-question catalog is in [QUESTIONS.md](QUESTIONS.md).
 Windows: `.venv\Scripts\python -m pstb.gui --open`. Opens
 http://127.0.0.1:8000 (add `--port 8777` to change it).
 
-**It will refuse a non-loopback bind, and that is deliberate.** Nothing
-this app serves is authenticated — every balance, every customer, the
-ad-hoc SQL tool — so the loopback bind is the whole access-control story.
-To reach it from your laptop, forward the port instead of widening the
-bind:
+### Letting other people reach it
+
+By default the app binds 127.0.0.1 and answers only a caller on that
+machine. `--host 0.0.0.0` on its own is refused, and that is deliberate:
+nothing this app serves is authenticated — every balance, every customer,
+the ad-hoc SQL tool — so with no other control the bind is the whole access
+story. There are two supported ways to widen it.
+
+**One person, from their own laptop — forward the port.** Nothing to
+configure, and the ledger never leaves loopback:
 
 ```bash
 ssh -L 8000:localhost:8000 <this-host>
 ```
 
-then open http://localhost:8000 on your laptop. Requests carrying an
-unexpected `Host` header, or a proxy's `X-Forwarded-For`, are refused too:
-a page on the open web can otherwise resolve its own hostname to
-127.0.0.1 and read your ledger through the browser you left the tunnel
-open in.
+then open http://localhost:8000 on your laptop.
+
+**A team, from the network — `--share`.** This binds the routable address
+AND requires an access token on every request, including requests from
+127.0.0.1:
+
+```bash
+.venv/bin/python -m pstb.gui --host 0.0.0.0 --port 8016 --share
+```
+
+It prints a URL with the token in it. Send that link to whoever needs
+access; opening it once stores the token in a cookie and the rest of the
+session works normally. Anyone holding the link has full read access to
+the ledger, so treat it as the password it is.
+
+- Set `PSTB_AUTH_TOKEN` to pin the token, so a restart does not invalidate
+  the link everyone has already bookmarked. Without it, one is generated
+  per run.
+- `--allow-host <name>` (repeatable) restricts which `Host` names are
+  accepted. Without it any name is accepted and the token is the only
+  control — which is why `--share` refuses to run without one.
+
+Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
+and in loopback mode an unexpected `Host` header is refused as well: a page
+on the open web can otherwise resolve its own hostname to 127.0.0.1 and
+read your ledger through the browser you left the tunnel open in.
+
+### While it is starting
+
+Opening the page reports what the server is doing — connecting the answer
+engine, reading ledger defaults, finding the last posted period,
+discovering business units — with the elapsed time of the step in flight.
+A slow instance genuinely takes a while at "Finding the last posted
+period"; what that screen tells you is that it is working rather than
+hung, and if a step fails it shows the database's own error (`ORA-…`) with
+a retry button instead of sitting there.
+
+The web server now accepts connections before the answer engine has
+finished connecting, so the URL in the terminal is live immediately.
+Questions asked in that first moment fall back to a per-question server,
+which is slower but works; the page says so only if the shared engine
+actually fails.
 
 Five views sharing one scope bar (business unit, ledger, fiscal year, period):
 
