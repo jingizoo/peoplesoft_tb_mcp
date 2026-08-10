@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import os
 import re
@@ -886,18 +887,31 @@ def meta():
         out["business_units"] = []
         out["scopes_ready"] = False
         out["scopes_verified"] = False
-    # Scope comes from the DATABASE, validated against config — not raw config.
-    # On a real instance the config defaults are often the sample values.
-    try:
-        with progress.step("defaults"):
-            eff = engine.effective_defaults()
-        # One step covering all three period lookups below rather than three
-        # steps that each blink past: to the person waiting they are one
-        # question — "which period does this open on?" — and naming them
-        # separately would make the bar jump without telling them more.
-        progress.begin("period")
-        fy0, per0 = engine.last_posted_period(eff["business_unit"],
-                                              eff["ledger"])
+    # The DEFAULT business unit is discovered from the database, validated
+    # against config — but discovering it is not free and opening the page
+    # does not need it. effective_defaults() falls through to
+    # _ledger_scope_pairs(), whose verification probes PS_LEDGER, and
+    # last_posted_period() is two MIN/MAX aggregates over the same table:
+    # the slow query class here. Every cold page load paid for all of it
+    # before the first paint.
+    #
+    # And paid it for almost nothing. The browse views that read this scope
+    # bar are hidden (nav is display:none — Ask is the product), and the
+    # chat's scope is the one the person picks in the chooser, which comes
+    # from the catalog above. So this is served ONLY from caches something
+    # else already warmed. Cold, the page opens on config values flagged
+    # scope_ready:false, and whoever actually needs the discovered scope —
+    # a browse view — fetches /api/scope and waits for it then.
+    eff = engine.warm_effective_defaults()
+    if eff is not None:
+        progress.end("defaults", note="served from cache")
+        posted = engine.warm_last_posted_period(eff["business_unit"],
+                                                eff["ledger"])
+    else:
+        progress.skip("defaults", note="not needed to open the page")
+        posted = None
+    if eff is not None and posted is not None:
+        fy0, per0 = posted
         out["scope"] = {
             "business_unit": eff["business_unit"],
             "ledger": eff["ledger"],
@@ -909,39 +923,50 @@ def meta():
             "notes": eff["notes"],
         }
         out["ledgers"] = out["scope"]["ledgers"]
+        out["scope_ready"] = True
         if not any(b.get("business_unit") == eff["business_unit"]
                    for b in out["business_units"]):
             out["business_units"].append(
                 {"business_unit": eff["business_unit"], "descr": "(discovered)"})
-    except Exception as e:
-        progress.end("period", ok=False, note=f"{type(e).__name__}: {e}")
+        progress.end("period", note="served from cache")
+    else:
         out["scope"] = {"business_unit": d.business_unit, "ledger": d.ledger,
                         "ledgers": [d.ledger], "fiscal_year": 0, "period": 0,
-                        "max_regular_period": 12,
-                        "discovered": False, "notes": [f"scope discovery failed: {e}"]}
+                        "max_regular_period": 12, "discovered": False,
+                        "notes": ["Configured defaults. The database-verified "
+                                  "business unit loads when a view needs it."]}
         out["ledgers"] = [d.ledger]
+        out["scope_ready"] = False
+        progress.skip("period", note="not needed to open the page")
+
+    # The calendar lookup is a small setup table, not the ledger, so it stays.
+    # It is what puts a sensible year and period in the bar with no scope.
     try:
         cur = engine.resolve_period("")
         out["current"] = {"fiscal_year": cur["fiscal_year"], "period": cur["period"]}
     except Exception:
-        fy, per = engine._current_fy_period()
-        out["current"] = {"fiscal_year": fy, "period": per}
+        out["current"] = {"fiscal_year": dt.date.today().year, "period": 12}
 
     # The calendar's current period may have no postings yet (early in a month,
     # or before close). Opening on an empty screen reads as "broken", so tell
-    # the UI the newest period that actually has activity.
-    try:
-        rows, _ = db.query(
-            query_sql.scope_last_regular_period(db, engine._adj_periods()),
-            {"bu": out["scope"]["business_unit"], "led": out["scope"]["ledger"],
-             "fy": out["current"]["fiscal_year"]},
-            max_rows=1,
-        )
-        p = rows[0]["last_period"] if rows else None
-        out["last_period_with_data"] = int(p) if p is not None else out["current"]["period"]
-    except Exception:
-        out["last_period_with_data"] = out["current"]["period"]
-    progress.end("period")          # no-op if the failure path already did
+    # the UI the newest period that actually has activity — but only when the
+    # scope it would be measured against is already known. Cold, this was a
+    # third MIN/MAX over the ledger for a number the chat never reads.
+    out["last_period_with_data"] = out["current"]["period"]
+    if out["scope_ready"]:
+        try:
+            rows, _ = db.query(
+                query_sql.scope_last_regular_period(db, engine._adj_periods()),
+                {"bu": out["scope"]["business_unit"],
+                 "led": out["scope"]["ledger"],
+                 "fy": out["current"]["fiscal_year"]},
+                max_rows=1,
+            )
+            p = rows[0]["last_period"] if rows else None
+            if p is not None:
+                out["last_period_with_data"] = int(p)
+        except Exception:
+            pass
     return out
 
 

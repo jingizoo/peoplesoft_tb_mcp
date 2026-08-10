@@ -163,6 +163,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .bootsteps li .bi{flex:none;width:13px;text-align:center;font-size:11px;color:var(--line)}
 .bootsteps li .bt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bootsteps li .bm{font-variant-numeric:tabular-nums;opacity:.75}
+.bootsteps li .bn{opacity:.7}
 .bootsteps li.run{color:var(--ink)}
 .bootsteps li.run .bi{color:var(--accent)}
 .bootsteps li.done .bi{color:var(--ok)}
@@ -1866,7 +1867,11 @@ function bootPaint(){
       const li=el('li',{done:'done',running:'run',failed:'fail'}[s.status]||'');
       const mark={done:'✓',failed:'✕',running:'●',skipped:'–'}[s.status]||'○';
       li.append(el('span','bi',mark));
-      li.append(el('span','bt',esc(s.label)));
+      // A skipped step with no explanation reads as something missing. The
+      // note says why it was not needed, which is the whole point of not
+      // having done it.
+      li.append(el('span','bt',esc(s.label)+
+        ((s.status==='skipped'&&s.note)?' <span class="bn">— '+esc(s.note)+'</span>':'')));
       const t=bootSecs(s.ms);
       if(t) li.append(el('span','bm',t));
       list.append(li);
@@ -2026,7 +2031,41 @@ function chrome(){
   $('#l-adj').classList.toggle('hide',!(isTB||isRpt));
   $('#csv').classList.toggle('hide',!isTB);
 }
-function render(){ chrome(); ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,ar:viewAR,compare:viewCompare,chat:viewChat,diag:viewDiag}[VIEW])(); }
+// The database-verified default business unit is NOT loaded to open the
+// page: discovering it probes PS_LEDGER, and the chat never reads it — the
+// scope you chat in is the one you pick in the chooser. The browse views DO
+// read it, so they pay for it, once, when one of them is actually opened.
+let SCOPE_DISCOVERY=null;
+async function ensureScopeDiscovered(){
+  if(META.scope_ready) return;
+  if(!SCOPE_DISCOVERY) SCOPE_DISCOVERY=(async()=>{
+    busy('Finding your business unit…');
+    const d=await api('/api/scope');        // no arguments: the server discovers
+    META.scope={...(META.scope||{}),...d,discovered:true};
+    META.scope_ready=true;
+    const bu=$('#f-bu'),lg=$('#f-ledger');
+    if(![...bu.options].some(o=>o.value===d.business_unit))
+      bu.append(new Option(d.business_unit,d.business_unit));
+    bu.value=d.business_unit;
+    lg.innerHTML='';
+    (d.ledgers&&d.ledgers.length?d.ledgers:[d.ledger])
+      .forEach(l=>lg.append(new Option(l,l)));
+    lg.value=d.ledger;
+    if(d.fiscal_year){
+      $('#f-fy').value=d.fiscal_year;
+      rebuildPeriodOptions(d.max_regular_period,d.period);
+    }
+  })().catch(e=>{ SCOPE_DISCOVERY=null; throw e; });
+  return SCOPE_DISCOVERY;
+}
+async function render(){
+  chrome();
+  if(VIEW!=='chat'){
+    try{ await ensureScopeDiscovered(); }
+    catch(e){ oops('Could not determine the business unit: '+e.message); return; }
+  }
+  ({tb:viewTB,close:viewClose,rollup:viewRollup,reports:viewReports,ar:viewAR,compare:viewCompare,chat:viewChat,diag:viewDiag}[VIEW])();
+}
 
 /* ---------- tab views (same renderers the chat uses) ---------- */
 async function viewTB(){
