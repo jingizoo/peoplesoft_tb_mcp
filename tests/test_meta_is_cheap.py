@@ -105,6 +105,23 @@ class ColdMetaTests(unittest.TestCase):
         # when the scope it measures against is already known.
         self.assertLessEqual(len(ledger_hits), 1, "\n".join(ledger_hits))
 
+    def test_the_SECOND_warm_meta_queries_nothing_at_all(self) -> None:
+        # The first warm call may fill the calendar and activity caches.
+        # After that, "must return INSTANTLY" has to mean zero database
+        # round trips — the first cut of this file allowed one PS_LEDGER
+        # aggregate per page load FOREVER, plus two uncached calendar
+        # queries the cold-path cap quietly tolerated, and on a WAN
+        # deployment that was seconds of synchronous work in front of
+        # every paint for the life of the process.
+        eff = self.gapp.engine.effective_defaults()
+        self.gapp.engine.last_posted_period(eff["business_unit"],
+                                            eff["ledger"])
+        self.client.get("/api/meta")            # fills the remaining caches
+        _, queries = self._queries_during(
+            lambda: self.client.get("/api/meta"))
+        self.assertEqual(queries, [],
+                         "a warm /api/meta must serve entirely from memory")
+
 
 class WarmAccessorTests(unittest.TestCase):
     """The accessors exist to be safe to call from a page-serving path."""

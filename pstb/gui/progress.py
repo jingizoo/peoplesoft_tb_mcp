@@ -65,14 +65,32 @@ def begin(key: str, note: str = "") -> None:
 def end(key: str, ok: bool = True, note: str = "") -> None:
     with _lock:
         slot = _state.get(key)
+        if slot is None:
+            return
+        # A step that already FAILED may still learn WHY — or recover. The
+        # step() context manager records the raw exception at raise time —
+        # usually "ExceptionGroup: unhandled errors in a TaskGroup" — and
+        # the diagnosed cause (an ORA code from the subprocess's stderr)
+        # arrives seconds later. Without this, that second end() was a
+        # no-op and the boot bar showed the shrug forever while the real
+        # reason went only to a terminal nobody watches. A later SUCCESS
+        # (the engine's retry loop reconnecting) flips the step to done so
+        # a reloaded page stops reporting a failure that has been fixed.
+        if slot["status"] == FAILED and note:
+            slot["status"] = DONE if ok else FAILED
+            slot["note"] = note[:300]
+            return
         # Only a step still in flight can finish. Later refreshes reuse the
         # same code path as the boot-time one and must not restate a step
         # the page already ticked off.
-        if slot is None or slot["status"] not in (PENDING, RUNNING):
+        if slot["status"] not in (PENDING, RUNNING):
             return
-        started = slot["at"] or _started
-        slot.update({"status": DONE if ok else FAILED,
-                     "ms": int((time.monotonic() - started) * 1000)})
+        # A step that never began has no start time; measuring it from
+        # process start would report a fabricated duration — the warm
+        # path's instant cache hit read as a forty-second step.
+        ms = (int((time.monotonic() - slot["at"]) * 1000)
+              if slot["at"] else 0)
+        slot.update({"status": DONE if ok else FAILED, "ms": ms})
         if note:
             slot["note"] = note
 

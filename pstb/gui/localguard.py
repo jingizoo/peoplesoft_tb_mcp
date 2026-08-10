@@ -116,6 +116,16 @@ class Policy:
     def __post_init__(self) -> None:
         if self.shared and not self.token:
             raise ValueError(_NEEDS_TOKEN)
+        if self.hosts is None and not (self.shared and self.token):
+            # hosts=None means "accept any Host name", which is only safe
+            # when a token is the control in its place. Outside shared
+            # mode it is a hand-edit spelling that switches the DNS-
+            # rebinding check off while looking like a default.
+            raise ValueError(
+                "Policy(hosts=None) accepts every Host header, which "
+                "disables the DNS-rebinding control. That is only safe in "
+                "shared mode, where the token replaces it. Use the default "
+                "hosts, or run --share with a token.")
 
 
 POLICY = Policy()
@@ -194,27 +204,40 @@ def peer_is_loopback(client) -> bool:
         return False
 
 
-def presented_token(scope) -> str:
-    """The token this request carries, from any of the three places.
+def presented_tokens(scope) -> list:
+    """EVERY token this request carries, from all four places.
 
-    Header first (what the page's own fetches use once it has a cookie),
-    then cookie, then the query string — which exists so ONE pasted URL
-    works on the first click rather than needing a header-setting tool.
+    All of them, not the first found: after a restart mints a new token,
+    the browser still holds the OLD one as a cookie. The person pastes the
+    fresh URL — carrying the new token in the query — and the stale cookie
+    used to shadow it, so the correct link 401'd forever until they found
+    the cookie jar. A caller is authenticated when ANY credential they
+    presented is right; the middleware then overwrites the stale cookie
+    from the query, and the lockout heals itself on the next click.
     """
     headers = {k.decode("latin-1").lower(): v.decode("latin-1")
                for k, v in scope.get("headers") or []}
+    found: list = []
     bearer = headers.get("authorization", "")
     if bearer[:7].lower() == "bearer ":
-        return bearer[7:].strip()
+        found.append(bearer[7:].strip())
     if headers.get(TOKEN_HEADER):
-        return headers[TOKEN_HEADER].strip()
+        found.append(headers[TOKEN_HEADER].strip())
     for chunk in (headers.get("cookie") or "").split(";"):
         name, _, value = chunk.partition("=")
         if name.strip() == TOKEN_COOKIE:
-            return value.strip()
+            found.append(value.strip())
     query = parse_qs(
         (scope.get("query_string") or b"").decode("latin-1", "replace"))
-    return (query.get(TOKEN_QUERY) or [""])[0].strip()
+    found.append((query.get(TOKEN_QUERY) or [""])[0].strip())
+    return [t for t in found if t]
+
+
+def presented_token(scope) -> str:
+    """First token found, header before cookie before query. Kept for
+    callers that only need one; authentication checks all of them."""
+    tokens = presented_tokens(scope)
+    return tokens[0] if tokens else ""
 
 
 def token_ok(presented: str, policy: Optional[Policy] = None) -> bool:
@@ -261,6 +284,14 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
                 "address is being forged. This app trusts the real peer "
                 "address only.")
     if not host_matches(headers.get("host", ""), policy):
+        if policy.shared:
+            # The loopback advice is wrong in shared mode — the caller is
+            # legitimately remote, and the remedy is naming their host.
+            allowed = ", ".join(sorted(policy.hosts or ()))
+            return 400, (
+                f"Unexpected Host header {headers.get('host', '')!r}. In "
+                f"shared mode this server accepts: {allowed}. Restart with "
+                "--allow-host <name> to add the name your colleagues use.")
         return 400, (
             f"Unexpected Host header {headers.get('host', '')!r}. This "
             "server is reachable as 127.0.0.1 or localhost only — a "
@@ -268,10 +299,28 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
             "hostname to this machine to reach your data.")
     # Last, so a caller who fails an earlier rule is told about that rule
     # rather than being sent to look for a token they would then also need.
-    if policy.token and not token_ok(presented_token(scope), policy):
+    if policy.token and not any(token_ok(t, policy)
+                                for t in presented_tokens(scope)):
         return 401, (
             "This server is bound to a routable address, so it requires the "
             "access token printed when it started. Open the URL that "
             "printed with it, or send the token as an Authorization: Bearer "
             "header.")
+    # The configuration console stays MACHINE-LOCAL even in shared mode.
+    # The token grants colleagues read access to the app; the console
+    # WRITES credentials and settings behind a confirmation code that is
+    # computable by anyone (it is deliberateness, not authentication — its
+    # own docstring says so on the assumption that only the loopback guard
+    # admits callers). Handing every token holder the console would turn
+    # "share the dashboards" into "share the ability to change the Oracle
+    # password", which nothing in the printed warning promised.
+    if policy.shared:
+        path = str(scope.get("path") or "")
+        if ((path == "/console" or path.startswith("/console/")
+             or path.startswith("/api/console"))
+                and not peer_is_loopback(scope.get("client"))):
+            return 403, (
+                "The configuration console answers only from the machine "
+                "itself, even in shared mode. Reach it through an SSH "
+                "tunnel: ssh -L 8000:localhost:8000 <this-host>")
     return 0, ""

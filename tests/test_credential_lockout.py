@@ -68,6 +68,34 @@ class _Rejects:
         raise Exception(self.error)
 
 
+class _RejectsAtAcquire:
+    """The stand-in that matches REALITY: python-oracledb's thin mode builds
+    the pool object without connecting, and the logon — where a wrong
+    password actually surfaces — happens lazily at pool.acquire(), once per
+    session. A latch that only guards create_pool() never fires on this
+    path, which is the path every real deployment takes."""
+
+    POOL_GETMODE_WAIT = 1
+
+    class _Pool:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def acquire(self):
+            self.outer.attempts += 1
+            raise Exception(self.outer.error)
+
+        def close(self, force=False):
+            pass
+
+    def __init__(self, error: str):
+        self.error = error
+        self.attempts = 0
+
+    def create_pool(self, **_kw):
+        return self._Pool(self)
+
+
 class RetryTests(unittest.TestCase):
     def _oracle_db(self) -> Database:
         cfg = load_config(None)
@@ -113,6 +141,53 @@ class RetryTests(unittest.TestCase):
                 with self.assertRaises(DbError):
                     db._oracle_pool()
         self.assertEqual(fake.attempts, 4)
+
+    def test_a_rejection_at_ACQUIRE_latches_too(self) -> None:
+        """The blocker the first cut of this file missed.
+
+        In thin mode create_pool() does not log on — pool.acquire() does,
+        per query. Guarding only pool creation left the real path
+        unguarded: 25 queries were 25 rejected logons, and the shipped
+        DEFAULT profile locks the account at 10. The latch must fire on
+        the first acquire-time refusal and answer every later query from
+        memory."""
+        db = self._oracle_db()
+        fake = _RejectsAtAcquire(
+            "ORA-01017: invalid username/password; logon denied")
+        with patch.dict(sys.modules, {"oracledb": fake}):
+            for _ in range(25):
+                with self.assertRaises(DbError):
+                    with db._session():
+                        pass
+        self.assertEqual(fake.attempts, 1,
+                         "acquire-time logons count against "
+                         "FAILED_LOGIN_ATTEMPTS exactly like create-time "
+                         "ones")
+
+    def test_an_acquire_time_transient_failure_keeps_trying(self) -> None:
+        # A pool whose sessions die to a network blip must keep retrying:
+        # it costs the account nothing and recovers on its own.
+        db = self._oracle_db()
+        fake = _RejectsAtAcquire("ORA-12170: TNS:Connect timeout occurred")
+        with patch.dict(sys.modules, {"oracledb": fake}):
+            for _ in range(4):
+                with self.assertRaises(DbError):
+                    with db._session():
+                        pass
+        self.assertEqual(fake.attempts, 4)
+
+    def test_the_remedy_no_longer_promises_what_reload_cannot_do(self) -> None:
+        # The chat engine is a separate process that read its password at
+        # startup; the refusal must say restart for chat rather than
+        # promising one reload fixes everything.
+        db = self._oracle_db()
+        fake = _RejectsAtAcquire(
+            "ORA-01017: invalid username/password; logon denied")
+        with patch.dict(sys.modules, {"oracledb": fake}):
+            with self.assertRaises(DbError) as ctx:
+                with db._session():
+                    pass
+        self.assertIn("restart", str(ctx.exception).lower())
 
     def test_a_fresh_database_object_may_try_again(self) -> None:
         # Restart and the console's reload both build a new Database, which

@@ -274,10 +274,14 @@ class BindTests(unittest.TestCase):
 
         gapp, args, patch = self._run_main(share=True)
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
-            with _patch.dict(os.environ, {"PSTB_AUTH_TOKEN": "team-token-1"}):
+            # 16+ chars of URL-safe characters: a shorter or fancier token
+            # is refused at startup now, because it travels inside a URL
+            # and a cookie where '&' or spaces silently split it.
+            with _patch.dict(os.environ,
+                             {"PSTB_AUTH_TOKEN": "team-token-123456"}):
                 with _patch("uvicorn.run"):
                     gapp.main()
-        self.assertEqual(localguard.POLICY.token, "team-token-1")
+        self.assertEqual(localguard.POLICY.token, "team-token-123456")
 
     def test_a_loopback_bind_never_asks_for_a_token(self) -> None:
         from unittest.mock import patch as _patch
@@ -331,10 +335,6 @@ class SharedModeAppTests(unittest.TestCase):
     def test_a_refusal_is_still_unframeable(self) -> None:
         r = self._client().get("/api/meta")
         self.assertEqual(r.headers.get("x-frame-options"), "DENY")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class UnauthenticatedRoutableBindTests(unittest.TestCase):
@@ -391,3 +391,7 @@ class UnauthenticatedRoutableBindTests(unittest.TestCase):
         self.assertFalse(policy.shared)
         self.assertEqual(policy.token, "")
         self.assertEqual(policy.hosts, localguard.ALLOWED_HOSTS)
+
+
+if __name__ == "__main__":
+    unittest.main()

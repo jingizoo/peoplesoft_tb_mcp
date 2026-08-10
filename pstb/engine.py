@@ -91,6 +91,17 @@ class TBEngine:
         self._posted_cache: dict = {}
         self._rate_cache: dict = {}
         self._record_cols: dict = {}
+        # Calendar answers. Both are CONFIGURATION — which periods a year
+        # has, which fiscal period a date falls in — so they cannot change
+        # under a running process the way postings can. They were the two
+        # uncached queries left on the page-serving path: every /api/meta
+        # re-asked the calendar the same two questions, a WAN round trip
+        # each, in an endpoint documented "must return INSTANTLY".
+        self._max_reg_cache: dict = {}
+        self._resolve_cache: dict = {}
+        # (bu, ledger) -> (expires, (fiscal_years, last_posted)); the scope
+        # bar's per-pair activity, same TTL discipline as _posted_cache.
+        self._period_details_cache: dict = {}
 
     # ------------------------------------------------------------------ utils
     def _adj_periods(self) -> list[int]:
@@ -119,6 +130,12 @@ class TBEngine:
             d = dt.date.fromisoformat(d[:10]).isoformat()
         except ValueError:
             raise EngineError(f"Could not parse date {date!r} — pass ISO format YYYY-MM-DD")
+        # Keyed by the resolved DATE, so "today" naturally rolls over at
+        # midnight. Which fiscal period a date falls in is calendar
+        # configuration; asking the database again on every page load was
+        # a round trip for an answer that cannot change.
+        if d in self._resolve_cache:
+            return dict(self._resolve_cache[d])
         params = {
             "setid": self.cfg.defaults.setid,
             "cal": self.cfg.defaults.calendar_id,
@@ -131,7 +148,7 @@ class TBEngine:
                 f"(setid={params['setid']}, calendar={params['cal']})"
             )
         r = rows[0]
-        return {
+        resolved = {
             "date": d,
             "fiscal_year": int(r["fiscal_year"]),
             "period": int(r["period"]),
@@ -140,6 +157,8 @@ class TBEngine:
             "setid": params["setid"],
             "calendar_id": params["cal"],
         }
+        self._resolve_cache[d] = dict(resolved)
+        return resolved
 
     def _bu_has_data(self, bu: str) -> bool:
         rows, _ = self.db.query(
@@ -196,7 +215,8 @@ class TBEngine:
                 kept.extend(chunk)      # cannot prove empty — keep them
         return kept or pairs
 
-    def _ledger_scope_pairs(self, verify: bool = True
+    def _ledger_scope_pairs(self, verify: bool = True,
+                            setup_only: bool = False
                             ) -> tuple[list[tuple[str, str]], bool]:
         """Accessible BU/ledger pairs, from SETUP tables wherever possible.
 
@@ -204,6 +224,16 @@ class TBEngine:
         PS_LEDGER is not. Falling back to a DISTINCT over the balance table is
         the last resort and is capped, because on Oracle that is a full scan
         of the ledger index (SQLite hides this — it has a skip-scan).
+
+        ``setup_only`` stops BEFORE the fallbacks that touch PS_LEDGER. It
+        exists for the boot prime, whose entire promise is "instant
+        everywhere": on a site where the setup records are not granted, the
+        per-BU ledger probes and the DISTINCT are exactly the expensive
+        half the prime was written not to run, and they came back through
+        this fallback chain — at boot, in competition with the first
+        dashboard, on precisely the grant-limited sites the comment above
+        warns about. An empty answer lets the caller defer discovery
+        instead of paying for it at the worst possible moment.
         """
         def _collect(sql: str, cap: int) -> tuple[list[tuple[str, str]], bool]:
             rows, truncated = self.db.query(sql, {}, max_rows=cap)
@@ -226,6 +256,9 @@ class TBEngine:
                 return self._with_ledger_data(pairs), truncated
         except DbError:
             pass  # setup records not granted at this site — try the next source
+
+        if setup_only:
+            return [], False
 
         # BU list from setup, then each BU's ledgers from PS_LEDGER filtered
         # BY THAT BU — an index range scan on the leading column, not a scan
@@ -316,6 +349,9 @@ class TBEngine:
         self._rate_cache.clear()
         self._ledgers_cache.clear()
         self._periods_cache.clear()
+        self._max_reg_cache.clear()
+        self._resolve_cache.clear()
+        self._period_details_cache.clear()
 
     def effective_defaults(self) -> dict:
         """Config defaults validated against PS_LEDGER's accessible catalog.
@@ -612,7 +648,24 @@ class TBEngine:
         self, fy: int, business_unit: str = "", ledger: str = ""
     ) -> int:
         """Highest non-adjustment period in the calendar for this year (supports
-        13-period calendars); falls back to scoped ledger activity, then 12."""
+        13-period calendars); falls back to scoped ledger activity, then 12.
+
+        Cached for the process: a year's period structure is calendar
+        CONFIGURATION, and this was re-queried on every /api/meta and every
+        cross-year comparison — a WAN round trip each time for an answer
+        that cannot change under a running server.
+        """
+        cache_key = (int(fy), (business_unit or "").strip(),
+                     (ledger or "").strip())
+        if cache_key in self._max_reg_cache:
+            return self._max_reg_cache[cache_key]
+        value = self._max_regular_period_uncached(fy, business_unit, ledger)
+        self._max_reg_cache[cache_key] = value
+        return value
+
+    def _max_regular_period_uncached(
+        self, fy: int, business_unit: str = "", ledger: str = ""
+    ) -> int:
         adj = set(self._adj_periods())
         try:
             rows, _ = self.db.query(
@@ -2091,6 +2144,32 @@ class TBEngine:
             return None
         return str(rows[0].get("base_currency") or "").strip() or None
 
+    def scope_period_details(
+        self, bu: str, ledger: str
+    ) -> tuple[list[int], Optional[dict]]:
+        """Fiscal-year bounds and last posted period for ONE pair, cached.
+
+        The scope bar asks this on every BU/ledger change, and the answer
+        was computed twice per change — once here, once through
+        last_posted_period, the same two MIN/MAX statements against
+        PS_LEDGER re-issued back to back. Cached on the posted-period TTL
+        (journals move; configuration caches would be wrong here), and the
+        posted-period cache is fed from the same result so the second
+        asker pays nothing either.
+        """
+        key = ((bu or "").strip(), (ledger or "").strip())
+        cached = self._period_details_cache.get(key)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        details = self._scope_period_details(bu, ledger)
+        expires = time.monotonic() + self._scope_cache_ttl_seconds
+        self._period_details_cache[key] = (expires, details)
+        _, last_posted = details
+        if last_posted is not None:
+            self._posted_cache[key] = (
+                expires, (last_posted["fiscal_year"], last_posted["period"]))
+        return details
+
     def _scope_period_details(
         self, bu: str, ledger: str
     ) -> tuple[list[int], Optional[dict]]:
@@ -2144,7 +2223,8 @@ class TBEngine:
         return {"business_units": rows, "truncated": truncated}
 
     def list_financial_scopes(self, include_activity: bool = True,
-                              verify_pairs: bool = True) -> dict:
+                              verify_pairs: bool = True,
+                              setup_only: bool = False) -> dict:
         """Business units with base currency, their ledgers, and the fiscal
         years/periods that hold data — in one deterministic catalog response.
 
@@ -2168,7 +2248,8 @@ class TBEngine:
         # honest and small: a unit that exists in setup but has never been
         # posted to may be offered, and choosing it reports "no ledger data
         # in scope" — an answer, not a failure.
-        pairs, truncated = self._ledger_scope_pairs(verify=verify_pairs)
+        pairs, truncated = self._ledger_scope_pairs(verify=verify_pairs,
+                                                    setup_only=setup_only)
         enriched = self._business_unit_enrichment()
         scopes: dict[str, dict] = {}
         for bu, ledger in pairs:
@@ -2187,7 +2268,7 @@ class TBEngine:
             if not scope.get("base_currency") and currency:
                 scope["base_currency"] = currency
             if include_activity:
-                fiscal_years, last_posted = self._scope_period_details(
+                fiscal_years, last_posted = self.scope_period_details(
                     bu, ledger
                 )
             else:
@@ -2201,9 +2282,15 @@ class TBEngine:
                 "row_count": None,
             })
 
-        effective = self._remember_effective_defaults(
-            self._effective_defaults_from_pairs(pairs)
-        )
+        effective = self._effective_defaults_from_pairs(pairs)
+        # Remember the defaults ONLY when they were derived from verified
+        # pairs. An unverified prime remembering its guess with the full
+        # TTL made warm_effective_defaults() serve a unit the ledger may
+        # never have been posted to for fifteen minutes — and an empty
+        # setup-only prime would have cached "no scopes found" and
+        # suppressed real discovery for the same window.
+        if verify_pairs and pairs:
+            self._remember_effective_defaults(effective)
         note = (
             "Use these exact values; do not invent a business unit, ledger, or year. "
             "row_count is intentionally not calculated during scope discovery. "

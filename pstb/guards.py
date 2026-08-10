@@ -904,17 +904,61 @@ def tagged_payload_numbers(payloads) -> dict:
             for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", node):
                 add(_numeric_key(match), label)
 
+    def walk_sums(node, label):
+        """Ground whole-column TOTALS over row sets.
+
+        "What is the revenue of this parent across all the children" is
+        answered by summing a column the tool really returned — but the
+        total itself appears in no payload, so the guard withheld a correct
+        answer and told the user the numbers were invented. A caveat that
+        fires on a correct answer is worse than a miss. For every list of
+        row dicts, the per-column sums are grounded with the same sources
+        as the rows they add up; asking the model to do arithmetic on tool
+        data and then punishing the result is not a policy, it is a bug.
+        """
+        if isinstance(node, dict):
+            for value in node.values():
+                walk_sums(value, label)
+            return
+        if not isinstance(node, (list, tuple)):
+            return
+        by_field: dict = {}
+        for item in node:
+            if not isinstance(item, dict):
+                continue
+            for field_name, value in item.items():
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)):
+                    by_field.setdefault(field_name, []).append(float(value))
+                elif isinstance(value, str):
+                    text = value.strip()
+                    if re.fullmatch(r"-?\d[\d,]*(?:\.\d+)?", text):
+                        by_field.setdefault(field_name, []).append(
+                            float(text.replace(",", "")))
+        for values in by_field.values():
+            if len(values) >= 2:        # a single row's value is already in
+                total = sum(values)
+                add(_numeric_key(str(total)), label)
+                add(_numeric_key(str(round(total, 2))), label)
+        for item in node:               # nested row sets ground too
+            walk_sums(item, label)
+
     for raw in payloads or []:
         tool, raw = untag_payload(raw)
         label = source_of_tool(tool)
         if isinstance(raw, str):
             try:
-                walk(json.loads(raw), label)
+                parsed = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", raw):
                     add(_numeric_key(match), label)
+            else:
+                walk(parsed, label)
+                walk_sums(parsed, label)
         else:
             walk(raw, label)
+            walk_sums(raw, label)
     # Ground unit-scaled RESTATEMENTS of payload figures. "$4.55M" for a
     # payload 4,548,123.45 is the same fact at a coarser unit, not an
     # invented number — and withholding a correct aging answer over it
