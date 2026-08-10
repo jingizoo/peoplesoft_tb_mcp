@@ -498,7 +498,7 @@ function applyScopeCatalog(){
   if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
   return opts;
 }
-async function loadScopesInBackground(){
+async function loadScopesInBackground(attempt){
   // The page is already usable: policy questions, the wiki and general chat
   // work with no scope at all. Discovery fills the bar in when it lands
   // instead of holding the first paint hostage to a WAN round trip.
@@ -508,10 +508,17 @@ async function loadScopesInBackground(){
     META.financial_scopes=d.scopes||[];
     META.business_units=d.business_units||[];
     META.scopes_ready=true;
+    META.scopes_verified=d.verified!==false;
     const opts=applyScopeCatalog();   // learns the unit names on the way
     // A chooser already on screen was rendered empty — refresh it in place.
     if(!CHAT_SCOPE&&document.querySelector('#msgs .scope-chooser')&&opts.length)
       showScopeChooser();
+    // An unverified response is the boot prime's guess; the verified
+    // catalog is being built in the background RIGHT NOW, and without a
+    // re-ask it never reached the page — the stale list survived until a
+    // full reload. Bounded: ~6 quiet retries, then keep the guess.
+    if(d.verified===false&&(attempt||0)<6)
+      setTimeout(()=>loadScopesInBackground((attempt||0)+1),20000);
   }catch(e){
     SCOPE_LOAD_ERROR=e.message||String(e);
   }finally{
@@ -1412,17 +1419,44 @@ function renderRecords(d){
   sc.append(t); c.append(sc);
   return c;
 }
+function genericTable(rows){
+  const sc=el('div');sc.style.maxHeight='320px';sc.style.overflow='auto';
+  const t=el('table');
+  t.innerHTML='<thead><tr>'+Object.keys(rows[0]).map(k=>'<th'+(typeof rows[0][k]==='number'?' class="num"':'')+
+    '>'+esc(k.replace(/_/g,' '))+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.slice(0,200).map(r=>'<tr>'+Object.entries(r).map(([k,v])=>typeof v==='number'&&/amt|amount|balance|ending|beginning|activity|total|paid|due|gross|net/.test(k)
+      ?'<td class="num">'+money(v)+'</td>':'<td'+(typeof v==='number'?' class="num"':'')+'>'+esc(v==null?'':(typeof v==='object'?JSON.stringify(v):v))+'</td>').join('')+'</tr>').join('')+'</tbody>';
+  sc.append(t);
+  return sc;
+}
 function renderGeneric(name,d){
-  const rows=Array.isArray(d)?d:(d.rows||d.accounts||d.periods||d.nodes||d.results||d.trees||d.business_units||null);
   const c=el('div','card');c.append(el('h2',null,esc(name)));
-  if(Array.isArray(rows)&&rows.length&&typeof rows[0]==='object'){
-    const sc=el('div');sc.style.maxHeight='320px';sc.style.overflow='auto';
-    const t=el('table');
-    t.innerHTML='<thead><tr>'+Object.keys(rows[0]).map(k=>'<th'+(typeof rows[0][k]==='number'?' class="num"':'')+
-      '>'+esc(k.replace(/_/g,' '))+'</th>').join('')+'</tr></thead><tbody>'+
-      rows.slice(0,200).map(r=>'<tr>'+Object.entries(r).map(([k,v])=>typeof v==='number'&&/amt|amount|balance|ending|beginning|activity|total/.test(k)
-        ?'<td class="num">'+money(v)+'</td>':'<td'+(typeof v==='number'?' class="num"':'')+'>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody>';
-    sc.append(t);c.append(sc);
+  // ANY list of row objects renders as a table, whatever its key is
+  // called. The old fixed key list (rows/accounts/periods/…) predates the
+  // AP pack, whose payloads carry payments, vouchers and vendors — every
+  // one of them fell through to a raw-JSON dump capped at 2,000
+  // characters, which is what "it is not formatting the result into a
+  // table, mostly on the payable side" looks like from the other end.
+  const isRows=v=>Array.isArray(v)&&v.length>0&&
+    v.every(x=>x&&typeof x==='object'&&!Array.isArray(x));
+  let tables=[];
+  if(Array.isArray(d)){ if(isRows(d)) tables.push(['',d]); }
+  else tables=Object.entries(d).filter(([,v])=>isRows(v));
+  if(tables.length){
+    tables.slice(0,3).forEach(([key,rows])=>{
+      if(key&&tables.length>1)
+        c.append(el('div','sub',esc(key.replace(/_/g,' '))));
+      c.append(genericTable(rows));
+    });
+    // Scalar context (totals, counts, the mode line) still matters —
+    // shown compactly under the table instead of being dropped.
+    if(!Array.isArray(d)){
+      const scalars=Object.entries(d).filter(([,v])=>v!==null&&typeof v!=='object')
+        .map(([k,v])=>esc(k.replace(/_/g,' '))+': '+
+          (typeof v==='number'&&/amt|amount|balance|total|paid|due|gross|net/.test(k)?money(v):esc(v)))
+        .slice(0,8);
+      if(scalars.length) c.append(el('div','pad dim',scalars.join(' · ')));
+    }
   } else {
     // DOM append() returns undefined — chaining .textContent off it threw,
     // so every non-tabular payload silently rendered nothing.
@@ -1891,20 +1925,32 @@ function bootPaint(){
   if(hint&&!BOOT.failed){
     const slow=running&&running.ms>12000||waited>15000;
     hint.classList.toggle('hide',!slow);
-    if(slow) hint.textContent=(waited>60000
+    if(slow) hint.textContent=((BOOT.pollFails||0)>3
+      // "Nothing is stuck" was asserted from wall-clock alone, even while
+      // every poll was failing — say what is actually known.
+      ? 'The server has stopped answering the progress check. The page '
+        +'cannot tell what is happening — the service may be down.'
+      : (waited>60000
       ? 'Still waiting on the database. If this never finishes, check the '
         +'VPN and that the listener is reachable from this host.'
       : 'The database is answering. Nothing is stuck — the page fills in as '
-        +'soon as it replies.');
+        +'soon as it replies.'));
   }
 }
 async function bootPollOnce(){
   try{
     const r=await fetch('/api/boot',{cache:'no-store'});
-    if(!r.ok) return;                       // guard refusal: /api/meta says why
+    if(!r.ok){ BOOT.pollFails=(BOOT.pollFails||0)+1; return; }
     const d=await r.json();
     if(Array.isArray(d.steps)) BOOT.steps=d.steps;
-  }catch(e){ /* the poll must never be the thing that breaks the boot */ }
+    BOOT.pollFails=0;
+  }catch(e){
+    // the poll must never be the thing that breaks the boot — but its
+    // failures are COUNTED, so the reassurance hint cannot keep saying
+    // "nothing is stuck" on wall-clock alone while the server has
+    // stopped answering entirely.
+    BOOT.pollFails=(BOOT.pollFails||0)+1;
+  }
   bootPaint();
 }
 function bootStart(){
@@ -1948,22 +1994,53 @@ function bootFail(message,detail){
     return;
   }
   bootSay('Drawing the workspace');
+  // The token rode in on the URL and is now a cookie; scrub it from the
+  // address bar so it does not live on in browser history, bookmarks and
+  // screen shares for everyone the link was pasted to.
+  try{
+    if(new URLSearchParams(location.search).has('token')){
+      const u=new URL(location.href); u.searchParams.delete('token');
+      history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);
+    }
+  }catch(e){}
   // 'degraded' specifically, NOT "not shared yet". The shared engine now
   // starts in the background so the page can paint first, so at first paint
   // it is normally still 'starting' — banner-on-absence would cry wolf on
   // every single boot and teach people to ignore the one that matters.
-  if(META.mcp_session&&META.mcp_session.state==='degraded'){
-    // The engine fell back to one server per question. If the cause is
-    // fatal (a database logon, a broken install) every question will fail
-    // the same way — say WHY at the top of the page, not in a terminal
-    // nobody is watching.
-    const b=el('div','msg err');
-    b.style.margin='10px 16px';
+  //
+  // And because it is normally still 'starting', ONE look can never see a
+  // degradation — the connect fails seconds after this fetch. So the state
+  // is WATCHED until it settles: a cheap memory-only /api/boot poll, ending
+  // at 'ready' (banner removed if a retry recovered) or showing the banner
+  // with the diagnosed cause at 'degraded'. Without this the engine failed
+  // silently and every question quietly paid a fresh subprocess and DB
+  // logon — "the app got slow" with nothing on screen saying why.
+  function engineBanner(err){
+    let b=document.getElementById('mcp-banner');
+    if(!b){
+      b=el('div','msg err'); b.id='mcp-banner'; b.style.margin='10px 16px';
+      document.body.prepend(b);
+    }
     b.innerHTML='<b>Chat engine degraded:</b> the shared answer server could not start, '+
-      'so questions run slower and may fail.<br><span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px">'+
-      esc(META.mcp_session.error||'no detail captured')+'</span>';
-    document.body.prepend(b);
+      'so questions run slower and may fail. It retries on its own; this notice clears if it recovers.'+
+      '<br><span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px">'+
+      esc(err||'no detail captured')+'</span>';
   }
+  (async function watchEngine(){
+    let state=(META.mcp_session||{}).state||'starting';
+    if(state==='degraded') engineBanner((META.mcp_session||{}).error);
+    // Poll until the state settles — and keep watching a degraded engine,
+    // because the worker retries and the banner should clear on recovery.
+    for(let i=0;i<240&&state!=='stopped';i++){    // ~20 min at 5s
+      if(state==='ready'){ const b=document.getElementById('mcp-banner'); if(b) b.remove(); return; }
+      await new Promise(r=>setTimeout(r,5000));
+      try{
+        const d=await (await fetch('/api/boot',{cache:'no-store'})).json();
+        state=(d.mcp_session||{}).state||state;
+        if(state==='degraded') engineBanner((d.mcp_session||{}).error);
+      }catch(e){}
+    }
+  })();
   renderBuildTag();   // META carries the build; the tag renders before this resolves
   const bu=$('#f-bu'), lg=$('#f-ledger'), per=$('#f-per');
   const sc0=META.scope||{};
@@ -2021,7 +2098,12 @@ function bootFail(message,detail){
 // Last resort: an exception anywhere above must not leave the overlay
 // covering a page that is otherwise fine underneath it. Not after a
 // bootFail — there the overlay is carrying the only copy of the error.
+// BOTH events: the boot sequence is an async IIFE, and a throw inside an
+// async function fires 'unhandledrejection', not 'error' — with only the
+// error listener the splash stayed up forever, polling forever, on any
+// uncaught await failure.
 window.addEventListener('error',()=>{ if(!BOOT.failed) bootFinish(); },{once:true});
+window.addEventListener('unhandledrejection',()=>{ if(!BOOT.failed) bootFinish(); },{once:true});
 
 function chrome(){
   const isTB=VIEW==='tb', isChat=VIEW==='chat', isRpt=VIEW==='reports';

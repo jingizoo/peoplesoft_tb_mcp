@@ -151,7 +151,9 @@ _CREDENTIAL_REMEDY = (
     "  - A password containing $ or {} must be single-quoted in .env, and must "
     "NOT be exported from a shell that expands it — a shell-mangled password "
     "is indistinguishable from a wrong one here.\n"
-    "  - After fixing it: restart, or use the configuration console's reload."
+    "  - After fixing it: the configuration console's reload picks it up for "
+    "the dashboards. The chat's answer engine is a separate process that "
+    "read its password at startup, so chat needs a service restart."
 )
 
 
@@ -405,6 +407,11 @@ class Database:
         with self._lock:
             if self._conn is not None:
                 return self._conn
+            # Re-checked INSIDE the lock, as the Oracle path does: two
+            # threads can both pass the unlocked check, and the second
+            # would burn one more failed logon after the first latched.
+            if self._credentials_refused:
+                raise DbError(self._credentials_refused)
             try:
                 import pyodbc
             except ImportError as e:
@@ -431,9 +438,25 @@ class Database:
         and are independent, so no cross-channel lock is taken."""
         if self.dialect == "oracle":
             pool = self._oracle_pool()
+            # The latch has to guard the ACQUIRE, not just pool creation.
+            # In thin mode create_pool() builds the pool object without
+            # logging on — the logon happens here, lazily, per session. So
+            # this is where a wrong password actually surfaces, and without
+            # the check here every query re-offered it to the server:
+            # exactly the FAILED_LOGIN_ATTEMPTS lockout the latch exists to
+            # prevent, still live on the one path a real instance takes.
+            if self._credentials_refused:
+                raise DbError(self._credentials_refused)
             try:
                 conn = pool.acquire()
             except Exception as e:
+                if _is_credential_failure(str(e)):
+                    c = self.cfg.db
+                    self._credentials_refused = (
+                        f"Oracle refused these credentials for "
+                        f"{c.oracle_user}@{c.oracle_dsn}: {e}\n"
+                        f"{_CREDENTIAL_REMEDY}")
+                    raise DbError(self._credentials_refused) from e
                 raise DbError(f"Oracle connection failed: {e}") from e
             if self._timeout_ms > 0:
                 conn.call_timeout = self._timeout_ms

@@ -149,17 +149,46 @@ class PrimeCostTests(unittest.TestCase):
         seen: list = []
         done = threading.Event()
 
-        def record(include_activity=True, verify_pairs=True):
+        def record(include_activity=True, verify_pairs=True,
+                   setup_only=False):
             seen.append({"include_activity": include_activity,
-                         "verify_pairs": verify_pairs})
+                         "verify_pairs": verify_pairs,
+                         "setup_only": setup_only})
             done.set()
             return {"scopes": []}
 
         with patch.object(self.gapp.engine, "list_financial_scopes", record):
             self.gapp._prime_scope_catalog()
             self.assertTrue(done.wait(10), "the prime thread never ran")
+        # setup_only is load-bearing: without it, a site whose setup
+        # records are not granted fell through to the per-BU PS_LEDGER
+        # probes AT BOOT — the exact expensive half this test exists to
+        # keep out of the boot path.
         self.assertEqual(seen, [{"include_activity": False,
-                                 "verify_pairs": False}])
+                                 "verify_pairs": False,
+                                 "setup_only": True}])
+
+    def test_an_empty_setup_only_prime_is_not_cached(self) -> None:
+        # No setup grants -> empty catalog. Caching it would serve "no
+        # business units exist" until the TTL; deferring means the first
+        # real request builds honestly.
+        import threading
+
+        done = threading.Event()
+
+        def empty(**_k):
+            done.set()
+            return {"scopes": []}
+
+        with patch.object(self.gapp.engine, "list_financial_scopes", empty):
+            self.gapp._prime_scope_catalog()
+            self.assertTrue(done.wait(10))
+            import time as _t
+            for _ in range(50):          # let the thread finish its writes
+                if self.gapp._scope_cache["value"] is None:
+                    break
+                _t.sleep(0.05)
+        self.assertIsNone(self.gapp._scope_cache["value"])
 
     def test_the_prime_does_not_rebuild_a_catalog_it_already_has(self) -> None:
         # A persisted catalog from the last run is seeded at import. Paying

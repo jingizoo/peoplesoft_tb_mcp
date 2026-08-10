@@ -87,16 +87,20 @@ class QueryBudgetTests(unittest.TestCase):
         self.assertEqual(got, budget, BUDGET_MSG.format(
             name=name, got=got, budget=budget))
 
+    # Budgets LOWERED 2026-08-10: the calendar answers (_max_regular_period,
+    # resolve_period) became process-lifetime caches — they are calendar
+    # CONFIGURATION, re-asked on every warm call for an answer that cannot
+    # change under a running server. A warm tool call no longer pays them.
     def test_trial_balance_budget(self) -> None:
-        self._assert_budget("get_trial_balance", 2,
+        self._assert_budget("get_trial_balance", 1,
                             lambda: self.engine.trial_balance())
 
     def test_account_balance_budget(self) -> None:
-        self._assert_budget("get_account_balance", 3,
+        self._assert_budget("get_account_balance", 1,
                             lambda: self.engine.account_balance("1100"))
 
     def test_ar_aging_budget(self) -> None:
-        self._assert_budget("get_ar_aging", 4, lambda: self.ar.aging())
+        self._assert_budget("get_ar_aging", 3, lambda: self.ar.aging())
 
     def test_cross_bu_top_billing_budget(self) -> None:
         self._assert_budget(
@@ -105,7 +109,7 @@ class QueryBudgetTests(unittest.TestCase):
                 business_unit="ALL", display_currency="USD"))
 
     def test_integrity_check_budget(self) -> None:
-        self._assert_budget("tb_integrity_check", 8,
+        self._assert_budget("tb_integrity_check", 7,
                             lambda: self.engine.tb_integrity_check())
 
     def test_next_wave_tool_budgets(self) -> None:
@@ -143,7 +147,9 @@ class QueryBudgetTests(unittest.TestCase):
              lambda: self.engine.explain_balance_change(
                  account="6000-6999", by="DEPTID", business_unit="US001",
                  fiscal_year=2026, period=6, vs_period=5)),
-            ("explain_balance_change (prior-year)", 3,
+            # prior-year now matches same-year: the extra query WAS the
+            # calendar's last regular period, served from cache when warm.
+            ("explain_balance_change (prior-year)", 2,
              lambda: self.engine.explain_balance_change(
                  account="1000-1999", by="ACCOUNT", business_unit="US001",
                  fiscal_year=2026, period=6, vs_fiscal_year=2025,

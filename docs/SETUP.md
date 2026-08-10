@@ -331,10 +331,20 @@ the ledger, so treat it as the password it is.
 
 - Set `PSTB_AUTH_TOKEN` to pin the token, so a restart does not invalidate
   the link everyone has already bookmarked. Without it, one is generated
-  per run.
+  per run. A pinned token must be 16–128 characters of `A–Z a–z 0–9 - _`:
+  it travels inside a URL and a cookie, where anything else gets split or
+  re-encoded and locks out the people it was minted for. (A restart that
+  changes the token does not strand old cookies — the fresh link wins over
+  a stale cookie and quietly replaces it.)
 - `--allow-host <name>` (repeatable) restricts which `Host` names are
   accepted. Without it any name is accepted and the token is the only
   control — which is why `--share` refuses to run without one.
+- **The configuration console stays machine-local.** The token grants
+  colleagues *read* access to the dashboards; `/console` — which can
+  change settings and rotate credentials — answers only from the machine
+  itself (SSH tunnel), token or not.
+- This is cleartext HTTP. Keep it inside the VPN, or front it with a TLS
+  proxy if the network between colleagues and the box is not trusted.
 
 Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
 and in loopback mode an unexpected `Host` header is refused as well: a page
