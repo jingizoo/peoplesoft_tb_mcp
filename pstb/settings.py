@@ -140,13 +140,34 @@ ENV_KEYS = frozenset(k for k, _, _ in ENV_SETTINGS)
 # logged. Anything not here is refused by the writer itself, so a bug in a
 # handler cannot widen the set.
 SECRET_KEYS = frozenset({"PSFT_QAS_PASSWORD", "ORACLE_PASSWORD",
-                         "CONFLUENCE_API_TOKEN", "ANTHROPIC_API_KEY"})
+                         "CONFLUENCE_API_TOKEN", "ANTHROPIC_API_KEY",
+                         "PSTB_AUTH_TOKEN"})
 
 SECRET_LABELS = {
     "PSFT_QAS_PASSWORD": "PeopleSoft QAS password",
     "ORACLE_PASSWORD": "Oracle database password",
     "CONFLUENCE_API_TOKEN": "Confluence API token",
     "ANTHROPIC_API_KEY": "Anthropic API key",
+    "PSTB_AUTH_TOKEN": "Shared access token (--share)",
+}
+
+# Secrets this app DEFINES, so a random value is a valid one and offering to
+# mint it is a kindness. The others authenticate against something else —
+# Oracle, Confluence, Anthropic — where a generated value is simply wrong,
+# and a Generate button beside them would be a trap.
+SECRET_GENERATABLE = frozenset({"PSTB_AUTH_TOKEN"})
+
+# Shown beside the field, for the secrets whose consequences are not obvious
+# from the label alone: what it unlocks, and what changing it costs.
+SECRET_HELP = {
+    "PSTB_AUTH_TOKEN": (
+        "Used only when the app is bound to a routable address with "
+        "--share; ignored on 127.0.0.1. It is one shared password, not a "
+        "per-person login — anyone holding it has full read access to the "
+        "ledger, every customer, the ad-hoc SQL tool and this console. "
+        "Setting it here is what makes one link keep working across "
+        "restarts instead of a fresh token being generated each time. "
+        "Changing it invalidates every link already handed out."),
 }
 
 
@@ -352,7 +373,9 @@ def which_secrets_are_set(env_path: Path) -> dict:
             name, _, value = line.partition("=")
             if name.strip() in SECRET_KEYS and value.strip().strip("'\""):
                 present.add(name.strip())
-    return {k: {"set": k in present, "label": SECRET_LABELS[k]}
+    return {k: {"set": k in present, "label": SECRET_LABELS[k],
+                "help": SECRET_HELP.get(k, ""),
+                "generate": k in SECRET_GENERATABLE}
             for k in sorted(SECRET_KEYS)}
 
 
