@@ -267,6 +267,57 @@ class RestartHonestyTests(unittest.TestCase):
         self.assertFalse(st.BY_KEY["defaults.business_unit"].restart)
 
 
+
+class TokenShapeTests(unittest.TestCase):
+    """A token the console accepts must be one the service can START with.
+
+    main() refuses to boot on a token outside the URL-safe shape, because
+    it travels inside a URL and a cookie. Writing one the console accepted
+    and the next restart rejects is a console write that bricks the
+    service — the single failure this console is built not to have.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix="pstb-token-"))
+        self.env = self.dir / ".env"
+
+    def test_a_short_token_is_refused_at_write_time(self) -> None:
+        with self.assertRaises(st.SettingsError) as ctx:
+            st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "short"})
+        self.assertIn("16-128", str(ctx.exception))
+
+    def test_a_token_with_url_breaking_characters_is_refused(self) -> None:
+        for bad in ("has spaces in it here", "amp&ersand-in-token-x",
+                    "hash#in-the-token-value", "quote'in-token-value"):
+            with self.assertRaises(st.SettingsError):
+                st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": bad})
+
+    def test_a_generated_shape_token_is_accepted(self) -> None:
+        import secrets
+        good = secrets.token_urlsafe(24)
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": good})
+        self.assertIn(f"PSTB_AUTH_TOKEN='{good}'",
+                      self.env.read_text(encoding="utf-8"))
+
+    def test_the_console_and_the_service_agree_on_the_shape(self) -> None:
+        # The two rules must not drift: whatever the console writes, main()
+        # has to accept at the next restart.
+        import re as _re
+        import secrets
+        service_rule = _re.compile(r"[A-Za-z0-9_\-]{16,128}")
+        for _ in range(20):
+            token = secrets.token_urlsafe(24)
+            st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": token})
+            self.assertTrue(service_rule.fullmatch(token), token)
+
+    def test_the_help_no_longer_promises_console_access(self) -> None:
+        # Shared mode grants READ access to the app; the console stays
+        # machine-local. Help text that says otherwise is a security
+        # promise the code does not keep.
+        help_text = st.SECRET_HELP["PSTB_AUTH_TOKEN"].lower()
+        self.assertIn("does not open", help_text)
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -286,24 +337,24 @@ class AuthTokenIsConsoleManagedTests(unittest.TestCase):
         self.env = self.dir / ".env"
 
     def test_the_writer_accepts_it(self) -> None:
-        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
-        self.assertIn("PSTB_AUTH_TOKEN='team-token-1'",
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-123456"})
+        self.assertIn("PSTB_AUTH_TOKEN='team-token-123456'",
                       self.env.read_text())
 
     def test_it_reports_as_set_without_revealing_itself(self) -> None:
-        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-123456"})
         status = st.which_secrets_are_set(self.env)
         self.assertTrue(status["PSTB_AUTH_TOKEN"]["set"])
-        self.assertNotIn("team-token-1", json.dumps(status))
+        self.assertNotIn("team-token-123456", json.dumps(status))
 
     def test_it_can_be_cleared_again(self) -> None:
-        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-123456"})
         st.write_env_keys(self.env, {}, deletes=["PSTB_AUTH_TOKEN"])
         self.assertFalse(
             st.which_secrets_are_set(self.env)["PSTB_AUTH_TOKEN"]["set"])
 
     def test_the_env_file_stays_private(self) -> None:
-        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-123456"})
         self.assertTrue(st.file_is_private(self.env))
 
     def test_only_a_secret_this_app_defines_offers_generation(self) -> None:

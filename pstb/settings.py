@@ -21,6 +21,7 @@ a console change is deleting a line from a short file, or the file itself.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import time
@@ -161,13 +162,17 @@ SECRET_GENERATABLE = frozenset({"PSTB_AUTH_TOKEN"})
 # from the label alone: what it unlocks, and what changing it costs.
 SECRET_HELP = {
     "PSTB_AUTH_TOKEN": (
-        "Used only when the app is bound to a routable address with "
-        "--share; ignored on 127.0.0.1. It is one shared password, not a "
+        "OPTIONAL, and off unless you set it. With --share the page is "
+        "served at a plain URL and colleagues just open it; setting a "
+        "token here is what makes every request require one instead. "
+        "Ignored on 127.0.0.1. It is one shared password, not a "
         "per-person login — anyone holding it has full read access to the "
-        "ledger, every customer, the ad-hoc SQL tool and this console. "
-        "Setting it here is what makes one link keep working across "
-        "restarts instead of a fresh token being generated each time. "
-        "Changing it invalidates every link already handed out."),
+        "ledger, every customer and the ad-hoc SQL tool. It does NOT open "
+        "this console, which answers only from the machine itself. "
+        "16-128 characters of A-Z, a-z, 0-9, '-' or '_' — it travels "
+        "inside a URL and a cookie, and the service refuses to start with "
+        "anything else. Clearing it goes back to the plain URL. Changing "
+        "it invalidates every link already handed out."),
 }
 
 
@@ -331,6 +336,18 @@ def write_env_keys(env_path: Path, updates: dict, deletes=()) -> None:
         if key not in allowed:
             raise SettingsError(f"{key} is not a value this console sets")
     for key, value in updates.items():
+        if key == "PSTB_AUTH_TOKEN" and not re.fullmatch(
+                r"[A-Za-z0-9_\-]{16,128}", str(value)):
+            # main() refuses to START with a token outside this shape — it
+            # travels inside a URL and a cookie, where other characters get
+            # split or re-encoded. The console must apply the same rule at
+            # WRITE time: a value accepted here and refused at the next
+            # restart is a write that bricks the service, which is the one
+            # failure this console must not have.
+            raise SettingsError(
+                f"{_label(key)} must be 16-128 characters of A-Z, a-z, "
+                "0-9, '-' or '_'. Use Generate, or: python3 -c \"import "
+                "secrets; print(secrets.token_urlsafe(24))\"")
         if "${" in str(value):
             raise SettingsError(
                 f"{_label(key)} contains '${{', which .env "

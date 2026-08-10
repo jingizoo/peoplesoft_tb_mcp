@@ -236,22 +236,26 @@ class BindTests(unittest.TestCase):
             setattr(args, key, value)
         return gapp, args, patch
 
-    def test_main_refuses_a_non_loopback_bind_with_no_authentication(self) -> None:
-        # A flag must not be able to hand an UNAUTHENTICATED ledger to the
-        # network. docs used to advise exactly this.
+    def test_a_routable_bind_is_never_reached_by_ACCIDENT(self) -> None:
+        # Binding the network stays a deliberate act — but the remedy is a
+        # flag, not a credential. Refusing the thing the operator actually
+        # wants is how a guard gets edited out of the source instead.
         gapp, args, patch = self._run_main()
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
             with self.assertRaises(SystemExit) as ctx:
                 gapp.main()
         message = str(ctx.exception)
-        self.assertIn("without authentication", message)
+        self.assertIn("by accident", message)
         self.assertIn("ssh -L", message, "refusing without the alternative "
                                          "just moves the problem")
         self.assertIn("--share", message, "the refusal has to name the "
                                           "supported way to do this, or the "
                                           "next person deletes the check")
 
-    def test_share_binds_the_network_and_mints_a_token(self) -> None:
+    def test_share_alone_serves_a_plain_url_with_no_token(self) -> None:
+        # The token was never asked for. --share binds the network and
+        # prints the URL people actually type; PSTB_AUTH_TOKEN is the
+        # opt-in for anyone who wants authentication.
         import os
         from unittest.mock import patch as _patch
 
@@ -266,7 +270,29 @@ class BindTests(unittest.TestCase):
         self.assertFalse(served.call_args.kwargs["proxy_headers"],
                          "a forwarded header must never rewrite the peer")
         self.assertTrue(localguard.POLICY.shared)
-        self.assertGreaterEqual(len(localguard.POLICY.token), 16)
+        self.assertEqual(localguard.POLICY.token, "")
+        self.assertTrue(localguard.POLICY.unauthenticated,
+                        "open on the network must be RECORDED as deliberate")
+        # And it serves: a colleague on the LAN just opens the URL.
+        status, _ = localguard.rejection(
+            _scope(host="finhost:8000", client=("10.0.0.5", 1)))
+        self.assertEqual(status, 0)
+
+    def test_open_mode_still_keeps_the_console_on_this_machine(self) -> None:
+        # No token means colleagues read the dashboards. It must not also
+        # mean colleagues can rotate the Oracle password.
+        import os
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main(share=True)
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with _patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PSTB_AUTH_TOKEN", None)
+                with _patch("uvicorn.run"):
+                    gapp.main()
+        remote = dict(_scope(host="finhost:8000", client=("10.0.0.5", 1)))
+        remote["path"] = "/api/console/secrets"
+        self.assertEqual(localguard.rejection(remote)[0], 403)
 
     def test_share_reuses_a_configured_token_across_restarts(self) -> None:
         import os
@@ -374,8 +400,20 @@ class UnauthenticatedRoutableBindTests(unittest.TestCase):
             message = str(ctx.exception)
             self.assertIn("--share", message)
             self.assertIn("PSTB_AUTH_TOKEN", message)
-            self.assertIn("ad-hoc SQL", message,
-                          "say what is exposed, not just that a rule failed")
+            self.assertIn("unauthenticated=True", message,
+                          "name the deliberate spelling, or the next person "
+                          "invents their own")
+
+    def test_open_on_purpose_is_a_supported_spelling(self) -> None:
+        # The distinction that matters is deliberate vs accidental, not
+        # authenticated vs not. This is what main() builds for --share.
+        policy = localguard.Policy(hosts=None, token="", shared=True,
+                                   unauthenticated=True)
+        self.assertTrue(policy.shared)
+        self.assertEqual(
+            localguard.rejection(
+                _scope(host="anything", client=("10.0.0.5", 1)),
+                policy)[0], 0)
 
     def test_the_supported_shared_mode_still_builds(self) -> None:
         policy = localguard.configure("0.0.0.0", "a-real-token")
