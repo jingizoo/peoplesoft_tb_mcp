@@ -171,12 +171,14 @@ function renderSecrets(s){
         <div class="hint">
           ${f.set ? '<span class="pill ok">set</span>' : '<span class="pill">not set</span>'}
           <code>${esc(key)}</code>
+          ${f.help ? `<div style="margin-top:5px">${esc(f.help)}</div>` : ""}
         </div>
       </div><div>
         <input id="s_${esc(key)}" type="password" placeholder="new value"
                autocomplete="new-password">
         <div style="margin-top:6px;display:flex;gap:6px">
           <button class="ghost" data-set="${esc(key)}">Set</button>
+          ${f.generate ? `<button class="ghost" data-generate="${esc(key)}">Generate</button>` : ""}
           ${f.set ? `<button class="ghost" data-clear="${esc(key)}">Clear</button>` : ""}
         </div>
       </div></div>`).join("") +
@@ -253,12 +255,30 @@ document.getElementById("saveenv").onclick = async () => {
 
 document.getElementById("secrets").onclick = async (e) => {
   const setKey = e.target.dataset?.set, clearKey = e.target.dataset?.clear;
+  const genKey = e.target.dataset?.generate;
   const msg = document.getElementById("kmsg");
+  if (genKey){
+    // Generated HERE, in the browser, from the platform CSPRNG. A token
+    // typed by a person is a token someone can guess, and one minted by
+    // the server would have to travel back over the wire to be shown.
+    // Filled into the field rather than saved: it is visible for exactly
+    // as long as it takes to copy, and Set is still a deliberate act.
+    const raw = new Uint8Array(24);
+    crypto.getRandomValues(raw);
+    const token = btoa(String.fromCharCode(...raw))
+      .replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+    const field = document.getElementById("s_" + genKey);
+    field.type = "text";           // copy it now; it is never readable again
+    field.value = token;
+    field.select();
+    return say(msg, "Generated — copy it now, then press Set. It cannot be " +
+                    "read back afterwards.", true);
+  }
   if (setKey){
     const field = document.getElementById("s_" + setKey);
     const r = await api("/api/console/secrets",
       {secrets:{[setKey]:{action:"set", value: field.value}}});
-    field.value = "";
+    field.value = ""; field.type = "password";   // a generated one was shown
     if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
     say(msg, "Stored. " + r.data.restart_note, true);
     await load();

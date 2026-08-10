@@ -15,6 +15,7 @@ candidate does not load.
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -268,3 +269,61 @@ class RestartHonestyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthTokenIsConsoleManagedTests(unittest.TestCase):
+    """Rotating the shared access token must not need a shell.
+
+    The console exists to change settings without an admin or an SSH key.
+    PSTB_AUTH_TOKEN was absent from SECRET_KEYS, so write_env_keys refused
+    it by design and the one secret that decides who can reach the app at
+    all was the one secret only a shell could set.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp())
+        self.env = self.dir / ".env"
+
+    def test_the_writer_accepts_it(self) -> None:
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        self.assertIn("PSTB_AUTH_TOKEN='team-token-1'",
+                      self.env.read_text())
+
+    def test_it_reports_as_set_without_revealing_itself(self) -> None:
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        status = st.which_secrets_are_set(self.env)
+        self.assertTrue(status["PSTB_AUTH_TOKEN"]["set"])
+        self.assertNotIn("team-token-1", json.dumps(status))
+
+    def test_it_can_be_cleared_again(self) -> None:
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        st.write_env_keys(self.env, {}, deletes=["PSTB_AUTH_TOKEN"])
+        self.assertFalse(
+            st.which_secrets_are_set(self.env)["PSTB_AUTH_TOKEN"]["set"])
+
+    def test_the_env_file_stays_private(self) -> None:
+        st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "team-token-1"})
+        self.assertTrue(st.file_is_private(self.env))
+
+    def test_only_a_secret_this_app_defines_offers_generation(self) -> None:
+        # A generated Oracle password is simply wrong, and a Generate button
+        # beside one would be a trap.
+        status = st.which_secrets_are_set(self.env)
+        self.assertTrue(status["PSTB_AUTH_TOKEN"]["generate"])
+        for key in ("ORACLE_PASSWORD", "PSFT_QAS_PASSWORD",
+                    "CONFLUENCE_API_TOKEN", "ANTHROPIC_API_KEY"):
+            self.assertFalse(status[key]["generate"], key)
+
+    def test_the_field_says_what_holding_the_token_means(self) -> None:
+        help_text = st.which_secrets_are_set(self.env)["PSTB_AUTH_TOKEN"]["help"]
+        self.assertIn("shared password", help_text)
+        self.assertIn("--share", help_text)
+        self.assertIn("invalidates every link", help_text)
+
+    def test_a_token_containing_a_dollar_brace_is_refused_not_mangled(self) -> None:
+        # .env expands ${...} on the next read, so a stored token would not
+        # be the one that was typed — and a mangled token is indistinguishable
+        # from a wrong one at the door.
+        with self.assertRaises(st.SettingsError):
+            st.write_env_keys(self.env, {"PSTB_AUTH_TOKEN": "ab${x}cd"})
