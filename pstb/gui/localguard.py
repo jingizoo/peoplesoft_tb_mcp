@@ -69,6 +69,29 @@ _SECURITY_HEADERS = {
 }
 
 
+# Named once, used by both the constructor and configure(), because the two
+# ways to reach the same mistake deserve the same answer. The first version
+# of this raised a bare "a routable bind requires a token" — true, and
+# useless: it named the rule and not the remedy, so the next person read it
+# as an obstacle and set POLICY by hand with shared=True and no token, which
+# turns every check in this module off at once. An error that does not say
+# what to do instead is a design that chooses its own bypass.
+_NEEDS_TOKEN = (
+    "A routable bind requires an access token — without one, every balance, "
+    "every customer, the ad-hoc SQL tool and the configuration console are "
+    "readable by anyone who can route to this host.\n"
+    "  Supported ways to run this:\n"
+    "    python -m pstb.gui --host 0.0.0.0 --port 8016 --share\n"
+    "        mints a token, prints it inside a URL to paste once.\n"
+    "    PSTB_AUTH_TOKEN=<shared secret> python -m pstb.gui "
+    "--host 0.0.0.0 --port 8016 --share\n"
+    "        same, with a token that survives restarts.\n"
+    "  Setting shared=True with no token is not a lighter version of this. "
+    "It disables the peer check, the Host check and the token check together "
+    "— strictly more open than the loopback default this replaced."
+)
+
+
 @dataclass(frozen=True)
 class Policy:
     """How this process decided to be reachable. Set once, in main().
@@ -78,11 +101,21 @@ class Policy:
     guessing wrong locks out the very people the mode exists for. The token
     is the control there — a rebound page is same-origin with the ATTACKER's
     name, so the browser never sends it our cookie.
+
+    Validated in the CONSTRUCTOR, not only in configure(), because the state
+    that matters is unauthenticated-and-routable and it must not be
+    reachable by any spelling. Assigning POLICY directly is a normal thing
+    for a person in a hurry to try; it should fail with the remedy in hand,
+    at startup, rather than quietly serving the ledger to the network.
     """
 
     hosts: Optional[frozenset] = field(default=ALLOWED_HOSTS)
     token: str = ""
     shared: bool = False
+
+    def __post_init__(self) -> None:
+        if self.shared and not self.token:
+            raise ValueError(_NEEDS_TOKEN)
 
 
 POLICY = Policy()
@@ -95,7 +128,7 @@ def configure(host: str, token: str = "",
     extra = {h.strip().lower() for h in (allowed_hosts or ()) if h and h.strip()}
     shared = not peer_is_loopback((host, 0))
     if shared and not token:
-        raise ValueError("a routable bind requires a token")
+        raise ValueError(_NEEDS_TOKEN)
     if not shared:
         hosts: Optional[frozenset] = frozenset(ALLOWED_HOSTS | extra)
     elif extra:

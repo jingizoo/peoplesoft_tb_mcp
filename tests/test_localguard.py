@@ -335,3 +335,59 @@ class SharedModeAppTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnauthenticatedRoutableBindTests(unittest.TestCase):
+    """The one state that must not be reachable by any spelling.
+
+    A deployment hit `ValueError: a routable bind requires a token`, read it
+    as an obstacle rather than an instruction — it named the rule and not the
+    remedy — and set POLICY by hand with shared=True and no token. That does
+    not weaken one control. It turns off the peer check, the Host check and
+    the token check together, leaving the general ledger, every customer, the
+    ad-hoc SQL tool and the configuration console readable by anyone who can
+    route to the host: strictly more open than the loopback default it
+    replaced.
+
+    So the constructor validates too, and every refusal carries the command
+    that works.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(setattr, localguard, "POLICY", localguard.POLICY)
+
+    def test_the_hand_built_bypass_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            localguard.Policy(hosts=None, token="", shared=True)
+
+    def test_configure_raises_the_same_way(self) -> None:
+        with self.assertRaises(ValueError):
+            localguard.configure("0.0.0.0", "")
+
+    def test_every_refusal_names_a_command_that_works(self) -> None:
+        # The remedy has to be in the error. A person who has to go and look
+        # for it is a person who edits the guard instead.
+        for build in (lambda: localguard.Policy(shared=True),
+                      lambda: localguard.configure("0.0.0.0", "")):
+            with self.assertRaises(ValueError) as ctx:
+                build()
+            message = str(ctx.exception)
+            self.assertIn("--share", message)
+            self.assertIn("PSTB_AUTH_TOKEN", message)
+            self.assertIn("ad-hoc SQL", message,
+                          "say what is exposed, not just that a rule failed")
+
+    def test_the_supported_shared_mode_still_builds(self) -> None:
+        policy = localguard.configure("0.0.0.0", "a-real-token")
+        self.assertTrue(policy.shared)
+        self.assertEqual(policy.token, "a-real-token")
+        self.assertEqual(
+            localguard.rejection(
+                _scope(host="finhost", client=("10.0.0.5", 1),
+                       extra={"Authorization": "Bearer a-real-token"}))[0], 0)
+
+    def test_the_loopback_default_is_untouched(self) -> None:
+        policy = localguard.Policy()
+        self.assertFalse(policy.shared)
+        self.assertEqual(policy.token, "")
+        self.assertEqual(policy.hosts, localguard.ALLOWED_HOSTS)
