@@ -46,6 +46,36 @@ ps_api:
   timeout_seconds: 60
   max_rows: 5000
 
+# Business-unit row security, read from PeopleSoft's own configuration.
+#
+# NOT AUTHENTICATION while the sign-in asks for a user ID and no password:
+# anyone who reaches the page can type any user ID, including a privileged
+# one. What it does is apply PeopleSoft's own row-security rules to the
+# session, so an honest user sees their units and the model cannot wander
+# across them. SSO replaces resolve_operator() in pstb/gui/app.py and
+# nothing else has to move.
+#
+# Before switching this on against a real instance, run:
+#     .venv/bin/python scripts/diagnose_bu_security.py
+# It reports which security records are readable by the account this app
+# uses, and what a given user ID resolves to.
+security:
+  enabled: false
+  # Users who see every unit whatever the security records say. Keep at
+  # least one: it is the account that still works while a grant is broken.
+  privileged_users: []
+  # Blank = probe the stock FSCM records (PS_SEC_BU_OPR, then PS_SEC_BU_CLS
+  # joined through PSOPRDEFN.ROWSECCLASS). Set both for a custom record.
+  unit_record: ""
+  unit_key: ""
+  # refuse = show nothing and name the missing grant when security is on
+  # but unreadable. allow = degrade to full access, which should be typed
+  # deliberately rather than reached by accident.
+  on_unavailable: refuse
+  # Ad-hoc SQL picks its own WHERE clause, so no argument check can bound
+  # it to a unit. Off for restricted users; privileged users are unaffected.
+  raw_sql_for_restricted: false
+
 llm:
   provider: ollama        # ollama | gemini | claude  (override per run: --provider, or PSTB_LLM_PROVIDER)
   ollama_host: http://localhost:11434

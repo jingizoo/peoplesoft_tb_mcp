@@ -167,6 +167,88 @@ _TOOL_SCOPE_ARGS = {
 # anywhere else "ALL" would be taken for a literal unit name and quietly
 # return nothing.
 BU_ALL_TOOLS = {"get_top_billing_customers"}
+
+# Tools that read PeopleSoft data without naming a business unit, so a
+# restricted user reaching them would see every unit's rows. They are not
+# refused outright — most are catalogs or shape lookups with no figures in
+# them — but the ad-hoc ones are, below.
+_UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"}
+
+
+def filter_scope_payload(tool_name: str, payload: str, access) -> str:
+    """Narrow a scope-catalog RESULT to the units this person holds.
+
+    The catalog tool runs inside the MCP server, which has no identity —
+    it is one shared subprocess answering every session — so the filtering
+    has to happen here, on the way back, where the caller is known. Without
+    it a restricted user's model is handed the full list of unit names and
+    then blocked from every one it tries: the names leak and the turn
+    burns its rounds discovering that.
+    """
+    if access is None or getattr(access, "all_units", True):
+        return payload
+    if tool_name != "list_financial_scopes" or not isinstance(payload, str):
+        return payload
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+    if not isinstance(data, dict) or "scopes" not in data:
+        return payload
+    kept = [s for s in (data.get("scopes") or [])
+            if access.allows((s or {}).get("business_unit"))]
+    dropped = len(data.get("scopes") or []) - len(kept)
+    data["scopes"] = kept
+    if dropped:
+        # Disclosed, never silent: the model has to know the catalog it is
+        # reasoning over is partial, or it will describe it as complete.
+        data["note"] = ((data.get("note") or "") + f" Filtered to the "
+                        f"{len(kept)} business unit(s) {access.oprid} is "
+                        f"authorised for; {dropped} other(s) exist and are "
+                        "not shown.").strip()
+        data["access_filtered"] = True
+    return json.dumps(data)
+
+
+def unit_access_block(tool_name: str, args, access,
+                      allow_raw_sql: bool = False) -> str:
+    """Why this call must not run for this person, or "" to allow it.
+
+    The second gate, behind the scope lock. The scope lock asks "does this
+    match what the user selected"; this asks "is the user allowed to
+    select it at all", and they are different questions: a person can type
+    a unit they were never granted into a question, and the model will
+    faithfully pass it through.
+
+    Returns a REASON rather than raising, because the agent loop already
+    has a blocked-with-remedy path that puts the refusal in front of the
+    model — which then re-asks within the units the person does have,
+    instead of the turn dying.
+    """
+    if access is None or getattr(access, "all_units", True):
+        return ""
+    if tool_name == "list_financial_scopes":
+        return ""                       # the catalog is filtered at source
+    if tool_name in _UNSCOPED_DATA_TOOLS and not allow_raw_sql:
+        # Ad-hoc SQL and a saved PSQuery both choose their own WHERE
+        # clause, so no argument check can bound them to a unit. Rather
+        # than pretend otherwise, they are off for a restricted user and
+        # the refusal says which curated tools answer the same question.
+        return (
+            f"{tool_name} is not available to {access.oprid}: it runs "
+            "arbitrary SQL, which cannot be limited to the business units "
+            f"PeopleSoft grants this user ({', '.join(sorted(access.units)) or 'none'}). "
+            "Use the curated tools — they carry the unit and are filtered.")
+    for key in ("business_unit", "bu"):
+        value = (args or {}).get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text or text.upper() in _BU_ALL_VALUES:
+            continue
+        if not access.allows(text):
+            return access.refusal(text)
+    return ""
 _BU_ALL_VALUES = {"ALL", "*"}
 
 # WHICH scope fields are governance and which are convenience.

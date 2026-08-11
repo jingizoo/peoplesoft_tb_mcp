@@ -145,6 +145,35 @@ class PsApiCfg:
 
 
 @dataclass
+class SecurityCfg:
+    """Business-unit row security, read from PeopleSoft's own configuration.
+
+    NOT authentication while the sign-in takes a user ID and no password:
+    anyone can type any ID. It mirrors PeopleSoft's rules so an honest user
+    sees their own units and the model cannot wander across them; it stops
+    nobody who is trying. See pstb/security.py.
+    """
+    enabled: bool = False
+    # OPRIDs that see every unit whatever the security records say. Named
+    # here rather than derived, so the account used to FIX a broken grant
+    # does not depend on that grant being readable.
+    privileged_users: list = field(default_factory=list)
+    # Blank = probe the stock FSCM records (PS_SEC_BU_OPR, then
+    # PS_SEC_BU_CLS). Set both when this site keeps unit security in a
+    # custom record; unit_key is OPRID for user-level, or the permission
+    # list field (e.g. OPRCLASS) for class-level.
+    unit_record: str = ""
+    unit_key: str = ""
+    # What to do when security is enabled and unreadable. "refuse" shows
+    # nothing and says which grant is missing; "allow" degrades to full
+    # access, which is a decision a site should have to type.
+    on_unavailable: str = "refuse"
+    # Ad-hoc SQL bypasses every curated tool's scope handling, so for a
+    # restricted user it is off by default. A privileged user is unaffected.
+    raw_sql_for_restricted: bool = False
+
+
+@dataclass
 class Config:
     root: Path = field(default_factory=Path.cwd)
     defaults: Defaults = field(default_factory=Defaults)
@@ -162,6 +191,7 @@ class Config:
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
+    security: SecurityCfg = field(default_factory=SecurityCfg)
 
     @classmethod
     def sample(cls, root: Path | str) -> "Config":
@@ -302,6 +332,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
         _apply_section(cfg.ps_api, data.get("ps_api"))
+        _apply_section(cfg.security, data.get("security"))
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]
         for name, block in (data.get("sources") or {}).items():

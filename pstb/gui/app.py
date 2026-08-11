@@ -31,11 +31,12 @@ from ..ar import ARBilling, ARError
 from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
+from ..security import RowSecurity, SecurityError
 from ..wiki import WikiError, make_wiki
 from . import console, localguard, progress
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, JSONResponse, Response
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
@@ -263,6 +264,10 @@ async def _access_guard(request, call_next):
     # fetches — which carry no query string — are authenticated too. Set only
     # after the request was ACCEPTED, so a wrong token never gets stored and
     # then silently re-sent forever.
+    #
+    # (Business-unit security is enforced in _row_security_guard below, not
+    # here, because it has to read the query string and answer 401/403 with
+    # a message the page can act on.)
     if not status and localguard.POLICY.token and localguard.token_in_query(
             request.scope):
         response.set_cookie(
@@ -270,6 +275,135 @@ async def _access_guard(request, call_next):
             httponly=True, samesite="strict", path="/")
     localguard.apply_security_headers(response.headers)
     return response
+
+
+# Routes that must answer before anyone has signed in, or the page cannot
+# render the sign-in form to sign in with.
+_OPEN_PATHS = frozenset({
+    "/", "/api/meta", "/api/boot", "/api/session", "/api/signin",
+    "/api/signout", "/console",
+})
+
+
+# Routes that read something OTHER than the unit-keyed PeopleSoft ledger.
+# They still need a signed-in session, but a business unit means nothing to
+# them — and a user with no ledger grants must still be able to ask a policy
+# question, or "no access to the numbers" silently becomes "no access to the
+# handbook either".
+_UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
+                       "/api/chat/reset", "/api/question-report")
+
+
+def _needs_unit_check(path: str) -> bool:
+    if path in _OPEN_PATHS or not path.startswith("/api/"):
+        return False
+    if path.startswith("/api/console"):
+        return False
+    return not path.startswith(_UNIT_FREE_PREFIXES)
+
+
+def _default_unit_for(access) -> str:
+    """The unit an unqualified request should read, for THIS person.
+
+    The site default when they hold it — so a privileged-adjacent user's
+    experience is unchanged — and otherwise the first unit they do hold.
+    Alphabetical rather than clever: any rule here is arbitrary, and an
+    arbitrary rule that is stable beats one that moves.
+    """
+    mine = sorted(getattr(access, "units", ()) or ())
+    if not mine:
+        raise SecurityError(
+            f"{access.oprid} is granted no business units, so there is no "
+            f"data to show. {access.detail}")
+    try:
+        discovered = engine.warm_effective_defaults()
+        if discovered and access.allows(discovered["business_unit"]):
+            return discovered["business_unit"]
+    except Exception:
+        pass
+    default = (cfg.defaults.business_unit or "").strip().upper()
+    return default if default in access.units else mine[0]
+
+
+def _with_unit(query_string: bytes, unit: str) -> bytes:
+    from urllib.parse import parse_qsl, urlencode
+
+    pairs = [(k, v) for k, v in parse_qsl(
+        query_string.decode("latin-1"), keep_blank_values=True)
+        if k != "business_unit"]
+    pairs.append(("business_unit", unit))
+    return urlencode(pairs).encode("latin-1")
+
+
+@app.middleware("http")
+async def _row_security_guard(request, call_next):
+    """One gate for every data route, present and future.
+
+    Checking business units inside each handler would work until somebody
+    adds the seventeenth endpoint and forgets — and the failure mode of
+    forgetting is silently serving another unit's ledger, which nobody
+    notices because it looks exactly like a correct answer. So the check
+    lives in front of all of them and reads the request rather than the
+    signature: any `business_unit` the caller names must be one their
+    PeopleSoft user ID grants.
+
+    Wiki and diagnostics routes pass through: they carry no unit, and a
+    guard that refuses a policy question because the person has no ledger
+    access would be answering a question nobody asked.
+    """
+    path = request.url.path
+    if not row_security.enabled or path in _OPEN_PATHS \
+            or not path.startswith("/api/") \
+            or path.startswith("/api/console"):
+        return await call_next(request)
+    if not _needs_unit_check(path):
+        # Signed in, but no unit resolution: see _UNIT_FREE_PREFIXES.
+        try:
+            access_for_request(request)
+        except HTTPException as e:
+            return JSONResponse(
+                status_code=e.status_code,
+                content={"error": e.detail,
+                         "signin_required": e.status_code == 401})
+        return await call_next(request)
+    try:
+        access = access_for_request(request)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code,
+                            content={"error": e.detail,
+                                     "signin_required": e.status_code == 401})
+    if access is not None and not access.all_units:
+        wanted = [v for v in request.query_params.getlist("business_unit")
+                  if str(v).strip()]
+        for bu in wanted:
+            # "ALL" is a superset request, and for a restricted user the
+            # superset it means is *their* units — the tools that accept it
+            # label every row with its own unit, so narrowing is honest.
+            if str(bu).strip().upper() in {"ALL", "*"}:
+                continue
+            if not access.allows(bu):
+                return JSONResponse(status_code=403,
+                                    content={"error": access.refusal(bu)})
+        if not wanted:
+            # THE OMITTED PARAMETER IS THE DANGEROUS CASE. A request that
+            # names no unit does not read nothing — it falls through to the
+            # site's discovered default, which is chosen from the whole
+            # installation and is very often a unit this person was never
+            # granted. Measured before this existed: a CA001-only user
+            # asking /api/trial-balance with no arguments got US001's
+            # complete trial balance, 200 OK, no warning.
+            #
+            # So the default is resolved HERE, inside their reach, and
+            # written into the request. Every handler then sees an explicit
+            # unit and the payload names it, which is what makes the
+            # narrowing visible rather than silent.
+            try:
+                mine = _default_unit_for(access)
+            except SecurityError as e:
+                return JSONResponse(status_code=403, content={"error": str(e)})
+            request.scope["query_string"] = _with_unit(
+                request.scope.get("query_string") or b"", mine)
+    return await call_next(request)
 
 
 # How long a turn may hold its conversation before a NEW question stops
@@ -283,6 +417,50 @@ _ABANDONED_AFTER = float(os.environ.get("PSTB_TURN_ABANDONED_SECONDS", "180"))
 # budget. Bounded so the wait plus the answer still fits inside the browser's
 # patience rather than consuming all of it before work starts.
 _QUEUE_WAIT = float(os.environ.get("PSTB_QUEUE_WAIT_SECONDS", "45"))
+
+
+USER_COOKIE = "pstb_user"
+row_security = RowSecurity(db, cfg)
+
+
+def resolve_operator(request) -> str:
+    """WHO is asking. The seam SSO replaces, and the only one.
+
+    Today: the user ID this browser typed on the sign-in page, carried in
+    a session cookie. Tomorrow: the subject the identity provider vouched
+    for. Everything downstream asks row_security about the string this
+    returns, so the swap is this function and the sign-in page — nothing
+    that enforces anything has to move.
+
+    It is worth being blunt about what today's version is: a typed user ID
+    with no password identifies nobody. It scopes an honest session to the
+    units PeopleSoft grants that user, which is what stops a wrong-unit
+    answer reaching a screen by accident and stops the model wandering
+    across units. It stops nobody who types someone else's ID.
+    """
+    return str(request.cookies.get(USER_COOKIE) or "").strip().upper()
+
+
+def access_for_request(request):
+    """The caller's business-unit reach, or None when security is off."""
+    if not row_security.enabled:
+        return None
+    if request is None:  # noqa: SIM108
+        # A direct in-process call (a test, a script) carries no browser
+        # and therefore no identity. Refuse rather than assume: an
+        # unidentified caller is exactly the case this feature exists for.
+        raise HTTPException(
+            status_code=401,
+            detail="Sign in with your PeopleSoft user ID to see ledger data.")
+    who = resolve_operator(request)
+    if not who:
+        raise HTTPException(
+            status_code=401,
+            detail="Sign in with your PeopleSoft user ID to see ledger data.")
+    try:
+        return row_security.access_for(who)
+    except SecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
 
 
 @dataclass
@@ -731,6 +909,20 @@ def _financial_scope_catalog(force: bool = False) -> dict:
     return built
 
 
+def _visible_scopes(catalog: dict, access) -> list:
+    """The catalog's units, narrowed to what this caller may see.
+
+    Applied on the way OUT of the shared cache, never on the way in: the
+    expensive discovery is the same for everyone and is built once, and a
+    per-user catalog in a shared cache is how one person's reach ends up
+    served to the next person who asks.
+    """
+    scopes = catalog.get("scopes") or []
+    if access is None or getattr(access, "all_units", True):
+        return scopes
+    return [s for s in scopes if access.allows(s.get("business_unit"))]
+
+
 def _warm_scope_catalog():
     """The cached catalog (stale is fine — it is a list of business units,
     not a balance), or None when this deployment has never discovered one.
@@ -953,8 +1145,17 @@ def index():
 
 
 @app.get("/api/meta")
-def meta():
+def meta(request: Request = None):
     d = cfg.defaults
+    # /api/meta answers before sign-in (the page needs it to render the
+    # sign-in form), so a caller with no identity gets the catalog EMPTY
+    # rather than complete. Serving the full unit list to an unsigned
+    # session would hand out the thing the feature exists to withhold.
+    try:
+        meta_access = access_for_request(request)
+        meta_signed_in = True
+    except HTTPException:
+        meta_access, meta_signed_in = None, not row_security.enabled
     out = {
         "defaults": {
             "business_unit": d.business_unit,
@@ -978,6 +1179,15 @@ def meta():
         ),
         "llm": {"provider": cfg.llm.provider,
                 "model": provider_model(cfg)},
+        # The page reads this to decide whether to render the sign-in form
+        # before anything else. is_authentication is stated, not implied:
+        # a user ID with no password identifies nobody.
+        "security": {"enabled": row_security.enabled,
+                     "signed_in": meta_signed_in,
+                     "oprid": (meta_access.oprid if meta_access else ""),
+                     "all_units": (meta_access.all_units
+                                   if meta_access else True),
+                     "is_authentication": False},
         "raw_sql": cfg.tools.allow_raw_sql,
     }
     # PS_LEDGER is the authority for selectable financial scopes.  The GL
@@ -990,8 +1200,10 @@ def meta():
     # only when a previous request already warmed the cache; otherwise the
     # client fetches /api/scopes in the background and fills the bar in.
     warm = _warm_scope_catalog()
+    if warm is not None and not meta_signed_in:
+        warm = None                 # signed out: no catalog, no unit names
     if warm is not None:
-        out["financial_scopes"] = warm.get("scopes") or []
+        out["financial_scopes"] = _visible_scopes(warm, meta_access)
         out["business_units"] = [
             {
                 "business_unit": item.get("business_unit"),
@@ -1115,6 +1327,83 @@ def meta():
     return out
 
 
+@app.get("/api/session")
+def whoami(request: Request = None):
+    """Who this browser is signed in as, and what that reaches.
+
+    Always 200 — the page uses this to decide whether to show the sign-in
+    form, so a 401 here would be the page asking itself a question it
+    cannot answer.
+    """
+    if not row_security.enabled:
+        return {"security_enabled": False, "signed_in": True,
+                "oprid": "", "units": [], "all_units": True,
+                "detail": "Business-unit security is off for this deployment."}
+    who = resolve_operator(request)
+    if not who:
+        return {"security_enabled": True, "signed_in": False, "oprid": "",
+                "units": [], "all_units": False,
+                "detail": "Sign in with your PeopleSoft user ID.",
+                "is_authentication": False}
+    try:
+        access = row_security.access_for(who)
+    except SecurityError as e:
+        return {"security_enabled": True, "signed_in": False, "oprid": who,
+                "units": [], "all_units": False, "error": str(e),
+                "is_authentication": False}
+    return {"security_enabled": True, "signed_in": True, "oprid": access.oprid,
+            "units": sorted(access.units), "all_units": access.all_units,
+            "privileged": access.privileged, "source": access.source,
+            "detail": access.detail, "summary": access.describe(),
+            "is_authentication": False}
+
+
+@app.post("/api/signin")
+def signin(payload: dict, request: Request = None):
+    """Adopt a PeopleSoft user ID for this browser session.
+
+    Deliberately not called 'login': there is no password and nothing is
+    verified about the person. What it does is bind the session to a user
+    ID so PeopleSoft's own row security can be applied to it — and the
+    response says so, because a page that looks like a login while
+    checking nothing teaches people it is one.
+    """
+    if not row_security.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Business-unit security is off (security.enabled: false); "
+                   "there is nothing to sign in to.")
+    who = str((payload or {}).get("oprid") or "").strip().upper()
+    if not who or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,30}", who):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a PeopleSoft user ID (letters, numbers, '_', '.', "
+                   "'-'; up to 30 characters).")
+    try:
+        access = row_security.access_for(who)
+    except SecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    body = {"ok": True, "oprid": access.oprid,
+            "units": sorted(access.units), "all_units": access.all_units,
+            "privileged": access.privileged, "summary": access.describe(),
+            "detail": access.detail,
+            "note": ("This is a scope selector, not a login — no password "
+                     "was asked for and none was checked.")}
+    response = JSONResponse(content=body)
+    # Session-scoped: closing the browser ends it, like the console's
+    # confirmation. httponly so page script cannot read or forge it.
+    response.set_cookie(USER_COOKIE, access.oprid, httponly=True,
+                        samesite="strict", path="/")
+    return response
+
+
+@app.post("/api/signout")
+def signout():
+    response = JSONResponse(content={"ok": True})
+    response.delete_cookie(USER_COOKIE, path="/")
+    return response
+
+
 @app.get("/api/boot")
 def boot_progress():
     """Which startup step the server is on RIGHT NOW.
@@ -1213,7 +1502,7 @@ def question_report():
 
 
 @app.post("/api/export")
-def export_csv(payload: dict):
+def export_csv(payload: dict, request: Request = None):
     """Full-population CSV for one result card.
 
     The browser holds a display-capped preview; this re-runs the same tool
@@ -1241,6 +1530,19 @@ def export_csv(payload: dict):
     tool = str(body.get("tool") or "")
     if not tool:
         raise HTTPException(status_code=400, detail="tool is required")
+    # The unit rides in the BODY here, where the query-string gate cannot
+    # see it — and export re-runs the tool at the full population ceiling,
+    # so an unchecked one hands over more rows than the screen ever showed.
+    access = access_for_request(request)
+    if access is not None and not access.all_units:
+        args = body.get("args") or {}
+        named = str(args.get("business_unit") or "").strip()
+        if named and named.upper() not in {"ALL", "*"} and not access.allows(named):
+            raise HTTPException(status_code=403, detail=access.refusal(named))
+        if not named:
+            args = dict(args)
+            args["business_unit"] = _default_unit_for(access)
+            body = dict(body, args=args)
     registry = _export.build_registry(
         engine=engine, ar=ar, modules=ModulePacks(engine),
         report_runner=report_runner, coupa=_coupa_mod.from_env(),
@@ -1286,15 +1588,22 @@ def compare(
 
 
 @app.get("/api/scopes")
-def scopes_catalog(force: bool = False):
+def scopes_catalog(force: bool = False, request: Request = None):
     """Business-unit / ledger catalog, built on demand.
 
     Split out of /api/meta so the page can paint immediately and fill this in
     when it arrives. Safe to call repeatedly: it is cached.
+
+    The CACHE is shared and the VIEW is per-user: discovery is expensive and
+    identical for everyone, so it is built once and then narrowed to the
+    caller's units on the way out. Caching a filtered catalog would serve
+    one person's reach to the next person who asked.
     """
+    access = access_for_request(request)
+
     def _build() -> dict:
         catalog = _financial_scope_catalog(force=force)
-        scopes = catalog.get("scopes") or []
+        scopes = _visible_scopes(catalog, access)
         return {
             "scopes": scopes,
             "business_units": [
@@ -1314,11 +1623,30 @@ def scopes_catalog(force: bool = False):
 
 
 @app.get("/api/scope")
-def scope_for(business_unit: str = "", ledger: str = ""):
+def scope_for(business_unit: str = "", ledger: str = "", request: Request = None):
     """Ledgers and last posted period for a business unit — feeds the cascading
     scope bar so changing BU repopulates ledger/year/period from real data."""
+    access = access_for_request(request)
+
+    def _default_unit() -> str:
+        """The discovered default, narrowed to what this caller may see.
+
+        Called with no business_unit, this endpoint discovers the site's
+        default — which is a real unit chosen from the whole installation,
+        so for a restricted user it can easily be one they were never
+        granted. Handing it back would put another unit's name in their
+        scope bar and their next query behind a 403 they did not cause.
+        """
+        discovered = engine.effective_defaults()["business_unit"]
+        if access is None or access.allows(discovered):
+            return discovered
+        mine = sorted(access.units)
+        if not mine:
+            raise EngineError(access.refusal(discovered))
+        return mine[0]
+
     def _scope(business_unit: str, ledger: str) -> dict:
-        bu = (business_unit or "").strip() or engine.effective_defaults()["business_unit"]
+        bu = (business_unit or "").strip() or _default_unit()
         leds = engine.list_ledgers(bu)
         ledgers = leds.get("ledgers") or []
         led = (ledger or "").strip()
@@ -1460,8 +1788,13 @@ def wiki_page(page_id: str):
 
 
 @app.post("/api/chat")
-async def chat(payload: dict):
+async def chat(payload: dict, request: Request = None):
     """Run one governed chat turn in a browser-session + DB-scope context."""
+    # Row security is resolved ONCE per turn and handed to the agent loop,
+    # so every tool call the model makes is checked against the same
+    # answer. Resolving it per call would let a security change land
+    # mid-turn and produce an answer assembled under two different rules.
+    access = access_for_request(request)
     message = (payload or {}).get("message", "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
@@ -1550,6 +1883,19 @@ async def chat(payload: dict):
             )
         )
         active_scope: Optional[dict] = None
+        # The scope the browser sends is a claim, and it is injected into
+        # the prompt as "verified against PS_LEDGER" — so it is checked
+        # against this person's grants BEFORE it becomes something the
+        # model is told to trust.
+        if access is not None and not access.all_units and has_requested_scope:
+            claimed = str((requested_scope or {}).get("business_unit")
+                          or (requested_scope or {}).get("bu") or "").strip()
+            if claimed and not access.allows(claimed):
+                return JSONResponse(status_code=403, content={
+                    "error": access.refusal(claimed),
+                    "scope_required": True,
+                    "scope_options": [],
+                    "tool_calls": []})
         if has_requested_scope or _question_requires_scope(message):
             try:
                 # Validation can fall back to a latest-posted-period lookup
@@ -1644,7 +1990,13 @@ async def chat(payload: dict):
                 from ..client.llm_ollama import OllamaProvider as P
             return P(cfg, prompt, tools)
 
+        # The user is part of the key: provider entries hold conversation
+        # history including prior tool payloads, and reusing one across
+        # sign-ins would carry another person's figures into this turn's
+        # grounding.
         key = _provider_key(session_id, provider_name, active_scope)
+        if access is not None:
+            key = key + (access.oprid,)
         provider_entry = _provider_sessions.get_or_create(
             key, make_provider
         )
@@ -1754,6 +2106,10 @@ async def chat(payload: dict):
                     tool_started=_on_started,
                     prior_payloads=prior_payloads,
                     result_limit=result_limit,
+                    access=access,
+                    allow_raw_sql=bool(
+                        getattr(cfg.security, "raw_sql_for_restricted",
+                                False)),
                 )
             finally:
                 _activity_done(session_id, turn_token)

@@ -2224,7 +2224,8 @@ class TBEngine:
 
     def list_financial_scopes(self, include_activity: bool = True,
                               verify_pairs: bool = True,
-                              setup_only: bool = False) -> dict:
+                              setup_only: bool = False,
+                              access=None) -> dict:
         """Business units with base currency, their ledgers, and the fiscal
         years/periods that hold data — in one deterministic catalog response.
 
@@ -2250,6 +2251,14 @@ class TBEngine:
         # in scope" — an answer, not a failure.
         pairs, truncated = self._ledger_scope_pairs(verify=verify_pairs,
                                                     setup_only=setup_only)
+        # Row security narrows the catalog BEFORE anything is built from it,
+        # so a unit the user may not see is never offered in the chooser,
+        # never named in a scope-discovery answer, and never becomes the
+        # discovered default. Filtering the rendered output instead would
+        # leave it in `effective`, which is the value everything downstream
+        # falls back to.
+        if access is not None and not getattr(access, "all_units", True):
+            pairs = [(bu, led) for bu, led in pairs if access.allows(bu)]
         enriched = self._business_unit_enrichment()
         scopes: dict[str, dict] = {}
         for bu, ledger in pairs:
