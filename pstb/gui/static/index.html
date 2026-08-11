@@ -139,6 +139,20 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .tool-card>summary::-webkit-details-marker{display:none}
 .tool-card>summary .chev{transition:transform .15s;font-size:10px;color:var(--muted)}
 .tool-card[open]>summary .chev{transform:rotate(90deg)}
+#signin{position:fixed;inset:0;z-index:998;display:flex;align-items:center;
+  justify-content:center;background:var(--bg)}
+#signin.hide{display:none}
+.signin-title{font-size:19px;font-weight:600;margin-bottom:6px}
+.signin-sub{color:var(--muted);font-size:13px;max-width:380px;margin-bottom:16px;
+  line-height:1.5}
+.signin-input{width:260px;padding:10px 12px;border-radius:8px;font-size:15px;
+  text-transform:uppercase;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg);margin-bottom:10px}
+.signin-err{color:var(--bad);font-size:13px;margin-top:10px;max-width:380px;
+  line-height:1.5;white-space:pre-wrap;text-align:left}
+.signin-err.hide{display:none}
+.signin-note{color:var(--muted);font-size:11.5px;max-width:380px;margin-top:18px;
+  line-height:1.5;border-top:1px solid var(--line);padding-top:12px}
 #splash{position:fixed;inset:0;z-index:999;display:flex;align-items:center;justify-content:center;
   background:var(--bg);transition:opacity .35s ease}
 #splash.done{opacity:0;pointer-events:none}
@@ -269,6 +283,27 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <div class="boothint hide" id="boothint"></div>
     <div class="booterr hide" id="booterr"></div>
     <button class="btn hide" id="bootretry" type="button">Try again</button>
+  </div>
+</div>
+<div id="signin" class="hide">
+  <div class="boot">
+    <div class="signin-title">Sign in</div>
+    <div class="signin-sub" id="signin-sub">
+      Business-unit security is on: you will see the units your user ID is
+      granted in the finance system, and nothing else.
+    </div>
+    <input id="signin-id" class="signin-input" type="text" autocomplete="off"
+           spellcheck="false" placeholder="User ID" maxlength="30"
+           aria-label="User ID">
+    <button class="btn" id="signin-go" type="button">Continue</button>
+    <div class="signin-err hide" id="signin-err" role="alert"></div>
+    <!-- Said on the page, not only in a docstring. A form that looks like a
+         login while checking nothing teaches people it is one, and the day
+         this becomes SSO is the day that assumption gets expensive. -->
+    <div class="signin-note">
+      No password is asked for and none is checked. This selects whose
+      finance-system access to apply — it does not verify who you are.
+    </div>
   </div>
 </div>
 <div class="app">
@@ -1984,6 +2019,39 @@ function bootFail(message,detail){
   bootPaint();
 }
 
+function showSignIn(){
+  // Resolves when the user is signed in. Never rejects: a failed attempt
+  // shows its reason and waits, because the only way out of this screen
+  // is a user ID that works.
+  return new Promise(resolve=>{
+    const box=$('#signin'), input=$('#signin-id'), go=$('#signin-go'),
+          err=$('#signin-err');
+    box.classList.remove('hide');
+    setTimeout(()=>input.focus(),50);
+    async function attempt(){
+      const oprid=(input.value||'').trim();
+      if(!oprid){ input.focus(); return; }
+      go.disabled=true; go.textContent='Checking…'; err.classList.add('hide');
+      try{
+        const r=await fetch('/api/signin',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({oprid})});
+        const d=await r.json().catch(()=>({}));
+        if(!r.ok) throw new Error(d.detail||d.error||('HTTP '+r.status));
+        box.classList.add('hide');
+        resolve(d);
+      }catch(e){
+        err.textContent=e.message||String(e);
+        err.classList.remove('hide');
+      }finally{
+        go.disabled=false; go.textContent='Continue';
+      }
+    }
+    go.onclick=attempt;
+    input.onkeydown=e=>{ if(e.key==='Enter') attempt(); };
+  });
+}
+
 /* ---------- boot ---------- */
 (async function(){
   bootStart();
@@ -1992,6 +2060,15 @@ function bootFail(message,detail){
     bootFail('Could not load the workspace.',
       'The server did not answer /api/meta: '+e.message);
     return;
+  }
+  // Business-unit security: if it is on and this browser is not signed
+  // in, stop here and show the sign-in. Before the workspace renders, not
+  // after — a page that paints the ledger and THEN asks who you are has
+  // already shown you the thing it was about to restrict.
+  if(META.security&&META.security.enabled&&!META.security.signed_in){
+    bootFinish();
+    await showSignIn();
+    META=await api('/api/meta');      // re-read: the catalog is per-user
   }
   bootSay('Drawing the workspace');
   // The token rode in on the URL and is now a cookie; scrub it from the
@@ -2078,6 +2155,19 @@ function bootFail(message,detail){
   bu.addEventListener('change',async()=>{await rescope(false); render();});
   lg.addEventListener('change',async()=>{await rescope(true); render();});
   $('#brandsub').textContent=META.defaults.business_unit+' · '+META.defaults.ledger;
+  if(META.security&&META.security.enabled&&META.security.signed_in){
+    const who=el('div');
+    who.style.cssText='margin-bottom:6px';
+    who.innerHTML='signed in as <b>'+esc(META.security.oprid)+'</b>'+
+      (META.security.all_units?' <span style="color:var(--muted)">(all units)</span>':'')+
+      ' <a href="#" id="signout" style="color:var(--muted)">sign out</a>';
+    $('#navfoot').before(who);
+    who.querySelector('#signout').onclick=async e=>{
+      e.preventDefault();
+      await fetch('/api/signout',{method:'POST'});
+      location.reload();
+    };
+  }
   $('#navfoot').innerHTML=((META.scope&&META.scope.discovered)
     ?'<span style="color:var(--warn)">scope discovered from DB</span><br>':'')+
     '<b>'+esc(META.backend)+'</b> data'+(META.use_views?' (views)':'')+

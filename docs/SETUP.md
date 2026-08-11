@@ -274,6 +274,76 @@ replays the same graded questions through whichever provider you name:
 .venv/bin/python scripts/eval.py --provider gemini
 ```
 
+## 4b. Restrict data by business unit (optional)
+
+Off by default. Switched on, each person signs in with their user ID and
+sees only the business units the finance system grants that ID — everyone
+else's units disappear from the chooser, from answers, and from the
+catalog the model reasons over. One or more IDs can be named privileged
+and see everything.
+
+**Read this first.** The sign-in asks for a user ID and no password, so it
+identifies nobody: anyone who can reach the page can type any ID,
+including a privileged one. What it gives you is PeopleSoft's own row
+rules applied to the session — an honest user cannot stray into another
+unit and neither can the model. It is a scope selector, not an access
+control, and the page says so where people can read it. SSO replaces
+`resolve_operator()` in `pstb/gui/app.py`; nothing that enforces anything
+has to move when it does.
+
+**1. See what your instance actually has**
+
+```bash
+.venv/bin/python scripts/diagnose_bu_security.py --user SOMEUSER
+```
+
+It reports which security records the app's account can read, which model
+this site uses — by user ID (`PS_SEC_BU_OPR`) or by row-security
+permission list (`PS_SEC_BU_CLS` through `PSOPRDEFN.ROWSECCLASS`) — how
+many rows are in it, and what one real user resolves to. Exit code 1 when
+security is on and unreadable, so it can gate a deployment.
+
+Do this before switching anything on. A read-only reporting account
+frequently has SELECT on the ledger and not on the security records, and
+that is the single most common reason this feature shows nobody anything.
+
+**2. Switch it on**
+
+```yaml
+security:
+  enabled: true
+  privileged_users: ["FINADMIN"]     # keep at least one
+  on_unavailable: refuse
+```
+
+Or from `/console`, which has the same three switches.
+
+- `privileged_users` is read from config, not from the database, on
+  purpose: it is the account that still works while a grant is being
+  fixed.
+- `on_unavailable: refuse` means security that is on but unreadable shows
+  **nothing** and names the missing grant. `allow` degrades to full access
+  instead — a decision that should be typed rather than reached.
+- `unit_record` / `unit_key` point at a custom record if this site keeps
+  unit security somewhere other than the stock ones.
+- Ad-hoc SQL (`run_sql`) is off for restricted users, because a query
+  writes its own `WHERE` clause and no argument check can bound it to a
+  unit. `raw_sql_for_restricted: true` overrides that.
+
+**What is enforced, and where**
+
+| | |
+|---|---|
+| The chooser and the catalog | filtered where they are built, so a foreign unit never becomes the discovered default |
+| Every `/api/*` data route | one gate in front of all of them — a named unit must be granted, and an **omitted** one resolves inside the user's reach rather than falling through to the site default |
+| Every tool the model calls | checked before the call leaves the client, with a refusal the model can act on |
+| The scope catalog the model reads | narrowed on the way back, and told that it was |
+| CSV export | checked against the body, where the query-string gate cannot see it |
+
+The bundled sample ships users to try this with: `FIN_US001` (one unit),
+`FIN_CA001` (a unit with no ledger data — the honest empty case),
+`AP_CLERK` (class-based), `AUDITOR` (two units), `NOACCESS` (none).
+
 ## 5. Verify it works
 
 ```bash

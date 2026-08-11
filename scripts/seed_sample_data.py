@@ -325,6 +325,16 @@ CREATE TABLE PS_PYMNT_VCHR_XREF (
 CREATE TABLE PSRECDEFN (
   RECNAME TEXT, RECDESCR TEXT, RECTYPE INTEGER, SQLTABLENAME TEXT);
 CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
+-- PeopleTools operator definitions and FSCM business-unit row security.
+-- Real shape (abridged): PSOPRDEFN is the user list, and ROWSECCLASS on it
+-- is the permission list PeopleSoft uses for ROW security specifically —
+-- which is what PS_SEC_BU_CLS keys on. PS_SEC_BU_OPR is the user-level
+-- form of the same rule. A site uses one or the other; both are seeded so
+-- the discovery in pstb/security.py has both shapes to find.
+CREATE TABLE PSOPRDEFN (
+  OPRID TEXT, OPRDEFNDESC TEXT, ROWSECCLASS TEXT, ACCTLOCK INTEGER);
+CREATE TABLE PS_SEC_BU_OPR (OPRID TEXT, BUSINESS_UNIT TEXT);
+CREATE TABLE PS_SEC_BU_CLS (OPRCLASS TEXT, BUSINESS_UNIT TEXT);
 -- PeopleTools QUERY catalog. Real shape (abridged): PSQRYDEFN holds the
 -- definition and its owner (OPRID blank = public), PSQRYBIND the runtime
 -- prompts, PSQRYRECORD which records it reads. Discovery of existing
@@ -527,6 +537,33 @@ def main() -> None:
         ("PROJ_RESOURCE", "Project Cost Transactions", 0, ""),
     ]
     con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
+
+    # Users and their business-unit reach. US001 is the only unit with
+    # ledger data, and that is deliberate: CA001 exists so a restricted
+    # user can be DENIED something, which is the only way the restriction
+    # is observable. A grant to a unit that holds no rows is a real
+    # PeopleSoft state too, and the app has to say so rather than look
+    # broken.
+    con.executemany(
+        "INSERT INTO PSOPRDEFN VALUES (?,?,?,?)",
+        [
+            ("FIN_US001", "US ledger analyst", "", 0),
+            ("FIN_CA001", "Canada ledger analyst", "", 0),
+            ("AP_CLERK", "AP clerk (row security by class)", "ROWSEC_US", 0),
+            ("AUDITOR", "Auditor, all units", "ROWSEC_ALL", 0),
+            ("NOACCESS", "Starter account, no units granted", "", 0),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO PS_SEC_BU_OPR VALUES (?,?)",
+        [("FIN_US001", "US001"), ("FIN_CA001", "CA001"),
+         ("AUDITOR", "US001"), ("AUDITOR", "CA001")],
+    )
+    con.executemany(
+        "INSERT INTO PS_SEC_BU_CLS VALUES (?,?)",
+        [("ROWSEC_US", "US001"), ("ROWSEC_ALL", "US001"),
+         ("ROWSEC_ALL", "CA001")],
+    )
 
     # Existing PSQueries — the institutional knowledge worth reusing. Two
     # public finance queries with prompts, one private (OPRID set) that

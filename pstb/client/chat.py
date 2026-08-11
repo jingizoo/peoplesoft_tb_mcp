@@ -38,7 +38,9 @@ from ..guards import (
     normalize_request_scope,
     promises_tool_call,
     question_financial_domains,
+    filter_scope_payload,
     tool_result_status,
+    unit_access_block,
     rate_caveat,
     rate_findings,
     ungrounded_figures,
@@ -342,7 +344,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      tool_observer: Callable | None = None,
                      tool_started: Callable | None = None,
                      prior_payloads: list | None = None,
-                     result_limit: int = 0) -> str:
+                     result_limit: int = 0,
+                     access=None,
+                     allow_raw_sql: bool = True) -> str:
     """Run one model turn with deterministic source ordering.
 
     ``scope`` is an optional, user-validated request scope. Concrete values are
@@ -461,7 +465,18 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             blocked = ""
             next_step = ""
             was_scope_block = False
-            if (
+            # Row security first: a unit this person was never granted is
+            # refused before the scope lock even looks at it, because the
+            # scope lock's question ("does this match what you selected")
+            # has no opinion about units you could never select.
+            denied = unit_access_block(call.name, effective_args, access,
+                                       allow_raw_sql=allow_raw_sql)
+            if denied:
+                blocked = denied
+                next_step = (
+                    "Ask about a business unit this user is authorised for, "
+                    "or ask the PeopleSoft security administrator for access.")
+            elif (
                 surface == "gui"
                 and not request_scope
                 and not is_policy_tool(call.name)
@@ -553,6 +568,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                                         limit=result_limit)
             )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            # The catalog comes back from a server that does not know who
+            # asked; narrow it here, where we do.
+            out = filter_scope_payload(call.name, out, access)
             return (index, call, effective_args, blocked, out, elapsed_ms,
                     was_scope_block)
 

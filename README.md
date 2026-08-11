@@ -153,6 +153,24 @@ Whichever you pick, measure it rather than assuming:
 .venv/bin/python scripts/eval.py --provider claude
 ```
 
+## Restricting data by business unit
+
+Off by default. Switched on, each person signs in with their user ID and
+sees only the business units PeopleSoft grants that ID — the chooser, the
+answers and the catalog the model reads are all narrowed, and named
+privileged users see everything.
+
+It is a **scope selector, not a login**: the sign-in takes a user ID and no
+password, so it applies PeopleSoft's row rules to an honest session and
+stops nobody who types someone else's ID. SSO replaces one function when
+it arrives. Check what your instance supports before switching it on:
+
+```bash
+.venv/bin/python scripts/diagnose_bu_security.py --user SOMEUSER
+```
+
+Full walkthrough in [docs/SETUP.md](docs/SETUP.md#4b-restrict-data-by-business-unit-optional).
+
 ## Connecting your real PeopleSoft database (Oracle)
 
 1. Get a **read-only** Oracle account with SELECT on the GL tables (or the
