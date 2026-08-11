@@ -183,6 +183,10 @@ class TBEngine:
         )
         return bool(rows)
 
+    def _one_row(self) -> str:
+        """The dialect's one-row source for a bare SELECT."""
+        return "DUAL" if self.db.dialect == "oracle" else "(SELECT 1) AS _one"
+
     def _with_ledger_data(self, pairs: list) -> list:
         """Drop catalog entries that carry no ledger rows, so the UI never
         offers a scope that cannot answer. Probing is capped: past the cap the
@@ -204,8 +208,20 @@ class TBEngine:
             for i, (bu, ledger) in enumerate(chunk):
                 params[f"b{i}"], params[f"l{i}"] = bu, ledger
                 clauses.append(f"(BUSINESS_UNIT = :b{i} AND LEDGER = :l{i})")
-            sql = (f"SELECT DISTINCT BUSINESS_UNIT AS bu, LEDGER AS led "
-                   f"FROM {p}PS_LEDGER WHERE " + " OR ".join(clauses))
+            # EXISTS per pair, unioned — one round trip AND one row read
+            # per pair. The first cut asked for a DISTINCT over the OR'd
+            # pairs, which is a different cost entirely: DISTINCT cannot
+            # short-circuit, so proving "these ten units have data" meant
+            # reading every ledger row belonging to all ten. The comment
+            # above it said "milliseconds of database work", which is true
+            # of an existence probe and was never true of this.
+            selects = []
+            for i, (_bu, _led) in enumerate(chunk):
+                selects.append(
+                    f"SELECT :b{i} AS bu, :l{i} AS led FROM {self._one_row()} "
+                    f"WHERE EXISTS (SELECT 1 FROM {p}PS_LEDGER "
+                    f"WHERE BUSINESS_UNIT = :b{i} AND LEDGER = :l{i})")
+            sql = " UNION ALL ".join(selects)
             try:
                 rows, _ = self.db.query(sql, params, max_rows=SCOPE_BATCH)
                 found = {(str(r["bu"]).strip(), str(r["led"]).strip())
@@ -2333,7 +2349,20 @@ class TBEngine:
             )
         if bu in self._ledgers_cache:
             return self._ledgers_cache[bu]
-        rows, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu}, max_rows=50)
+        # Setup first. This is called every time the scope bar changes unit,
+        # and the balance-table form of the question reads every ledger row
+        # for the unit to return three strings — measured on the sample as
+        # cheap and structurally unbounded on a real instance, which is what
+        # "listing business units is slow" looks like from the outside.
+        rows = []
+        try:
+            rows, _ = self.db.query(q.ledgers_for_bu_setup(self.db),
+                                    {"bu": bu}, max_rows=50)
+        except DbError:
+            rows = []               # setup not granted here — fall through
+        if not rows:
+            rows, _ = self.db.query(q.ledgers_for_bu(self.db), {"bu": bu},
+                                    max_rows=50)
         if not rows:
             return {"business_unit": bu, "ledgers": [],
                     **self._scope_diagnosis(bu, self.cfg.defaults.ledger, 0)}

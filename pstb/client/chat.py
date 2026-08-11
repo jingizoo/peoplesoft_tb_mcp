@@ -37,6 +37,8 @@ from ..guards import (
     is_policy_tool,
     normalize_request_scope,
     promises_tool_call,
+    spans_business_units,
+    units_named_in,
     question_financial_domains,
     filter_scope_payload,
     tool_result_status,
@@ -346,7 +348,8 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      prior_payloads: list | None = None,
                      result_limit: int = 0,
                      access=None,
-                     allow_raw_sql: bool = True) -> str:
+                     allow_raw_sql: bool = True,
+                     known_units=()) -> str:
     """Run one model turn with deterministic source ordering.
 
     ``scope`` is an optional, user-validated request scope. Concrete values are
@@ -356,7 +359,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     """
     request_scope = normalize_request_scope(scope)
     intent = evidence_intent(user_text)
-    bu_override = wants_all_business_units(user_text)
+    # A question that NAMES two units crosses them just as surely as one
+    # that says "across all business units" — and that shape was invisible
+    # here, so the scope lock pinned the chip's unit and the model answered
+    # about one of the two. Naming a unit that is not the selected one
+    # counts too: the user's words are the newer instruction.
+    selected_unit = str((request_scope or {}).get("business_unit") or "")
+    crosses_units = spans_business_units(user_text, known_units, selected_unit)
+    bu_override = crosses_units
     turn_results: dict = {}
     required_financial_domains = question_financial_domains(user_text)
     # Tell the provider whether this question should open with a tool call.
@@ -368,7 +378,24 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     financial_fact_required = (
         intent == "data" and bool(required_financial_domains)
     )
-    resp: LLMResponse = await asyncio.to_thread(provider.send_user, user_text)
+    # Tell the model the shape of the question BEFORE it routes, not after
+    # a wasted round. Only the curated ranking tool takes business_unit=ALL,
+    # so a genuine crossing is one grouped query — and firing a single-unit
+    # tool first is exactly what this stops.
+    asked = user_text
+    if crosses_units and intent != "general":
+        named = units_named_in(user_text, known_units)
+        which = (", ".join(named) if len(named) > 1
+                 else "every business unit the question covers")
+        asked = (
+            f"{user_text}\n\n[Routing note: this question spans business "
+            f"units ({which}). The selected scope does NOT pin it. Answer it "
+            "with ONE call that returns every unit together — a grouped "
+            "run_sql with BUSINESS_UNIT in the SELECT and GROUP BY, or "
+            "business_unit=\"ALL\" on a curated tool that accepts it. Do "
+            "not call a single-unit tool once per unit, and do not answer "
+            "for one unit only.]")
+    resp: LLMResponse = await asyncio.to_thread(provider.send_user, asked)
     logged_calls: list[dict] = []
     rounds = 0
     hit_limit = False

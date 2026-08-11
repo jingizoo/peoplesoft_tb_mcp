@@ -668,7 +668,32 @@ def business_unit_base_currency(db: Database) -> str:
     return db.exists_sql(sql)
 
 
+def ledgers_for_bu_setup(db: Database) -> str:
+    """A unit's ledgers from SETUP, which is where the answer actually lives.
+
+    PS_BUS_UNIT_LED holds one row per unit and ledger group — tens of rows,
+    indexed on the unit. The balance table holds one row per unit, ledger,
+    account, chartfield combination and period, which for a real unit is
+    millions. Asking the balance table which ledgers exist reads all of
+    them to return three strings.
+    """
+    return f"""SELECT DISTINCT G.LEDGER AS ledger
+  FROM {db.prefix}PS_BUS_UNIT_LED B
+  JOIN {db.prefix}PS_LED_GRP_TBL G ON G.LEDGER_GROUP = B.LEDGER_GROUP
+ WHERE B.BUSINESS_UNIT = :bu AND B.LEDGER_GROUP IS NOT NULL
+ ORDER BY G.LEDGER"""
+
+
 def ledgers_for_bu(db: Database) -> str:
+    """LAST RESORT: the same question asked of the balance table.
+
+    Only when the setup records are not granted. DISTINCT does not
+    short-circuit — Oracle reads every index entry for the unit before it
+    can promise the list is complete — so on a live instance this is a
+    range scan of millions of entries to return a handful of values. It is
+    kept because a site that cannot read PS_BUS_UNIT_LED still needs an
+    answer, not because it is a reasonable way to get one.
+    """
     return f"""SELECT DISTINCT LEDGER AS ledger FROM {db.prefix}PS_LEDGER
  WHERE BUSINESS_UNIT = :bu ORDER BY LEDGER"""
 
