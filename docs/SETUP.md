@@ -344,6 +344,56 @@ The bundled sample ships users to try this with: `FIN_US001` (one unit),
 `FIN_CA001` (a unit with no ledger data — the honest empty case),
 `AP_CLERK` (class-based), `AUDITOR` (two units), `NOACCESS` (none).
 
+## 4c. Join paths (`join_path`)
+
+Ad-hoc SQL has always had the record names, the columns and the
+optimizer's opinion of a *finished* query — but nothing that says how to
+get from one record to another. So the model guessed, and a guessed join
+against a transaction table does not come back wrong, it comes back in
+four minutes.
+
+`join_path("PS_ITEM", "PS_CUSTOMER")` answers that from **this instance's
+own catalog**: shared key columns, weighted by whether those columns lead
+a real index on each side.
+
+```
+PS_ITEM -> PS_CUSTOMER on CUST_ID
+  indexed once you also pin BUSINESS_UNIT, SETID as a constant
+  confidence: high   cost: 2.0
+
+FROM PS_ITEM T0
+  JOIN PS_CUSTOMER T1 ON T0.CUST_ID = T1.CUST_ID
+```
+
+The second line is the useful half. PeopleSoft leads its indexes with
+SETID and BUSINESS_UNIT — values the selected scope has already fixed — so
+a join that looks unindexed is usually one constant away from a range
+scan. Nothing else in the app could tell you that.
+
+What it deliberately does **not** do:
+
+- It does not run anything, and it returns a FROM/JOIN skeleton rather
+  than a whole SELECT. What to select and how to filter is the question's
+  business; a half-guessed SELECT list is how a plausible wrong answer
+  starts.
+- It does not claim the join is *correct*. Shared column names are strong
+  evidence and are not a declared foreign key, so every payload carries
+  that caveat and points at `explain_query` for the finished statement.
+- It refuses to invent a bridge. Two records with nothing in common come
+  back `found: false` with what the source *can* reach, instead of a
+  creative path through a coincidence.
+
+Junk edges are excluded by construction: a join column has to identify
+something (dates, amounts, rates, descriptions are values, not keys — two
+records agreeing on `INVOICE_DT` is a cartesian product with an ON
+clause), and columns every record carries (`SETID`, `EFFDT`,
+`BUSINESS_UNIT`) never make an edge on their own.
+
+The graph is derived at runtime from `db.columns()` and `db.indexes()`,
+cached for 15 minutes, and bounded to the curated record map plus whatever
+records you name — a live instance has tens of thousands of records, and
+building every pair would be its own outage.
+
 ## 5. Verify it works
 
 ```bash

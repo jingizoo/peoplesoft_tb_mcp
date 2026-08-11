@@ -288,6 +288,21 @@ The curated tools carry the whole chain server-side:
 Chain across ROUNDS only when a later query genuinely needs an earlier
 answer as input; never to reassemble what one grouped call returns whole.
 
+## Joining two records: ask, do not guess
+Before ANY multi-table run_sql, call join_path(from_record, to_record). It
+reads this instance's own catalog and returns the ON columns, a FROM/JOIN
+skeleton, and — the part that matters — which columns to pin as constants
+so the join uses an index instead of scanning. PeopleSoft leads its indexes
+with SETID and BUSINESS_UNIT, which the selected scope has already fixed
+for you, so a join that looks unindexed is usually one constant away from
+a range scan.
+  "revenue by customer" -> join_path("PS_ITEM", "PS_CUSTOMER")
+      -> ON CUST_ID, pin SETID and BUSINESS_UNIT
+If it returns found:false the records may genuinely not be related — say
+so and ask, rather than inventing a bridge. Its confidence is about SHARED
+COLUMN NAMES, not a declared foreign key: check the join means what you
+intend, then explain_query the finished statement.
+
 ## Performance: plan before you join
 Transaction tables here are large; a careless join times out rather than
 erroring. Before writing an ad-hoc join or aggregate over PS_LEDGER,
