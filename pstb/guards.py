@@ -621,6 +621,51 @@ def wants_all_business_units(question: str) -> bool:
     return bool(_ALL_BU_RE.search(question or ""))
 
 
+def units_named_in(question: str, known_units) -> list:
+    """Business units this question NAMES, matched against the real catalog.
+
+    Matching against the catalog rather than a pattern, because a unit code
+    is whatever the site made it — US001, CAN, 10500, EMEA_SHARED — and any
+    regex for "looks like a business unit" is either blind to half of them
+    or matches every account number in the sentence.
+    """
+    text = (question or "").upper()
+    found = []
+    for unit in known_units or ():
+        code = str(unit or "").strip().upper()
+        # Bounded so US001 does not match inside US0012, and so a two-letter
+        # code does not match inside an ordinary word.
+        if code and re.search(rf"(?<![A-Z0-9_]){re.escape(code)}(?![A-Z0-9_])",
+                              text):
+            found.append(code)
+    return sorted(set(found))
+
+
+def spans_business_units(question: str, known_units=(),
+                         selected_unit: str = "") -> bool:
+    """Does answering this question require crossing business units?
+
+    Two ways it can, and only one was detected before:
+
+      1. The user SAYS the crossing — "across all business units",
+         "company-wide". That is wants_all_business_units().
+      2. The user NAMES the units — "compare US001 and CA001", or names a
+         single unit that is not the one selected in the chip.
+
+    The second is the common shape and it silently failed: the scope lock
+    pinned the selected unit, the model dutifully called a single-unit tool
+    with it, and the answer covered one of the two units the person asked
+    about while looking exactly as confident as a correct one.
+    """
+    if wants_all_business_units(question):
+        return True
+    named = units_named_in(question, known_units)
+    if len(named) > 1:
+        return True
+    selected = (selected_unit or "").strip().upper()
+    return bool(named and selected and named[0] != selected)
+
+
 def apply_request_scope(tool_name: str, args: Mapping | None,
                         request_scope: Mapping | None,
                         allow_bu_override: bool = False) -> dict:

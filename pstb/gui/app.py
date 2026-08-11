@@ -2110,6 +2110,11 @@ async def chat(payload: dict, request: Request = None):
                     allow_raw_sql=bool(
                         getattr(cfg.security, "raw_sql_for_restricted",
                                 False)),
+                    # The catalog is already in hand; it is what lets a
+                    # question that NAMES two units be recognised as
+                    # crossing them.
+                    known_units=[s.get("business_unit")
+                                 for s in (catalog.get("scopes") or [])],
                 )
             finally:
                 _activity_done(session_id, turn_token)
