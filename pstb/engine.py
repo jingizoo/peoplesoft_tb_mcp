@@ -25,7 +25,8 @@ BALANCE_EPS = 0.005
 CLOSE_PERIOD = 999
 INTERNAL_ROW_CAP = 100_000
 SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
-SCOPE_PROBE_CAP = 250          # max existence probes when filtering the catalog
+SCOPE_PROBE_CAP = 250
+GRAPH_MAX_HOPS = 4          # max existence probes when filtering the catalog
 SCOPE_BATCH = 50               # pairs verified per round trip
 SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balances
 
@@ -2788,6 +2789,63 @@ class TBEngine:
     # Records small enough that a full scan is not worth blocking. Setup and
     # reference tables are read end-to-end all the time and that is correct.
     _SCAN_ROW_FLOOR = 50_000
+
+    def join_path(self, from_record: str, to_record: str,
+                  through=()) -> dict:
+        """How to join two records here, and what it will cost.
+
+        The gap this fills: a model writing ad-hoc SQL has the record
+        names, the columns and the optimizer's opinion of a FINISHED query
+        — but nothing that tells it how to get from one record to another,
+        so it guesses. A guessed join against a transaction table does not
+        come back wrong, it comes back in four minutes.
+        """
+        start = (from_record or "").strip().upper()
+        goal = (to_record or "").strip().upper()
+        if not start or not goal:
+            raise EngineError(
+                "join_path needs from_record and to_record. Use "
+                "search_records to find record names.")
+        graph = self._record_graph()
+        for name in (start, goal):
+            if not self.db.columns(name):
+                raise EngineError(
+                    f"{name} is not readable here — check the name with "
+                    "search_records, or the SELECT grant with "
+                    "describe_table.")
+        path = graph.path(start, goal, extra=[t.upper() for t in
+                                             (through or ()) if t])
+        if path is None:
+            reachable = [h.right for h in graph.paths_from(start)][:8]
+            return {
+                "from": start, "to": goal, "found": False,
+                "note": (f"No join path found from {start} to {goal} within "
+                         f"{GRAPH_MAX_HOPS} hops of shared key columns. They "
+                         "may genuinely not be related, or the link may run "
+                         "through a record outside the catalog this graph "
+                         "covers — name it in `through` and ask again."),
+                "reachable_from_source": reachable,
+            }
+        out = path.as_dict()
+        out.update({"from": start, "to": goal, "found": True})
+        # Said every time, because a path presented as fact is a path
+        # nobody checks: shared column names are strong evidence of a
+        # relationship and are not a declared foreign key.
+        out["caveat"] = (
+            "Derived from column names shared between these records and the "
+            "indexes this database actually has — evidence, not a declared "
+            "foreign key. Confirm the join means what you intend before "
+            "trusting the numbers, and run explain_query on the finished "
+            "statement.")
+        return out
+
+    def _record_graph(self):
+        if getattr(self, "_graph", None) is None:
+            from .graph import RecordGraph
+            seed = [rec for recs in self.RECORD_MAP.values()
+                    for rec, *_ in recs]
+            self._graph = RecordGraph(self.db, seed)
+        return self._graph
 
     def explain_query(self, sql: str) -> dict:
         """Ask the optimizer how it WOULD run a query — before running it.

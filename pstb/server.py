@@ -734,6 +734,19 @@ if cfg.tools.allow_raw_sql:
         return _safe(engine.for_source(source).explain_query, sql=sql)
 
     @mcp.tool()
+    def join_path(from_record: str, to_record: str, source: str = "") -> dict:
+        """How to JOIN two PeopleSoft records here — the ON columns, and
+                whether this database's indexes can actually serve them.
+                USE THIS BEFORE writing any multi-table run_sql. It returns a
+                FROM/JOIN skeleton, which columns to pin as constants to turn a
+                scan into a range scan (usually SETID or BUSINESS_UNIT, which the
+                selected scope already fixes), and a confidence. Guessing a join
+                against PS_LEDGER or PS_ITEM does not fail fast — it consumes the
+                whole query timeout."""
+        return _safe(engine.for_source(source).join_path,
+                     from_record=from_record, to_record=to_record)
+
+    @mcp.tool()
     def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
         """Find the right PeopleSoft record for a question by searching
                 PeopleTools metadata — record DESCRIPTIONS and field names, not just

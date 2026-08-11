@@ -61,7 +61,10 @@ class IndexCatalogTests(_EngineCase):
         self.assertIn("LEADING", out["index_note"])
 
     def test_a_table_with_no_index_says_so_plainly(self) -> None:
-        out = self.engine.describe_table("PS_ITEM")
+        # Was PS_ITEM until the sample gained the indexes the join graph
+        # ranks by. PS_ASSET is still deliberately unindexed, so the
+        # "no index — expect a full scan" wording stays covered.
+        out = self.engine.describe_table("PS_ASSET")
         self.assertEqual(out["indexes"], [])
         self.assertIn("full", out["index_note"].lower())
 
