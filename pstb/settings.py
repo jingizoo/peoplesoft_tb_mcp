@@ -163,7 +163,7 @@ SECRET_LABELS = {
     "ORACLE_PASSWORD": "Oracle database password",
     "CONFLUENCE_API_TOKEN": "Confluence API token",
     "ANTHROPIC_API_KEY": "Anthropic API key",
-    "PSTB_AUTH_TOKEN": "Shared access token (--share)",
+    "PSTB_AUTH_TOKEN": "Shared access token (network bind)",
 }
 
 # Secrets this app DEFINES, so a random value is a valid one and offering to
@@ -176,7 +176,8 @@ SECRET_GENERATABLE = frozenset({"PSTB_AUTH_TOKEN"})
 # from the label alone: what it unlocks, and what changing it costs.
 SECRET_HELP = {
     "PSTB_AUTH_TOKEN": (
-        "OPTIONAL, and off unless you set it. With --share the page is "
+        "OPTIONAL, and off unless you set it. On the default network "
+        "bind the page is "
         "served at a plain URL and colleagues just open it; setting a "
         "token here is what makes every request require one instead. "
         "Ignored on 127.0.0.1. It is one shared password, not a "

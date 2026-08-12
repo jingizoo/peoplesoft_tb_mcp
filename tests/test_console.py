@@ -369,7 +369,11 @@ class AuthTokenIsConsoleManagedTests(unittest.TestCase):
     def test_the_field_says_what_holding_the_token_means(self) -> None:
         help_text = st.which_secrets_are_set(self.env)["PSTB_AUTH_TOKEN"]["help"]
         self.assertIn("shared password", help_text)
-        self.assertIn("--share", help_text)
+        # Was "--share". The flag stopped being a requirement when the
+        # network bind became the default, so the help has to name the
+        # CONDITION the token applies to rather than a flag the operator
+        # may now never pass.
+        self.assertIn("network bind", help_text)
         self.assertIn("invalidates every link", help_text)
 
     def test_a_token_containing_a_dollar_brace_is_refused_not_mangled(self) -> None:

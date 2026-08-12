@@ -2355,38 +2355,41 @@ def main() -> None:
     import uvicorn
 
     ap = argparse.ArgumentParser(description="PeopleSoft trial-balance web UI")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8000)
+    # The deployment this is built for is a shared box inside the VPN, and
+    # a default nobody can use is a default everyone overrides — every
+    # start became "--host 0.0.0.0 --port 8016 --share" typed out again.
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address (default 0.0.0.0, reachable on the "
+                         "network). Use 127.0.0.1 for this machine only.")
+    ap.add_argument("--port", type=int, default=8016,
+                    help="port to listen on (default 8016)")
     ap.add_argument("--open", action="store_true", help="open a browser window")
     ap.add_argument(
         "--share", action="store_true",
-        help="serve a routable address so colleagues can open the URL. No "
-             "token unless PSTB_AUTH_TOKEN is set; prints what is exposed")
+        help="accepted and no longer required: a routable bind is already "
+             "the default and always prints what it exposes. Kept so "
+             "existing commands and scripts keep working.")
     ap.add_argument(
         "--allow-host", action="append", default=[], metavar="NAME",
-        help="with --share, the only Host names accepted (repeatable). "
-             "Omit to accept any name and rely on the token alone.")
+        help="on a routable bind, the only Host names accepted "
+             "(repeatable). Omit to accept any name and rely on the token "
+             "alone.")
     args = ap.parse_args()
 
     loopback = localguard.peer_is_loopback((args.host, args.port))
-    # A routable bind is not refused any more — it is CONDITIONAL. Refusing
-    # it outright made one control do two jobs: it was the access story and
-    # also the answer to "three of us need this page", and a team given only
-    # those two options deletes the check. What it must never be is
-    # unauthenticated, so --share turns on a token instead of turning off a
-    # guard, and the bind alone still cannot hand the ledger to the network.
-    if not loopback and not args.share:
-        raise SystemExit(
-            f"\n  Refusing to bind {args.host} by accident: every balance, "
-            "every customer and the ad-hoc SQL tool would be reachable by "
-            "anyone who can route to this host.\n"
-            "  If that is what you want, say so:\n"
-            f"      python -m pstb.gui --host {args.host} "
-            f"--port {args.port} --share\n"
-            "  If you would rather keep it local, forward the port:\n"
-            f"      ssh -L {args.port}:localhost:{args.port} <this-host>\n"
-            f"      then open http://localhost:{args.port}\n")
-
+    # --share used to be a REQUIRED acknowledgement, and refusing to start
+    # without it was worth it while the default was loopback: a routable
+    # bind could then only happen on purpose. Once the default is routable
+    # that reasoning inverts — the flag would refuse the out-of-the-box
+    # command, and a gate that fires on the intended case is a gate people
+    # delete rather than read.
+    #
+    # What actually informs is the banner below, which is printed on every
+    # routable start whether or not the flag was passed, and which says in
+    # plain words what is now reachable. That is kept, and so is everything
+    # the flag never controlled: the Host check, the optional token, and
+    # /console answering only from this machine no matter what the network
+    # policy is.
     if loopback and args.share:
         # Silently ignoring the flag taught the operator the wrong lesson —
         # they believed a token was required and it was not.
@@ -2435,6 +2438,8 @@ def main() -> None:
               "the VPN; this is cleartext HTTP.")
         print("  To require a token instead, set PSTB_AUTH_TOKEN and "
               "restart.")
+        print(f"  To keep it on this machine only: --host 127.0.0.1, then "
+              f"ssh -L {args.port}:localhost:{args.port} <this-host>.")
         print("  The configuration console is not shared either way: "
               "/console answers only from this machine (SSH tunnel).")
     elif token:

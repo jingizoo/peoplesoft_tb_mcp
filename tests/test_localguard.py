@@ -230,27 +230,76 @@ class BindTests(unittest.TestCase):
         from unittest.mock import patch
 
         from pstb.gui import app as gapp
-        args = argparse.Namespace(host="0.0.0.0", port=8000, open=False,
+        args = argparse.Namespace(host="0.0.0.0", port=8016, open=False,
                                   share=False, allow_host=[])
         for key, value in overrides.items():
             setattr(args, key, value)
         return gapp, args, patch
 
-    def test_a_routable_bind_is_never_reached_by_ACCIDENT(self) -> None:
-        # Binding the network stays a deliberate act — but the remedy is a
-        # flag, not a credential. Refusing the thing the operator actually
-        # wants is how a guard gets edited out of the source instead.
-        gapp, args, patch = self._run_main()
+    def test_the_default_bind_is_shared_and_SAYS_so(self) -> None:
+        """The acknowledgement moved from a flag to the banner.
+
+        Requiring --share was right while loopback was the default: a
+        routable bind could then only happen on purpose. The deployment
+        this serves is a shared box, so the default is now routable — and
+        a gate that fires on the intended command is a gate people delete
+        rather than read. What has to survive is the DISCLOSURE, which is
+        printed on every routable start whether or not the flag was
+        passed, and which names the way back to loopback.
+        """
+        import io
+        import os
+        from contextlib import redirect_stdout
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main()          # share=False
+        out = io.StringIO()
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
-            with self.assertRaises(SystemExit) as ctx:
+            with _patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PSTB_AUTH_TOKEN", None)
+                with _patch("uvicorn.run") as served:
+                    with redirect_stdout(out):
+                        gapp.main()
+        served.assert_called_once()
+        self.assertEqual(served.call_args.kwargs["host"], "0.0.0.0")
+        banner = out.getvalue()
+        self.assertIn("Anyone who can route to this host", banner)
+        self.assertIn("read every balance", banner)
+        self.assertIn("127.0.0.1", banner,
+                      "the way back to machine-only has to be on screen, or "
+                      "the person who wanted it cannot find it")
+        self.assertIn("ssh -L", banner)
+        self.assertTrue(localguard.POLICY.unauthenticated,
+                        "open on the network must still be RECORDED")
+
+    def test_the_defaults_are_the_ones_the_deploy_uses(self) -> None:
+        # 0.0.0.0:8016 with no flags at all. A default nobody can use is a
+        # default everyone overrides, and then the flags are the real
+        # interface and the code is documentation of a path no one takes.
+        import io
+        import os
+        from contextlib import redirect_stdout
+        from unittest.mock import patch as _patch
+
+        from pstb.gui import app as gapp
+        with _patch("sys.argv", ["pstb.gui"]):
+            with _patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PSTB_AUTH_TOKEN", None)
+                with _patch("uvicorn.run") as served:
+                    with redirect_stdout(io.StringIO()):
+                        gapp.main()
+        self.assertEqual(served.call_args.kwargs["host"], "0.0.0.0")
+        self.assertEqual(served.call_args.kwargs["port"], 8016)
+
+    def test_asking_for_loopback_still_gets_loopback(self) -> None:
+        from unittest.mock import patch as _patch
+
+        gapp, args, patch = self._run_main(host="127.0.0.1")
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with _patch("uvicorn.run") as served:
                 gapp.main()
-        message = str(ctx.exception)
-        self.assertIn("by accident", message)
-        self.assertIn("ssh -L", message, "refusing without the alternative "
-                                         "just moves the problem")
-        self.assertIn("--share", message, "the refusal has to name the "
-                                          "supported way to do this, or the "
-                                          "next person deletes the check")
+        self.assertEqual(served.call_args.kwargs["host"], "127.0.0.1")
+        self.assertFalse(localguard.POLICY.shared)
 
     def test_share_alone_serves_a_plain_url_with_no_token(self) -> None:
         # The token was never asked for. --share binds the network and
