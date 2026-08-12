@@ -323,16 +323,22 @@ def _probe_config(root: Path, overlay: Path) -> tuple:
         "sys.path.insert(0, sys.argv[1])\n"
         "src, overlay = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])\n"
         "d = pathlib.Path(tempfile.mkdtemp())\n"
-        "shutil.copy(src / 'config.yaml', d / 'config.yaml')\n"
+        "shutil.copy(src, d / 'config.yaml')\n"
         "shutil.copy(overlay, d / 'config.local.yaml')\n"
         "from pstb.config import load_config\n"
         "load_config(str(d / 'config.yaml'))\n"
         "print('OK')\n"
     )
     pkg = str(Path(__file__).resolve().parents[2])
+    # The base to merge the candidate over is this deployment's config.yaml,
+    # or the shipped example when it has none — copying a hard-coded
+    # 'config.yaml' refused every console save on a box that had not created
+    # one, and the reason it gave was "the validator could not start".
+    from ..config import base_config_path
     try:
         out = subprocess.run(
-            [sys.executable, "-c", code, pkg, str(root), str(overlay)],
+            [sys.executable, "-c", code, pkg,
+             str(base_config_path(root)), str(overlay)],
             capture_output=True, text=True, timeout=60)
     except Exception as e:
         return False, f"the validator could not start: {type(e).__name__}"
