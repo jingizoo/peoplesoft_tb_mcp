@@ -393,7 +393,8 @@ def get_top_billing_customers(
 
 
 @mcp.tool()
-def get_invoice_lifecycle(business_unit: str = "") -> dict:
+def get_invoice_lifecycle(business_unit: str = "",
+                          as_of_date: str = "") -> dict:
     """Where is the billing delay: the pipeline from the billing interface
     to AR as STAGES — interface waiting/error, bills by status with amounts
     and ages, finalized-but-not-in-AR orphans, open in AR — with the
@@ -401,7 +402,8 @@ def get_invoice_lifecycle(business_unit: str = "") -> dict:
     flow / what is stuck between order and cash". Cycle times appear only
     where the site stores creation timestamps; otherwise current stage
     ages are reported and the limitation is disclosed."""
-    return _safe(ar.invoice_lifecycle, business_unit=business_unit)
+    return _safe(ar.invoice_lifecycle, business_unit=business_unit,
+                 as_of_date=as_of_date)
 
 
 @mcp.tool()
@@ -427,7 +429,7 @@ def get_customer_financial_360(cust_id: str = "", business_unit: str = "",
 
 @mcp.tool()
 def search_vendors(query: str = "", limit: int = 25,
-                   business_unit: str = "") -> dict:
+                   business_unit: str = "", as_of_date: str = "") -> dict:
     """Find a supplier by ID or name substring, with its open payables and
     whether it belongs to a corporate supplier group. The AP counterpart of
     search_customers. Use it FIRST when the question names a supplier by
@@ -435,6 +437,9 @@ def search_vendors(query: str = "", limit: int = 25,
     belongs_to_a_corporate_family or heads_a_corporate_family, the balance
     shown is that legal entity ALONE — say so, and use
     get_vendor_payables_network for the group."""
+    # as_of_date is accepted so the scope guard can inject it uniformly;
+    # a supplier's identity does not change with the date, so it is not
+    # used. Refusing it would raise a TypeError on every scoped call.
     return _safe(modules.search_vendors, query=query, limit=limit,
                  business_unit=business_unit)
 
@@ -472,18 +477,20 @@ def get_dso_trend(business_unit: str = "", fiscal_year: int = 0) -> dict:
 
 
 @mcp.tool()
-def get_cash_outlook(business_unit: str = "", weeks: int = 8) -> dict:
+def get_cash_outlook(business_unit: str = "", weeks: int = 8,
+                     as_of_date: str = "") -> dict:
     """Expected cash by week from DUE DATES: inflows from open AR items,
     outflows from open vouchers, net per currency, overdue in its own
     bucket. This is due-date arithmetic — the starting point a treasurer
     refines — NOT a payment-behavior forecast, and the payload says so.
     Use for "cash outlook / what is due in and out over the next weeks"."""
-    return _safe(ar.cash_outlook, business_unit=business_unit, weeks=weeks)
+    return _safe(ar.cash_outlook, business_unit=business_unit, weeks=weeks,
+                 as_of_date=as_of_date)
 
 
 @mcp.tool()
 def get_vendor_intelligence(business_unit: str = "", months: int = 12,
-                            n: int = 20) -> dict:
+                            n: int = 20, as_of_date: str = "") -> dict:
     """Top vendors with HOW WE PAY them: payment totals and share, plus
     amount-weighted days early/late versus voucher due dates, and computed
     observations (paying early = cash handed over sooner than required;
@@ -491,13 +498,14 @@ def get_vendor_intelligence(business_unit: str = "", months: int = 12,
     intelligence. Use for "top vendors / do we pay early or late / vendor
     concentration". Copy observations verbatim — they are arithmetic."""
     return _safe(modules.vendor_intelligence, business_unit=business_unit,
-                 months=months, n=n)
+                 months=months, n=n, as_of_date=as_of_date)
 
 
 @mcp.tool()
 def get_customer_intelligence(business_unit: str = "", n: int = 20,
                               months: int = 12,
-                              display_currency: str = "") -> dict:
+                              display_currency: str = "",
+                              as_of_date: str = "") -> dict:
     """Top customers WITH context: where they are based (city/state/
     country), what they buy (top products from bill lines), and how they
     pay (open AR, overdue, average days late, disputes) — plus computed
@@ -508,7 +516,8 @@ def get_customer_intelligence(business_unit: str = "", n: int = 20,
     records, and every figure is in the payload. Plain ranking with no
     context is get_top_billing_customers."""
     return _safe(ar.customer_intelligence, business_unit=business_unit,
-                 n=n, months=months, display_currency=display_currency)
+                 n=n, months=months, display_currency=display_currency,
+                 as_of_date=as_of_date)
 
 
 @mcp.tool()
@@ -1067,7 +1076,8 @@ def coupa_to_ap_tie(days: int = 90) -> dict:
 
 @mcp.tool()
 def get_duplicate_payments(business_unit: str = "", months: int = 12,
-                           tolerance_days: int = 7) -> dict:
+                           tolerance_days: int = 7,
+                           as_of_date: str = "") -> dict:
     """AP audit: possible duplicate vouchers. Two disclosed lists — the
     same vendor invoice number vouchered twice (near-certain duplicate),
     and same vendor + same amount within a few days under different
@@ -1075,7 +1085,8 @@ def get_duplicate_payments(business_unit: str = "", months: int = 12,
     Use for "any duplicate payments / did we pay anything twice". An empty
     result is a real answer."""
     return _safe(modules.duplicate_payments, business_unit=business_unit,
-                 months=months, tolerance_days=tolerance_days)
+                 months=months, tolerance_days=tolerance_days,
+                 as_of_date=as_of_date)
 
 
 @mcp.tool()
