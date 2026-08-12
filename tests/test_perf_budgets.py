@@ -32,6 +32,28 @@ from pstb.engine import TBEngine  # noqa: E402
 from pstb.guards import (misattributed_figures, payload_numbers,
                          ungrounded_figures)  # noqa: E402
 
+def _with_salt(fn):
+    """Run fn with the identity-matching salt present.
+
+    get_vendor_payables_network skips two reads when PSTB_MATCH_SALT is
+    unset, and CI does not set it — so an unsalted budget would pin the
+    cheap path and never notice the real one growing.
+    """
+    import os
+
+    def wrapped():
+        saved = os.environ.get("PSTB_MATCH_SALT")
+        os.environ["PSTB_MATCH_SALT"] = "perf-budget-salt"
+        try:
+            return fn()
+        finally:
+            if saved is None:
+                os.environ.pop("PSTB_MATCH_SALT", None)
+            else:
+                os.environ["PSTB_MATCH_SALT"] = saved
+    return wrapped
+
+
 BUDGET_MSG = (
     "\n\nThis is the speed lock-in gate: a warm {name} call now issues "
     "{got} queries where the budget is {budget}. Every extra query is a "
@@ -118,6 +140,7 @@ class QueryBudgetTests(unittest.TestCase):
         from pstb.ar import ARBilling
         from pstb.modules import ModulePacks
         from pstb.relationships import Relationships
+        from pstb.vendors import VendorNetwork
         ar = ARBilling(self.engine)
         modules = ModulePacks(self.engine)
         for name, budget, fn in [
@@ -152,6 +175,22 @@ class QueryBudgetTests(unittest.TestCase):
             ("get_customer_ar", 6,
              lambda: ar.customer(customer="C1001", business_unit="US001",
                                  as_of_date="2026-08-06")),
+            # The payables network reads four record families the 360 does
+            # not (vouchers, payments, bank accounts, tax ids) and delegates
+            # duplicate detection to an existing tool rather than
+            # recomputing it. search_vendors is 2: the row carries its own
+            # parent, but whether a supplier OWNS anyone lives in rows its
+            # WHERE clause excludes.
+            # Budgeted WITH the salt set, so the identity check is inside
+            # the number. Budgeting the unsalted path would pin 9 and let
+            # the two reads it skips grow unnoticed.
+            ("get_vendor_payables_network", 11, _with_salt(
+                lambda: VendorNetwork(modules).vendor_payables_network(
+                    vendor_id="V1001", business_unit="US001",
+                    as_of_date="2026-08-06"))),
+            ("search_vendors", 2,
+             lambda: modules.search_vendors(query="Ridge",
+                                            business_unit="US001")),
             ("get_customer_financial_360", 11,
              lambda: Relationships(ar).customer_financial_360(
                  cust_id="C1001", business_unit="US001",

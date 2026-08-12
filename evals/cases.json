@@ -364,6 +364,40 @@
       }
     },
     {
+      "id": "vendor-network-unprompted",
+      "question": "Give me the full picture for supplier Ridgeline Supply Co",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_vendor_payables_network"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "the payables relationship layer has to fire without being asked for by name. A preceding search_vendors call is fine \u2014 the tool takes an id \u2014 but the turn must reach the network."
+      }
+    },
+    {
+      "id": "vendor-shared-bank-account",
+      "question": "Are we paying two different suppliers into the same bank account?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_vendor_payables_network",
+          "search_vendors"
+        ],
+        "not_refused": true,
+        "_why": "the shared-bank-account check lives in the network tool and nowhere else. Refusing this, or answering it from ad-hoc SQL over the bank record, are both failures \u2014 the second because the account numbers would then reach the model."
+      }
+    },
+    {
       "id": "duplicate-payments",
       "question": "Any duplicate vendor payments?",
       "scope": {

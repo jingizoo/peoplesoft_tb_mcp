@@ -46,13 +46,16 @@ class _SampleCase(unittest.TestCase):
 class OpenPayablesTests(_SampleCase):
     def test_paid_vouchers_are_not_owed(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
-        # The seed has six fully paid vouchers and four open ones.
-        self.assertEqual(out["voucher_count"], 4)
-        self.assertEqual(out["open_total"], 115200.0)
+        # Six fully paid vouchers, eight open — four for the original three
+        # suppliers and four added with the supplier family and the
+        # shared-bank pair.
+        self.assertEqual(out["voucher_count"], 8)
+        self.assertEqual(out["open_total"], 192750.0)
 
     def test_overdue_is_judged_against_as_of(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
-        self.assertEqual(out["overdue_total"], 27650.0)
+        # Cobalt's 27,650 plus Ridgeline Fasteners' 22,300.
+        self.assertEqual(out["overdue_total"], 49950.0)
         cobalt = next(v for v in out["by_vendor"]
                       if v["vendor"] == "Cobalt IT Services")
         self.assertEqual(cobalt["overdue_amount"], 27650.0)
@@ -70,7 +73,8 @@ class OpenPayablesTests(_SampleCase):
 
     def test_due_soon_window_is_seven_days(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
-        self.assertEqual(out["due_within_7_days"], 18400.0)
+        # VCHR90001 (18,400 due 08-09) and VCHR90008 (14,800 due 08-11).
+        self.assertEqual(out["due_within_7_days"], 33200.0)
 
 
 class VendorPaymentsTests(_SampleCase):
@@ -191,7 +195,7 @@ class ShapeFallbackTests(unittest.TestCase):
         tmp, db, m = self._mutated([("PS_VOUCHER", "DUE_DT")])
         try:
             out = m.open_payables(as_of_date="2026-08-04")
-            self.assertEqual(out["open_total"], 115200.0)
+            self.assertEqual(out["open_total"], 192750.0)
             self.assertEqual(out["overdue_total"], 0.0)
             self.assertTrue(any("DUE_DT" in n
                                 for n in out["record_notes"]))
@@ -203,9 +207,9 @@ class ShapeFallbackTests(unittest.TestCase):
         tmp, db, m = self._mutated([("PS_VOUCHER", "CLOSE_STATUS")])
         try:
             out = m.open_payables(as_of_date="2026-08-04")
-            # The four open vouchers have no payment xref, so the fallback
+            # The open vouchers have no payment xref, so the fallback
             # finds the same set — and says how it decided.
-            self.assertEqual(out["voucher_count"], 4)
+            self.assertEqual(out["voucher_count"], 8)
             self.assertTrue(any("CLOSE_STATUS" in n
                                 for n in out["record_notes"]))
         finally:

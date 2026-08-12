@@ -156,7 +156,7 @@ ENV_KEYS = frozenset(k for k, _, _ in ENV_SETTINGS)
 # handler cannot widen the set.
 SECRET_KEYS = frozenset({"PSFT_QAS_PASSWORD", "ORACLE_PASSWORD",
                          "CONFLUENCE_API_TOKEN", "ANTHROPIC_API_KEY",
-                         "PSTB_AUTH_TOKEN"})
+                         "PSTB_AUTH_TOKEN", "PSTB_MATCH_SALT"})
 
 SECRET_LABELS = {
     "PSFT_QAS_PASSWORD": "PeopleSoft QAS password",
@@ -164,13 +164,14 @@ SECRET_LABELS = {
     "CONFLUENCE_API_TOKEN": "Confluence API token",
     "ANTHROPIC_API_KEY": "Anthropic API key",
     "PSTB_AUTH_TOKEN": "Shared access token (network bind)",
+    "PSTB_MATCH_SALT": "Salt for supplier identity matching",
 }
 
 # Secrets this app DEFINES, so a random value is a valid one and offering to
 # mint it is a kindness. The others authenticate against something else —
 # Oracle, Confluence, Anthropic — where a generated value is simply wrong,
 # and a Generate button beside them would be a trap.
-SECRET_GENERATABLE = frozenset({"PSTB_AUTH_TOKEN"})
+SECRET_GENERATABLE = frozenset({"PSTB_AUTH_TOKEN", "PSTB_MATCH_SALT"})
 
 # Shown beside the field, for the secrets whose consequences are not obvious
 # from the label alone: what it unlocks, and what changing it costs.
@@ -188,6 +189,17 @@ SECRET_HELP = {
         "inside a URL and a cookie, and the service refuses to start with "
         "anything else. Clearing it goes back to the plain URL. Changing "
         "it invalidates every link already handed out."),
+    "PSTB_MATCH_SALT": (
+        "Required before get_vendor_payables_network will check whether two "
+        "suppliers share a remit bank account or a taxpayer id. Those "
+        "values are never shown; they are compared as a KEYED hash, and "
+        "this is the key. Without it the check reports itself unavailable "
+        "rather than falling back to an unkeyed hash — an unkeyed hash of "
+        "a nine-digit identifier can be reversed by trying every one of "
+        "them, so it would be the raw value with extra steps. Generate it "
+        "here; nobody needs to know its value, and it is never sent "
+        "anywhere. Changing it changes every token, which breaks nothing "
+        "but makes tokens from an older answer no longer comparable."),
 }
 
 

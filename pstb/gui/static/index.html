@@ -1645,6 +1645,7 @@ function renderToolResult(name,data,args){
     if(name==='run_report') return renderReport(data);
     if(name==='get_customer_intelligence') return renderCustomerIntel(data);
     if(name==='get_customer_financial_360') return renderCustomer360(data);
+    if(name==='get_vendor_payables_network') return renderVendorNetwork(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
@@ -1893,6 +1894,127 @@ function renderCustomer360(d){
       '<div style="margin:4px 0"><span class="badge dim">'+esc(k.replace(/_/g,' ').toLowerCase())+
       '</span> '+kinds[k].map(e=>esc(label[e.from]||e.from)+' → '+
         esc(label[e.to]||e.to)).join(' &nbsp;·&nbsp; ')+'</div>').join('')));
+    frag.append(c);
+  }
+
+  if((d.record_notes||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Notes <span class="sub">what this site could and could not answer</span>'));
+    c.append(el('div','pad',(d.record_notes||[]).map(n=>'<div>'+esc(n)+'</div>').join('')));
+    frag.append(c);
+  }
+  return frag;
+}
+// One supplier, everything connected. The identity links are the part
+// that does not exist on the customer side: another supplier remitting to
+// the same bank account is the finding, and the account number itself is
+// deliberately not here to be shown — only a keyed token, so two rows can
+// be compared without anyone reading the value.
+function renderVendorNetwork(d){
+  if(d.scope_status) return noData(d);
+  const frag=document.createDocumentFragment();
+  const m2=v=>Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const per=(rows,key)=>(rows||[]).map(r=>m2(r[key])+' '+esc(r.currency||'')).join('  ·  ')||'0';
+  const sup=d.supplier||{}, fam=d.family||{}, pay=d.payables||{};
+  const links=(d.identity_links&&d.identity_links.links)||[];
+  const dup=d.duplicates||{};
+  const loc=[sup.location&&sup.location.city,sup.location&&sup.location.state].filter(Boolean).join(', ');
+  const vouchers=pay.largest_open_vouchers||[];
+  const overdue=vouchers.filter(v=>v.days_past_due>0).reduce((a,v)=>a+v.amount,0);
+
+  const head=el('div','card');
+  head.append(el('h2',null,esc(sup.name||sup.vendor_id||'Supplier')+
+    ' <span class="sub">'+esc(sup.vendor_id||'')+(loc?' · '+esc(loc):'')+
+    ' · '+esc(d.business_unit||'')+' · as of '+esc(d.as_of_date||'')+'</span>'));
+  head.append(tiles([
+    ['Open payables', per(pay.totals_by_currency,'open_amount'),
+     (pay.totals_by_currency||[]).reduce((a,r)=>a+(r.vouchers||0),0)+' vouchers','cr'],
+    ['Past due', overdue?m2(overdue):'0',
+     vouchers.filter(v=>v.days_past_due>0).length+' vouchers','bad'],
+    ['Shared keys', String(links.length),
+     d.identity_links&&d.identity_links.supported===false
+       ?'not checked — see notes':'bank account or tax id',
+     links.length?'bad':''],
+    ['Duplicate vouchers',
+     String((dup.exact_invoice_duplicates||[]).length),
+     dup.supported===false?'not checked':'same invoice, more than once','']
+  ]));
+  frag.append(head);
+
+  if((d.needs_attention||[]).length){
+    const cls={open_payable:'',overdue_payable:'bad',stuck_in_pipeline:'warn',
+      shared_bank_account:'bad',shared_tax_id:'bad',duplicate_voucher:'warn'};
+    const c=el('div','card');
+    c.append(el('h2',null,'Needs attention <span class="sub">arithmetic over'+
+      ' the records below — not generated advice</span>'));
+    c.append(el('div','pad',(d.needs_attention||[]).map(a=>
+      '<div style="margin:4px 0"><span class="badge '+(cls[a.kind]||'dim')+'">'+
+      esc(a.kind.replace(/_/g,' '))+'</span> '+esc(a.headline)+'</div>').join('')));
+    frag.append(c);
+  }
+
+  if(links.length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Shared keys <span class="sub">a reason to check,'+
+      ' NOT evidence that two suppliers are one company</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>What</th><th>Suppliers</th><th>Token</th></tr></thead><tbody>'+
+      links.map(l=>'<tr><td>'+esc(l.kind.replace(/_/g,' '))+'</td>'+
+        '<td>'+(l.suppliers||[]).map(esc).join(' · ')+'</td>'+
+        '<td><code style="font-size:11px">'+esc(l.token)+'</code></td></tr>').join('')+
+      '</tbody>';
+    c.append(t);
+    c.append(el('div','pad','<span class="sub">'+
+      esc((d.identity_links&&d.identity_links.read_this_as)||'')+'</span>'));
+    frag.append(c);
+  }
+
+  if((fam.members||[]).length>1){
+    const c=el('div','card');
+    c.append(el('h2',null,'Supplier family <span class="sub">'+
+      fam.members.length+' companies · from the hierarchy in the system,'+
+      ' never matched by name or by bank account</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Supplier</th><th>Role</th><th>Based in</th>'+
+      '<th class="num">Open</th><th class="num">Paid</th></tr></thead><tbody>'+
+      fam.members.map(m=>{
+        const l=[m.location&&m.location.city,m.location&&m.location.state].filter(Boolean).join(', ');
+        return '<tr><td><b>'+esc(m.vendor_id)+'</b> '+esc(m.name||'')+'</td>'+
+          '<td>'+esc(m.role||'')+'</td><td>'+(l?esc(l):'<span class="sub">n/a</span>')+'</td>'+
+          '<td class="num">'+per(m.payables,'open_amount')+'</td>'+
+          '<td class="num">'+(m.spend?m2(m.spend.paid):'—')+'</td></tr>';
+      }).join('')+'</tbody>';
+    c.append(t); frag.append(c);
+  }
+
+  if(vouchers.length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Open vouchers <span class="sub">largest first</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Voucher</th><th>Supplier</th><th>Invoice</th>'+
+      '<th>Due</th><th class="num">Amount</th><th class="num">Days late</th>'+
+      '<th>Pipeline</th></tr></thead><tbody>'+
+      vouchers.map(v=>'<tr><td><b>'+esc(v.voucher_id)+'</b></td>'+
+        '<td>'+esc(v.vendor_id)+'</td><td>'+esc(v.invoice_id||'')+'</td>'+
+        '<td>'+esc(v.due_date||'')+'</td>'+
+        '<td class="num">'+m2(v.amount)+' '+esc(v.currency||'')+'</td>'+
+        '<td class="num">'+(v.days_past_due||'—')+'</td>'+
+        '<td>'+(v.entry_status==='R'?'<span class="badge warn">recycle</span>':'')+
+        (v.post_status==='U'?' <span class="badge warn">unposted</span>':'')+'</td></tr>'
+      ).join('')+'</tbody>';
+    const sc=el('div'); sc.style.maxHeight='320px'; sc.style.overflow='auto'; sc.append(t);
+    c.append(sc); frag.append(c);
+  }
+
+  if((dup.exact_invoice_duplicates||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Duplicate vouchers <span class="sub">from '+
+      esc(dup.from_tool||'get_duplicate_payments')+'</span>'));
+    c.append(el('div','pad',(dup.exact_invoice_duplicates||[]).map(x=>
+      '<div style="margin:4px 0"><b>'+esc(x.invoice_id)+'</b> — '+x.vouchers+
+      ' vouchers totalling '+m2(x.total)+' for '+esc(x.vendor||x.vendor_id)+
+      '</div>').join('')+'<div class="sub" style="margin-top:6px">'+
+      esc(dup.note||'')+'</div>'));
     frag.append(c);
   }
 
