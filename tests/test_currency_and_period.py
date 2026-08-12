@@ -212,5 +212,95 @@ class PeriodScopeTests(unittest.TestCase):
                                      "as_of_date": "31/03/2026"})
 
 
+class TopBillingWindowTests(unittest.TestCase):
+    """A ranking is only as good as the population it ranked.
+
+    Three defects, all of which produce a confident wrong list rather than
+    a visibly broken one.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ar = _ar()
+
+    def test_twelve_months_is_a_year_not_three_hundred_and_sixty_days(self):
+        from pstb.ar import _months_before
+        import datetime as dt
+        out = self.ar.top_billing_customers(business_unit=BU,
+                                            as_of_date="2026-08-12",
+                                            display_currency="USD")
+        self.assertEqual(out["since"], "2025-08-12")
+        # months*30 landed here, five days late, every year.
+        self.assertNotEqual(out["since"], "2025-08-17")
+        self.assertEqual(
+            _months_before(dt.date(2026, 8, 12), 12), dt.date(2025, 8, 12))
+
+    def test_month_end_clamps_instead_of_overflowing(self) -> None:
+        # One month before 31 March is the end of February, not 3 March.
+        from pstb.ar import _months_before
+        import datetime as dt
+        self.assertEqual(_months_before(dt.date(2026, 3, 31), 1),
+                         dt.date(2026, 2, 28))
+        self.assertEqual(_months_before(dt.date(2024, 3, 31), 1),
+                         dt.date(2024, 2, 29))
+        self.assertEqual(_months_before(dt.date(2024, 2, 29), 12),
+                         dt.date(2023, 2, 28))
+
+    def test_the_window_has_an_UPPER_bound_too(self) -> None:
+        # This became live the moment the scope chip's period started
+        # arriving here as as_of_date: a backdated ranking was still
+        # counting invoices dated after it.
+        early = self.ar.top_billing_customers(
+            business_unit=BU, as_of_date="2026-03-31", months=120,
+            display_currency="USD")
+        late = self.ar.top_billing_customers(
+            business_unit=BU, as_of_date="2026-08-12", months=120,
+            display_currency="USD")
+        self.assertLess(early["total_billed"], late["total_billed"])
+        for row in early["customers"]:
+            self.assertLessEqual(row["last_invoice_dt"] or "", "2026-03-31")
+
+    def test_the_window_is_stated_in_the_note(self) -> None:
+        out = self.ar.top_billing_customers(business_unit=BU,
+                                            as_of_date="2026-08-12",
+                                            display_currency="USD")
+        self.assertIn("2025-08-12 to 2026-08-12 inclusive", out["note"])
+
+    def test_a_complete_ranking_says_it_is_complete(self) -> None:
+        out = self.ar.top_billing_customers(business_unit=BU,
+                                            display_currency="USD")
+        self.assertTrue(out["ranking_complete"])
+        self.assertNotIn("NOT RELIABLE", out["note"])
+
+    def test_a_cut_off_population_refuses_to_pose_as_a_ranking(self) -> None:
+        # The worst of the three: a top-N over a truncated read can name
+        # the wrong top customer, which is a wrong answer wearing a right
+        # one. Forcing the cap is the only way to exercise it here.
+        real = self.ar.db.query
+
+        def capped(sql, params=None, **kw):
+            if "PS_BI_HDR" in sql and "BILL_TO_CUST_ID" in sql:
+                kw["max_rows"] = 2
+            return real(sql, params, **kw)
+
+        self.ar.db.query = capped
+        try:
+            out = self.ar.top_billing_customers(business_unit=BU,
+                                                display_currency="USD")
+        finally:
+            self.ar.db.query = real
+        self.assertFalse(out["ranking_complete"])
+        self.assertIn("NOT RELIABLE", out["note"])
+        self.assertIn("Narrow the window", out["note"])
+
+    def test_still_buying_uses_calendar_months_as_well(self) -> None:
+        out = self.ar.top_billing_customers(
+            business_unit=BU, as_of_date="2026-08-12",
+            active_within_months=3, display_currency="USD")
+        self.assertEqual(out["active_since"], "2026-05-12")
+        for row in out["customers"]:
+            self.assertGreaterEqual(row["last_invoice_dt"], "2026-05-12")
+
+
 if __name__ == "__main__":
     unittest.main()
