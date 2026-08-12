@@ -142,6 +142,84 @@ class AgingTests(unittest.TestCase):
         self.assertIn("Single-customer", out["corporate_families"]["note"])
 
 
+class HierarchyTests(unittest.TestCase):
+    """The grouping itself, at the shapes real master data contains.
+
+    Every case here was found by an adversarial pass over the first draft,
+    and every one of them produced a wrong combined exposure that looked
+    exactly as authoritative as a right one.
+    """
+
+    @staticmethod
+    def _row(cid, parent, total, name=None, disputed=0.0):
+        return {"cust_id": cid, "name": name or cid, "total": total,
+                "corporate_parent": parent, "disputed_amt": disputed}
+
+    def test_a_three_level_chain_is_ONE_family(self) -> None:
+        # Grouping one hop deep put the middle company in two families and
+        # reported the top group short by everything beneath it.
+        out = _families([self._row("TOP", "TOP", 1000),
+                         self._row("MID", "TOP", 500),
+                         self._row("LEAF", "MID", 200)], 1700.0)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["corporate_parent"], "TOP")
+        self.assertEqual(out[0]["member_count"], 3)
+        self.assertEqual(out[0]["combined_total"], 1700.0)
+
+    def test_a_pointer_cycle_lands_everyone_in_one_family(self) -> None:
+        # A owns B owns A exists in master data. Breaking the loop at a
+        # different place for each of them is the same bug in a costume.
+        out = _families([self._row("A", "B", 10), self._row("B", "A", 20)],
+                        30.0)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["member_count"], 2)
+
+    def test_a_group_is_never_labelled_with_a_members_name(self) -> None:
+        # A holding company with no open items is not "Globex - West".
+        out = _families([self._row("C9", "C1", 60, "Globex - West"),
+                         self._row("C8", "C1", 40, "Globex - East")], 100.0)
+        self.assertIsNone(out[0]["name"])
+        self.assertTrue(out[0]["parent_has_no_open_items"])
+
+    def test_a_members_credit_cannot_inflate_the_concentration(self) -> None:
+        # Dividing the largest member by the NETTED total published 805.7%
+        # as a concentration measure — and the number guard certifies it,
+        # because a rate a tool declared is a rate the guard trusts.
+        out = _families([self._row("P", "P", 100_000),
+                         self._row("S", "P", -95_000)], 5_000.0)
+        self.assertEqual(out[0]["largest_member_share_pct"], 100.0)
+
+    def test_an_all_credit_family_reports_no_concentration(self) -> None:
+        out = _families([self._row("P", "P", -1_000),
+                         self._row("S", "P", -4_000)], -5_000.0)
+        self.assertIsNone(out[0]["largest_member_share_pct"])
+        self.assertIsNone(out[0]["share_of_ar_pct"],
+                          "a share of a negative total is not a share")
+
+    def test_nothing_is_dropped_without_saying_so(self) -> None:
+        from pstb.ar import FAMILY_CAP
+        rows = []
+        for i in range(FAMILY_CAP + 4):
+            rows += [self._row(f"P{i:02d}", f"P{i:02d}", 1000 - i),
+                     self._row(f"S{i:02d}", f"P{i:02d}", 10)]
+        self.assertEqual(len(_families(rows, 100000.0)), FAMILY_CAP + 4,
+                         "the helper returns everything; the CALLER caps")
+        block = _ar()._family_block(_families(rows, 1e5)[:FAMILY_CAP],
+                                    FAMILY_CAP + 4, True, False)
+        self.assertTrue(block["truncated"])
+        self.assertEqual(block["families_found"], FAMILY_CAP + 4)
+        self.assertIn(f"of {FAMILY_CAP + 4}", block["note"])
+
+    def test_unknown_is_not_reported_as_no(self) -> None:
+        # The failure this whole feature exists to prevent, made by the
+        # feature itself: telling a site that cannot know that its
+        # customers are unrelated.
+        cannot_know = _ar()._family_block([], 0, False, False)
+        self.assertIn("UNKNOWN", cannot_know["note"])
+        knows = _ar()._family_block([], 0, True, False)
+        self.assertIn("No customer in this aging", knows["note"])
+
+
 class SearchTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -162,10 +240,67 @@ class SearchTests(unittest.TestCase):
                      if c["cust_id"] == "C1011")
         self.assertEqual(c1011["corporate_parent"], "C1011")
 
+    def test_searching_the_PARENT_by_name_also_reveals_the_group(self):
+        # The likelier half of the failure: the parent is what people type,
+        # and its own row cannot say it owns anything — the children are
+        # rows the WHERE clause excluded.
+        out = _ar().search_customers(query="ACME Industrial",
+                                     business_unit=BU)
+        self.assertIn("C1001", out["heads_a_corporate_family"])
+        head = next(c for c in out["customers"] if c["cust_id"] == "C1001")
+        self.assertTrue(head["heads_a_corporate_family"])
+
+    def test_a_site_without_the_column_pays_nothing_for_the_lookup(self):
+        class NoCorporate(Database):
+            def columns(self, table):
+                cols = super().columns(table)
+                return ({c for c in cols if c != "CORPORATE_CUST_ID"}
+                        if table == "PS_CUSTOMER" else cols)
+
+        ar = _ar(NoCorporate)
+        ar.search_customers(query="ACME", business_unit=BU)   # warm
+        seen: list = []
+        original = ar.db.query
+
+        def spy(sql, params=None, **kw):
+            seen.append(sql)
+            return original(sql, params, **kw)
+
+        ar.db.query = spy
+        try:
+            out = ar.search_customers(query="ACME", business_unit=BU)
+        finally:
+            ar.db.query = original
+        self.assertEqual(len(seen), 1, seen)
+        self.assertNotIn("heads_a_corporate_family", out)
+
     def test_a_lone_customer_gets_no_next_step(self) -> None:
         out = _ar().search_customers(query="Harborview", business_unit=BU)
         self.assertTrue(out["customers"])
         self.assertNotIn("next_step", out)
+
+
+class CustomerARTests(unittest.TestCase):
+    """The tool the prompt routes "what does X owe" to, and where it stops."""
+
+    def test_the_balance_says_whether_it_is_the_whole_company(self) -> None:
+        out = _ar().customer(customer="C1001", business_unit=BU)
+        fam = out["corporate_family"]
+        self.assertEqual(fam["role"], "parent")
+        self.assertIn("legal entity ALONE", fam["next_step"])
+        self.assertIn("get_customer_financial_360", fam["next_step"])
+
+    def test_a_subsidiary_is_told_who_owns_it(self) -> None:
+        fam = _ar().customer(customer="C1009",
+                             business_unit=BU)["corporate_family"]
+        self.assertEqual(fam["role"], "subsidiary")
+        self.assertEqual(fam["corporate_parent"], "C1001")
+
+    def test_a_standalone_customer_gets_no_family_block(self) -> None:
+        # Silence is the honest answer, and a block on every customer would
+        # teach people to ignore it.
+        self.assertNotIn("corporate_family",
+                         _ar().customer(customer="C1007", business_unit=BU))
 
 
 class PromptTests(unittest.TestCase):
@@ -192,10 +327,19 @@ class PromptTests(unittest.TestCase):
         self.assertIn("CORPORATE_CUST_ID", self.text)
         self.assertIn("NEVER from names looking alike", self.text)
 
+    def test_the_wide_route_resolves_the_name_before_the_id(self) -> None:
+        # get_customer_financial_360 takes a cust_id, not a name. Routing
+        # "tell me about ACME Industrial" straight at it invites a guessed
+        # id and a customer_not_found.
+        wide = self.text[self.text.index("ONE named customer"):]
+        self.assertIn("search_customers to turn the NAME into a cust_id",
+                      wide[:900])
+
     def test_the_payload_keys_that_signal_a_family_are_named(self) -> None:
         # A prompt that describes the idea but not the key the model will
         # actually see is a prompt the model cannot act on.
         for key in ("corporate_parent", "belongs_to_a_corporate_family",
+                    "heads_a_corporate_family", "corporate_family",
                     "corporate_families"):
             self.assertIn(key, self.text)
 
@@ -248,6 +392,24 @@ class NextStepTests(unittest.TestCase):
                                               set()), [])
         self.assertEqual(_observed_next_steps("get_ar_aging", {"x": object()},
                                               "", BU, set()), [])
+
+    def test_it_does_not_send_the_model_back_for_what_the_turn_ran(self):
+        # The 360 for C1004 and an aging in the same batch: the aging would
+        # otherwise point at the 360 for C1004, which is already on screen.
+        already = {("get_customer_financial_360", "C1004")}
+        steps = _observed_next_steps(
+            "get_ar_aging", self.ar.aging(business_unit=BU), "", BU, set(),
+            already)
+        self.assertNotIn(
+            "Show the complete financial picture for customer C1004",
+            [s["ask"] for s in steps])
+
+    def test_one_customers_AR_produces_pointers_too(self) -> None:
+        # get_customer_ar reports its customer under a singular key, so the
+        # rule registered for it silently found nothing for half its tools.
+        one = self.ar.customer(customer="C1004", business_unit=BU)
+        self.assertTrue(_observed_next_steps("get_customer_ar", one, "", BU,
+                                             set()))
 
     def test_a_clean_result_gets_no_pointers(self) -> None:
         self.assertEqual(_observed_next_steps(

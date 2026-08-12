@@ -34,6 +34,7 @@ called on demand — nothing here runs at page load.
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from .ar import ARBilling, ARError, _NONBLANK, _iso, _iso_opt
@@ -634,11 +635,15 @@ class Relationships:
             edge(f"PAY:{app['deposit_id']}:{app['payment_seq']}",
                  f"ITEM:{app['item']}", "APPLIED_TO")
 
-        mapped = {"items": min(len(items["items"]), SHOWN_ROWS),
-                  "bills": min(len(billing["not_yet_finalized"]),
-                               SHOWN_ROWS),
-                  "payments": min(len(cash.get("payments") or []),
-                                  SHOWN_ROWS)}
+        # Count the nodes that exist, not the rows that were offered: the
+        # credit/rebill chain adds bills the pipeline slice never saw, and
+        # a node whose id repeats is stored once. Disclosure that is
+        # re-derived from the inputs is disclosure of the wrong number.
+        kinds = Counter(n["type"] for n in nodes)
+        mapped = {"items": kinds["Receivable"],
+                  "bills": kinds["Bill"] + kinds["Credit"] + kinds["Rebill"],
+                  "payments": kinds["Payment"],
+                  "customers": kinds["Customer"]}
         return {"nodes": nodes, "edges": edges,
                 "truncated": (len(seen) >= NODE_CAP
                               or len(items["items"]) > SHOWN_ROWS

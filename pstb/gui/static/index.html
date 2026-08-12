@@ -1901,8 +1901,11 @@ function renderAging(d){
   const fam=(d.corporate_families&&d.corporate_families.families)||[];
   if(fam.length){
     const fc=el('div','card');
-    fc.append(el('h2',null,'Corporate families <span class="sub">'+fam.length+
-      ' group'+(fam.length===1?'':'s')+
+    const cf=d.corporate_families||{};
+    const found=(cf.families_found!=null?cf.families_found:fam.length);
+    fc.append(el('h2',null,'Corporate families <span class="sub">'+
+      (cf.truncated?'the '+fam.length+' largest of '+found
+                   :found+' group'+(found===1?'':'s'))+
       ' · from the hierarchy in the system, never matched by name</span>'));
     const ft=el('table');
     ft.innerHTML='<thead><tr><th>Group</th><th>Companies</th>'+

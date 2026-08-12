@@ -322,14 +322,13 @@
       },
       "expect": {
         "any_tool": [
-          "get_customer_financial_360",
-          "search_customers"
+          "get_customer_financial_360"
         ],
         "not_tool": [
           "run_sql"
         ],
         "not_refused": true,
-        "_why": "the relationship layer has to fire without being asked for by name. A wide question about one customer routes to the 360, or at minimum resolves the name first \u2014 search_customers then reports that ACME is a corporate family and points at the 360."
+        "_why": "the relationship layer has to fire without being asked for by name. A preceding search_customers call is fine \u2014 any_tool is 'at least one of' \u2014 but the turn must reach the 360, which is the routing this case exists to hold."
       }
     },
     {

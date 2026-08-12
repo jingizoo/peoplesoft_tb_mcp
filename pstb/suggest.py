@@ -193,8 +193,13 @@ def _from_ar_aging(p: dict, ctx: Context) -> list:
             severity=BOOKS_DISAGREE))
 
     disp = str(p.get("display_currency") or "")
-    customers = [c for c in (p.get("customers") or [])
-                 if _num(c.get("total")) > 0]
+    # get_customer_ar is shape-identical except that its one customer sits
+    # under "customer", singular. The rule is registered for both tools, so
+    # without this it silently found nothing for half of them.
+    rows = list(p.get("customers") or [])
+    if not rows and isinstance(p.get("customer"), dict):
+        rows = [p["customer"]]
+    customers = [c for c in rows if _num(c.get("total")) > 0]
     if customers:
         worst = max(customers, key=lambda c: _num(c.get("total")))
         cid = str(worst.get("cust_id") or "")
@@ -212,8 +217,7 @@ def _from_ar_aging(p: dict, ctx: Context) -> list:
                 evidence_from="get_ar_aging",
                 amount=_num(worst.get("total")), currency=disp,
                 severity=FOLLOW_UP))
-    disputed = [c for c in (p.get("customers") or [])
-                if _num(c.get("disputed_amt"))]
+    disputed = [c for c in rows if _num(c.get("disputed_amt"))]
     if disputed:
         worst = max(disputed, key=lambda c: abs(_num(c.get("disputed_amt"))))
         out.append(Suggestion(

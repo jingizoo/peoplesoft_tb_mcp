@@ -192,8 +192,12 @@ def _truncate_json(text: str, limit: int) -> str:
     return out if len(out) <= limit else out[:limit] + "\n...[truncated]"
 
 
+_ID_ARGS = ("cust_id", "customer", "customer_id", "vendor_id", "account",
+            "invoice", "invoice_id")
+
+
 def _observed_next_steps(name: str, parsed: dict, question: str,
-                         unit: str, seen: set) -> list:
+                         unit: str, seen: set, already=()) -> list:
     """Turn this result's own figures into machine-visible next steps.
 
     The suggestion rules already read tool payloads and produce a finding
@@ -208,11 +212,17 @@ def _observed_next_steps(name: str, parsed: dict, question: str,
     any failure — a next step is never worth an answer.
     """
     try:
-        from ..suggest import suggestions_for
+        from ..suggest import _subject, suggestions_for
         out = []
         for s in suggestions_for([(name, parsed)], question=question,
                                  business_unit=unit):
             if s["question"] in seen:
+                continue
+            # suggest.py suppresses "you already ran that" within a single
+            # payload; it cannot see the OTHER calls of the same turn. So a
+            # turn that ran the 360 for C1004 and an aging got told, by the
+            # aging, to go and run the 360 for C1004.
+            if (s["answered_by"], _subject(s["question"])) in already:
                 continue
             seen.add(s["question"])
             out.append({"finding": s["because"], "ask": s["question"],
@@ -403,6 +413,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # One pointer per turn, not one per tool that noticed the same
     # thing: aging and the 360 both spot an unapplied deposit.
     observed_seen: set = set()
+    # (tool, id) this turn already ran, so a pointer never sends the model
+    # back for something it has.
+    observed_asked: set = set()
     required_financial_domains = question_financial_domains(user_text)
     # Tell the provider whether this question should open with a tool call.
     # The Gemini provider forces function-calling mode ANY on that first
@@ -645,6 +658,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 continue
             outcomes = await asyncio.gather(
                 *(run_call(i, c) for i, c in phase))
+            # What this batch already answered, before any of it is drained
+            # — the first result must not be told to go and fetch the
+            # fourth, which the model requested in the same breath.
+            for _o in outcomes:
+                for _k in _ID_ARGS:
+                    _v = (_o[2] or {}).get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        observed_asked.add((_o[1].name, _v.strip()))
             for (index, call, effective_args, blocked, out, elapsed_ms,
                  was_scope_block) in sorted(outcomes, key=lambda o: o[0]):
                 if was_scope_block:
@@ -703,7 +724,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                             steps = _observed_next_steps(
                                 call.name, parsed, user_text,
                                 str(effective_args.get("business_unit") or ""),
-                                observed_seen)
+                                observed_seen, observed_asked)
                             if steps:
                                 parsed["observed_next_steps"] = steps
                                 parsed["observed_next_steps_note"] = (

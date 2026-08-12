@@ -117,6 +117,7 @@ class QueryBudgetTests(unittest.TestCase):
         # budgets at all — the exact drift the speed gate exists to stop.
         from pstb.ar import ARBilling
         from pstb.modules import ModulePacks
+        from pstb.relationships import Relationships
         ar = ARBilling(self.engine)
         modules = ModulePacks(self.engine)
         for name, budget, fn in [
@@ -136,6 +137,22 @@ class QueryBudgetTests(unittest.TestCase):
                                                 as_of_date="2026-08-06")),
             ("get_invoice_totals", 1,
              lambda: ar.invoice_totals(business_unit="US001")),
+            # The relationship layer. search_customers costs ONE more than
+            # it used to: the row carries its own corporate_parent, but
+            # whether a customer OWNS anyone lives in rows the WHERE clause
+            # excluded, and the parent is what people type. Deliberate, and
+            # budgeted here so the next one is not.
+            ("search_customers", 2,
+             lambda: ar.search_customers(query="ACME",
+                                         business_unit="US001")),
+            # search_customers (2) + aging for one customer (4).
+            ("get_customer_ar", 6,
+             lambda: ar.customer(customer="C1001", business_unit="US001",
+                                 as_of_date="2026-08-06")),
+            ("get_customer_financial_360", 11,
+             lambda: Relationships(ar).customer_financial_360(
+                 cust_id="C1001", business_unit="US001",
+                 as_of_date="2026-08-06")),
             # Two entries, because the branches genuinely differ and one
             # cannot cover both. Splitting by a chartfield is FREE — extras
             # only widen the SELECT and GROUP BY of a fetch that happens
@@ -193,6 +210,32 @@ class GuardCeilingTests(unittest.TestCase):
         self.assertTrue(any("987" in f for f in invented),
                         "the ceiling test must still exercise a real "
                         "detection, not just timing")
+
+    def test_the_family_rollup_stays_linear_in_customers(self) -> None:
+        """The rollup runs inside every aging, on every customer row.
+
+        Looking the parent up by walking the customer list once per group
+        is quadratic, and quadratic is invisible on a 9-customer sample and
+        822 ms on a real one — the exact shape of every "why is this slow"
+        report this project has had. The query gate above cannot see it:
+        the rollup issues no query at all.
+        """
+        from pstb.ar import _families
+        rows = []
+        for i in range(10_000):
+            parent = f"P{i // 3:05d}"
+            rows.append({"cust_id": f"C{i:05d}", "name": f"C{i}",
+                         "total": 100.0 + i, "disputed_amt": 0.0,
+                         "corporate_parent": parent})
+        t0 = time.perf_counter()
+        out = _families(rows, 1_000_000.0)
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.5,
+                        f"the family rollup took {elapsed:.2f}s on 10,000 "
+                        "customers — it runs inside every aging and issues "
+                        "no query, so nothing else in this file would catch "
+                        "it going quadratic")
+        self.assertTrue(out, "the timing must exercise a real grouping")
 
     def test_attribution_adds_one_walk_not_a_second_pass_per_figure(self):
         """The attribution guard also runs on every answer, and it reads
