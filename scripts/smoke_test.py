@@ -1324,8 +1324,12 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the timing run stays behind an explicit button",
           "include_timings=" in _script and "onclick=()=>go(true)" in _script,
           "the slow close-readiness measurement lost its explicit gate")
+    # Was pinned to clipboard.writeText directly, which is the call that
+    # does not exist for a colleague on the network bind. The property that
+    # matters is that the summary is copyable, through the shared helper
+    # that has a fallback.
     check("the DBA summary is copyable text",
-          "clipboard.writeText(d.dba_summary)" in _script,
+          "copyText(d.dba_summary" in _script,
           "the copy-paste DBA summary is gone")
     check("the diagnostics tab shows the question-log report",
           "renderQlogReport" in _script and "/api/question-report" in _script,
@@ -1400,6 +1404,31 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           not _untested,
           "chips with no eval case: " + "; ".join(_untested))
     check("the page suggests a healthy breadth", len(_chips) >= 10)
+
+    # Copy has to work for the COLLEAGUE, not just the developer.
+    # navigator.clipboard is undefined outside a secure context, and the
+    # default bind is now plain HTTP on 0.0.0.0:8016 — so on every machine
+    # except localhost the modern API is simply absent. A copy button that
+    # silently does nothing is worse than no copy button, and it is exactly
+    # the bug nobody catches locally.
+    check("clipboard use is guarded by a secure-context check",
+          "navigator.clipboard&&window.isSecureContext" in _html)
+    check("there is an execCommand fallback for plain HTTP",
+          "document.execCommand('copy')" in _html)
+    # One call site, inside the one helper that guards it. A second one
+    # added later is how the fallback gets bypassed without anyone noticing.
+    _copy_fn = _html[_html.find("function copyText("):
+                     _html.find("function selectNodeText(")]
+    check("navigator.clipboard has exactly one call site",
+          _html.count("navigator.clipboard.writeText(") == 1,
+          f"found {_html.count('navigator.clipboard.writeText(')}")
+    check("that call site is inside the guarded helper",
+          "navigator.clipboard.writeText(" in _copy_fn
+          and "window.isSecureContext" in _copy_fn)
+    check("a refused copy leaves the text selectable instead of silent",
+          "selectNodeText" in _html and "Press Ctrl+C" in _html)
+    check("tables copy as TSV, which a spreadsheet splits into columns",
+          "function tableToTsv" in _html and "join('\\t')" in _html)
 
     check("the concept register holds exactly its one evidenced seed",
           list(_SEEDS) == ["billing_invoiced"],
