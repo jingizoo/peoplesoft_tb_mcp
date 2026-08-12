@@ -1124,7 +1124,34 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
         scope["fiscal_year"] = fiscal_year
     if period is not None:
         scope["period"] = period
+    # The chip's period reached the LEDGER tools and stopped there. AR,
+    # Billing and AP do not filter on FISCAL_YEAR/ACCOUNTING_PERIOD — they
+    # take a DATE — so with FY2025 P12 selected the trial balance showed
+    # 2025 and the receivables beside it showed today, with nothing on
+    # screen admitting the two were different moments. Resolve the period
+    # to its end date here, where the calendar is actually reachable.
+    end = _period_end_date(fiscal_year, period)
+    if end:
+        scope["as_of_date"] = end
     return scope
+
+
+def _period_end_date(fiscal_year, period) -> str:
+    """The last day of a fiscal period, or "" when the calendar cannot say.
+
+    Best effort on purpose: a site whose calendar record is not granted
+    keeps the behaviour it has today (each tool's own default) rather than
+    losing the whole scope. Cheap on repeat — list_periods is cached.
+    """
+    if not fiscal_year or not period:
+        return ""
+    try:
+        for row in engine.list_periods(int(fiscal_year)).get("periods") or []:
+            if int(row.get("period") or 0) == int(period):
+                return str(row.get("end_dt") or "")[:10]
+    except Exception:                       # noqa: BLE001
+        return ""
+    return ""
 
 
 def _question_requires_scope(message: str) -> bool:
