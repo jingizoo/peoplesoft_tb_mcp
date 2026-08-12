@@ -26,12 +26,10 @@ CLOSE_PERIOD = 999
 INTERNAL_ROW_CAP = 100_000
 SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
 SCOPE_PROBE_CAP = 250
-# The per-BU fallback is serial and each statement is a full network round
-# trip, so its cost is (units x one DISTINCT over the ledger). Forty units
-# at three seconds is two minutes, and the loop would attempt 250. A wall
-# clock is the only honest bound: the cost per unit is a property of THEIR
-# instance, not something this code can predict.
-SCOPE_FALLBACK_BUDGET_SECONDS = 20.0
+# Unit x ledger combinations the grid probe will consider. Each batch of 50
+# is one statement of short-circuiting EXISTS, so this is 80 statements at
+# the ceiling — bounded, and nothing like the per-unit DISTINCT it replaced.
+SCOPE_GRID_CAP = 4_000
 GRAPH_MAX_HOPS = 4          # max existence probes when filtering the catalog
 SCOPE_BATCH = 50               # pairs verified per round trip
 SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balances
@@ -92,7 +90,6 @@ class TBEngine:
         # about how. Set by _ledger_scope_pairs, read into the payload.
         self._scope_source = ""
         self._scope_note = ""
-        self._scope_probe_cursor = 0
         # The MCP server is a SEPARATE PROCESS from the GUI, so the GUI's
         # 900s catalog cache does nothing for a model that calls
         # list_financial_scopes mid-conversation: every call rebuilt from
@@ -208,12 +205,21 @@ class TBEngine:
         """The dialect's one-row source for a bare SELECT."""
         return "DUAL" if self.db.dialect == "oracle" else "(SELECT 1) AS _one"
 
-    def _with_ledger_data(self, pairs: list) -> list:
+    def _with_ledger_data(self, pairs: list, cap: int = 0,
+                          keep_all_on_empty: bool = True) -> list:
         """Drop catalog entries that carry no ledger rows, so the UI never
         offers a scope that cannot answer. Probing is capped: past the cap the
         catalog is returned unfiltered rather than paying thousands of
-        round-trips on a very large installation."""
-        if len(pairs) > SCOPE_PROBE_CAP:
+        round-trips on a very large installation.
+
+        ``keep_all_on_empty`` is the difference between two callers. For a
+        SETUP-derived list, everything probing empty almost certainly means
+        the probe is wrong rather than the installation, so the catalog is
+        kept. For a GUESSED list — a grid of candidate ledger names — empty
+        means the guess was wrong, and pretending otherwise would offer
+        every unit a ledger it does not have.
+        """
+        if len(pairs) > (cap or SCOPE_PROBE_CAP):
             return pairs
         # ONE query per batch, not one per pair. Each probe is milliseconds of
         # database work but a full network round trip; on a WAN with a few
@@ -250,6 +256,8 @@ class TBEngine:
                 kept.extend(pair for pair in chunk if pair in found)
             except DbError:
                 kept.extend(chunk)      # cannot prove empty — keep them
+        if not kept and not keep_all_on_empty:
+            return []
         return kept or pairs
 
     def _ledger_scope_pairs(self, verify: bool = True,
@@ -312,44 +320,68 @@ class TBEngine:
         # BY THAT BU — an index range scan on the leading column, not a scan
         # of the whole table. A BU defined in setup but never posted to
         # contributes no pairs, so it is not offered as an answerable scope.
-        self._scope_source = "per-unit-probe"
+        # Ask the ledger which units hold which ledgers WITHOUT a DISTINCT.
+        # This used to run `SELECT DISTINCT LEDGER FROM PS_LEDGER WHERE
+        # BUSINESS_UNIT = :bu` once per unit. DISTINCT cannot short-circuit
+        # — it reads every ledger row belonging to that unit to return three
+        # strings — and measured on a real instance one of those took 43
+        # seconds. Two hundred and fifty of them is the whole complaint.
+        #
+        # The ledger NAMES come from a setup record of tens of rows. Which
+        # unit actually holds each one is then a batched EXISTS per pair,
+        # and EXISTS stops at the first row. Same answer, and the per-pair
+        # cost stops depending on how much was posted.
+        self._scope_source = "bu-grid-probe"
         try:
             rows, truncated = self.db.query(q.scope_bu_list(self.db), {},
                                             max_rows=SCOPE_ROW_CAP)
             bus = [str(r.get("business_unit") or "").strip() for r in rows]
             bus = [b for b in bus if b][:SCOPE_PROBE_CAP]
-            # Start where the LAST call stopped, so a budget that runs out
-            # does not mean the same first units forever and the rest never.
-            start = self._scope_probe_cursor % len(bus) if bus else 0
-            order = bus[start:] + bus[:start]
-            pairs, done, deadline = [], 0, (
-                time.monotonic() + SCOPE_FALLBACK_BUDGET_SECONDS)
-            for bu in order:
-                if done and time.monotonic() > deadline:
-                    break
-                led_rows, _ = self.db.query(q.ledgers_for_bu(self.db),
-                                            {"bu": bu}, max_rows=200)
-                done += 1
-                for lr in led_rows:
-                    led = str(lr.get("ledger") or lr.get("l") or "").strip()
-                    if led:
-                        pairs.append((bu, led))
-            self._scope_probe_cursor = (start + done) % (len(bus) or 1)
-            if done < len(bus):
-                truncated = True
-                self._scope_note += (
-                    f" It covered {done} of {len(bus)} business units "
-                    f"within {SCOPE_FALLBACK_BUDGET_SECONDS:.0f}s; the rest "
-                    "are NOT in this catalog and the next call resumes "
-                    "where this one stopped.")
-            if pairs:
-                return pairs, truncated
+            names = self._candidate_ledger_names()
+            if bus and names:
+                grid = [(bu, led) for bu in bus for led in names]
+                if len(grid) > SCOPE_GRID_CAP:
+                    grid = grid[:SCOPE_GRID_CAP]
+                    truncated = True
+                    self._scope_note += (
+                        f" The unit x ledger grid was cut at "
+                        f"{SCOPE_GRID_CAP} combinations.")
+                pairs = self._with_ledger_data(grid, cap=SCOPE_GRID_CAP,
+                                               keep_all_on_empty=False)
+                if pairs:
+                    self._scope_note += (
+                        f" It probed {len(bus)} business units against "
+                        f"{len(names)} ledger names from setup.")
+                    return pairs, truncated
         except DbError as e:
-            self._scope_note += f" The per-unit probe also failed ({e})."
+            self._scope_note += f" The grid probe also failed ({e})."
 
         # Last resort: the balance table itself. Capped, and slow by nature.
         self._scope_source = "ledger-scan"
         return _collect(q.financial_scope_pairs(self.db), SCOPE_ROW_CAP)
+
+    def _candidate_ledger_names(self) -> list:
+        """Ledger names to probe for, cheapest source first.
+
+        Never the balance table: producing this list from PS_LEDGER is the
+        very scan the grid probe exists to avoid. If setup cannot answer,
+        the configured ledger alone is still enough to find the scopes that
+        matter, and the caller falls through to the single installation-wide
+        DISTINCT if even that finds nothing.
+        """
+        names: list = []
+        try:
+            rows, _ = self.db.query(q.ledger_names_setup(self.db), {},
+                                    max_rows=200)
+            names = [str(r.get("ledger") or "").strip() for r in rows]
+            names = [n for n in names if n]
+        except DbError:
+            self._scope_note += (" PS_LED_GRP_TBL could not be read either, "
+                                 "so only the configured ledger was probed.")
+        cfg_led = (self.cfg.defaults.ledger or "").strip()
+        if cfg_led and cfg_led not in names:
+            names.insert(0, cfg_led)
+        return names
 
     def _effective_defaults_from_pairs(
         self, pairs: list[tuple[str, str]]
@@ -431,10 +463,54 @@ class TBEngine:
         now = time.monotonic()
         if self._eff_defaults is not None and now < self._eff_defaults_expires_at:
             return self._eff_defaults
+
+        # CONFIRM the configured pair before DISCOVERING an alternative to
+        # it. Every AR aging, every close-readiness and every tool that
+        # resolves an omitted business unit lands here, and it was building
+        # the entire BU/ledger catalog to answer "is US001 ACTUALS real?".
+        # On an instance whose setup grants are missing that means one
+        # DISTINCT over PS_LEDGER per business unit — measured on a real
+        # box at 268 statements and 355 seconds inside a single aging call.
+        # The configured pair is right on almost every installation, and
+        # confirming it is ONE existence probe that stops at the first row.
+        cfg_bu = (self.cfg.defaults.business_unit or "").strip()
+        cfg_led = (self.cfg.defaults.ledger or "").strip()
+        if cfg_bu and cfg_led:
+            try:
+                if self._pair_has_data(cfg_bu, cfg_led):
+                    return self._remember_effective_defaults({
+                        "business_unit": cfg_bu,
+                        "ledger": cfg_led,
+                        # From SETUP only. Asking the balance table which
+                        # other ledgers this unit has is the very query
+                        # this fast path exists to avoid.
+                        "ledgers": self._setup_ledgers(cfg_bu) or [cfg_led],
+                        "discovered": False,
+                        "notes": [],
+                    })
+            except DbError:
+                pass    # fall through and discover, as before
+
         pairs, _ = self._ledger_scope_pairs()
         return self._remember_effective_defaults(
             self._effective_defaults_from_pairs(pairs)
         )
+
+    def _setup_ledgers(self, bu: str) -> list:
+        """This unit's ledgers from the setup records, or nothing.
+
+        Deliberately never falls back to PS_LEDGER: the caller is on the
+        path that must not pay for discovery, and an incomplete ledger list
+        costs a dropdown entry while a DISTINCT over the balance table
+        costs half a minute.
+        """
+        try:
+            rows, _ = self.db.query(q.ledgers_for_bu_setup(self.db),
+                                    {"bu": bu}, max_rows=50)
+        except DbError:
+            return []
+        return [str(r.get("ledger") or "").strip() for r in rows
+                if str(r.get("ledger") or "").strip()]
 
     def warm_effective_defaults(self) -> Optional[dict]:
         """The discovered defaults IF they are already known, else None.
@@ -499,6 +575,27 @@ class TBEngine:
         bu = (business_unit or "").strip()
         if not bu:
             return self.effective_defaults()["ledger"]
+        # Same shape as effective_defaults: CONFIRM before you DISCOVER.
+        # list_ledgers falls back to a DISTINCT over PS_LEDGER when the
+        # setup grant is missing, and that statement was measured at 43
+        # seconds on the reporting instance. Asking whether the configured
+        # ledger has rows for this unit is one probe that stops at the
+        # first row, and it is the right answer almost every time.
+        configured = (self.cfg.defaults.ledger or "").strip()
+        # Only when list_ledgers would MISS: a warm catalog already knows
+        # the answer for free, and probing anyway would trade a cached
+        # lookup for a round trip on the hottest path in the app.
+        if configured and bu not in self._ledgers_cache:
+            key = ("confirm-led", bu, configured)
+            hit = self._resolve_cache.get(key)
+            if hit is None:
+                try:
+                    hit = self._pair_has_data(bu, configured)
+                except DbError:
+                    hit = False
+                self._resolve_cache[key] = hit
+            if hit:
+                return configured
         # Go through the cached accessor: this and list_ledgers were issuing
         # the same statement separately, and on a WAN every duplicate is a
         # full round trip the user waits on.

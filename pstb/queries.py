@@ -684,6 +684,19 @@ def ledgers_for_bu_setup(db: Database) -> str:
  ORDER BY G.LEDGER"""
 
 
+def ledger_names_setup(db: Database) -> str:
+    """Every ledger this installation defines — tens of rows, from setup.
+
+    The name list is all a grid probe needs: which units actually HOLD each
+    ledger is then one short-circuiting EXISTS per pair, instead of one
+    unbounded DISTINCT over the balance table per unit.
+    """
+    return f"""SELECT DISTINCT LEDGER AS ledger
+  FROM {db.prefix}PS_LED_GRP_TBL
+ WHERE LEDGER IS NOT NULL
+ ORDER BY LEDGER"""
+
+
 def ledgers_for_bu(db: Database) -> str:
     """LAST RESORT: the same question asked of the balance table.
 
