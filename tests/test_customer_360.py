@@ -300,12 +300,11 @@ class RefusalTests(unittest.TestCase):
                                               business_unit=BU)
         self.assertEqual(out["scope_status"], "customer_not_found")
         self.assertIn("NO DATA", out["detail"])
-        self.assertIn("C1001", out["known_customer_ids"])
 
     def test_no_customer_at_all_is_refused_with_the_way_forward(self):
-        with self.assertRaises(ARError) as ctx:
-            self.rel.customer_financial_360(business_unit=BU)
-        self.assertIn("search_customers", str(ctx.exception))
+        out = self.rel.customer_financial_360(business_unit=BU)
+        self.assertEqual(out["scope_status"], "customer_required")
+        self.assertIn("name", out["detail"])
 
     def test_the_tool_is_gated_by_business_unit(self) -> None:
         restricted = Access(oprid="FIN_US001", units=frozenset({"US001"}))

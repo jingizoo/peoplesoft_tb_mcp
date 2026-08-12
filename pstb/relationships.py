@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .ar import ARBilling, ARError, _NONBLANK, _iso, _iso_opt
 from .db import DbError
-from .engine import r2
+from .engine import r2, resolve_party_ref
 
 # A corporate family with more members than this is a group structure, not
 # a customer question; the answer would be a wall of rows either way.
@@ -787,11 +787,6 @@ class Relationships:
                                include_family: bool = True,
                                months: int = 12,
                                as_of_date: str = "") -> dict:
-        cust = (cust_id or "").strip()
-        if not cust:
-            raise ARError(
-                "customer_financial_360 needs a customer ID. Use "
-                "search_customers to find one by name.")
         bu = self.ar._bu(business_unit)
         asof = self.ar._asof(as_of_date)
         setid = self.e.resolve_setid(bu, "CUSTOMER")
@@ -799,19 +794,43 @@ class Relationships:
         since = (_iso(asof) - dt.timedelta(days=window * 31)).isoformat()
         notes: list = []
 
-        family = self._family(setid, cust, include_family, notes)
-        if not family:
-            known, _ = self.db.query(
-                f"SELECT CUST_ID AS cid FROM {self.db.prefix}PS_CUSTOMER "
-                "WHERE SETID = :setid ORDER BY CUST_ID",
-                {"setid": setid}, max_rows=15)
-            return {
-                "scope_status": "customer_not_found",
-                "detail": f"Customer {cust!r} does not exist in SETID "
-                          f"{setid!r}. This is NO DATA, not a zero balance.",
-                "business_unit": bu, "setid": setid,
-                "known_customer_ids": [str(r["cid"]) for r in known],
-            }
+        # cust_id is what the caller HAS, which for a person asking about a
+        # company is its NAME. Compare it to CUST_ID and stop, and "revenue
+        # for CIBC" comes back "does not exist" for a customer that does.
+        #
+        # The id is tried FIRST, on the anchor read this needs anyway, so
+        # the common path costs exactly what it did before: no search, no
+        # extra round trip, and no dependence on the records search_
+        # customers joins — an id lookup must not start failing because
+        # PS_ITEM is unreadable. Only a miss falls through to the name.
+        cust = (cust_id or "").strip()
+        probe: list = []
+        family = self._family(setid, cust, include_family, probe) if cust \
+            else []
+        if family:
+            notes.extend(probe)
+        else:
+            cust, read_as, refusal = resolve_party_ref(
+                cust_id,
+                lambda term: self.ar.search_customers(
+                    term, limit=10, business_unit=bu)["customers"],
+                "cust_id", "customer")
+            if refusal:
+                refusal.update({"business_unit": bu, "setid": setid})
+                return refusal
+            if read_as:
+                notes.append(read_as)
+            family = self._family(setid, cust, include_family, notes)
+            if not family:
+                # Search saw it, the anchor read did not: a row outside this
+                # SETID, or one the scope cannot see.
+                return {
+                    "scope_status": "customer_not_found",
+                    "detail": f"Customer {cust!r} does not exist in SETID "
+                              f"{setid!r}. This is NO DATA, not a zero "
+                              "balance.",
+                    "business_unit": bu, "setid": setid,
+                }
         ids = [m["cust_id"] for m in family]
 
         # The branches read different records and do not depend on each

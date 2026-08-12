@@ -75,6 +75,83 @@ def _dr_cr(ending: float) -> tuple[float, float]:
     return (r2(ending), 0.0) if ending >= 0 else (0.0, r2(-ending))
 
 
+def resolve_party_ref(term: str, search, id_key: str, label: str) -> tuple:
+    """Turn what a person typed — an id, a full name, or a fragment — into
+    ONE id. Returns (resolved_id, note, refusal); exactly one of resolved_id
+    and refusal is set.
+
+    People name companies, not keys. Asked "what is revenue for CIBC", a
+    model reaches for the tool it was told to use and passes CIBC where an
+    id belongs, because that is the only string it has. A tool that compares
+    that against CUST_ID and stops answers a real customer with "does not
+    exist", which reads as a zero and is the worst possible failure: wrong,
+    confident, and quiet.
+
+    So the lookup is the same one a person would do, in order:
+
+      1. an exact id, which always wins — an id is never a guess;
+      2. an exact NAME, even when a fragment of it matches several others.
+         "ACME Industrial" must not be called ambiguous just because "ACME
+         Logistics Group" exists;
+      3. one fragment match, disclosed in `note` so the answer can say what
+         it resolved rather than quietly substituting a different company;
+      4. several — ASK. Never pick the biggest, the first, or the closest.
+      5. none — retry on the longest word ("CIBC Markets Inc" against a
+         master that says "CIBC MARKETS"), and offer what that finds as
+         did_you_mean. Offered, not applied: a loose match is a suggestion,
+         and substituting one company for another is not a rounding error.
+
+    The search callable is passed in rather than a table name, so the caller
+    keeps its own SETID, business-unit scope and row security. This function
+    touches no database.
+    """
+    t = (term or "").strip()
+    if not t:
+        return "", "", {
+            "scope_status": f"{label}_required",
+            "detail": f"A {label} is required — an id, or a name to look up.",
+        }
+    matches = list(search(t) or [])
+
+    def take(row) -> tuple:
+        rid = str(row.get(id_key) or "")
+        name = str(row.get("name") or "").strip()
+        if rid.upper() == t.upper():
+            return rid, "", None
+        shown = f"{rid} ({name})" if name else rid
+        return rid, f"Read {t!r} as {label} {shown}.", None
+
+    for row in matches:                       # 1. an exact id
+        if str(row.get(id_key) or "").upper() == t.upper():
+            return take(row)
+    named = [r for r in matches               # 2. an exact name
+             if str(r.get("name") or "").strip().upper() == t.upper()]
+    if len(named) == 1:
+        return take(named[0])
+    if len(matches) == 1:                     # 3. one fragment match
+        return take(matches[0])
+    if matches:                               # 4. several — ask
+        return "", "", {
+            "scope_status": f"ambiguous_{label}",
+            "detail": f"{len(matches)} {label}s match {t!r}. Ask which one "
+                      f"is meant, then call again with that id.",
+            "multiple_matches": matches[:10],
+        }
+    # 5. nothing matched the whole string.
+    words = sorted((w for w in re.split(r"[^A-Za-z0-9]+", t) if len(w) > 2),
+                   key=len, reverse=True)
+    loose = list(search(words[0])) if words and words[0].upper() != t.upper() \
+        else []
+    return "", "", {
+        "scope_status": f"{label}_not_found",
+        "detail": f"No {label} matches {t!r} by id or by name. This is NO "
+                  f"DATA, not a zero balance — do not report it as one.",
+        "did_you_mean": [{id_key: str(r.get(id_key) or ""),
+                          "name": r.get("name")} for r in loose[:10]],
+        "searched_by": "id and name",
+    }
+
+
 class TBEngine:
     def __init__(self, db: Database, cfg: Config):
         self.db = db

@@ -328,12 +328,18 @@ class PromptTests(unittest.TestCase):
         self.assertIn("NEVER from names looking alike", self.text)
 
     def test_the_wide_route_resolves_the_name_before_the_id(self) -> None:
-        # get_customer_financial_360 takes a cust_id, not a name. Routing
-        # "tell me about ACME Industrial" straight at it invites a guessed
-        # id and a customer_not_found.
+        # This used to require a search_customers round FIRST, because the
+        # 360 compared cust_id to CUST_ID and a name got customer_not_found.
+        # The tool resolves the name itself now, so the instruction is the
+        # opposite one — and the model is told what the two refusal payloads
+        # mean, since being handed a question it must relay is the case a
+        # rule about calling order never covered.
         wide = self.text[self.text.index("ONE named customer"):]
-        self.assertIn("search_customers to turn the NAME into a cust_id",
-                      wide[:900])
+        self.assertIn("cust_id accepts an id OR a name", wide[:1600])
+        self.assertIn("ambiguous_customer", wide[:1600])
+        self.assertIn("customer_not_found", wide[:1600])
+        self.assertNotIn("search_customers to turn the NAME into a cust_id",
+                         self.text, "a round trip the server now does")
 
     def test_the_payload_keys_that_signal_a_family_are_named(self) -> None:
         # A prompt that describes the idea but not the key the model will

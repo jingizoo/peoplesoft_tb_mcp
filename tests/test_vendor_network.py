@@ -303,14 +303,13 @@ class RefusalTests(_Salted):
     def test_an_unknown_supplier_is_NO_DATA_not_a_zero_balance(self) -> None:
         out = _net().vendor_payables_network(vendor_id="V9999",
                                              business_unit=BU)
-        self.assertEqual(out["scope_status"], "vendor_not_found")
+        self.assertEqual(out["scope_status"], "supplier_not_found")
         self.assertIn("NO DATA", out["detail"])
-        self.assertIn("V1001", out["known_vendor_ids"])
 
     def test_no_supplier_at_all_names_the_way_forward(self) -> None:
-        with self.assertRaises(ModuleError) as ctx:
-            _net().vendor_payables_network(business_unit=BU)
-        self.assertIn("search_vendors", str(ctx.exception))
+        out = _net().vendor_payables_network(business_unit=BU)
+        self.assertEqual(out["scope_status"], "supplier_required")
+        self.assertIn("name", out["detail"])
 
     def test_it_is_gated_by_business_unit(self) -> None:
         restricted = Access(oprid="FIN_US001", units=frozenset({"US001"}))
@@ -360,7 +359,12 @@ class PromptTests(unittest.TestCase):
     def test_the_wide_supplier_question_routes_to_the_network(self) -> None:
         self.assertIn("get_vendor_payables_network", self.text)
         block = self.text[self.text.index("Suppliers work the same way"):]
-        self.assertIn("search_vendors to", block[:900])
+        # No search_vendors round first: vendor_id resolves a name itself,
+        # the same way cust_id does. What the model needs told instead is
+        # what comes back when a name matches several suppliers, or none.
+        self.assertIn("takes an id OR a name", block[:900])
+        self.assertIn("ambiguous_supplier", block[:900])
+        self.assertIn("supplier_not_found", block[:900])
 
     def test_the_prompt_forbids_claiming_to_know_the_value(self) -> None:
         block = self.text[self.text.index("IDENTITY LINKS"):]
