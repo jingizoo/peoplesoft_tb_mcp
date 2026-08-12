@@ -296,6 +296,39 @@
       }
     },
     {
+      "id": "customer-360",
+      "question": "Show the complete financial picture for customer C1001: related companies, current billing, blocked revenue, overdue AR, payments, credits, disputes and anything requiring action.",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_customer_financial_360"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "one customer, everything connected \u2014 the 360 tool answers it in one call. Reaching for ad-hoc SQL means assembling the joins by hand, which is exactly the work the tool exists to have already checked."
+      }
+    },
+    {
+      "id": "customer-360-family",
+      "question": "Which subsidiaries contribute to customer C1001's overdue balance?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_customer_financial_360"
+        ],
+        "not_refused": true,
+        "_why": "the corporate hierarchy question must go to the tool that reads the recorded hierarchy \u2014 grouping customers any other way invents a consolidation."
+      }
+    },
+    {
       "id": "duplicate-payments",
       "question": "Any duplicate vendor payments?",
       "scope": {

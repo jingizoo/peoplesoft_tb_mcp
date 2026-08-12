@@ -25,6 +25,7 @@ from .ar import ARBilling, ARError
 from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
+from .relationships import Relationships
 from .report import ReportError, ReportRunner
 from . import wiki as wiki_mod
 from .wiki import WikiError, make_wiki
@@ -34,6 +35,7 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+relationships = Relationships(ar)
 from .connectors import ConnectorError
 from .connectors import coupa as _coupa_mod
 coupa = _coupa_mod.from_env()
@@ -394,6 +396,27 @@ def get_invoice_lifecycle(business_unit: str = "") -> dict:
     where the site stores creation timestamps; otherwise current stage
     ages are reported and the limitation is disclosed."""
     return _safe(ar.invoice_lifecycle, business_unit=business_unit)
+
+
+@mcp.tool()
+def get_customer_financial_360(cust_id: str = "", business_unit: str = "",
+                               include_family: bool = True,
+                               months: int = 12,
+                               as_of_date: str = "") -> dict:
+    """ONE customer, everything connected: the corporate family, current
+    billing (finalized and still in flight), open receivables with aging
+    and disputes, cash received and how much of it was actually applied,
+    credit/rebill chains and what they netted to, plus a needs_attention
+    list and a node/edge relationship graph. Use for "give me the complete
+    picture for customer X", "what is stuck", "which subsidiaries drive the
+    parent's overdue balance", "is any of their cash unapplied". Family
+    membership comes from the corporate hierarchy recorded in the system —
+    customers are NEVER grouped by name. Totals are per currency and are
+    not added across currencies. For a ranked list of many customers use
+    get_customer_intelligence instead."""
+    return _safe(relationships.customer_financial_360, cust_id=cust_id,
+                 business_unit=business_unit, include_family=include_family,
+                 months=months, as_of_date=as_of_date)
 
 
 @mcp.tool()

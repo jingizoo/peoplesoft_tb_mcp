@@ -852,7 +852,12 @@ def main() -> None:
     # represents an unaffiliated customer.
     FAMILY = {"C1009": "C1001", "C1010": "C1001"}
     customers = customers + [("C1009", "ACME Industrial - West"),
-                             ("C1010", "ACME Industrial - Components")]
+                             ("C1010", "ACME Industrial - Components"),
+                             # Same name, different company. It is its own
+                             # corporate parent, so nothing may fold it into
+                             # the ACME family — the trap that any
+                             # name-similarity match walks straight into.
+                             ("C1011", "ACME Logistics Group")]
     cust_rows = [(SETID, cid, name, "A", SETID, FAMILY.get(cid, cid))
                  for cid, name in customers]
     cust_rows.append((SETID, "C1008", "Harborview Hotels", "I",

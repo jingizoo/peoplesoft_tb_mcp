@@ -1540,6 +1540,7 @@ function renderToolResult(name,data,args){
     if(name==='list_financial_scopes') return renderScopes(data);
     if(name==='run_report') return renderReport(data);
     if(name==='get_customer_intelligence') return renderCustomerIntel(data);
+    if(name==='get_customer_financial_360') return renderCustomer360(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
@@ -1651,6 +1652,151 @@ function renderCustomerIntel(d){
       '<div style="margin:4px 0"><span class="badge '+(cls[o.kind]||'dim')+'">'+esc(o.kind.replace(/_/g,' '))+'</span> '+
       esc(o.text)+'</div>').join('')));
     frag.append(oc);
+  }
+  return frag;
+}
+// One customer, everything connected. The point of the layout is that the
+// four states a receivable can be in — owed, disputed, billed-not-finalized,
+// paid-but-not-applied — sit next to each other. Split across four screens
+// they are four normal-looking numbers; together they are the answer.
+function renderCustomer360(d){
+  if(d.scope_status) return noData(d);
+  const frag=document.createDocumentFragment();
+  const m2=v=>Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const per=(rows,key)=>(rows||[]).map(r=>m2(r[key])+' '+esc(r.currency||'')).join('  ·  ')||'0';
+  const cust=d.customer||{}, fam=d.family||{}, recv=d.receivables||{};
+  const cash=d.cash||{}, bill=d.billing||{}, adj=d.adjustments||{};
+  const loc=[cust.location&&cust.location.city,cust.location&&cust.location.state,
+             cust.location&&cust.location.country].filter(Boolean).join(', ');
+  const members=fam.members||[];
+  const pipeline=(bill.not_yet_finalized||[]).reduce((a,b)=>a+(b.amount||0),0);
+
+  const head=el('div','card');
+  head.append(el('h2',null,esc(cust.name||cust.cust_id||'Customer')+
+    ' <span class="sub">'+esc(cust.cust_id||'')+(loc?' · '+esc(loc):'')+
+    ' · '+esc(d.business_unit||'')+' · as of '+esc(d.as_of_date||'')+'</span>'));
+  head.append(tiles([
+    ['Open receivable', per(recv.totals_by_currency,'open_balance'),
+     (recv.totals_by_currency||[]).reduce((a,r)=>a+(r.open_items||0),0)+' open items','dr'],
+    ['Past due', per(recv.totals_by_currency,'overdue'),
+     'oldest '+((recv.totals_by_currency||[])[0]||{}).oldest_days_past_due+' days','bad'],
+    ['Cash not applied', per(cash.totals_by_currency,'unapplied'),
+     cash.supported===false?'payments not readable here':'received, sitting on deposits','cr'],
+    ['Not yet finalized', pipeline?m2(pipeline):'0',
+     (bill.not_yet_finalized||[]).length+' bills still in billing','']
+  ]));
+  frag.append(head);
+
+  if((d.needs_attention||[]).length){
+    const cls={overdue_receivable:'bad',disputed:'warn',
+      cash_received_not_applied:'warn',credits_not_applied:'warn',
+      credit_not_fully_rebilled:'bad',revenue_not_yet_billed:'warn',
+      aged_item:'bad'};
+    const c=el('div','card');
+    c.append(el('h2',null,'Needs attention <span class="sub">arithmetic over the'+
+      ' records below — not generated advice</span>'));
+    c.append(el('div','pad',(d.needs_attention||[]).map(a=>
+      '<div style="margin:4px 0"><span class="badge '+(cls[a.kind]||'dim')+'">'+
+      esc(a.kind.replace(/_/g,' '))+'</span> '+esc(a.headline)+'</div>').join('')));
+    frag.append(c);
+  }
+
+  if(members.length>1){
+    const c=el('div','card');
+    c.append(el('h2',null,'Corporate family <span class="sub">'+members.length+
+      ' companies · from the hierarchy in the system, never matched by name</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Customer</th><th>Role</th><th>Based in</th>'+
+      '<th class="num">Open</th><th class="num">Past due</th><th class="num">Oldest</th></tr></thead><tbody>'+
+      members.map(m=>{
+        const r=(m.receivables||[]);
+        const l=[m.location&&m.location.city,m.location&&m.location.state].filter(Boolean).join(', ');
+        return '<tr><td><b>'+esc(m.cust_id)+'</b> '+esc(m.name||'')+'</td>'+
+          '<td>'+esc(m.role||'')+'</td><td>'+(l?esc(l):'<span class="sub">n/a</span>')+'</td>'+
+          '<td class="num">'+per(r,'open_balance')+'</td>'+
+          '<td class="num">'+per(r,'overdue')+'</td>'+
+          '<td class="num">'+(r[0]?r[0].oldest_days_past_due+'d':'—')+'</td></tr>';
+      }).join('')+'</tbody>';
+    c.append(t); frag.append(c);
+  }
+
+  const items=recv.largest_open_items||[];
+  if(items.length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Largest open items <span class="sub">aged on '+
+      esc(recv.aging_basis||'')+'</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Item</th><th>Customer</th><th>Due</th>'+
+      '<th class="num">Balance</th><th class="num">Paid down</th>'+
+      '<th class="num">Days late</th><th>Dispute</th></tr></thead><tbody>'+
+      items.map(i=>'<tr><td><b>'+esc(i.item)+'</b></td><td>'+esc(i.cust_id)+'</td>'+
+        '<td>'+esc(i.due_date||'')+'</td>'+
+        '<td class="num">'+m2(i.balance)+' '+esc(i.currency||'')+'</td>'+
+        '<td class="num">'+(i.paid_down?m2(i.paid_down):'—')+'</td>'+
+        '<td class="num">'+(i.days_past_due||'—')+'</td>'+
+        '<td>'+(i.in_dispute?'<span class="badge bad">'+esc(i.dispute_status||'in dispute')+'</span>':'')+'</td></tr>'
+      ).join('')+'</tbody>';
+    const sc=el('div'); sc.style.maxHeight='320px'; sc.style.overflow='auto'; sc.append(t);
+    c.append(sc); frag.append(c);
+  }
+
+  if((adj.chains||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Credit and rebill <span class="sub">what the chain'+
+      ' netted to — invisible one invoice at a time</span>'));
+    c.append(el('div','pad',(adj.chains||[]).map(ch=>
+      '<div style="margin:6px 0"><b>'+esc(ch.original_invoice)+'</b> '+
+      m2(ch.original_amount)+
+      (ch.corrections||[]).map(x=>' → <b>'+esc(x.invoice)+'</b> ('+
+        esc(x.adjustment_type||'adj')+') '+m2(x.amount)).join('')+
+      ' &nbsp;=&nbsp; net '+m2(ch.net_billed)+
+      (ch.given_up?' <span class="badge bad">'+m2(ch.given_up)+' never re-billed</span>':'')+
+      '</div>').join('')));
+    frag.append(c);
+  }
+
+  if((cash.payments||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Payments received <span class="sub">and how much of'+
+      ' each was applied</span>'));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Deposit</th><th>Customer</th><th>Date</th>'+
+      '<th class="num">Received</th><th class="num">Applied</th>'+
+      '<th class="num">Unapplied</th><th>Applied to</th></tr></thead><tbody>'+
+      (cash.payments||[]).map(p=>{
+        const to=(cash.applications||[]).filter(a=>a.deposit_id===p.deposit_id)
+          .map(a=>esc(a.item)).join(', ');
+        return '<tr><td><b>'+esc(p.deposit_id)+'</b></td><td>'+esc(p.cust_id)+'</td>'+
+          '<td>'+esc(p.payment_date||'')+'</td>'+
+          '<td class="num">'+m2(p.amount)+' '+esc(p.currency||'')+'</td>'+
+          '<td class="num">'+m2(p.applied)+'</td>'+
+          '<td class="num">'+(p.unapplied?'<b>'+m2(p.unapplied)+'</b>':'—')+'</td>'+
+          '<td>'+(to||'<span class="sub">nothing</span>')+'</td></tr>';
+      }).join('')+'</tbody>';
+    c.append(t); frag.append(c);
+  }
+
+  const g=d.relationships||{};
+  if((g.edges||[]).length){
+    const label={}; (g.nodes||[]).forEach(n=>{label[n.id]=n.label||n.id;});
+    const kinds={};
+    (g.edges||[]).forEach(e=>{(kinds[e.type]=kinds[e.type]||[]).push(e);});
+    const c=el('div','card');
+    c.append(el('h2',null,'How these are connected <span class="sub">'+
+      (g.nodes||[]).length+' records · '+(g.edges||[]).length+
+      ' links, each from a key column in the records themselves</span>'));
+    c.append(el('div','pad',Object.keys(kinds).map(k=>
+      '<div style="margin:4px 0"><span class="badge dim">'+esc(k.replace(/_/g,' ').toLowerCase())+
+      '</span> '+kinds[k].map(e=>esc(label[e.from]||e.from)+' → '+
+        esc(label[e.to]||e.to)).join(' &nbsp;·&nbsp; ')+'</div>').join('')));
+    frag.append(c);
+  }
+
+  if((d.record_notes||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Notes <span class="sub">what this site could and could not answer</span>'));
+    c.append(el('div','pad',(d.record_notes||[]).map(n=>'<div>'+esc(n)+'</div>').join('')));
+    frag.append(c);
   }
   return frag;
 }
