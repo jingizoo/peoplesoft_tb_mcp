@@ -923,7 +923,10 @@ def get_vendor_payments(business_unit: str = "", vendor: str = "",
     — count, total, last payment date; voids excluded where the record
     carries a status. vendor filters by id or name substring; empty ranks
     all. Use for "how much did we pay X / top vendors by spend / when did we
-    last pay X"."""
+    last pay X". A payment is made by a pay cycle, not by a business unit,
+    so the unit is applied through the voucher cross-reference: check
+    scoped_to_business_unit, and if it is false the totals cover the whole
+    installation — say so rather than naming the unit."""
     return _safe(modules.vendor_payments, business_unit=business_unit,
                  vendor=vendor, months=months, n=n, as_of_date=as_of_date)
 

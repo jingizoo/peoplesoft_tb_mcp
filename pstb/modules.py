@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+from .db import DbError
 from .engine import EngineError, TBEngine, r2
 
 
@@ -58,6 +59,24 @@ class ModulePacks:
 
     def _cols(self, table: str) -> set:
         return self.db.columns(table)
+
+    def _vendor_names(self) -> str:
+        """One row per vendor id, from a record keyed on (SETID, VENDOR_ID).
+
+        Joining PS_VENDOR directly on VENDOR_ID alone is a FAN-OUT: a
+        supplier set up under SHARE and two business SETIDs multiplies every
+        voucher row by three. Downstream that is not a cosmetic error —
+        COUNT(*) > 1 then reports a single voucher as a duplicate payment,
+        and a summed spend triples. It never shows on the bundled sample,
+        which has one SETID.
+
+        MAX(NAME1) rather than a SETID predicate on purpose: the caller has
+        a business unit, not a vendor SETID, and resolving one to the other
+        is a per-BU setup read this join does not need — the name is a
+        label, and the id is the thing that identifies.
+        """
+        return (f"(SELECT VENDOR_ID, MAX(NAME1) AS NAME1 "
+                f"FROM {self.db.prefix}PS_VENDOR GROUP BY VENDOR_ID)")
 
     def _need(self, table: str, columns: list) -> None:
         cols = self._cols(table)
@@ -114,8 +133,7 @@ class ModulePacks:
        {cur} AS currency, {due or 'NULL'} AS due_dt,
        {entry} AS entry_status, {post} AS post_status
   FROM {p}PS_VOUCHER V
-  LEFT JOIN (SELECT VENDOR_ID, MAX(NAME1) AS NAME1 FROM {p}PS_VENDOR
-              GROUP BY VENDOR_ID) N ON N.VENDOR_ID = V.VENDOR_ID
+  LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID
  WHERE V.BUSINESS_UNIT = :bu AND {open_pred}""",
             {"bu": bu}, max_rows=10_000)
 
@@ -198,16 +216,49 @@ class ModulePacks:
             days=max(int(months or 12), 1) * 30)).isoformat()
         self._need("PS_VOUCHER", ["BUSINESS_UNIT", "VOUCHER_ID",
                                   "VENDOR_ID", "GROSS_AMT"])
+        # This tool reads three records, and only one of them was ever
+        # checked. On a site without the payment cross-reference the SELECT
+        # below raised ORA-00942 with no remedy in it, while every sibling
+        # in this file answers a missing record by name.
+        self._need("PS_PYMNT_VCHR_XREF", ["BUSINESS_UNIT", "VOUCHER_ID",
+                                          "PYMNT_ID", "PAID_AMT"])
+        self._need("PS_PAYMENT_TBL", ["PYMNT_ID", "PYMNT_DT"])
         p = self.db.prefix
+        notes: list = []
+        # Optional columns, guarded the way open_payables guards its own.
+        # Timing is the POINT of this tool, so losing DUE_DT has to be said
+        # out loud rather than reported as "no vendor pays early or late".
+        if "DUE_DT" in self._cols("PS_VOUCHER"):
+            due_sel = "V.DUE_DT"
+        else:
+            due_sel = "NULL"
+            notes.append("PS_VOUCHER here has no DUE_DT; days early/late "
+                         "cannot be computed, so avg_days_vs_due is null "
+                         "for every vendor and the early/late observations "
+                         "are withheld — not evidence that payment timing "
+                         "is on time.")
+        if self.db.has_column("PS_VENDOR", "NAME1"):
+            name_sel = "N.NAME1"
+        else:
+            name_sel = "NULL"
+            notes.append("PS_VENDOR here has no NAME1; vendors are "
+                         "identified by ID only.")
+        if self.db.has_column("PS_PAYMENT_TBL", "CURRENCY_CD"):
+            cur_sel = "P.CURRENCY_CD"
+        else:
+            cur_sel = "NULL"
+            notes.append("PS_PAYMENT_TBL here has no CURRENCY_CD; amounts "
+                         "are assumed to be in one currency.")
         rows, _ = self.db.query(
-            f"SELECT V.VENDOR_ID AS vendor_id, N.NAME1 AS vendor, "
-            f"P.PYMNT_DT AS paid_dt, V.DUE_DT AS due_dt, "
-            f"X.PAID_AMT AS amount, P.CURRENCY_CD AS currency "
+            f"SELECT V.VENDOR_ID AS vendor_id, {name_sel} AS vendor, "
+            f"P.PYMNT_DT AS paid_dt, {due_sel} AS due_dt, "
+            f"X.PAID_AMT AS amount, {cur_sel} AS currency "
             f"FROM {p}PS_PYMNT_VCHR_XREF X "
             f"JOIN {p}PS_VOUCHER V ON V.BUSINESS_UNIT = X.BUSINESS_UNIT "
             f"AND V.VOUCHER_ID = X.VOUCHER_ID "
             f"JOIN {p}PS_PAYMENT_TBL P ON P.PYMNT_ID = X.PYMNT_ID "
-            f"LEFT JOIN {p}PS_VENDOR N ON N.VENDOR_ID = V.VENDOR_ID "
+            f"LEFT JOIN {self._vendor_names()} N "
+            f"ON N.VENDOR_ID = V.VENDOR_ID "
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND P.PYMNT_DT >= {self.db.date_bind('since')}",
             {"bu": bu, "since": since}, max_rows=10_000)
@@ -262,7 +313,9 @@ class ModulePacks:
                          f"receives {ranked[0]['share_pct']}% of payment "
                          "value — supply concentration worth a second "
                          "source conversation.")})
-        notes = []
+        # Append, never reassign: the shape notes gathered before the query
+        # say which columns this site does not have, and rebinding the list
+        # here threw all of them away.
         if not self._cols("PS_VENDOR_ADDR"):
             notes.append("PS_VENDOR_ADDR not present — vendor geography "
                          "is not available at this site.")
@@ -301,8 +354,8 @@ class ModulePacks:
             f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
             f"V.INVOICE_ID AS invoice_id, COUNT(*) AS n, "
             f"SUM(V.GROSS_AMT) AS total "
-            f"FROM {p}PS_VOUCHER V LEFT JOIN {p}PS_VENDOR N "
-            f"ON N.VENDOR_ID = V.VENDOR_ID "
+            f"FROM {p}PS_VOUCHER V "
+            f"LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID "
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
             f"GROUP BY V.VENDOR_ID, V.INVOICE_ID HAVING COUNT(*) > 1",
@@ -319,8 +372,8 @@ class ModulePacks:
         cand, _ = self.db.query(
             f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
             f"V.GROSS_AMT AS amount, COUNT(*) AS n "
-            f"FROM {p}PS_VOUCHER V LEFT JOIN {p}PS_VENDOR N "
-            f"ON N.VENDOR_ID = V.VENDOR_ID "
+            f"FROM {p}PS_VOUCHER V "
+            f"LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID "
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
             f"GROUP BY V.VENDOR_ID, V.GROSS_AMT HAVING COUNT(*) > 1",
@@ -409,19 +462,66 @@ class ModulePacks:
                          + (" OR UPPER(N.NAME1) LIKE :vname" if name != "NULL"
                             else "") + ")")
         void_pred = " AND P.PYMNT_STATUS <> 'V'" if has_status else ""
-        rows, _ = self.db.query(
-            f"""SELECT P.VENDOR_ID AS vendor_id, {name} AS vendor,
+        # PS_PAYMENT_TBL is BANK-level: a payment belongs to a pay cycle and
+        # a bank account, not to a business unit. There is no BUSINESS_UNIT
+        # column to filter on, and this tool used to print the unit beside a
+        # total that covered the whole installation — the shape of wrong
+        # answer that reads as precise. The link exists, one hop away, in
+        # the voucher cross-reference; EXISTS stops at the first matching
+        # voucher rather than counting them.
+        # Attempt the scoped read, and report what actually happened rather
+        # than what the catalog implied. Deciding from introspection alone
+        # is wrong in both directions: an empty column list means "could not
+        # read", not "not there", so assuming the reference shape claims a
+        # scope that may never have applied, and assuming absence widens the
+        # population on a site where the record is fine.
+        xref = self._cols("PS_PYMNT_VCHR_XREF")
+        bu_pred = ("" if (xref and not {"BUSINESS_UNIT", "PYMNT_ID"} <= xref)
+                   else f" AND EXISTS (SELECT 1 FROM {p}PS_PYMNT_VCHR_XREF X "
+                        "WHERE X.PYMNT_ID = P.PYMNT_ID "
+                        "AND X.BUSINESS_UNIT = :bu)")
+        if bu_pred:
+            params["bu"] = bu
+        notes: list = []
+        def _read(scope_pred: str, binds: dict):
+            return self.db.query(
+                f"""SELECT P.VENDOR_ID AS vendor_id, {name} AS vendor,
        COUNT(*) AS payments, SUM(P.PYMNT_AMT) AS paid,
        MAX(P.PYMNT_DT) AS last_payment_dt
   FROM {p}PS_PAYMENT_TBL P
-  LEFT JOIN (SELECT VENDOR_ID, MAX(NAME1) AS NAME1 FROM {p}PS_VENDOR
-              GROUP BY VENDOR_ID) N ON N.VENDOR_ID = P.VENDOR_ID
- WHERE P.PYMNT_DT >= {self.db.date_bind('since')}{void_pred}{vend_pred}
- GROUP BY P.VENDOR_ID{', ' + name if name != 'NULL' else ''}
- ORDER BY 4 DESC""",
-            params, max_rows=5_000)
+  LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = P.VENDOR_ID
+ WHERE P.PYMNT_DT >= {self.db.date_bind('since')}"""
+                f"{scope_pred}{void_pred}{vend_pred}\n"
+                f" GROUP BY P.VENDOR_ID"
+                f"{', ' + name if name != 'NULL' else ''}\n"
+                f" ORDER BY 4 DESC", binds, max_rows=5_000)
+
+        scoped = bool(bu_pred)
+        try:
+            rows, _ = _read(bu_pred, params)
+        except DbError as e:
+            if not scoped:
+                raise
+            scoped = False
+            rows, _ = _read("", {k: v for k, v in params.items()
+                                 if k != "bu"})
+            notes.append(
+                f"The payment cross-reference could not be read ({e}), and "
+                "PS_PAYMENT_TBL carries no business unit — a payment is made "
+                "by a pay cycle, not by a unit.")
+        if not scoped and not notes:
+            notes.append(
+                "PS_PYMNT_VCHR_XREF has no BUSINESS_UNIT/PYMNT_ID pair here, "
+                "and PS_PAYMENT_TBL carries no business unit — a payment is "
+                "made by a pay cycle, not by a unit.")
+        if not scoped:
+            notes[-1] += (f" The totals below therefore cover the WHOLE "
+                          f"INSTALLATION, not {bu} alone.")
         out = {
-            "business_unit": bu, "window_months": int(months or 12),
+            "business_unit": bu,
+            # Say whether the unit above actually bounded the figures.
+            "scoped_to_business_unit": scoped,
+            "window_months": int(months or 12),
             "since": since, "as_of": asof,
             "vendors": [
                 {"vendor_id": r["vendor_id"], "vendor": r.get("vendor"),
@@ -435,8 +535,13 @@ class ModulePacks:
             "note": ("Payments by payment date; voided payments excluded"
                      if has_status else
                      "Payments by payment date; PS_PAYMENT_TBL here has no "
-                     "PYMNT_STATUS, so voids cannot be excluded"),
+                     "PYMNT_STATUS, so voids cannot be excluded")
+            + (f"; scoped to {bu} through the voucher cross-reference"
+               if scoped else "; NOT scoped to a business unit — see "
+                              "record_notes"),
         }
+        if notes:
+            out["record_notes"] = notes
         if term and not rows:
             out["note"] = (f"No payments to a vendor matching {term!r} in "
                            f"the last {months} months. Widen the window, or "
