@@ -50,6 +50,11 @@ BILL_DETAIL_CAP = 300
 CHAIN_CAP = 100
 PAYMENT_CAP = 200
 NODE_CAP = 400
+# The graph maps the rows the payload actually SHOWS. Mapping all 300 open
+# items when the readable list stops at 25 made the map the largest thing
+# in the answer and pushed it past the context limit, at which point the
+# whole payload is cut mid-object and the reader gets nothing at all.
+SHOWN_ROWS = 25
 
 
 def _days(a, b) -> int:
@@ -561,20 +566,33 @@ class Relationships:
     # ------------------------------------------------------------ the graph
     def _graph(self, family: list, receivables: dict, items: dict,
                billing: dict, chains: dict, cash: dict) -> dict:
-        """Nodes and edges over what was just read — nothing inferred.
+        """A MAP of what connects to what — deliberately carrying no money.
 
-        Every edge here exists because a column in one record names a key in
+        Every edge exists because a column in one record names a key in
         another: CORPORATE_CUST_ID names the parent, PS_PAYMENT_ITEM names
         the item a deposit paid, CR_REBILL_INV names the invoice a credit
         corrects. No edge is created from resemblance.
+
+        The nodes used to repeat every balance, amount and due date that
+        already sat in the sections above. Measured on the sample that was
+        a third of a small payload and most of a large one, for figures
+        NOTHING read: the browser card uses id, label and the edge triple
+        and ignores the rest. Worse, the duplicates were live to the
+        grounding guard, which grounds per-column sums over any list of row
+        dicts — so a 300-item graph handed the model an allowlist of ~275
+        balances the readable sections had capped at 25, and pushed the
+        payload toward the truncation that blanks the card outright.
+
+        So the map is now a map. Amounts live in receivables, billing,
+        adjustments and cash, exactly once, and this says how those rows
+        reach each other.
         """
         nodes, edges, seen = [], [], set()
 
-        def node(nid: str, kind: str, label: str, **extra) -> str:
+        def node(nid: str, kind: str, label: str) -> str:
             if nid not in seen and len(nodes) < NODE_CAP:
                 seen.add(nid)
-                nodes.append({"id": nid, "type": kind, "label": label,
-                              **extra})
+                nodes.append({"id": nid, "type": kind, "label": label})
             return nid
 
         def edge(src: str, dst: str, kind: str, **extra) -> None:
@@ -582,58 +600,62 @@ class Relationships:
                 edges.append({"from": src, "to": dst, "type": kind, **extra})
 
         for m in family:
-            cid = m["cust_id"]
-            totals = receivables["by_customer"].get(cid) or []
-            node(f"CUST:{cid}", "Customer", m["name"] or cid,
-                 cust_id=cid, role=m["role"],
-                 open_balance=[{"currency": t["currency"],
-                                "amount": t["open_balance"]} for t in totals])
+            node(f"CUST:{m['cust_id']}", "Customer",
+                 m["name"] or m["cust_id"])
         for m in family:
             parent = m.get("corporate_parent")
             if parent and parent != m["cust_id"]:
                 edge(f"CUST:{m['cust_id']}", f"CUST:{parent}",
                      "SUBSIDIARY_OF", basis="PS_CUSTOMER.CORPORATE_CUST_ID")
 
-        for it in items["items"]:
-            nid = node(f"ITEM:{it['item']}", "Receivable", it["item"],
-                       balance=it["balance"], currency=it["currency"],
-                       days_past_due=it["days_past_due"],
-                       in_dispute=it["in_dispute"])
+        # Same slice the payload displays, so every node on the map is a
+        # row the reader can also look up. An edge whose endpoint fell
+        # outside the slice is dropped by edge() rather than left dangling.
+        for it in items["items"][:SHOWN_ROWS]:
+            nid = node(f"ITEM:{it['item']}", "Receivable", it["item"])
             edge(f"CUST:{it['cust_id']}", nid, "OWES")
-        for b in billing["not_yet_finalized"]:
-            nid = node(f"BILL:{b['invoice']}", "Bill", b["invoice"],
-                       status=b["status"], meaning=b["meaning"],
-                       amount=b["amount"], currency=b["currency"])
+        for b in billing["not_yet_finalized"][:SHOWN_ROWS]:
+            nid = node(f"BILL:{b['invoice']}", "Bill", b["invoice"])
             edge(f"CUST:{b['cust_id']}", nid, "BILLED_TO")
         for ch in chains.get("chains") or []:
             oid = node(f"BILL:{ch['original_invoice']}", "Bill",
-                       ch["original_invoice"], amount=ch["original_amount"])
+                       ch["original_invoice"])
             edge(f"CUST:{ch['cust_id']}", oid, "BILLED_TO")
             for c in ch["corrections"]:
                 cid = node(f"BILL:{c['invoice']}",
                            "Credit" if c["amount"] < 0 else "Rebill",
-                           c["invoice"], amount=c["amount"],
-                           adjustment_type=c["adjustment_type"])
-                edge(cid, oid, "CORRECTS",
-                     basis="PS_BI_HDR.CR_REBILL_INV")
-        for pay in cash.get("payments") or []:
+                           c["invoice"])
+                edge(cid, oid, "CORRECTS", basis="PS_BI_HDR.CR_REBILL_INV")
+        for pay in (cash.get("payments") or [])[:SHOWN_ROWS]:
             nid = node(f"PAY:{pay['deposit_id']}:{pay['payment_seq']}",
-                       "Payment", pay["deposit_id"], amount=pay["amount"],
-                       applied=pay["applied"], unapplied=pay["unapplied"],
-                       currency=pay["currency"],
-                       payment_date=pay["payment_date"])
+                       "Payment", pay["deposit_id"])
             edge(f"CUST:{pay['cust_id']}", nid, "PAID")
         for app in cash.get("applications") or []:
             edge(f"PAY:{app['deposit_id']}:{app['payment_seq']}",
-                 f"ITEM:{app['item']}", "APPLIED_TO",
-                 amount=app["applied_amount"])
+                 f"ITEM:{app['item']}", "APPLIED_TO")
 
+        mapped = {"items": min(len(items["items"]), SHOWN_ROWS),
+                  "bills": min(len(billing["not_yet_finalized"]),
+                               SHOWN_ROWS),
+                  "payments": min(len(cash.get("payments") or []),
+                                  SHOWN_ROWS)}
         return {"nodes": nodes, "edges": edges,
-                "truncated": len(seen) >= NODE_CAP,
+                "truncated": (len(seen) >= NODE_CAP
+                              or len(items["items"]) > SHOWN_ROWS
+                              or len(billing["not_yet_finalized"])
+                              > SHOWN_ROWS
+                              or len(cash.get("payments") or []) > SHOWN_ROWS),
+                "maps_at_most_per_kind": SHOWN_ROWS, "mapped": mapped,
                 "basis": "Edges come from key columns in the records "
                          "themselves — corporate hierarchy, payment "
                          "application, credit/rebill reference. None is "
-                         "inferred from names or amounts."}
+                         "inferred from names or amounts.",
+                "read_this_as": "A map, not a source of figures. It says "
+                                "WHICH records connect; every amount is in "
+                                "receivables, billing, adjustments or cash "
+                                "above. Quote figures from those, and use "
+                                "this to explain how they relate.",
+                }
 
     # -------------------------------------------------------- what to do now
     def _attention(self, family: list, receivables: dict, items: dict,
@@ -869,7 +891,7 @@ class Relationships:
                 "totals_by_currency": recv["totals_by_currency"],
                 "bucket_labels": recv["bucket_labels"],
                 "aging_basis": recv["aging_basis"],
-                "largest_open_items": items["items"][:25],
+                "largest_open_items": items["items"][:SHOWN_ROWS],
             },
             "billing": bill,
             "adjustments": chains,

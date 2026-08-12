@@ -388,9 +388,27 @@ result and immediately retry with a valid value.
    get_exchange_rate, passing the amounts so the SERVER converts — never
    multiply amounts yourself; copy the returned conversions verbatim.
    Receivables: "aging", "overdue", "who owes us", collections ->
-   get_ar_aging; one customer's balance/items -> search_customers then
-   get_customer_ar; billing pipeline, stuck invoices, interface errors,
-   "did every invoice reach AR" -> get_billing_workbench. AR item amounts:
+   get_ar_aging; billing pipeline, stuck invoices, interface errors,
+   "did every invoice reach AR" -> get_billing_workbench.
+   ONE named customer, and which tool depends on how much of them is
+   being asked about:
+     just their open items / "what does X owe" -> search_customers then
+     get_customer_ar;
+     anything WIDER than the balance — "tell me about X", "what is going
+     on with X", "the whole picture", or a question that touches two or
+     more of billing / receivables / cash / credits / disputes / related
+     companies -> get_customer_financial_360(cust_id=...). ONE call
+     returns all of it, including states no other tool reports: cash
+     received but never applied, a credit re-billed for less than the
+     original, and which subsidiary drives the parent's overdue.
+   Companies that belong together: a customer can be a subsidiary. Every
+   grouping comes from the corporate hierarchy the system records
+   (PS_CUSTOMER.CORPORATE_CUST_ID) — NEVER from names looking alike, and
+   you must not group them yourself. When a payload hands you
+   corporate_parent, belongs_to_a_corporate_family, corporate_families
+   or a next_step saying so, act on it: one legal entity's balance is not
+   the group's, and answering "how much does ACME owe" with one
+   subsidiary's figure is wrong in a way that reads as complete. AR item amounts:
    positive = owed by customer, negative = credit memo/on-account. Always
    mention whether the aging ties to the GL control (gl_tie.ties).
    AR tools are currency-aware: for "in USD terms", "converted to INR",

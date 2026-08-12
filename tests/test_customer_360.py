@@ -206,7 +206,37 @@ class GraphTests(unittest.TestCase):
     def test_a_payment_links_to_the_item_it_paid(self) -> None:
         applied = [e for e in self.g["edges"] if e["type"] == "APPLIED_TO"]
         self.assertEqual(applied[0]["to"], "ITEM:INV-260602")
-        self.assertEqual(applied[0]["amount"], 25_000.00)
+
+    def test_the_map_carries_no_money(self) -> None:
+        """Every figure lives in exactly one place, and it is not here.
+
+        The nodes used to repeat the balance, amount and due date already
+        sitting in the readable sections. Nothing consumed them — the card
+        reads id, label and the edge triple — but the grounding guard did,
+        and a 300-item graph handed the model an allowlist of balances the
+        readable list had capped at 25.
+        """
+        money = {"balance", "amount", "open_balance", "applied", "unapplied",
+                 "currency", "days_past_due", "original_amount"}
+        for n in self.g["nodes"]:
+            self.assertEqual(set(n), {"id", "type", "label"}, n)
+        for e in self.g["edges"]:
+            self.assertFalse(money & set(e), e)
+        cash = next(a for a in self.out["cash"]["applications"]
+                    if a["item"] == "INV-260602")
+        self.assertEqual(cash["applied_amount"], 25_000.00,
+                         "the amount still exists — in cash.applications")
+
+    def test_the_map_covers_what_the_payload_shows(self) -> None:
+        # A map of 300 items beside a list of 25 is the largest thing in
+        # the answer and the reason the whole payload gets cut mid-object.
+        from pstb.relationships import SHOWN_ROWS
+        shown = {i["item"] for i in
+                 self.out["receivables"]["largest_open_items"]}
+        mapped = {n["label"] for n in self.g["nodes"]
+                  if n["type"] == "Receivable"}
+        self.assertTrue(mapped <= shown, mapped - shown)
+        self.assertEqual(self.g["maps_at_most_per_kind"], SHOWN_ROWS)
 
     def test_the_credit_points_at_the_invoice_it_corrects(self) -> None:
         corrects = [e for e in self.g["edges"] if e["type"] == "CORRECTS"]

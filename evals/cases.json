@@ -314,6 +314,42 @@
       }
     },
     {
+      "id": "customer-360-unprompted",
+      "question": "Tell me about ACME Industrial",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "get_customer_financial_360",
+          "search_customers"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "the relationship layer has to fire without being asked for by name. A wide question about one customer routes to the 360, or at minimum resolves the name first \u2014 search_customers then reports that ACME is a corporate family and points at the 360."
+      }
+    },
+    {
+      "id": "customer-family-exposure",
+      "question": "How much does ACME owe us in total?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "search_customers",
+          "get_customer_financial_360",
+          "get_ar_aging"
+        ],
+        "not_refused": true,
+        "_why": "ACME is three legal entities. Every route to this answer now carries the corporate family \u2014 search_customers flags the subsidiaries, aging rolls them up, the 360 combines them \u2014 so answering with one entity's balance is a mistake the payload argues against."
+      }
+    },
+    {
       "id": "customer-360-family",
       "question": "Which subsidiaries contribute to customer C1001's overdue balance?",
       "scope": {
