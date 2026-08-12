@@ -227,17 +227,58 @@ def _env(name: str, current: str) -> str:
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
+CONFIG_NAME = "config.yaml"
+EXAMPLE_NAME = "config.example.yaml"
+
+
+def base_config_path(root: Path | str) -> Path:
+    """The base config to read from a deployment root: that deployment's own
+    config.yaml, or the shipped config.example.yaml when it has none yet.
+
+    config.yaml is per-deployment and deliberately NOT tracked by git, so
+    `git pull` on a deployed box can never overwrite the settings someone
+    tuned there. The cost of that is a fresh clone — and CI — starts with no
+    config.yaml at all, and this fallback is what keeps them working with no
+    copy step, on exactly the values the example ships.
+
+    Note which way the fallback runs: an existing config.yaml always wins,
+    so a deployment never silently reverts to sample values because an
+    upgrade shipped a newer example.
+    """
+    cfg_path = Path(root) / CONFIG_NAME
+    if cfg_path.exists():
+        return cfg_path
+    example = cfg_path.parent / EXAMPLE_NAME
+    return example if example.exists() else cfg_path
+
+
+def _or_example(cfg_path: Path) -> Path:
+    """config.example.yaml beside cfg_path, when cfg_path itself is absent.
+
+    Scoped to the SAME directory: a mistyped --config still reports the path
+    the caller asked for rather than quietly loading some other tree's
+    example.
+    """
+    return base_config_path(cfg_path.parent) if cfg_path.name == CONFIG_NAME \
+        else cfg_path
+
+
 def resolve_config_path(path: Optional[str] = None) -> Path:
     """Where the config lives: path arg > $PSTB_CONFIG > ./config.yaml >
-    <package root>/config.yaml. Pure path logic (no yaml import), so tests
-    can verify it under a bare interpreter."""
+    <package root>/config.yaml — and beside each of those, config.example.yaml
+    when the deployment has not created its own config.yaml yet. Pure path
+    logic (no yaml import), so tests can verify it under a bare interpreter."""
     explicit = path or os.environ.get("PSTB_CONFIG")
     if explicit:
         cfg_path = Path(explicit)
-        return cfg_path if cfg_path.is_absolute() else Path.cwd() / cfg_path
-    cfg_path = Path.cwd() / "config.yaml"
-    if not cfg_path.exists() and (_PACKAGE_ROOT / "config.yaml").exists():
-        return _PACKAGE_ROOT / "config.yaml"
+        if not cfg_path.is_absolute():
+            cfg_path = Path.cwd() / cfg_path
+        return _or_example(cfg_path)
+    cfg_path = base_config_path(Path.cwd())
+    if not cfg_path.exists():
+        packaged = base_config_path(_PACKAGE_ROOT)
+        if packaged.exists():
+            return packaged
     return cfg_path
 
 

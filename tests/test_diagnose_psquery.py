@@ -76,7 +76,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_config_points_at_the_preflight(self) -> None:
         self.assertIn("diagnose_psquery",
-                      (ROOT / "config.yaml").read_text())
+                      (ROOT / "config.example.yaml").read_text())
 
 
 if __name__ == "__main__":

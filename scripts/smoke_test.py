@@ -911,9 +911,13 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
                   "from pstb.config import resolve_config_path; "
                   "print(resolve_config_path())"],
                  cwd=str(ROOT / "scripts"), capture_output=True, text=True)
+    # It resolves to config.yaml when this deployment has one and to the
+    # tracked config.example.yaml when it does not — both live at the root,
+    # and picking up neither is the failure that mattered.
     check("config resolves to the package root from any cwd",
           _r.returncode == 0
-          and _r.stdout.strip() == str(ROOT / "config.yaml"),
+          and _r.stdout.strip() in (str(ROOT / "config.yaml"),
+                                    str(ROOT / "config.example.yaml")),
           _r.stdout.strip() or _r.stderr.strip()[:80])
 
     print("== source registry: ask-anything on a second database ==")

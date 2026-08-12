@@ -155,7 +155,10 @@ class QasConfigTests(unittest.TestCase):
                          "own IB catalog rather than hardcode it")
 
     def test_config_yaml_never_carries_the_password(self) -> None:
-        text = (ROOT / "config.yaml").read_text()
+        # The tracked example is the only config in git — a deployment's own
+        # config.yaml is ignored — so this is the file a password could
+        # actually be committed into.
+        text = (ROOT / "config.example.yaml").read_text()
         self.assertNotIn("PSFT_QAS_PASSWORD", text.split("#")[0])
         self.assertNotIn("password:", text.lower().split("ps_api")[-1][:200])
 

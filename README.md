@@ -177,9 +177,12 @@ Full walkthrough in [docs/SETUP.md](docs/SETUP.md#4b-restrict-data-by-business-u
    `XX_TB_*` views), e.g. from your DBA.
 2. `pip install -e ".[oracle]"` inside the venv.
 3. In `.env`: `ORACLE_DSN=host:1521/SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`.
-4. In `config.yaml`: `db.backend: oracle`, `db.schema: SYSADM`, and your real
+4. In `config.yaml` (`cp config.example.yaml config.yaml` if you have not run
+   the wizard): `db.backend: oracle`, `db.schema: SYSADM`, and your real
    `defaults:` (business unit, ledger, setid, calendar, adjustment periods,
-   suspense + retained-earnings accounts).
+   suspense + retained-earnings accounts). This file is git-ignored, so an
+   upgrade never overwrites it — see
+   [docs/SETUP.md](docs/SETUP.md#9-configuration-files-and-upgrading-without-losing-them).
 5. Optional but recommended: have a DBA run [sql/oracle/](sql/oracle/)
    `01..06` and set `db.use_views: true`. Rationale, semantics, and deployment
    notes (App Designer vs direct DDL, materialized-view option) are in

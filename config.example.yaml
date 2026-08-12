@@ -1,4 +1,16 @@
-# PeopleSoft TB agent configuration.
+# PeopleSoft TB agent configuration — THE SHIPPED DEFAULTS.
+#
+# This file is tracked by git and is replaced on every upgrade. Your own
+# settings belong in config.yaml beside it, which git ignores, so a pull can
+# never overwrite what you tuned on this machine:
+#
+#     cp config.example.yaml config.yaml     # then edit config.yaml
+#
+# Until that file exists, the app reads this one — a fresh clone runs with no
+# setup step. scripts/setup.py writes config.yaml for you, and the /console
+# page writes config.local.yaml, a third layer that overrides individual keys
+# without touching either file.
+#
 # Secrets (DB passwords, API tokens, GCP project) live in .env — see .env.example.
 
 defaults:

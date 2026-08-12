@@ -768,8 +768,57 @@ one period range, an account filter) before widening again.
 | pip TLS/certificate errors | corporate TLS inspection — point pip at the internal mirror (step 3) |
 | PowerShell blocks activation | you do not need to activate; call `.venv\Scripts\python` directly |
 
-## 9. What is safe to commit
+## 9. Configuration files, and upgrading without losing them
 
-`.gitignore` already excludes `.venv/`, `.env`, the generated sample database,
-and build artifacts. **`.env` holds credentials — never commit it.** Share
-`.env.example` instead.
+Nothing that describes *this* machine is tracked by git, so `git pull` can
+never overwrite it. Four layers, each one winning over the one above:
+
+| File | Tracked? | Written by | Holds |
+|---|---|---|---|
+| `config.example.yaml` | **yes** | the project | shipped defaults; replaced on every upgrade |
+| `config.yaml` | no | `scripts/setup.py`, or you | this installation's settings |
+| `config.local.yaml` | no | the `/console` page | individual keys, overriding the two above |
+| `.env` | no (mode 600) | `scripts/setup.py`, or you | passwords, API keys, DSN |
+
+With no `config.yaml` at all the app reads `config.example.yaml`, so a fresh
+clone runs immediately. Create yours by running `python scripts/setup.py`, or
+by hand:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+An existing `config.yaml` always wins over a newer example — an upgrade
+cannot silently repoint a live deployment at the sample ledger.
+
+### Upgrading a machine that already has a hand-edited `config.yaml`
+
+Earlier versions tracked `config.yaml`, so a machine set up before this change
+has a *tracked, modified* file that `git pull` will stop on. Run this once,
+before the pull:
+
+```bash
+cp config.yaml config.yaml.keep && git checkout -- config.yaml
+```
+
+Then pull, and put your settings back:
+
+```bash
+mv config.yaml.keep config.yaml
+```
+
+From then on `config.yaml` is ignored and every later pull leaves it alone.
+Check what you have with `git status` — it should not list `config.yaml`.
+
+## 10. What is safe to commit
+
+`.gitignore` already excludes `.venv/`, `.env`, `config.yaml`,
+`config.local.yaml`, the generated sample database, `logs/`, and build
+artifacts. **`.env` holds credentials — never commit it.** Share
+`.env.example` and `config.example.yaml` instead.
+
+One trap when editing `.gitignore`: git has no inline comment there. A
+trailing `# note` after a pattern becomes part of the pattern, the rule then
+matches nothing, and the file it was meant to protect gets committed. Put
+comments on their own lines. `tests/test_config_is_per_deployment.py` checks
+each rule still matches the file it names.

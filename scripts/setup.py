@@ -44,6 +44,9 @@ import time
 MIN_PYTHON = (3, 10)
 ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 CONFIG = os.path.join(ROOT, "config.yaml")
+# The tracked defaults. config.yaml is per-deployment and git-ignored, so on
+# a fresh clone this is the only config on disk and the wizard seeds from it.
+EXAMPLE = os.path.join(ROOT, "config.example.yaml")
 ENVFILE = os.path.join(ROOT, ".env")
 PROBE_TIMEOUT = 60
 
@@ -338,13 +341,14 @@ def _atomic_write(path, text, mode=None):
     os.replace(tmp, path)
 
 
-def _read_config_values():
+def _read_config_values(src=None):
     """Existing config values, so a re-run defaults to what is already set.
 
     Parsed with PyYAML when the venv has it; otherwise a small line reader
     covers the flat keys this wizard writes.
     """
-    if not os.path.exists(CONFIG):
+    src = src or CONFIG
+    if not os.path.exists(src):
         return {}
     snippet = (
         "import json,sys\n"
@@ -357,7 +361,7 @@ def _read_config_values():
         "    print(json.dumps({'ok': False, 'error': str(e)[:200]}))\n"
     )
     if os.path.exists(venv_python()):
-        res = run_in_venv(snippet, env={"CFG": CONFIG}, timeout=30)
+        res = run_in_venv(snippet, env={"CFG": src}, timeout=30)
         if res.get("ok"):
             data = res.get("data") or {}
             d = data.get("defaults") or {}
@@ -1096,10 +1100,16 @@ def main():
     state = {"timeout": 120, "pool_max": 8, "allow_sql": True, "max_rows": 500}
     try:
         step_python()
-        existing = _read_config_values() if os.path.exists(venv_python()) else {}
+        have_venv = os.path.exists(venv_python())
+        existing = _read_config_values() if have_venv else {}
         if existing:
             state.update(existing)
             info("existing configuration found; press Enter to keep each value")
+        elif have_venv:
+            # No config.yaml — a fresh clone, since it is not tracked. Seed
+            # from the shipped example so the offered defaults are the
+            # documented ones, WITHOUT claiming a configuration exists.
+            state.update(_read_config_values(EXAMPLE))
 
         backend = args.backend
         if backend is None:

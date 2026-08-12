@@ -16,6 +16,17 @@ config.yaml.bak-*
 BUILD_INFO.json
 site_memory.json
 
-# Written by the configuration console; per-deployment, never shared.
+# Per-deployment configuration. Every one of these is settings for THIS
+# machine, so none of them is tracked and `git pull` cannot overwrite them.
+# The tracked defaults ship as config.example.yaml / .env.example, and the
+# app falls back to config.example.yaml until a config.yaml exists.
+#
+# NO TRAILING COMMENTS BELOW. git has no inline comment in this file: a
+# "# note" after a pattern becomes part of the pattern, so the rule matches
+# nothing and the file it was meant to protect is committed.
+#
+# yours — written by scripts/setup.py, or hand-edited
+config.yaml
+# written by the configuration console
 config.local.yaml
 config.local.yaml.bak-*
