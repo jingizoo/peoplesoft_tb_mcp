@@ -135,11 +135,34 @@ class PrimeCostTests(unittest.TestCase):
     what it is attempting".
     """
 
+    @staticmethod
+    def _quiesce() -> None:
+        """Wait out any prime or refresh thread an earlier test started.
+
+        Both write the module-global scope cache from a daemon thread, so a
+        test that asserts on that cache is really asserting on whoever
+        finished last. On a fast machine that is itself; on a loaded runner
+        it is the previous test's boot prime, which lands a real catalog in
+        the slot this test just cleared. Failed exactly that way in CI and
+        never locally, which is the signature.
+        """
+        import threading
+
+        for _ in range(100):
+            live = [t for t in threading.enumerate()
+                    if t.name.startswith("scope-catalog")]
+            if not live:
+                return
+            for t in live:
+                t.join(0.1)
+
     def setUp(self) -> None:
         from pstb.gui import app as gapp
         self.gapp = gapp
+        self._quiesce()
         self.saved = dict(gapp._scope_cache)
         self.addCleanup(lambda: gapp._scope_cache.update(self.saved))
+        self.addCleanup(self._quiesce)
         gapp._scope_cache.update({"value": None, "expires": 0.0,
                                   "refreshing": False})
 
