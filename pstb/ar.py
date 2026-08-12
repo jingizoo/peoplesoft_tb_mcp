@@ -71,6 +71,113 @@ def _iso_opt(day) -> Optional[dt.date]:
     return _iso(day)
 
 
+# The ten largest groups are a finding; every group is a directory. Capped
+# at the CALL SITE, not in the helper, so the pre-slice count survives and
+# the payload can say what it dropped.
+FAMILY_CAP = 10
+
+
+def _corporate_root(cust_id: str, parent_of: dict) -> str:
+    """The topmost company above this one, following the recorded pointers.
+
+    One hop is not a hierarchy. A three-level structure — LEAF owned by MID
+    owned by TOP — grouped one hop deep puts MID in two families at once and
+    reports the top group short by everything below MID: two overlapping
+    "combined exposures", neither of them the company's real position.
+
+    Two edges that must not become a crash or a coin flip. A parent with no
+    open items is not in these rows, and is still the right root. And a
+    pointer cycle (A owns B owns A, which master data does contain) needs a
+    STABLE representative, not merely a broken loop — break the loop at a
+    different place for A than for B and they land in different families,
+    which is the bug in a costume.
+    """
+    path, cur = [], cust_id
+    while True:
+        parent = parent_of.get(cur) or ""
+        if not parent or parent == cur:
+            return cur
+        if parent in path or parent == cust_id:
+            return min(path + [cur, parent])      # cycle: lowest id wins
+        path.append(cur)
+        if parent not in parent_of:
+            return parent                         # parent has no open items
+        cur = parent
+
+
+def _families(customers: list, grand_total: float) -> list:
+    """Group the aging by the corporate hierarchy the system recorded.
+
+    This is the whole reason a relationship layer earns its place in an
+    answer nobody asked a relationship question about. Ask for an aging and
+    ACME Industrial, ACME Industrial - West and ACME Industrial - Components
+    come back at ranks 1, 8 and 9 as three strangers; the fact that they are
+    one company owing 39% of the receivable is not on the screen anywhere,
+    and no amount of reading the rows produces it.
+
+    Grouping is on CORPORATE_CUST_ID and nothing else. Names are not
+    compared: "ACME Logistics Group" is a different company and folding it
+    in would invent a consolidation nobody approved — a wrong combined
+    exposure looks exactly as authoritative as a right one.
+
+    Pure arithmetic over rows already in hand. No query, no database access,
+    no second pass over PS_ITEM — and indexed, not scanned: looking the
+    parent up by walking the customer list once per group turned a 76 ms
+    aging into 822 ms at ten thousand customers, which is the shape of every
+    "why is this slow" report this project has had.
+    """
+    by_id = {c["cust_id"]: c for c in customers}
+    parent_of = {c["cust_id"]: (c.get("corporate_parent") or "")
+                 for c in customers}
+    groups: dict = {}
+    for c in customers:
+        root = _corporate_root(c["cust_id"], parent_of)
+        if root != c["cust_id"]:
+            groups.setdefault(root, []).append(c)
+    # The root is a customer in its own right and may or may not have open
+    # items. Add its row once, here, so its balance is counted once.
+    for root, rows in groups.items():
+        head = by_id.get(root)
+        if head is not None:
+            rows.insert(0, head)
+
+    out = []
+    for root, rows in groups.items():
+        if len(rows) < 2:
+            continue                      # a family of one is just a customer
+        head = by_id.get(root)
+        combined = r2(sum(c["total"] for c in rows))
+        # Concentration over GROSS exposure. Dividing the largest member by
+        # the NETTED total lets one member's credit balance shrink the
+        # denominator and nothing else, which published "805.7%" as a
+        # concentration measure — and the number guard certifies it, because
+        # a rate a tool declared is a rate the guard trusts.
+        positive = [c["total"] for c in rows if c["total"] > 0]
+        out.append({
+            "corporate_parent": root,
+            # Never borrow a member's identity for the group. A holding
+            # company with no open items is not "Globex - West".
+            "name": ((head.get("name") or root) if head is not None
+                     else None),
+            "parent_has_no_open_items": head is None,
+            "members": [{"cust_id": c["cust_id"], "name": c.get("name"),
+                         "total": c["total"],
+                         "disputed_amt": c.get("disputed_amt", 0.0)}
+                        for c in sorted(rows, key=lambda x: -x["total"])],
+            "member_count": len(rows),
+            "combined_total": combined,
+            "combined_disputed": r2(sum(c.get("disputed_amt", 0.0)
+                                        for c in rows)),
+            "share_of_ar_pct": (r2(combined / grand_total * 100.0)
+                                if grand_total > 0 else None),
+            "largest_member_share_pct": (
+                r2(max(positive) / sum(positive) * 100.0) if positive
+                else None),
+        })
+    out.sort(key=lambda f: -abs(f["combined_total"]))
+    return out
+
+
 class ARBilling:
     def __init__(self, engine: TBEngine):
         self.e = engine
@@ -173,6 +280,12 @@ class ARBilling:
         shape = {
             "name": "NAME1" if (not cols or "NAME1" in cols) else "",
             "status": "CUST_STATUS" if (not cols or "CUST_STATUS" in cols) else "",
+            # The corporate hierarchy the site records. Optional because
+            # plenty of installations never populate it — and where it is
+            # absent the honest answer is a flat list, never a family
+            # guessed from names.
+            "corp": ("CORPORATE_CUST_ID"
+                     if (not cols or "CORPORATE_CUST_ID" in cols) else ""),
             "notes": [],
         }
         if cols and not shape["name"]:
@@ -183,6 +296,12 @@ class ARBilling:
             shape["notes"].append(
                 "PS_CUSTOMER here has no CUST_STATUS; active/inactive is not "
                 "reported.")
+        if cols and not shape["corp"]:
+            shape["notes"].append(
+                "PS_CUSTOMER here has no CORPORATE_CUST_ID; this site does "
+                "not record a corporate hierarchy, so customers that belong "
+                "to the same group are listed separately and no combined "
+                "exposure is reported.")
         if cols:
             self._shapes["PS_CUSTOMER"] = shape
         return shape
@@ -240,6 +359,51 @@ class ARBilling:
                  "currency": cur_c, "notes": notes}
         self._shapes["PS_ITEM"] = shape
         return shape
+
+    def _family_block(self, families: list, found: int, has_corp: bool,
+                      single_customer: bool) -> dict:
+        """The rollup, plus an honest account of what it could not see.
+
+        Three states, not two. "No customer here shares a corporate parent"
+        is a finding; "this site does not record who owns whom" is an
+        absence. Reporting the second as the first tells a controller their
+        customers are unrelated on the one kind of installation that cannot
+        know — and it is the failure this whole feature exists to prevent,
+        made by the feature itself.
+        """
+        if single_customer:
+            return {"families": [], "families_found": 0, "truncated": False,
+                    "note": "Single-customer aging; no family rollup. Ask "
+                            "get_customer_financial_360 for this customer's "
+                            "corporate family."}
+        basis = ("PS_CUSTOMER.CORPORATE_CUST_ID — the hierarchy this system "
+                 "records, followed all the way to the topmost owner. "
+                 "Customers are never grouped by name; a same-named company "
+                 "that is its own corporate parent is a different company. "
+                 "share_of_ar_pct is of total open AR; "
+                 "largest_member_share_pct is of the family's GROSS debit "
+                 "exposure, so a member's credit balance cannot inflate it.")
+        if families:
+            note = ("Customers below that belong to one corporate family, "
+                    "with their combined exposure. The rows in 'customers' "
+                    "are per legal entity and already sum to the totals — "
+                    "these do NOT add to them.")
+        elif has_corp:
+            note = ("No customer in this aging shares a corporate parent "
+                    "with another.")
+        else:
+            note = ("This site does not record a corporate hierarchy "
+                    "(PS_CUSTOMER has no CORPORATE_CUST_ID), so whether any "
+                    "of these customers belong to one group is UNKNOWN — "
+                    "not answered as no.")
+        out = {"families": families, "families_found": found,
+               "truncated": found > len(families),
+               "basis": basis, "note": note}
+        if out["truncated"]:
+            out["note"] += (f" Showing the {len(families)} largest of "
+                            f"{found} corporate families by combined "
+                            "exposure.")
+        return out
 
     def _aging_basis(self, shape: dict) -> str:
         parts = [f"I.{c}" for c in (shape["due"], shape["date"]) if c]
@@ -373,9 +537,14 @@ class ARBilling:
         c_name = f"C.{cs['name']} AS name" if cs["name"] else "NULL AS name"
         c_stat = (f"C.{cs['status']} AS cust_status" if cs["status"]
                   else "NULL AS cust_status")
-        c_group = "".join(f", C.{c}" for c in (cs["name"], cs["status"]) if c)
+        # Free: the LEFT JOIN to PS_CUSTOMER is already in this statement,
+        # so the corporate parent costs one column, not one query.
+        c_corp = (f"C.{cs['corp']} AS corporate_parent" if cs["corp"]
+                  else "NULL AS corporate_parent")
+        c_group = "".join(f", C.{c}" for c in
+                          (cs["name"], cs["status"], cs["corp"]) if c)
         return f"""SELECT I.CUST_ID AS cust_id, {c_name},
-       {c_stat}, {cur_sel},
+       {c_stat}, {c_corp}, {cur_sel},
        {', '.join(cases)},
        SUM(I.BAL_AMT) AS total,
        SUM(CASE WHEN I.BAL_AMT < 0 THEN I.BAL_AMT ELSE 0 END) AS credit_amt,
@@ -478,6 +647,11 @@ class ARBilling:
             c = by_cust.setdefault(r["cust_id"], {
                 "cust_id": r["cust_id"], "name": r.get("name"),
                 "customer_status": r.get("cust_status"),
+                # Only when the column produced something. An empty string
+                # on every row of a 10,000-customer aging is 220 KB of
+                # nothing, at a site that by definition has no families.
+                **({"corporate_parent": str(r["corporate_parent"])}
+                   if r.get("corporate_parent") else {}),
                 **{lb: 0.0 for lb in labels},
                 "total": 0.0, "credit_amt": 0.0, "disputed_amt": 0.0,
                 "oldest_days_past_due": 0, "item_count": 0,
@@ -518,6 +692,11 @@ class ARBilling:
         base = totals["total"] or 0.0
         shares = ({lb: r2(totals[lb] / base * 100.0) for lb in labels}
                   if base else {})
+        # Who is actually one company. Costs no query — the corporate
+        # parent rode in on the join the summary already performs.
+        all_families = _families(customers, totals["total"])
+        families = all_families[:FAMILY_CAP]
+        has_corp = bool(self._customer_shape().get("corp"))
         out = {
             "business_unit": bu,
             "as_of": asof,
@@ -529,6 +708,8 @@ class ARBilling:
             "overdue_pct": r2(overdue / base * 100.0) if base else None,
             "bucket_share_pct": shares,
             "gl_tie": self._gl_tie(bu),
+            "corporate_families": self._family_block(
+                families, len(all_families), has_corp, bool(cust)),
             "note": (
                 f"All amounts converted server-side to {disp}. Positive = owed "
                 "by the customer; negative = credit memo or on-account receipt. "
@@ -539,8 +720,14 @@ class ARBilling:
         if any(len(c["currencies"]) > 1 or c["currencies"] != [disp]
                for c in customers):
             out["fx_applied"] = sorted(n for _, n in fx_cache.values())
-        if shape["notes"]:
-            out["record_notes"] = list(shape["notes"])
+        # PS_CUSTOMER's adaptations belong here too. A site with no
+        # CORPORATE_CUST_ID gets a flat list either way; the difference
+        # between "these customers are unrelated" and "this site does not
+        # record who owns whom" is the whole value of saying it.
+        notes = list(shape["notes"]) + list(
+            self._customer_shape().get("notes") or [])
+        if notes:
+            out["record_notes"] = notes
 
         _fy, _per, latest_end = self._latest_posted_period(bu)
         if latest_end and asof < latest_end:
@@ -630,6 +817,26 @@ class ARBilling:
             "note": result["note"],
         }
         out["display_currency"] = result.get("display_currency")
+        # The prompt routes "what does X owe" here, and here is where the
+        # answer stops. A balance that is one third of the group's, with
+        # nothing saying so, is the wrong answer wearing a complete one.
+        row = next((m for m in matches if m["cust_id"] == cust_id), None)
+        if row is not None:
+            parent = str(row.get("corporate_parent") or "")
+            heads = bool(row.get("heads_a_corporate_family"))
+            if heads or (parent and parent != cust_id):
+                out["corporate_family"] = {
+                    "role": "subsidiary" if parent and parent != cust_id
+                            else "parent",
+                    "corporate_parent": parent or cust_id,
+                    "basis": "PS_CUSTOMER.CORPORATE_CUST_ID",
+                    "next_step": (
+                        "The balance above is this legal entity ALONE. It "
+                        "belongs to a corporate family; for the group's "
+                        "combined position call "
+                        f"get_customer_financial_360(cust_id="
+                        f"'{parent or cust_id}')."),
+                }
         for k in ("historical_approximation", "warning", "fx_applied",
                   "record_notes"):
             if k in result:
@@ -651,10 +858,16 @@ class ARBilling:
         c_name = f"C.{cs['name']} AS name" if cs["name"] else "NULL AS name"
         c_stat = (f"C.{cs['status']} AS status" if cs["status"]
                   else "NULL AS status")
+        # Resolving a NAME to an id is the moment to say whether that id is
+        # part of something bigger. Without it, "how much does ACME owe" is
+        # answered for one legal entity out of three and looks complete.
+        # One more column on a row already being selected.
+        c_corp = (f"C.{cs['corp']} AS corporate_parent" if cs["corp"]
+                  else "NULL AS corporate_parent")
         # Withdraw the name predicate rather than let it match nothing.
         name_pred = f"UPPER(C.{cs['name']}) LIKE :q OR " if cs["name"] else ""
         sql = f"""SELECT C.CUST_ID AS cust_id, {c_name},
-       {c_stat}, COALESCE(B.bal, 0) AS open_balance
+       {c_stat}, {c_corp}, COALESCE(B.bal, 0) AS open_balance
   FROM {p}PS_CUSTOMER C
   LEFT JOIN (SELECT CUST_ID, SUM(BAL_AMT) AS bal FROM {p}PS_ITEM
               WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'
@@ -663,13 +876,59 @@ class ARBilling:
    AND ({name_pred}UPPER(C.CUST_ID) LIKE :qa)
  ORDER BY C.CUST_ID"""
         rows, truncated = self.db.query(sql, params, max_rows=max(int(limit or 25), 1))
+        in_a_group = []
         for r in rows:
             r["open_balance"] = r2(r["open_balance"])
+            parent = str(r.get("corporate_parent") or "")
+            r["corporate_parent"] = parent
+            if parent and parent != r["cust_id"]:
+                in_a_group.append(r["cust_id"])
+        # Pointing UP is free — the row carries its own parent. Pointing
+        # DOWN is not: whether C1001 owns anything lives in rows this WHERE
+        # clause excluded. Searching the parent by name and being told
+        # nothing is the more likely half of the failure, because the parent
+        # is what people type. One grouped read, and a site that refuses it
+        # loses the flag rather than the search.
+        heads = self._family_heads(setid, [r["cust_id"] for r in rows],
+                                   bool(cs["corp"]))
+        for r in rows:
+            r["heads_a_corporate_family"] = r["cust_id"] in heads
         out = {"customers": rows, "count": len(rows), "truncated": truncated,
                "note": "status A=active, I=inactive; open_balance sums open items"}
+        if in_a_group or heads:
+            out["belongs_to_a_corporate_family"] = in_a_group
+            out["heads_a_corporate_family"] = sorted(heads)
+            out["next_step"] = (
+                "This is a corporate family, not a standalone customer: "
+                "corporate_parent names the company that owns a subsidiary, "
+                "and heads_a_corporate_family lists the ones that own "
+                "others. open_balance above is each legal entity ALONE. For "
+                "the group's combined position call "
+                "get_customer_financial_360(cust_id=<the parent>), which "
+                "rolls the family up from the recorded hierarchy."
+            )
         if cs["notes"]:
             out["record_notes"] = cs["notes"]
         return out
+
+    def _family_heads(self, setid: str, cust_ids: list,
+                      has_corp: bool) -> set:
+        """Which of these customers OWN others, in one grouped read."""
+        if not has_corp or not cust_ids:
+            return set()
+        binds = {f"h{i}": cid for i, cid in enumerate(cust_ids)}
+        expr = "(" + ", ".join(f":{k}" for k in binds) + ")"
+        try:
+            rows, _ = self.db.query(
+                f"SELECT CORPORATE_CUST_ID AS parent, COUNT(*) AS n "
+                f"FROM {self.db.prefix}PS_CUSTOMER "
+                f"WHERE SETID = :setid AND CORPORATE_CUST_ID IN {expr} "
+                "AND CUST_ID <> CORPORATE_CUST_ID "
+                "GROUP BY CORPORATE_CUST_ID",
+                {"setid": setid, **binds}, max_rows=len(cust_ids) + 1)
+        except DbError:
+            return set()
+        return {str(r["parent"]) for r in rows if int(r["n"] or 0) > 0}
 
     # Bill statuses by lifecycle class. INV is the only status that IS
     # revenue; the pipeline statuses can still become revenue; CAN never

@@ -90,9 +90,16 @@ class AsyncDiscoveryTests(unittest.TestCase):
                 if r.status_code == 200:
                     return
                 detail = r.text.lower()
+                # "Ollama is not running" is an LLM-provider failure, which
+                # is what this test wants to see — but it was not in the
+                # list, so the suite went red on any dev box where the
+                # local model server happened to be down. A gate that fails
+                # for the right reason under the wrong name teaches people
+                # to ignore it. The MCP-symptom check below still runs.
                 provider_missing = ("package not installed" in detail
                                     or "google-genai" in detail
-                                    or "gcloud" in detail)
+                                    or "gcloud" in detail
+                                    or "failed to connect to ollama" in detail)
                 self.assertTrue(
                     provider_missing,
                     msg=f"expected an LLM-provider error, got {r.text[:200]}")

@@ -1894,6 +1894,35 @@ function renderAging(d){
     frag.append(el('div','card','<div class="pad" style="color:var(--muted);font-size:12px">'+
       d.record_notes.map(esc).join('<br>')+'</div>'));
   }
+  // Who is actually one company. Three ACME rows at ranks 1, 8 and 9 read
+  // as three customers; the combined 39% of the receivable is not visible
+  // anywhere else on this screen, and no amount of reading the rows below
+  // produces it.
+  const fam=(d.corporate_families&&d.corporate_families.families)||[];
+  if(fam.length){
+    const fc=el('div','card');
+    const cf=d.corporate_families||{};
+    const found=(cf.families_found!=null?cf.families_found:fam.length);
+    fc.append(el('h2',null,'Corporate families <span class="sub">'+
+      (cf.truncated?'the '+fam.length+' largest of '+found
+                   :found+' group'+(found===1?'':'s'))+
+      ' · from the hierarchy in the system, never matched by name</span>'));
+    const ft=el('table');
+    ft.innerHTML='<thead><tr><th>Group</th><th>Companies</th>'+
+      '<th class="num">Combined</th><th class="num">Share of AR</th>'+
+      '<th class="num">Largest member</th></tr></thead><tbody>'+
+      fam.map(f=>'<tr><td><b>'+esc(f.name||f.corporate_parent)+'</b> <span class="sub">'+
+        esc(f.corporate_parent)+'</span></td>'+
+        '<td>'+(f.members||[]).map(m=>esc(m.cust_id)).join(' · ')+'</td>'+
+        '<td class="num"><b>'+money(f.combined_total)+'</b></td>'+
+        '<td class="num">'+(f.share_of_ar_pct!=null?f.share_of_ar_pct.toFixed(1)+'%':'—')+'</td>'+
+        '<td class="num">'+(f.largest_member_share_pct!=null?f.largest_member_share_pct.toFixed(1)+'%':'—')+'</td></tr>'
+      ).join('')+'</tbody>';
+    fc.append(ft);
+    fc.append(el('div','pad','<span class="sub">'+
+      esc((d.corporate_families&&d.corporate_families.note)||'')+'</span>'));
+    frag.append(fc);
+  }
   const c=el('div','card');
   c.append(el('h2',null,'Aging by customer <span class="sub">as of '+esc(d.as_of)+
     (d.display_currency?' · in '+esc(d.display_currency):'')+'</span>'));

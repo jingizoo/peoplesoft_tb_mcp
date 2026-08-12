@@ -192,6 +192,48 @@ def _truncate_json(text: str, limit: int) -> str:
     return out if len(out) <= limit else out[:limit] + "\n...[truncated]"
 
 
+_ID_ARGS = ("cust_id", "customer", "customer_id", "vendor_id", "account",
+            "invoice", "invoice_id")
+
+
+def _observed_next_steps(name: str, parsed: dict, question: str,
+                         unit: str, seen: set, already=()) -> list:
+    """Turn this result's own figures into machine-visible next steps.
+
+    The suggestion rules already read tool payloads and produce a finding
+    plus the tool that answers it — but only the human saw them, as chips
+    under the answer. So the model would report an aging and stop, while
+    the machinery beside it had already worked out that one customer's
+    cash was sitting unapplied and which tool would show it.
+
+    These are pointers, not findings: every figure in them is quoted from
+    the payload they came out of, so they add no new number to ground.
+    Capped at three, deduplicated across the turn, and skipped entirely on
+    any failure — a next step is never worth an answer.
+    """
+    try:
+        from ..suggest import _subject, suggestions_for
+        out = []
+        for s in suggestions_for([(name, parsed)], question=question,
+                                 business_unit=unit):
+            if s["question"] in seen:
+                continue
+            # suggest.py suppresses "you already ran that" within a single
+            # payload; it cannot see the OTHER calls of the same turn. So a
+            # turn that ran the 360 for C1004 and an aging got told, by the
+            # aging, to go and run the 360 for C1004.
+            if (s["answered_by"], _subject(s["question"])) in already:
+                continue
+            seen.add(s["question"])
+            out.append({"finding": s["because"], "ask": s["question"],
+                        "tool": s["answered_by"]})
+            if len(out) >= 3:
+                break
+        return out
+    except Exception:                       # noqa: BLE001
+        return []
+
+
 def _compact_args(args: dict, limit: int = 90) -> str:
     """Readable one-line tool arguments for the trail.
 
@@ -368,6 +410,12 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     crosses_units = spans_business_units(user_text, known_units, selected_unit)
     bu_override = crosses_units
     turn_results: dict = {}
+    # One pointer per turn, not one per tool that noticed the same
+    # thing: aging and the 360 both spot an unapplied deposit.
+    observed_seen: set = set()
+    # (tool, id) this turn already ran, so a pointer never sends the model
+    # back for something it has.
+    observed_asked: set = set()
     required_financial_domains = question_financial_domains(user_text)
     # Tell the provider whether this question should open with a tool call.
     # The Gemini provider forces function-calling mode ANY on that first
@@ -610,6 +658,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 continue
             outcomes = await asyncio.gather(
                 *(run_call(i, c) for i, c in phase))
+            # What this batch already answered, before any of it is drained
+            # — the first result must not be told to go and fetch the
+            # fourth, which the model requested in the same breath.
+            for _o in outcomes:
+                for _k in _ID_ARGS:
+                    _v = (_o[2] or {}).get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        observed_asked.add((_o[1].name, _v.strip()))
             for (index, call, effective_args, blocked, out, elapsed_ms,
                  was_scope_block) in sorted(outcomes, key=lambda o: o[0]):
                 if was_scope_block:
@@ -665,6 +721,18 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                             rid = f"r{len(turn_results) + 1}"
                             turn_results[rid] = parsed
                             parsed["result_id"] = rid
+                            steps = _observed_next_steps(
+                                call.name, parsed, user_text,
+                                str(effective_args.get("business_unit") or ""),
+                                observed_seen, observed_asked)
+                            if steps:
+                                parsed["observed_next_steps"] = steps
+                                parsed["observed_next_steps_note"] = (
+                                    "Computed from the figures in THIS "
+                                    "result. Pointers, not new facts — do "
+                                    "not restate a finding as if a tool "
+                                    "reported it separately. Follow one "
+                                    "only if it answers what was asked.")
                             out = json.dumps(parsed)
                     except (json.JSONDecodeError, TypeError):
                         pass
