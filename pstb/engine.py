@@ -26,6 +26,12 @@ CLOSE_PERIOD = 999
 INTERNAL_ROW_CAP = 100_000
 SCOPE_ROW_CAP = 5_000          # catalog reads are bounded — never a full ledger scan
 SCOPE_PROBE_CAP = 250
+# The per-BU fallback is serial and each statement is a full network round
+# trip, so its cost is (units x one DISTINCT over the ledger). Forty units
+# at three seconds is two minutes, and the loop would attempt 250. A wall
+# clock is the only honest bound: the cost per unit is a property of THEIR
+# instance, not something this code can predict.
+SCOPE_FALLBACK_BUDGET_SECONDS = 20.0
 GRAPH_MAX_HOPS = 4          # max existence probes when filtering the catalog
 SCOPE_BATCH = 50               # pairs verified per round trip
 SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balances
@@ -82,6 +88,20 @@ class TBEngine:
         self._eff_defaults: Optional[dict] = None
         self._eff_defaults_expires_at = 0.0
         self._scope_cache_ttl_seconds = SCOPE_CACHE_TTL_SECONDS
+        # Which source answered, and anything the operator needs to know
+        # about how. Set by _ledger_scope_pairs, read into the payload.
+        self._scope_source = ""
+        self._scope_note = ""
+        self._scope_probe_cursor = 0
+        # The MCP server is a SEPARATE PROCESS from the GUI, so the GUI's
+        # 900s catalog cache does nothing for a model that calls
+        # list_financial_scopes mid-conversation: every call rebuilt from
+        # scratch, and on a grant-limited site every call paid the per-unit
+        # fallback again. Keyed on the flags because the answers genuinely
+        # differ, and never populated for an access-filtered build — one
+        # user's narrowed catalog must not be served to the next asker.
+        self._catalog_cache: dict = {}
+        self._bu_enrichment_cache: Optional[tuple] = None
         self._tree_ctl: dict = {}
         # Setup lookups repeat many times per question and each is a WAN
         # round trip on a real instance. They describe how the installation
@@ -264,6 +284,8 @@ class TBEngine:
                     seen.add((bu, ledger))
             return pairs, truncated
 
+        self._scope_source = "setup"
+        self._scope_note = ""
         try:
             pairs, truncated = _collect(q.scope_setup_pairs(self.db),
                                         SCOPE_ROW_CAP)
@@ -271,35 +293,62 @@ class TBEngine:
                 if not verify:
                     return pairs, truncated
                 return self._with_ledger_data(pairs), truncated
-        except DbError:
-            pass  # setup records not granted at this site — try the next source
+        except DbError as e:
+            # Not granted here. This is the branch that turns a two-statement
+            # catalog into a per-unit loop, and it used to happen in total
+            # silence — no note, no flag, nothing in the payload to explain
+            # why discovery took a minute. Record it.
+            self._scope_note = (
+                "PS_BUS_UNIT_LED / PS_LED_GRP_TBL could not be read "
+                f"({e}); discovery fell back to probing the ledger per "
+                "business unit, which is far slower. Granting SELECT on "
+                "those two setup records makes this one query.")
 
         if setup_only:
+            self._scope_source = "deferred"
             return [], False
 
         # BU list from setup, then each BU's ledgers from PS_LEDGER filtered
         # BY THAT BU — an index range scan on the leading column, not a scan
         # of the whole table. A BU defined in setup but never posted to
         # contributes no pairs, so it is not offered as an answerable scope.
+        self._scope_source = "per-unit-probe"
         try:
             rows, truncated = self.db.query(q.scope_bu_list(self.db), {},
                                             max_rows=SCOPE_ROW_CAP)
             bus = [str(r.get("business_unit") or "").strip() for r in rows]
             bus = [b for b in bus if b][:SCOPE_PROBE_CAP]
-            pairs = []
-            for bu in bus:
+            # Start where the LAST call stopped, so a budget that runs out
+            # does not mean the same first units forever and the rest never.
+            start = self._scope_probe_cursor % len(bus) if bus else 0
+            order = bus[start:] + bus[:start]
+            pairs, done, deadline = [], 0, (
+                time.monotonic() + SCOPE_FALLBACK_BUDGET_SECONDS)
+            for bu in order:
+                if done and time.monotonic() > deadline:
+                    break
                 led_rows, _ = self.db.query(q.ledgers_for_bu(self.db),
                                             {"bu": bu}, max_rows=200)
+                done += 1
                 for lr in led_rows:
                     led = str(lr.get("ledger") or lr.get("l") or "").strip()
                     if led:
                         pairs.append((bu, led))
+            self._scope_probe_cursor = (start + done) % (len(bus) or 1)
+            if done < len(bus):
+                truncated = True
+                self._scope_note += (
+                    f" It covered {done} of {len(bus)} business units "
+                    f"within {SCOPE_FALLBACK_BUDGET_SECONDS:.0f}s; the rest "
+                    "are NOT in this catalog and the next call resumes "
+                    "where this one stopped.")
             if pairs:
                 return pairs, truncated
-        except DbError:
-            pass
+        except DbError as e:
+            self._scope_note += f" The per-unit probe also failed ({e})."
 
         # Last resort: the balance table itself. Capped, and slow by nature.
+        self._scope_source = "ledger-scan"
         return _collect(q.financial_scope_pairs(self.db), SCOPE_ROW_CAP)
 
     def _effective_defaults_from_pairs(
@@ -369,6 +418,8 @@ class TBEngine:
         self._max_reg_cache.clear()
         self._resolve_cache.clear()
         self._period_details_cache.clear()
+        self._catalog_cache.clear()
+        self._bu_enrichment_cache = None
 
     def effective_defaults(self) -> dict:
         """Config defaults validated against PS_LEDGER's accessible catalog.
@@ -2128,7 +2179,17 @@ class TBEngine:
         return report
 
     def _business_unit_enrichment(self) -> dict[str, dict]:
-        """Best-effort setup metadata, never the authority for valid scopes."""
+        """Best-effort setup metadata, never the authority for valid scopes.
+
+        Descriptions and base currencies are CONFIGURATION, and this ran
+        once per catalog build in every flag combination — including the
+        boot prime, where it was half of the two statements the prime is
+        allowed. Same TTL as every other scope cache, so a newly onboarded
+        unit still appears without a restart.
+        """
+        cached = self._bu_enrichment_cache
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
         try:
             rows, _ = self.db.query(
                 q.business_units(self.db), {}, max_rows=INTERNAL_ROW_CAP
@@ -2146,6 +2207,8 @@ class TBEngine:
                     str(row.get("base_currency") or "").strip() or None
                 ),
             }
+        self._bu_enrichment_cache = (
+            time.monotonic() + self._scope_cache_ttl_seconds, enriched)
         return enriched
 
     def _ledger_scope_currency(self, bu: str, ledger: str) -> Optional[str]:
@@ -2266,6 +2329,14 @@ class TBEngine:
         # honest and small: a unit that exists in setup but has never been
         # posted to may be offered, and choosing it reports "no ledger data
         # in scope" — an answer, not a failure.
+        # An access-filtered build is never cached and never served from
+        # cache: it is one user's reach, and the next asker's may differ.
+        key = (bool(include_activity), bool(verify_pairs), bool(setup_only))
+        shareable = access is None or getattr(access, "all_units", False)
+        if shareable:
+            hit = self._catalog_cache.get(key)
+            if hit and time.monotonic() < hit[0]:
+                return hit[1]
         pairs, truncated = self._ledger_scope_pairs(verify=verify_pairs,
                                                     setup_only=setup_only)
         # Row security narrows the catalog BEFORE anything is built from it,
@@ -2328,18 +2399,33 @@ class TBEngine:
         )
         if truncated:
             note += (
-                f" The catalog exceeded the safety cap of {INTERNAL_ROW_CAP} "
-                "BU/ledger pairs and is truncated."
+                f" The catalog was cut at the safety cap of {SCOPE_ROW_CAP} "
+                "BU/ledger pairs and does not list every scope."
             )
-        return {
+        if self._scope_note:
+            note += " " + self._scope_note.strip()
+        # Verification is SKIPPED past the probe cap, and saying nothing let
+        # the page treat an unverified catalog as final. A pair that was
+        # never probed may hold no ledger data at all.
+        skipped = verify_pairs and len(pairs) > SCOPE_PROBE_CAP
+        out = {
             "scopes": list(scopes.values()),
             "default": {
                 "business_unit": effective["business_unit"],
                 "ledger": effective["ledger"],
             },
-            "note": note,
+            "note": note + (
+                f" Pairs were NOT verified against ledger data: there are "
+                f"{len(pairs)}, past the probe cap of {SCOPE_PROBE_CAP}."
+                if skipped else ""),
             "truncated": truncated,
+            "verified": bool(verify_pairs) and not skipped,
+            "source": self._scope_source,
         }
+        if shareable:
+            self._catalog_cache[key] = (
+                time.monotonic() + self._scope_cache_ttl_seconds, out)
+        return out
 
     def list_ledgers(self, business_unit: str = "") -> dict:
         bu = (business_unit or "").strip()

@@ -216,10 +216,15 @@ class Database:
             names = {str(r.get("column_name") or r.get("name") or "").upper()
                      for r in rows} - {""}
         except Exception:
+            # A transient connection failure is not evidence a record is
+            # absent, so this one stays UNCACHED — the next call asks again.
             return set()
-        if names:
-            with self._catalog_lock:
-                self._catalog[key] = names
+        # A describe that SUCCEEDED and found nothing is a real answer, and
+        # refusing to remember it meant one dictionary read per absent
+        # record per catalog build, forever. On Oracle that is an
+        # ALL_TAB_COLUMNS query, not a free lookup.
+        with self._catalog_lock:
+            self._catalog[key] = names
         return names
 
     def has_column(self, table: str, column: str) -> bool:
