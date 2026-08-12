@@ -235,6 +235,12 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px;
   font-size:12px;cursor:pointer;color:var(--muted)}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
+.msg-actions{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+/* .csvbtn carries margin-left:auto to sit at the right of a card
+   summary; in these two rows it would shove the first button off
+   to the right instead. */
+.msg-actions .csvbtn,.table-copy .csvbtn{margin-left:0}
+.table-copy{display:flex;justify-content:flex-end;padding:0 14px 4px}
 /* Derived follow-ups sit under the answer, one per line, each with the
    figure that earned it. A row of bare chips reads as a guess; the
    reason is what makes it checkable. */
@@ -848,6 +854,96 @@ async function downloadExport(tool,args,result,btn){
 }
 const CSV_HINT='Download the FULL result as CSV \u2014 re-run server-side, '+
   'beyond the rows shown here';
+/* ===== copy =====
+   navigator.clipboard is undefined outside a SECURE CONTEXT, and the
+   default deployment is now a plain-HTTP bind on 0.0.0.0:8016 — so on
+   every machine except the one the developer tested on, localhost, the
+   modern API simply is not there. A copy button that silently does
+   nothing for everyone else is worse than no copy button, so the old
+   execCommand path is the fallback and the button says which outcome it
+   got. If both fail the text is selected in place, which at least leaves
+   Ctrl+C working. */
+function copyText(text, btn, done){
+  const ok=()=>{ if(!btn) return;
+    const was=btn.dataset.label||btn.textContent;
+    btn.dataset.label=was; btn.textContent=done||'Copied \u2713';
+    setTimeout(()=>{btn.textContent=btn.dataset.label;},1500); };
+  // Last resort with a way out. Both APIs can be refused — a hardened
+  // browser policy, an iframe without clipboard-write, a context where
+  // execCommand is disabled — and "nothing happened" is the one outcome
+  // that must not be possible. Select the text where it sits so the
+  // keyboard still works, and say which key.
+  const fail=()=>{
+    try{ selectNodeText(btn); }catch(e){ /* selection is a courtesy */ }
+    if(btn){ const was=btn.dataset.label||btn.textContent;
+      btn.dataset.label=was; btn.textContent='Press Ctrl+C';
+      setTimeout(()=>{btn.textContent=btn.dataset.label;},2500); } };
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(ok,()=>legacyCopy(text,ok,fail));
+    return;
+  }
+  legacyCopy(text,ok,fail);
+}
+// Select what the button was going to copy: the table it sits above, or
+// the message it sits inside. Ctrl+C then does what the click could not.
+function selectNodeText(btn){
+  if(!btn) return;
+  const bar=btn.closest('.table-copy');
+  const target=bar ? bar.nextElementSibling : btn.closest('.msg');
+  if(!target) return;
+  const range=document.createRange();
+  range.selectNodeContents(target);
+  const sel=window.getSelection();
+  sel.removeAllRanges(); sel.addRange(range);
+}
+function legacyCopy(text, ok, fail){
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  // Off-screen but focusable: display:none or visibility:hidden make the
+  // selection empty and the copy a no-op.
+  ta.setAttribute('readonly','');
+  ta.style.cssText='position:fixed;top:0;left:-9999px;opacity:0';
+  document.body.append(ta);
+  ta.select(); ta.setSelectionRange(0,text.length);
+  let copied=false;
+  try{ copied=document.execCommand('copy'); }catch(e){ copied=false; }
+  ta.remove();
+  (copied?ok:fail)();
+}
+// Tab-separated, because the person copying a financial table is pasting
+// it into a spreadsheet or an email, and TSV is the one format both of
+// those split into columns without an import dialog.
+function tableToTsv(table){
+  return [...table.querySelectorAll('tr')].map(tr=>
+    [...tr.querySelectorAll('th,td')]
+      .map(c=>c.textContent.replace(/\s+/g,' ').trim())
+      .join('\t')).join('\n');
+}
+// Every renderer builds plain <table>s, so wiring the copy here reaches all
+// of them at once — including the ones written after this. A card can hold
+// several tables (the 360 has five), and each gets its own button rather
+// than one that copies an ambiguous concatenation.
+function attachTableCopies(root){
+  if(!root) return;
+  root.querySelectorAll('table').forEach(t=>{
+    if(t.dataset.copyWired) return;
+    t.dataset.copyWired='1';
+    if(!t.querySelector('tbody tr')) return;   // nothing to copy yet
+    const bar=el('div','table-copy');
+    bar.append(copyTableButton(t));
+    t.parentNode.insertBefore(bar,t);
+  });
+}
+function copyTableButton(table,label){
+  const b=el('button','csvbtn',label||'Copy');
+  b.type='button';
+  b.title='Copy this table to the clipboard, tab-separated for a spreadsheet';
+  b.setAttribute('aria-label','Copy this table to the clipboard');
+  b.onclick=ev=>{ ev.preventDefault(); ev.stopPropagation();
+    copyText(tableToTsv(table), b); };
+  return b;
+}
+
 function csvButton(tool,args,result){
   const b=el('button','csvbtn','CSV');
   b.type='button'; b.title=CSV_HINT;
@@ -2560,8 +2656,7 @@ function renderDiag(d,holder){
     pre.style.cssText='margin:0 14px 12px;padding:10px;background:var(--bg);border:1px solid var(--line);'+
       'border-radius:7px;font-size:11.5px;overflow:auto;max-height:340px;white-space:pre';
     pre.textContent=d.dba_summary;
-    btn.onclick=()=>{navigator.clipboard.writeText(d.dba_summary).then(()=>{btn.textContent='Copied \u2713';
-      setTimeout(()=>btn.textContent='Copy',1500);});};
+    btn.onclick=()=>copyText(d.dba_summary,btn);
     c.append(btn,pre);
     holder.append(c);
   }
@@ -2833,10 +2928,14 @@ async function send(messageOverride,appendUser){
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       if(c.ok!==false&&hasTable(c.result))
         summary.append(csvButton(c.tool,c.args||{},c.result));
+      // CSV downloads a file; Copy puts it on the clipboard. Different
+      // jobs — one goes into a folder, the other into the email someone
+      // is already writing.
       card.append(summary);
       card.id='src-'+(++CARDSEQ);
       const node=renderToolResult(c.tool,c.result,c.args||{});
-      if(node){ const holder=el('div','inline'); holder.append(node); card.append(holder); }
+      if(node){ const holder=el('div','inline'); holder.append(node);
+        card.append(holder); attachTableCopies(holder); }
       else card.className='tool-card no-body';
       msgs.append(card);
       turnCards.push(card);
@@ -2865,6 +2964,27 @@ async function send(messageOverride,appendUser){
       if(fb) fb.onclick=async()=>{ fb.textContent='logged \u2713'; fb.style.pointerEvents='none';
         try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({turn_id:fb.dataset.turn,verdict:'bad'})}); }catch(e){} };
+      // Copy the ANSWER as it was written, not the rendered HTML: the
+      // figure links and the provenance underlines are this page's
+      // furniture, and pasting them into an email produces markup nobody
+      // asked for. j.answer is the model's own text.
+      const acts=el('div','msg-actions');
+      const copyBtn=el('button','csvbtn','Copy answer');
+      copyBtn.type='button';
+      copyBtn.setAttribute('aria-label','Copy this answer to the clipboard');
+      copyBtn.onclick=()=>copyText(j.answer,copyBtn);
+      acts.append(copyBtn);
+      if(turnCardMeta.length){
+        // The answer alone is a claim; the answer plus what it was read
+        // from is something a reviewer can check without this page.
+        const both=el('button','csvbtn','Copy with sources');
+        both.type='button';
+        both.setAttribute('aria-label',
+          'Copy this answer together with the source results it cites');
+        both.onclick=()=>copyText(answerWithSources(m,j),both);
+        acts.append(both);
+      }
+      b.append(acts);
       msgs.append(b);
       renderFollowUps(msgs,j.suggestions);
     }
@@ -2898,6 +3018,30 @@ function renderFollowUps(msgs,list){
     wrap.append(item);
   });
   msgs.append(wrap);
+}
+
+// Question, answer, and the tool results behind it — as text, so it can be
+// pasted into a ticket or a review thread by someone who does not have this
+// page open. Tables become TSV for the same reason the table copy does.
+function answerWithSources(question, j){
+  const parts=['Q: '+question,'','A: '+(j.answer||''),''];
+  const scope=j.scope||{};
+  const bits=[scope.business_unit,scope.ledger,
+              scope.fiscal_year?'FY'+scope.fiscal_year:''].filter(Boolean);
+  if(bits.length) parts.splice(1,0,'Scope: '+bits.join(' · '));
+  parts.push('--- sources ---');
+  (j.tool_calls||[]).forEach(c=>{
+    parts.push('');
+    parts.push(c.tool+'('+compactArgs(c.args)+')'+
+      (c.ms!==undefined?'  '+c.ms+' ms':'')+(c.ok===false?'  FAILED':''));
+    let payload=c.result;
+    if(typeof payload==='string'){
+      try{ payload=JSON.parse(payload); }catch(e){ /* keep the text */ }
+    }
+    parts.push(typeof payload==='string'?payload
+               :JSON.stringify(payload,null,1));
+  });
+  return parts.join('\n');
 }
 
 /* ---------- csv ---------- */
