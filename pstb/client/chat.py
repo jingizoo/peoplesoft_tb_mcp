@@ -384,6 +384,7 @@ def _evidence_nudge(intent: str, db_ok: bool, relevant_financial_db_ok: bool,
 
 async def agent_turn(provider: LLMProvider, session: ClientSession,
                      user_text: str, qlog=None, surface: str = "terminal",
+                     turn_meta: Optional[dict] = None,
                      scope: dict | None = None,
                      tool_observer: Callable | None = None,
                      tool_started: Callable | None = None,
@@ -878,7 +879,14 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                                 question=user_text, calls=logged_calls,
                                 rounds=rounds, answer=answer,
                                 hit_round_limit=hit_limit)
-        agent_turn.last_turn_id = turn_id  # for the GUI feedback button
+        # Per CALL, not on the function. Stashing it on agent_turn made the
+        # id a process global that every concurrent turn overwrote: two
+        # colleagues asking at once, and a thumbs-down on one answer logged
+        # against the other one's turn. The caller's own dict cannot race
+        # with anybody else's.
+        if turn_meta is not None:
+            turn_meta["turn_id"] = turn_id
+        agent_turn.last_turn_id = turn_id   # terminal client, single turn
     return answer
 
 

@@ -3058,7 +3058,16 @@ async function send(messageOverride,appendUser){
       const node=renderToolResult(c.tool,c.result,c.args||{});
       if(node){ const holder=el('div','inline'); holder.append(node);
         card.append(holder); attachTableCopies(holder); }
-      else card.className='tool-card no-body';
+      else if(c.result==null||c.result===undefined) card.className='tool-card no-body';
+      else {
+        // A renderer that returns nothing for a payload that EXISTS is a
+        // bug in the renderer, not an empty result. Showing the raw data
+        // is how the next one gets noticed instead of read as "no rows".
+        const holder=el('div','inline');
+        holder.append(renderGeneric(c.tool,c.result)||el('div','pad',
+          '(the payload could not be rendered — raw value below)'));
+        card.append(holder);
+      }
       msgs.append(card);
       turnCards.push(card);
       if(c.ok!==false) turnCardMeta.push({id:card.id,tool:c.tool,result:c.result});

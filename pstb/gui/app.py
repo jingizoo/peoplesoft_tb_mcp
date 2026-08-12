@@ -1923,6 +1923,11 @@ async def chat(payload: dict, request: Request = None):
     from ..client.prompt import system_prompt
 
     calls: list = []
+    # The turn id comes back in THIS dict, not off the function object: a
+    # module-level slot is overwritten by whichever concurrent turn
+    # finishes last, and a thumbs-down would then be logged against
+    # somebody else's answer.
+    turn_meta: dict = {}
     # Hoisted so the success return can read it even if the turn
     # never reached the block that fills it.
     turn_payloads: list = []
@@ -2109,7 +2114,14 @@ async def chat(payload: dict, request: Request = None):
             try:
                 data = _json.loads(out)
             except (ValueError, TypeError):
-                data = None
+                # NOT None. A result that is not JSON is a result the
+                # browser used to render as an empty card body — the tool
+                # name and its timing in the header, and nothing at all
+                # behind the arrow. Six tools spent a release in exactly
+                # that state, raising a TypeError the UI turned into
+                # silence. Hand the text through and let it be readable.
+                data = {"error": str(out)[:4000],
+                        "non_json_result": True}
             calls.append({
                 "tool": name, "args": args, "ms": ms, "ok": ok,
                 "result": data,
@@ -2208,6 +2220,7 @@ async def chat(payload: dict, request: Request = None):
                     tool_started=_on_started,
                     prior_payloads=prior_payloads,
                     result_limit=result_limit,
+                    turn_meta=turn_meta,
                     access=access,
                     allow_raw_sql=bool(
                         getattr(cfg.security, "raw_sql_for_restricted",
@@ -2258,7 +2271,7 @@ async def chat(payload: dict, request: Request = None):
     _suggestions_store(session_id, follow_ups)
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
             "scope": active_scope, "suggestions": follow_ups,
-            "turn_id": getattr(agent_turn, "last_turn_id", None)}
+            "turn_id": turn_meta.get("turn_id")}
 
 
 def _console_reload() -> dict:
@@ -2437,6 +2450,31 @@ def main() -> None:
     # the flag never controlled: the Host check, the optional token, and
     # /console answering only from this machine no matter what the network
     # policy is.
+    # Raw SQL, a routable bind and no row security is a COMBINATION, not
+    # three settings. Any one alone is defensible: ad-hoc SQL is this
+    # product's answer to every module without a curated tool; the network
+    # bind is the deployment; security off is a single-user install.
+    # Together they mean anyone who can reach the port can SELECT anything
+    # the database account can read, and nothing on the way in asks who
+    # they are.
+    #
+    # Refusing to start would be wrong — it would break the machine-local
+    # workflow this has always supported. So the dangerous COMBINATION is
+    # what fails closed: ad-hoc SQL switches off, and the banner names the
+    # two switches that turn it back on. An operator who wants it anyway
+    # says so once, in config, on purpose.
+    raw_sql_off_reason = ""
+    if (not loopback and cfg.tools.allow_raw_sql
+            and not cfg.security.enabled
+            and not getattr(cfg.tools, "raw_sql_on_shared_bind", False)):
+        cfg.tools.allow_raw_sql = False
+        raw_sql_off_reason = (
+            "Ad-hoc SQL is OFF: this bind is reachable from the network and "
+            "business-unit security is not on, so nothing identifies the "
+            "caller. Turn on security.enabled to restore it per user, or "
+            "set tools.raw_sql_on_shared_bind: true to accept that anyone "
+            "who can reach this port may query the database.")
+
     if loopback and args.share:
         # Silently ignoring the flag taught the operator the wrong lesson —
         # they believed a token was required and it was not.
@@ -2487,6 +2525,8 @@ def main() -> None:
               "restart.")
         print(f"  To keep it on this machine only: --host 127.0.0.1, then "
               f"ssh -L {args.port}:localhost:{args.port} <this-host>.")
+        if raw_sql_off_reason:
+            print("  " + raw_sql_off_reason)
         print("  The configuration console is not shared either way: "
               "/console answers only from this machine (SSH tunnel).")
     elif token:

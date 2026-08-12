@@ -112,6 +112,11 @@ class WikiCfg:
 @dataclass
 class ToolsCfg:
     allow_raw_sql: bool = True
+    # Ad-hoc SQL on a bind the whole network can reach, with no row
+    # security, is off unless an operator says otherwise here. The default
+    # stays True because the machine-local and the secured deployments both
+    # want it; what needs a deliberate hand is the third case.
+    raw_sql_on_shared_bind: bool = False
     max_rows: int = 200
     reports_path: str = "reports"
     question_log: str = "logs/questions.jsonl"
