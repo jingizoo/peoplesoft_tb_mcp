@@ -378,7 +378,25 @@ CREATE TABLE PS_RT_RATE_TBL (
   FROM_CUR TEXT, TO_CUR TEXT, RT_TYPE TEXT, EFFDT TEXT,
   RATE_MULT REAL, RATE_DIV REAL);
 CREATE TABLE PS_CUSTOMER (
-  SETID TEXT, CUST_ID TEXT, NAME1 TEXT, CUST_STATUS TEXT);
+  SETID TEXT, CUST_ID TEXT, NAME1 TEXT, CUST_STATUS TEXT,
+  -- The corporate hierarchy PeopleSoft itself keeps: a subsidiary points at
+  -- its parent, and a parent points at itself. This is the edge that makes
+  -- "which subsidiaries drive this parent's overdue balance" answerable
+  -- without anyone GUESSING that two customers are related.
+  CORPORATE_SETID TEXT, CORPORATE_CUST_ID TEXT);
+
+-- AR payments and how they were applied. A payment exists on its own (money
+-- arrived) and is APPLIED to items separately — money received but not
+-- applied is one of the states worth surfacing, and flattening the two into
+-- one row would hide it.
+CREATE TABLE PS_PAYMENT (
+  DEPOSIT_BU TEXT, DEPOSIT_ID TEXT, PAYMENT_SEQ_NUM INTEGER, CUST_ID TEXT,
+  PAYMENT_AMT REAL, PAYMENT_DT TEXT, PAYMENT_CURRENCY TEXT,
+  PAYMENT_STATUS TEXT);
+CREATE TABLE PS_PAYMENT_ITEM (
+  DEPOSIT_BU TEXT, DEPOSIT_ID TEXT, PAYMENT_SEQ_NUM INTEGER,
+  BUSINESS_UNIT TEXT, CUST_ID TEXT, ITEM TEXT, APPLIED_AMT REAL,
+  ACCTG_DT TEXT);
 CREATE TABLE PS_ITEM (
   BUSINESS_UNIT TEXT, CUST_ID TEXT, ITEM TEXT, ITEM_LINE INTEGER,
   ITEM_STATUS TEXT, BAL_AMT REAL, ORIG_ITEM_AMT REAL, BAL_CURRENCY TEXT,
@@ -386,7 +404,10 @@ CREATE TABLE PS_ITEM (
 CREATE TABLE PS_BI_HDR (
   BUSINESS_UNIT TEXT, INVOICE TEXT, BILL_STATUS TEXT, BILL_TO_CUST_ID TEXT,
   INVOICE_DT TEXT, ACCOUNTING_DT TEXT, INVOICE_AMOUNT REAL,
-  BI_CURRENCY_CD TEXT, BILL_TYPE_ID TEXT, BILL_SOURCE_ID TEXT);
+  BI_CURRENCY_CD TEXT, BILL_TYPE_ID TEXT, BILL_SOURCE_ID TEXT,
+  -- Credit and rebill point BACK at the invoice they correct. The CHAIN,
+  -- not the single row, is what tells you the net effect.
+  CR_REBILL_INV TEXT, ADJUSTMENT_TYPE TEXT);
 CREATE TABLE PS_CUST_ADDRESS (
   SETID TEXT, CUST_ID TEXT, ADDRESS_SEQ_NUM INTEGER,
   CITY TEXT, STATE TEXT, COUNTRY TEXT);
@@ -417,6 +438,9 @@ CREATE INDEX PS_LEDGER_IDX ON PS_LEDGER
 CREATE INDEX PS_ITEM_IDX ON PS_ITEM (BUSINESS_UNIT, CUST_ID, ITEM);
 CREATE INDEX PS_CUSTOMER_IDX ON PS_CUSTOMER (SETID, CUST_ID);
 CREATE INDEX PS_CUST_ADDRESS_IDX ON PS_CUST_ADDRESS (SETID, CUST_ID);
+CREATE INDEX PS_PAYMENT_IDX ON PS_PAYMENT (DEPOSIT_BU, CUST_ID, DEPOSIT_ID);
+CREATE INDEX PS_PAYMENT_ITEM_IDX ON PS_PAYMENT_ITEM
+  (BUSINESS_UNIT, CUST_ID, ITEM);
 CREATE INDEX PS_BI_HDR_IDX ON PS_BI_HDR
   (BUSINESS_UNIT, INVOICE, BILL_TO_CUST_ID);
 CREATE INDEX PS_BI_LINE_IDX ON PS_BI_LINE (BUSINESS_UNIT, INVOICE);
@@ -821,9 +845,24 @@ def main() -> None:
         ("C1005", "Orion Logistics"), ("C1006", "Summit Media"),
         ("C1007", "Redwood Utilities"),
     ]
-    cust_rows = [(SETID, cid, name, "A") for cid, name in customers]
-    cust_rows.append((SETID, "C1008", "Harborview Hotels", "I"))
-    con.executemany("INSERT INTO PS_CUSTOMER VALUES (?,?,?,?)", cust_rows)
+    # A corporate family, because a hierarchy of one proves nothing: ACME
+    # Industrial is the parent of two subsidiaries that bill separately, so
+    # "which subsidiaries drive this parent's overdue balance" has a real
+    # answer. Everyone else is their own parent, which is how PeopleSoft
+    # represents an unaffiliated customer.
+    FAMILY = {"C1009": "C1001", "C1010": "C1001"}
+    customers = customers + [("C1009", "ACME Industrial - West"),
+                             ("C1010", "ACME Industrial - Components"),
+                             # Same name, different company. It is its own
+                             # corporate parent, so nothing may fold it into
+                             # the ACME family — the trap that any
+                             # name-similarity match walks straight into.
+                             ("C1011", "ACME Logistics Group")]
+    cust_rows = [(SETID, cid, name, "A", SETID, FAMILY.get(cid, cid))
+                 for cid, name in customers]
+    cust_rows.append((SETID, "C1008", "Harborview Hotels", "I",
+                      SETID, "C1008"))
+    con.executemany("INSERT INTO PS_CUSTOMER VALUES (?,?,?,?,?,?)", cust_rows)
     con.execute("INSERT INTO PS_SET_CNTRL_REC VALUES (?,?,?)", (BU, "CUSTOMER", SETID))
 
     # Open items sum EXACTLY to the GL AR control (1100) balance at 2026-06-30,
@@ -849,6 +888,11 @@ def main() -> None:
         ("C1007", "INV-260609", 122_600.00, "2026-06-17", "2026-08-01", ""),
         ("C1007", "INV-260415", 31_800.00, "2026-04-15", "2026-05-15", ""),
         ("C1008", "INV-260210", 12_500.00, "2026-02-10", "2026-03-12", ""),
+        # The two subsidiaries bill in their own right. One of them is the
+        # only overdue member of the family, which is the whole point of
+        # being able to ask the parent about its children.
+        ("C1009", "INV-260620", 34_750.00, "2026-06-20", "2026-07-20", ""),
+        ("C1010", "INV-260505", 19_900.00, "2026-05-05", "2026-06-04", ""),
     ]
     # real PS_ITEM rows can carry NULL DUE_DT; one is seeded deliberately
     items.append(("C1006", "DM-260620", 4_200.00, "2026-06-20", None, ""))
@@ -856,12 +900,21 @@ def main() -> None:
     # equivalent (3,000 / 0.92 = 3,260.87 at the seeded EUR->USD rate) is
     # carved out of the plug so the converted subledger still ties to GL 1100
     # to the penny.
+    # Cash already received and applied. An open item's BALANCE is what is
+    # still owed; its ORIGINAL amount is what was billed. Seeding them equal
+    # everywhere would mean no customer had ever paid anything, and every
+    # payment question would have the same empty answer.
+    PAID = {"INV-260602": 25_000.00,   # paid down, still open
+            "INV-260609": 60_000.00,
+            "INV-260601": 20_000.00}   # partly paid; the rest sits unapplied
     eur_open, eur_usd_equiv = 3_000.00, 3_260.87
-    plug = r2(ar_target - sum(a for _, _, a, _, _, _ in items) - eur_usd_equiv)
+    plug = r2(ar_target - sum(a - PAID.get(i, 0.0)
+                              for _, i, a, _, _, _ in items) - eur_usd_equiv)
     assert plug > 0, f"AR plug went negative: {plug}"
     items.append(("C1001", "INV-260614", plug, "2026-06-29", "2026-08-08", ""))
     item_rows = [
-        (BU, cid, item, 1, "O", amt, amt, CURR, acctg, due, acctg, disp, "")
+        (BU, cid, item, 1, "O", r2(amt - PAID.get(item, 0.0)), amt, CURR,
+         acctg, due, acctg, disp, "")
         for cid, item, amt, acctg, due, disp in items
     ]
     # a few closed items for realism (excluded by ITEM_STATUS filters)
@@ -870,25 +923,72 @@ def main() -> None:
          "2026-03-05", "2026-04-04", "2026-03-05", "", ""),
         (BU, "C1006", "INV-260315", 1, "C", 0.0, 18_750.00, CURR,
          "2026-03-18", "2026-04-17", "2026-03-18", "", ""),
+        # The credit that closed INV-260301. See REBILL below.
+        (BU, "C1001", "CM-260301", 1, "C", 0.0, -52_000.00, CURR,
+         "2026-04-02", "2026-04-02", "2026-04-02", "", ""),
     ]
     con.executemany("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", item_rows)
 
     # Billing headers: one finalized (INV) header per AR invoice item, plus a
     # pipeline of not-yet-finalized work and one finalized-but-not-in-AR orphan.
+    # Credit and rebill: March's invoice to ACME was credited in full and
+    # rebilled in May for 13,500 less. Each row on its own looks ordinary;
+    # only the chain shows the money that never came back. item -> the
+    # invoice it corrects, and what kind of correction it is.
+    REBILL = {"CM-260301": ("INV-260301", "CR"),
+              "INV-260501": ("INV-260301", "RB")}
     hdrs = [
-        (BU, item, "INV", cid, acctg, acctg, amt, CURR, "STD", "CRM")
+        (BU, item, "INV", cid, acctg, acctg, amt, CURR, "STD", "CRM",
+         *REBILL.get(item, ("", "")))
         for cid, item, amt, acctg, _due, _d in items
         if item.startswith("INV-")
     ]
     hdrs += [
-        (BU, "INV-260701", "RDY", "C1003", "2026-07-18", "2026-07-18", 21_400.00, CURR, "STD", "CRM"),
-        (BU, "INV-260702", "RDY", "C1006", "2026-07-24", "2026-07-24", 9_850.00, CURR, "SVC", "PROJ"),
-        (BU, "INV-260703", "HLD", "C1004", "2026-07-10", "2026-07-10", 33_000.00, CURR, "STD", "CRM"),
-        (BU, "INV-260704", "NEW", "C1002", "2026-07-28", "2026-07-28", 5_600.00, CURR, "SVC", "MAN"),
-        (BU, "INV-260630", "CAN", "C1005", "2026-06-30", "2026-06-30", 14_000.00, CURR, "STD", "CRM"),
-        (BU, "INV-2606ORPH", "INV", "C1007", "2026-06-28", "2026-06-28", 27_500.00, CURR, "STD", "CRM"),
+        (BU, "INV-260301", "INV", "C1001", "2026-03-05", "2026-03-05",
+         52_000.00, CURR, "STD", "CRM", "", ""),
+        (BU, "CM-260301", "INV", "C1001", "2026-04-02", "2026-04-02",
+         -52_000.00, CURR, "STD", "CRM", *REBILL["CM-260301"]),
     ]
-    con.executemany("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)", hdrs)
+    hdrs += [
+        (BU, "INV-260701", "RDY", "C1003", "2026-07-18", "2026-07-18", 21_400.00, CURR, "STD", "CRM", "", ""),
+        (BU, "INV-260702", "RDY", "C1006", "2026-07-24", "2026-07-24", 9_850.00, CURR, "SVC", "PROJ", "", ""),
+        (BU, "INV-260703", "HLD", "C1004", "2026-07-10", "2026-07-10", 33_000.00, CURR, "STD", "CRM", "", ""),
+        (BU, "INV-260704", "NEW", "C1002", "2026-07-28", "2026-07-28", 5_600.00, CURR, "SVC", "MAN", "", ""),
+        (BU, "INV-260630", "CAN", "C1005", "2026-06-30", "2026-06-30", 14_000.00, CURR, "STD", "CRM", "", ""),
+        (BU, "INV-2606ORPH", "INV", "C1007", "2026-06-28", "2026-06-28", 27_500.00, CURR, "STD", "CRM", "", ""),
+    ]
+    con.executemany("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", hdrs)
+
+    # Cash received, and what it was applied to. The two are separate on
+    # purpose: a payment that arrived and was never applied still shows as
+    # money you are holding while the customer still shows as owing it.
+    # Applied amounts here must equal PAID above, or the subledger stops
+    # agreeing with itself.
+    con.executemany(
+        "INSERT INTO PS_PAYMENT VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (BU, "DEP-26031", 1, "C1006", 18_750.00, "2026-04-15", CURR, "C"),
+            (BU, "DEP-26061", 1, "C1001", 25_000.00, "2026-06-20", CURR, "C"),
+            (BU, "DEP-26062", 1, "C1007", 60_000.00, "2026-06-22", CURR, "C"),
+            # More cash than they applied it to: 10,000 of this customer's
+            # money is sitting on the deposit while their invoice still
+            # shows a balance.
+            (BU, "DEP-26063", 1, "C1004", 30_000.00, "2026-06-28", CURR, "W"),
+            # Received and never applied to anything at all.
+            (BU, "DEP-26064", 1, "C1005", 15_000.00, "2026-06-30", CURR, "U"),
+        ])
+    con.executemany(
+        "INSERT INTO PS_PAYMENT_ITEM VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (BU, "DEP-26031", 1, BU, "C1006", "INV-260315", 18_750.00,
+             "2026-04-15"),
+            (BU, "DEP-26061", 1, BU, "C1001", "INV-260602", 25_000.00,
+             "2026-06-20"),
+            (BU, "DEP-26062", 1, BU, "C1007", "INV-260609", 60_000.00,
+             "2026-06-22"),
+            (BU, "DEP-26063", 1, BU, "C1004", "INV-260601", 20_000.00,
+             "2026-06-28"),
+        ])
 
     # Customer geography — primary address per customer (sequence 1).
     con.executemany(
@@ -902,6 +1002,8 @@ def main() -> None:
             (SETID, "C1006", 1, "Toronto", "ON", "CAN"),
             (SETID, "C1007", 1, "Denver", "CO", "USA"),
             (SETID, "C1008", 1, "Miami", "FL", "USA"),
+            (SETID, "C1009", 1, "Phoenix", "AZ", "USA"),
+            (SETID, "C1010", 1, "Columbus", "OH", "USA"),
         ])
 
     # Bill lines: what each invoice actually charged. Lines sum EXACTLY to
@@ -951,18 +1053,18 @@ def main() -> None:
         ],
     )
     # One finalized EUR invoice (closed in AR so aging/tie stay single-currency)
-    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (BU, "INV-2606EUR", "INV", "C1006", "2026-06-22", "2026-06-22",
-                 2_000.00, "EUR", "STD", "CRM"))
+                 2_000.00, "EUR", "STD", "CRM", "", ""))
     con.execute("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (BU, "C1006", "INV-2606EUR", 1, "C", 0.0, 2_000.00, "EUR",
                  "2026-06-22", "2026-07-22", "2026-06-22", "", ""))
     con.execute("INSERT INTO PS_ITEM VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (BU, "C1006", "INV-2606EU2", 1, "O", eur_open, eur_open, "EUR",
                  "2026-06-24", "2026-07-24", "2026-06-24", "", ""))
-    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO PS_BI_HDR VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (BU, "INV-2606EU2", "INV", "C1006", "2026-06-24", "2026-06-24",
-                 eur_open, "EUR", "STD", "CRM"))
+                 eur_open, "EUR", "STD", "CRM", "", ""))
 
     con.executescript(VIEWS)
     con.executescript(INDEXES)

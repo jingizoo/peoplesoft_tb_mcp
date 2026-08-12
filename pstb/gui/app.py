@@ -28,6 +28,7 @@ from ..db import Database, DbError
 from ..engine import EngineError, TBEngine
 from .. import queries as query_sql
 from ..ar import ARBilling, ARError
+from ..relationships import Relationships
 from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
@@ -52,6 +53,7 @@ db = Database(cfg)
 engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
+relationships = Relationships(ar)
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
     wiki = make_wiki(cfg)
@@ -1720,6 +1722,15 @@ def ar_customer(customer: str, business_unit: str = "", as_of_date: str = ""):
                   as_of_date=as_of_date)
 
 
+@app.get("/api/customer-360")
+def customer_360(cust_id: str, business_unit: str = "",
+                 include_family: bool = True, months: int = 12,
+                 as_of_date: str = ""):
+    return _guard(relationships.customer_financial_360, cust_id=cust_id,
+                  business_unit=business_unit, include_family=include_family,
+                  months=months, as_of_date=as_of_date)
+
+
 @app.get("/api/ar/customers")
 def ar_customers(
     query: str = "", limit: int = 25, business_unit: str = ""
@@ -2174,7 +2185,7 @@ def _console_reload() -> dict:
     worse than not reloading. So this reloads the read-only views and says
     plainly that the chat path needs a restart.
     """
-    global cfg, db, engine, ar, report_runner
+    global cfg, db, engine, ar, report_runner, relationships
     reloaded: list = []
     # Adopt what the console just wrote to .env BEFORE rebuilding. dotenv
     # loads with override=False, so os.environ still holds the values from
@@ -2207,13 +2218,14 @@ def _console_reload() -> dict:
         new_db = Database(fresh)
         new_engine = TBEngine(new_db, fresh)
         new_ar = ARBilling(new_engine)
+        new_relationships = Relationships(new_ar)
         new_report = ReportRunner(new_engine)
     except Exception as e:
         # The old objects are still live and serving; say so.
         return {"reloaded": [],
                 "error": f"kept the running configuration: {e}"}
-    cfg, db, engine, ar, report_runner = (fresh, new_db, new_engine,
-                                          new_ar, new_report)
+    cfg, db, engine, ar, report_runner, relationships = (
+        fresh, new_db, new_engine, new_ar, new_report, new_relationships)
     reloaded = ["trial balance", "AR and billing", "reports", "diagnostics"]
     _scope_cache.update({"value": None, "expires": 0.0})
     reloaded.append("scope catalog")
