@@ -296,7 +296,25 @@ CREATE TABLE PS_BUS_UNIT_LED (BUSINESS_UNIT TEXT, LEDGER_GROUP TEXT);
 -- A minimal Payables slice. AP has no curated tools by design: it is the
 -- worked example that "ask anything" reaches every module through
 -- search_records + run_sql, so it must be exercised like a real question.
-CREATE TABLE PS_VENDOR (SETID TEXT, VENDOR_ID TEXT, NAME1 TEXT, VENDOR_STATUS TEXT);
+CREATE TABLE PS_VENDOR (
+  SETID TEXT, VENDOR_ID TEXT, NAME1 TEXT, VENDOR_STATUS TEXT,
+  -- The supplier hierarchy the system records, mirroring PS_CUSTOMER.
+  -- It is the ONLY thing allowed to say two suppliers are one company.
+  CORPORATE_SETID TEXT, CORPORATE_VENDOR TEXT,
+  -- Taxpayer identifier. Never returned; only ever compared as a keyed
+  -- hash, because two suppliers sharing one is worth knowing and the
+  -- number itself is not something a model needs to see.
+  VNDR_TIN TEXT);
+CREATE TABLE PS_VENDOR_ADDR (
+  SETID TEXT, VENDOR_ID TEXT, ADDRESS_SEQ_NUM INTEGER,
+  CITY TEXT, STATE TEXT, COUNTRY TEXT);
+-- Remit-to bank accounts. Two suppliers pointing at ONE account is the
+-- classic payables-fraud signal, and the account number is exactly the
+-- value that must not travel: compared as a keyed hash, never selected
+-- into a payload.
+CREATE TABLE PS_VNDR_BANK_ACCT (
+  SETID TEXT, VENDOR_ID TEXT, BANK_ACCT_SEQ_NBR INTEGER,
+  BANK_ID_NBR TEXT, BANK_ACCOUNT_NUM TEXT);
 CREATE TABLE PS_VOUCHER (
   BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, VENDOR_ID TEXT, INVOICE_ID TEXT,
   INVOICE_DT TEXT, DUE_DT TEXT, GROSS_AMT REAL, ENTRY_STATUS TEXT,
@@ -694,11 +712,58 @@ def main() -> None:
              "Execute a long-running query asynchronously"),
             ("VOUCHER_LOAD", "Create vouchers from staged data"),
         ])
+    # Suppliers, with the two traps every identity check has to survive.
+    #
+    # V1004/V1005 are subsidiaries of V1001 in the RECORDED hierarchy, so
+    # the family rollup has something real to roll up. V1006 is called
+    # "Ridgeline Supply Group" and is its own corporate parent — a
+    # different company that any name match folds into the Ridgeline
+    # family, producing a combined exposure that reads exactly as
+    # authoritative as a correct one.
+    #
+    # V1002 and V1007 share a remit-to bank account. V1003 and V1008 share
+    # a taxpayer id written two different ways. Neither pair shares a name.
     con.executemany(
-        "INSERT INTO PS_VENDOR VALUES (?,?,?,?)",
-        [(SETID, "V1001", "Ridgeline Supply Co", "A"),
-         (SETID, "V1002", "Cobalt IT Services", "A"),
-         (SETID, "V1003", "Harbor Freight Lines", "I")])
+        "INSERT INTO PS_VENDOR VALUES (?,?,?,?,?,?,?)",
+        [(SETID, "V1001", "Ridgeline Supply Co", "A", SETID, "V1001",
+          "94-3177001"),
+         (SETID, "V1002", "Cobalt IT Services", "A", SETID, "V1002",
+          "81-2299450"),
+         (SETID, "V1003", "Harbor Freight Lines", "I", SETID, "V1003",
+          "45-6001122"),
+         (SETID, "V1004", "Ridgeline Fasteners", "A", SETID, "V1001",
+          "94-3177002"),
+         (SETID, "V1005", "Ridgeline Logistics", "A", SETID, "V1001",
+          "94-3177003"),
+         (SETID, "V1006", "Ridgeline Supply Group", "A", SETID, "V1006",
+          "27-8830014"),
+         (SETID, "V1007", "Meridian Office Supply", "A", SETID, "V1007",
+          "33-5512009"),
+         # Same taxpayer id as V1003, written with punctuation and a
+         # leading zero. Literal equality misses it; normalising first
+         # does not.
+         (SETID, "V1008", "Harborline Transport LLC", "A", SETID, "V1008",
+          "045.600.1122")])
+    con.executemany(
+        "INSERT INTO PS_VENDOR_ADDR VALUES (?,?,?,?,?,?)",
+        [(SETID, "V1001", 1, "Akron", "OH", "USA"),
+         (SETID, "V1002", 1, "Raleigh", "NC", "USA"),
+         (SETID, "V1003", 1, "Long Beach", "CA", "USA"),
+         (SETID, "V1004", 1, "Akron", "OH", "USA"),
+         (SETID, "V1005", 1, "Toledo", "OH", "USA"),
+         (SETID, "V1006", 1, "Reno", "NV", "USA"),
+         (SETID, "V1007", 1, "Raleigh", "NC", "USA"),
+         (SETID, "V1008", 1, "Long Beach", "CA", "USA")])
+    # V1002 and V1007 remit to the SAME account, spelled differently. Two
+    # unrelated suppliers, one bank account, and nothing about their names
+    # or ids connects them.
+    con.executemany(
+        "INSERT INTO PS_VNDR_BANK_ACCT VALUES (?,?,?,?,?)",
+        [(SETID, "V1001", 1, "041000124", "8837-2210-04"),
+         (SETID, "V1002", 1, "053100300", "000123456789"),
+         (SETID, "V1003", 1, "121000358", "5590-8811-72"),
+         (SETID, "V1007", 1, "053100300", "0000123456789"),
+         (SETID, "V1004", 1, "041000124", "8837-2210-99")])
     _vouchers, _payments, _xref = [], [], []
     for i, (vend, amt, mon) in enumerate(
             [("V1001", 12_500.00, 3), ("V1001", 8_200.00, 4),
@@ -723,6 +788,21 @@ def main() -> None:
          64_000.00, "P", "O", "P", CURR),        # large, due this month
         (BU, "VCHR90004", "V1003", "INV-9004", "2026-07-20", "2026-08-19",
          5_150.00, "R", "O", "U", CURR),         # recycle + unposted
+    ]
+    # Payables for the supplier family, so the rollup has something to add
+    # and the subsidiaries are not empty rows on a screen.
+    _vouchers += [
+        (BU, "VCHR90005", "V1004", "INV-9005", "2026-06-18", "2026-07-18",
+         22_300.00, "P", "O", "P", CURR),        # past due, a subsidiary
+        (BU, "VCHR90006", "V1005", "INV-9006", "2026-07-25", "2026-08-24",
+         9_450.00, "P", "O", "P", CURR),
+        # The lookalike. Its exposure must never be added to Ridgeline's.
+        (BU, "VCHR90007", "V1006", "INV-9007", "2026-07-30", "2026-08-29",
+         31_000.00, "P", "O", "P", CURR),
+        # The shared-bank pair's other half, so the alert lands on a
+        # supplier that actually has money moving through it.
+        (BU, "VCHR90008", "V1007", "INV-9008", "2026-07-12", "2026-08-11",
+         14_800.00, "P", "O", "P", CURR),
     ]
     # A staged duplicate pair (same vendor + invoice number vouchered
     # twice) and a same-amount near-pair — closed, dated MARCH so the AP

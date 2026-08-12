@@ -26,6 +26,7 @@ from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
 from .relationships import Relationships
+from .vendors import VendorNetwork
 from .report import ReportError, ReportRunner
 from . import wiki as wiki_mod
 from .wiki import WikiError, make_wiki
@@ -41,6 +42,7 @@ from .connectors import coupa as _coupa_mod
 coupa = _coupa_mod.from_env()
 playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
+vendor_network = VendorNetwork(modules)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
 from .psquery import QueryCatalog
@@ -415,6 +417,42 @@ def get_customer_financial_360(cust_id: str = "", business_unit: str = "",
     not added across currencies. For a ranked list of many customers use
     get_customer_intelligence instead."""
     return _safe(relationships.customer_financial_360, cust_id=cust_id,
+                 business_unit=business_unit, include_family=include_family,
+                 months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def search_vendors(query: str = "", limit: int = 25,
+                   business_unit: str = "") -> dict:
+    """Find a supplier by ID or name substring, with its open payables and
+    whether it belongs to a corporate supplier group. The AP counterpart of
+    search_customers. Use it FIRST when the question names a supplier by
+    name rather than by id. If the payload reports
+    belongs_to_a_corporate_family or heads_a_corporate_family, the balance
+    shown is that legal entity ALONE — say so, and use
+    get_vendor_payables_network for the group."""
+    return _safe(modules.search_vendors, query=query, limit=limit,
+                 business_unit=business_unit)
+
+
+@mcp.tool()
+def get_vendor_payables_network(vendor_id: str = "", business_unit: str = "",
+                                include_family: bool = True,
+                                months: int = 12,
+                                as_of_date: str = "") -> dict:
+    """ONE supplier, everything connected: the corporate supplier family,
+    open payables with overdue and stuck vouchers, cash paid, duplicate
+    vouchers, and IDENTITY LINKS — other suppliers sharing the same remit
+    bank account or the same taxpayer id. Use for "the full picture for
+    supplier X", "who else banks where X banks", "are we paying two
+    suppliers into one account", "which subsidiaries owe the group's
+    balance". Takes a supplier ID: use search_vendors to turn a name into
+    one. Bank accounts and taxpayer ids are NEVER returned — a shared key
+    appears only as a keyed hash token, and a shared key is a reason to
+    investigate, NOT evidence that two suppliers are the same company.
+    Only the recorded corporate hierarchy says that; never group suppliers
+    by name yourself."""
+    return _safe(vendor_network.vendor_payables_network, vendor_id=vendor_id,
                  business_unit=business_unit, include_family=include_family,
                  months=months, as_of_date=as_of_date)
 

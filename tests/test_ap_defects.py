@@ -71,10 +71,10 @@ class FanOutTests(unittest.TestCase):
         # V1001 already exists under one SETID. Real installations carry the
         # same supplier under SHARE plus a business SETID or two.
         cls.fx = _Fixture(
-            "INSERT INTO PS_VENDOR VALUES "
-            "('US01','V1001','Ridgeline Supply Co','A')",
-            "INSERT INTO PS_VENDOR VALUES "
-            "('CA01','V1001','Ridgeline Supply Co','A')")
+            "INSERT INTO PS_VENDOR (SETID,VENDOR_ID,NAME1,VENDOR_STATUS) "
+            "VALUES ('US01','V1001','Ridgeline Supply Co','A')",
+            "INSERT INTO PS_VENDOR (SETID,VENDOR_ID,NAME1,VENDOR_STATUS) "
+            "VALUES ('CA01','V1001','Ridgeline Supply Co','A')")
         cls.packs = cls.fx.packs()
         cls.clean = _packs()
 
@@ -258,10 +258,15 @@ class ShapeGuardTests(unittest.TestCase):
 
     def test_the_geography_note_did_not_eat_the_others(self) -> None:
         # A later `notes = []` rebound the list and threw away every shape
-        # note gathered before the query.
-        out = self._without(PS_VOUCHER="DUE_DT").vendor_intelligence(
+        # note gathered before the query. PS_VENDOR_ADDR now exists in the
+        # sample, so the geography note is gone — drop BOTH and the list
+        # must still carry both absences.
+        out = self._without("PS_VENDOR_ADDR",
+                            PS_VOUCHER="DUE_DT").vendor_intelligence(
             business_unit=BU)
-        self.assertGreaterEqual(len(out["record_notes"]), 2, out)
+        notes = " ".join(out["record_notes"])
+        self.assertIn("DUE_DT", notes)
+        self.assertIn("PS_VENDOR_ADDR", notes)
 
 
 if __name__ == "__main__":

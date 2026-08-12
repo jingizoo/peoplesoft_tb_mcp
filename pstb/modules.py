@@ -329,6 +329,106 @@ class ModulePacks:
                      "Observations are computed, never invented."),
         }
 
+    def search_vendors(self, query: str = "", limit: int = 25,
+                       business_unit: str = "") -> dict:
+        """Find a supplier by id or name, and say if it is part of a group.
+
+        The AP counterpart to search_customers, and the thing the network's
+        refusal message needs to be able to name. Resolving a NAME to an id
+        is also the moment to say that id is part of something bigger:
+        without it, "how much do we owe Ridgeline" is answered for one
+        legal entity out of three and looks complete.
+        """
+        bu = self._bu(business_unit)
+        setid = self.e.resolve_setid(bu, "VENDOR")
+        p = self.db.prefix
+        cols = self._cols("PS_VENDOR")
+        name_c = "NAME1" if (not cols or "NAME1" in cols) else ""
+        stat_c = ("VENDOR_STATUS" if (not cols or "VENDOR_STATUS" in cols)
+                  else "")
+        corp_c = next((c for c in ("CORPORATE_VENDOR", "CORPORATE_VNDR_ID")
+                       if not cols or c in cols), "")
+        notes: list = []
+        if cols and not name_c:
+            notes.append("PS_VENDOR here has no NAME1; suppliers are "
+                         "identified by ID only and name search is not "
+                         "available.")
+        if cols and not corp_c:
+            notes.append("PS_VENDOR here records no corporate supplier "
+                         "column, so whether these suppliers belong to one "
+                         "group is UNKNOWN — not answered as no.")
+        term = (query or "").strip().upper()
+        params = {"setid": setid, "bu": bu,
+                  "q": f"%{term}%", "qa": f"{term}%"}
+        # Withdrawn rather than left to match nothing: UPPER(NULL) LIKE :q
+        # is false for every row, which would report "no such supplier"
+        # about suppliers that plainly exist.
+        name_pred = f"UPPER(V.{name_c}) LIKE :q OR " if name_c else ""
+        name_sel = f"V.{name_c}" if name_c else "NULL"
+        stat_sel = f"V.{stat_c}" if stat_c else "NULL"
+        corp_sel = f"V.{corp_c}" if corp_c else "NULL"
+        rows, truncated = self.db.query(
+            f"SELECT V.VENDOR_ID AS vendor_id, {name_sel} AS name, "
+            f"{stat_sel} AS status, {corp_sel} AS corporate_parent, "
+            "COALESCE(O.owed, 0) AS open_payables "
+            f"FROM {p}PS_VENDOR V "
+            f"LEFT JOIN (SELECT VENDOR_ID, SUM(GROSS_AMT) AS owed "
+            f"FROM {p}PS_VOUCHER WHERE BUSINESS_UNIT = :bu "
+            "GROUP BY VENDOR_ID) O ON O.VENDOR_ID = V.VENDOR_ID "
+            f"WHERE V.SETID = :setid AND ({name_pred}"
+            "UPPER(V.VENDOR_ID) LIKE :qa) ORDER BY V.VENDOR_ID",
+            params, max_rows=max(int(limit or 25), 1))
+        subs: list = []
+        for r in rows:
+            r["open_payables"] = r2(float(r["open_payables"] or 0))
+            parent = str(r.get("corporate_parent") or "")
+            r["corporate_parent"] = parent
+            if parent and parent != r["vendor_id"]:
+                subs.append(r["vendor_id"])
+        heads = self._vendor_family_heads(
+            setid, [r["vendor_id"] for r in rows], corp_c)
+        for r in rows:
+            r["heads_a_corporate_family"] = r["vendor_id"] in heads
+        out = {"vendors": rows, "count": len(rows), "truncated": truncated,
+               "note": "status A=active, I=inactive; open_payables sums "
+                       "vouchers for this business unit"}
+        if subs or heads:
+            out["belongs_to_a_corporate_family"] = subs
+            out["heads_a_corporate_family"] = sorted(heads)
+            out["next_step"] = (
+                "This is a supplier group, not a standalone supplier. "
+                "open_payables above is each legal entity ALONE. For the "
+                "group's combined position, its shared bank accounts and "
+                "its duplicate vouchers, call "
+                "get_vendor_payables_network(vendor_id=<the parent>).")
+        if notes:
+            out["record_notes"] = notes
+        return out
+
+    def _vendor_family_heads(self, setid: str, ids: list,
+                             corp_c: str) -> set:
+        """Which of these suppliers OWN others — one grouped read.
+
+        A supplier's own row cannot say it owns anything; the children are
+        rows the WHERE clause excluded. Searching the PARENT by name is the
+        likelier half of the question, because the parent is what people
+        type.
+        """
+        if not corp_c or not ids:
+            return set()
+        binds = {f"h{i}": v for i, v in enumerate(ids)}
+        expr = "(" + ", ".join(f":{k}" for k in binds) + ")"
+        try:
+            rows, _ = self.db.query(
+                f"SELECT {corp_c} AS parent, COUNT(*) AS n "
+                f"FROM {self.db.prefix}PS_VENDOR "
+                f"WHERE SETID = :setid AND {corp_c} IN {expr} "
+                f"AND VENDOR_ID <> {corp_c} GROUP BY {corp_c}",
+                {"setid": setid, **binds}, max_rows=len(ids) + 1)
+        except DbError:
+            return set()
+        return {str(r["parent"]) for r in rows if int(r["n"] or 0) > 0}
+
     def duplicate_payments(self, business_unit: str = "",
                            months: int = 12, tolerance_days: int = 7,
                            as_of_date: str = "") -> dict:

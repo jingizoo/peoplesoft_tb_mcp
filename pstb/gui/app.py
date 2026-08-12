@@ -29,6 +29,7 @@ from ..engine import EngineError, TBEngine
 from .. import queries as query_sql
 from ..ar import ARBilling, ARError
 from ..relationships import Relationships
+from ..vendors import VendorNetwork
 from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
@@ -54,6 +55,8 @@ engine = TBEngine(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 relationships = Relationships(ar)
+from ..modules import ModulePacks as _MP
+vendor_network = VendorNetwork(_MP(engine))
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
     wiki = make_wiki(cfg)
@@ -1766,6 +1769,23 @@ def customer_360(cust_id: str, business_unit: str = "",
     return _guard(relationships.customer_financial_360, cust_id=cust_id,
                   business_unit=business_unit, include_family=include_family,
                   months=months, as_of_date=as_of_date)
+
+
+@app.get("/api/vendor-network")
+def vendor_network_view(vendor_id: str, business_unit: str = "",
+                        include_family: bool = True, months: int = 12,
+                        as_of_date: str = ""):
+    return _guard(vendor_network.vendor_payables_network,
+                  vendor_id=vendor_id, business_unit=business_unit,
+                  include_family=include_family, months=months,
+                  as_of_date=as_of_date)
+
+
+@app.get("/api/vendors")
+def vendors_search(query: str = "", limit: int = 25,
+                   business_unit: str = ""):
+    return _guard(modules.search_vendors, query=query, limit=limit,
+                  business_unit=business_unit)
 
 
 @app.get("/api/ar/customers")
