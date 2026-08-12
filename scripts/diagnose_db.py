@@ -92,6 +92,42 @@ def main() -> int:
               "ORACLE_PASSWORD in .env and network access to the host.")
         return 1
 
+    # The thing people actually report as slow, and the one area this
+    # script had no section for at all — so the only way to learn which
+    # source discovery uses on a given instance was to read the code and
+    # guess. The answer decides everything: with the two setup grants the
+    # catalog is two statements; without them it is one DISTINCT over
+    # PS_LEDGER per business unit, serially.
+    print("\n1b. Scope discovery (the BU/ledger catalog behind the chip)")
+    setup = timed(
+        "PS_BUS_UNIT_LED + PS_LED_GRP_TBL (the fast path)",
+        lambda: db.query(q.scope_setup_pairs(db), {}, max_rows=5000),
+        expect_rows=True,
+        remedy=("Without SELECT on BOTH of these, discovery probes "
+                "PS_LEDGER once PER BUSINESS UNIT. Ask for: GRANT SELECT "
+                "ON PS_BUS_UNIT_LED and PS_LED_GRP_TBL."))
+    bu_rows = timed("PS_BUS_UNIT_TBL_GL (the fallback's unit list)",
+                    lambda: db.query(q.scope_bu_list(db), {}, max_rows=5000))
+    if setup is None or not (setup[0] if isinstance(setup, tuple) else setup):
+        # Time ONE fallback probe. Multiply it by the unit count and that
+        # product is the whole complaint.
+        units = len(bu_rows[0]) if isinstance(bu_rows, tuple) else 0
+        print(f"      the fallback would run this once per unit x {units} "
+              "units — the next line is the per-unit cost")
+        timed(f"  one PS_LEDGER ledger probe for {cfg.defaults.business_unit}",
+              lambda: db.query(q.ledgers_for_bu(db),
+                               {"bu": cfg.defaults.business_unit},
+                               max_rows=200))
+    built = timed("list_financial_scopes (cold, no activity)",
+                  lambda: engine.list_financial_scopes(include_activity=False))
+    if built is not None:
+        print(f"      source={built.get('source')!r} "
+              f"verified={built.get('verified')} "
+              f"scopes={len(built.get('scopes') or [])} "
+              f"truncated={built.get('truncated')}")
+        if built.get("note"):
+            print("      note: " + str(built["note"])[:300])
+
     print("\n2. Dimension tables (should be milliseconds)")
     timed("PS_BUS_UNIT_TBL_GL",
           lambda: db.query(q.business_units(db), {}, max_rows=50),

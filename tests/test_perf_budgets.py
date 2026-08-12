@@ -129,7 +129,10 @@ class QueryBudgetTests(unittest.TestCase):
             ("get_cash_outlook", 2,
              lambda: ar.cash_outlook(business_unit="US001",
                                      as_of_date="2026-08-06")),
-            ("get_vendor_intelligence", 2,
+            # Was 2. A describe that SUCCEEDED and found nothing is now
+            # remembered, so the repeated look for the absent
+            # PS_VENDOR_ADDR stopped being one dictionary read per call.
+            ("get_vendor_intelligence", 1,
              lambda: modules.vendor_intelligence(business_unit="US001",
                                                  as_of_date="2026-08-06")),
             ("get_duplicate_payments", 3,
@@ -173,6 +176,21 @@ class QueryBudgetTests(unittest.TestCase):
                  vs_period=12)),
         ]:
             self._assert_budget(name, budget, fn)
+
+    def test_the_catalog_itself_is_free_when_warm(self) -> None:
+        # The MCP server is a separate process from the GUI, so the GUI's
+        # 900s cache never helped a model that called this mid-conversation:
+        # every call rebuilt, and on a grant-limited site every call paid
+        # the per-unit fallback again.
+        self.engine.list_financial_scopes(include_activity=False)
+        self._assert_budget(
+            "list_financial_scopes (warm)", 0,
+            lambda: self.engine.list_financial_scopes(include_activity=False))
+
+    def test_the_business_unit_enrichment_is_free_when_warm(self) -> None:
+        self.engine._business_unit_enrichment()
+        self._assert_budget("_business_unit_enrichment (warm)", 0,
+                            lambda: self.engine._business_unit_enrichment())
 
     def test_warm_scope_subroutines_are_free(self) -> None:
         # The subroutines every tool leans on must serve from cache when
