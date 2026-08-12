@@ -1152,15 +1152,31 @@ function tiles(items){
     x.append(el('div','k',k),el('div','v '+(cls||''),v),el('div','n',n||''));g.append(x);});
   return g;
 }
+// A name that matched several companies is a QUESTION, not an absence.
+// Rendering it as "No data" told the reader nothing matched when in fact
+// four things did, and the list they needed was in the payload all along.
+function candidateRows(list){
+  return '<table><thead><tr><th>ID</th><th>Name</th><th class="num">Balance</th></tr></thead><tbody>'+
+    list.map(m=>'<tr><td class="mono">'+esc(m.cust_id||m.vendor_id||'')+'</td><td>'+
+      esc(m.name||'')+'</td><td class="num">'+
+      (m.open_balance!=null||m.open_payables!=null
+        ? money(m.open_balance!=null?m.open_balance:m.open_payables) : '')+
+      '</td></tr>').join('')+'</tbody></table>';
+}
 function noData(d){
   const c=el('div','card');
-  c.append(el('h2',null,'No data <span class="badge bad">'+esc(String(d.scope_status||'not found').replace(/_/g,' '))+'</span>'));
+  const many=Array.isArray(d.multiple_matches)&&d.multiple_matches.length;
+  const near=Array.isArray(d.did_you_mean)&&d.did_you_mean.length;
+  c.append(el('h2',null,(many?'Which one?':'No data')+
+    ' <span class="badge bad">'+esc(String(d.scope_status||'not found').replace(/_/g,' '))+'</span>'));
   let extra='';
   if(d.fiscal_years_with_data?.length) extra+='<p>Fiscal years with data: <b>'+d.fiscal_years_with_data.join(', ')+'</b></p>';
   if(d.known_business_units?.length) extra+='<p>Known business units: <b>'+d.known_business_units.map(esc).join(', ')+'</b></p>';
   if(d.known_ledgers?.length) extra+='<p>Known ledgers: <b>'+d.known_ledgers.map(esc).join(', ')+'</b></p>';
+  if(many) extra+=candidateRows(d.multiple_matches);
+  else if(near) extra+='<p>Did you mean:</p>'+candidateRows(d.did_you_mean);
   c.append(el('div','pad','<p>'+esc(d.detail||'Nothing matched this scope.')+'</p>'+extra+
-    '<p style="color:var(--muted)">This is not a zero or balanced trial balance.</p>'));
+    (many?'':'<p style="color:var(--muted)">This is not a zero or balanced trial balance.</p>')));
   return c;
 }
 function renderTB(d,opts){

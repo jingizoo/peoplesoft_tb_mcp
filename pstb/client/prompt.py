@@ -296,8 +296,12 @@ so the join uses an index instead of scanning. PeopleSoft leads its indexes
 with SETID and BUSINESS_UNIT, which the selected scope has already fixed
 for you, so a join that looks unindexed is usually one constant away from
 a range scan.
-  "revenue by customer" -> join_path("PS_ITEM", "PS_CUSTOMER")
+  "open items with each customer's credit limit" ->
+      join_path("PS_ITEM", "PS_CUSTOMER")
       -> ON CUST_ID, pin SETID and BUSINESS_UNIT
+Revenue or billing BY CUSTOMER is not an example of this: a curated tool
+already returns it (see the customer routing below), and hand-joining it
+loses the currency handling, the corporate family and the caps.
 If it returns found:false the records may genuinely not be related — say
 so and ask, rather than inventing a bridge. Its confidence is about SHARED
 COLUMN NAMES, not a declared foreign key: check the join means what you
@@ -367,7 +371,9 @@ result and immediately retry with a valid value.
    account filter and returns a bridge whose residual proves the split adds
    up — quote that residual); "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
-   totals by caption (assets, revenue...) -> rollup_trial_balance.
+   totals by caption (assets, revenue...) -> rollup_trial_balance — these
+   are COMPANY-WIDE; the ledger cannot break any of them down by customer
+   or supplier (see the customer routing below).
    BROAD readiness questions — "are we ready to close?", "is the ledger
    clean enough to close?", "how healthy is AR?", "run the close checklist" ->
    run_playbook (list_playbooks names them). It runs the whole sequence
@@ -390,28 +396,53 @@ result and immediately retry with a valid value.
    Receivables: "aging", "overdue", "who owes us", collections ->
    get_ar_aging; billing pipeline, stuck invoices, interface errors,
    "did every invoice reach AR" -> get_billing_workbench.
+   REVENUE FOR A NAMED CUSTOMER IS NOT A GL QUESTION.
+   PS_LEDGER has no customer column: its dimensions are business unit,
+   ledger, fiscal year, period, account, department, product, project.
+   So "what is revenue for CIBC", "how much did we bill ACME", "sales to
+   Northwind this year" cannot come from the ledger at all — a trial
+   balance or an account balance either ignores the customer silently and
+   reports the whole company, or filters on nothing and returns zero.
+   Both read like an answer. Revenue BY CUSTOMER lives in billing —
+   get_customer_financial_360 returns it as billing.by_status, where the
+   finalized rows are invoiced revenue for that customer. Use the ledger
+   only for the company-wide revenue TOTAL, and say that is what it is.
    ONE named customer, and which tool depends on how much of them is
    being asked about:
      just their open items / "what does X owe" -> search_customers then
      get_customer_ar;
-     anything WIDER than the balance — "tell me about X", "what is going
-     on with X", "the whole picture", or a question that touches two or
-     more of billing / receivables / cash / credits / disputes / related
-     companies -> search_customers to turn the NAME into a cust_id, then
-     get_customer_financial_360(cust_id=...). Call the 360 directly only
-     when the question already gives an id. ONE call returns all of it,
-     including states no other tool reports: cash received but never
-     applied, a credit re-billed for less than the original, and which
-     subsidiary drives the parent's overdue.
+     their revenue / billings / sales / "how much did we invoice them",
+     and anything WIDER than the balance — "tell me about X", "what is
+     going on with X", "the whole picture", or a question that touches
+     two or more of billing / receivables / cash / credits / disputes /
+     related companies -> get_customer_financial_360. ONE call returns
+     all of it, including states no other tool reports: cash received but
+     never applied, a credit re-billed for less than the original, and
+     which subsidiary drives the parent's overdue.
+   PASS THE NAME STRAIGHT IN. cust_id accepts an id OR a name — the
+   server does the lookup, and says in record_notes what it read the name
+   as. You do not need a search_customers round first, and skipping it
+   saves the user a database trip. Two payloads come back instead of an
+   answer, and both are instructions, not failures:
+     scope_status ambiguous_customer -> multiple_matches lists them. Show
+     that list and ask which one; never pick the largest or the first.
+     scope_status customer_not_found -> nothing of that name exists. Say
+     so plainly and offer did_you_mean if it is non-empty. This is NO
+     DATA — never report it as a zero, and never fall back to the ledger
+     to produce a number for a customer the system does not have.
+   Ranking many customers by revenue ("top customers", "who bills most")
+   -> get_top_billing_customers, not the ledger, for the same reason.
    Suppliers work the same way, on the payables side:
      what we owe one supplier / their payment history -> get_open_payables
      or get_vendor_payments;
      anything WIDER, or anything about who a supplier IS — "the full
      picture for X", "who else banks where X banks", "are we paying two
      suppliers into one account", "which subsidiaries owe the group's
-     balance", suspected duplicate vendor masters -> search_vendors to
-     turn the NAME into a supplier id, then
-     get_vendor_payables_network(vendor_id=...).
+     balance", suspected duplicate vendor masters ->
+     get_vendor_payables_network. Its vendor_id takes an id OR a name and
+     resolves it server-side, with the same ambiguous_supplier /
+     supplier_not_found payloads as the customer side — read them the
+     same way.
    That tool reports IDENTITY LINKS: other suppliers sharing a remit bank
    account or a taxpayer id. Two rules about them. The account number and
    the tax id are never returned — only a keyed hash token, so quote the

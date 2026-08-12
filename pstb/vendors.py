@@ -44,7 +44,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from .db import DbError
-from .engine import r2
+from .engine import r2, resolve_party_ref
 from .modules import ModuleError, ModulePacks, _iso, _iso_opt
 
 MEMBER_CAP = 60
@@ -685,11 +685,6 @@ class VendorNetwork:
                                 include_family: bool = True,
                                 months: int = 12,
                                 as_of_date: str = "") -> dict:
-        vid = (vendor_id or "").strip()
-        if not vid:
-            raise ModuleError(
-                "get_vendor_payables_network needs a supplier ID. Use "
-                "search_vendors to find one by name.")
         bu = self.mp._bu(business_unit)
         asof = self.mp._asof(as_of_date)
         setid = self.e.resolve_setid(bu, "VENDOR")
@@ -697,19 +692,34 @@ class VendorNetwork:
         since = (_iso(asof) - dt.timedelta(days=window * 31)).isoformat()
         notes: list = []
 
-        family = self._family(setid, vid, include_family, notes)
-        if not family:
-            known, _ = self.db.query(
-                f"SELECT VENDOR_ID AS v FROM {self.db.prefix}PS_VENDOR "
-                "WHERE SETID = :setid ORDER BY VENDOR_ID",
-                {"setid": setid}, max_rows=15)
-            return {
-                "scope_status": "vendor_not_found",
-                "detail": f"Supplier {vid!r} does not exist in SETID "
-                          f"{setid!r}. This is NO DATA, not a zero balance.",
-                "business_unit": bu, "setid": setid,
-                "known_vendor_ids": [str(r["v"]) for r in known],
-            }
+        # A supplier is named, not keyed, by everyone who asks about one.
+        # Id first on the anchor read, name only on a miss — the same order
+        # and the same reasons as the customer side; see resolve_party_ref.
+        vid = (vendor_id or "").strip()
+        probe: list = []
+        family = self._family(setid, vid, include_family, probe) if vid else []
+        if family:
+            notes.extend(probe)
+        else:
+            vid, read_as, refusal = resolve_party_ref(
+                vendor_id,
+                lambda term: self.mp.search_vendors(
+                    term, limit=10, business_unit=bu)["vendors"],
+                "vendor_id", "supplier")
+            if refusal:
+                refusal.update({"business_unit": bu, "setid": setid})
+                return refusal
+            if read_as:
+                notes.append(read_as)
+            family = self._family(setid, vid, include_family, notes)
+            if not family:
+                return {
+                    "scope_status": "supplier_not_found",
+                    "detail": f"Supplier {vid!r} does not exist in SETID "
+                              f"{setid!r}. This is NO DATA, not a zero "
+                              "balance.",
+                    "business_unit": bu, "setid": setid,
+                }
         ids = [m["vendor_id"] for m in family]
 
         def run(fn, *a):

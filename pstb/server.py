@@ -415,9 +415,16 @@ def get_customer_financial_360(cust_id: str = "", business_unit: str = "",
     billing (finalized and still in flight), open receivables with aging
     and disputes, cash received and how much of it was actually applied,
     credit/rebill chains and what they netted to, plus a needs_attention
-    list and a node/edge relationship graph. Use for "give me the complete
-    picture for customer X", "what is stuck", "which subsidiaries drive the
-    parent's overdue balance", "is any of their cash unapplied". Family
+    list and a node/edge relationship graph. THIS IS ALSO THE REVENUE TOOL
+    FOR ONE CUSTOMER — billing.by_status carries their invoiced revenue
+    over the window; PS_LEDGER has no customer column, so a trial balance
+    cannot answer it. Use for "revenue for customer X", "how much did we
+    bill X", "give me the complete picture for X", "what is stuck",
+    "which subsidiaries drive the parent's overdue balance". cust_id takes
+    an ID **or a name** — the server resolves it and reports what it read
+    the name as; several matches come back as scope_status
+    ambiguous_customer with multiple_matches to ask about, and none as
+    customer_not_found, which is NO DATA and never a zero. Family
     membership comes from the corporate hierarchy recorded in the system —
     customers are NEVER grouped by name. Totals are per currency and are
     not added across currencies. For a ranked list of many customers use
@@ -455,8 +462,12 @@ def get_vendor_payables_network(vendor_id: str = "", business_unit: str = "",
     bank account or the same taxpayer id. Use for "the full picture for
     supplier X", "who else banks where X banks", "are we paying two
     suppliers into one account", "which subsidiaries owe the group's
-    balance". Takes a supplier ID: use search_vendors to turn a name into
-    one. Bank accounts and taxpayer ids are NEVER returned — a shared key
+    balance", and for what we SPEND with one supplier — PS_LEDGER has no
+    supplier column, so a trial balance cannot answer that. vendor_id
+    takes an ID **or a name**, resolved server-side; several matches come
+    back as scope_status ambiguous_supplier with multiple_matches to ask
+    about, and none as supplier_not_found, which is NO DATA and never a
+    zero. Bank accounts and taxpayer ids are NEVER returned — a shared key
     appears only as a keyed hash token, and a shared key is a reason to
     investigate, NOT evidence that two suppliers are the same company.
     Only the recorded corporate hierarchy says that; never group suppliers
