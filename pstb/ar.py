@@ -65,6 +65,29 @@ def _iso(day) -> dt.date:
         raise ARError(f"Bad date {day!r} — use YYYY-MM-DD") from e
 
 
+def _months_before(day: dt.date, months: int) -> dt.date:
+    """The same day-of-month, N calendar months earlier.
+
+    "The last 12 months" is a calendar phrase and months*30 is 360 days —
+    five days short of a year, every year, and the five it drops are the
+    five just before the window opens. On a customer billed monthly that
+    is a whole invoice appearing or vanishing from a ranking depending on
+    which day someone asked.
+
+    Clamps the day rather than overflowing: one month before 31 March is
+    28 or 29 February, not 3 March.
+    """
+    months = max(int(months or 0), 0)
+    total = day.year * 12 + (day.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    if month == 2:
+        last = 29 if (year % 4 == 0 and (year % 100 or year % 400 == 0)) else 28
+    else:
+        last = 30 if month in (4, 6, 9, 11) else 31
+    return dt.date(year, month, min(day.day, last))
+
+
 def _iso_opt(day) -> Optional[dt.date]:
     if day is None or str(day).strip() in ("", "None"):
         return None
@@ -1681,12 +1704,12 @@ class ARBilling:
         bu_all = str(business_unit or "").strip().upper() in {"ALL", "*"}
         bu = "ALL" if bu_all else self._bu(business_unit)
         asof = self._asof(as_of_date)
-        since = (_iso(asof) - dt.timedelta(days=max(int(months or 12), 1) * 30)
-                 ).isoformat()
+        since = _months_before(_iso(asof),
+                               max(int(months or 12), 1)).isoformat()
         active_since = ""
         if int(active_within_months or 0) > 0:
-            active_since = (_iso(asof) - dt.timedelta(
-                days=int(active_within_months) * 30)).isoformat()
+            active_since = _months_before(
+                _iso(asof), int(active_within_months)).isoformat()
         p = self.db.prefix
         setid = None if bu_all else self.e.resolve_setid(bu, "CUSTOMER")
         bi = self._cols("PS_BI_HDR")
@@ -1715,7 +1738,7 @@ class ARBilling:
         having = (f" HAVING MAX(H.INVOICE_DT) >= {self.db.date_bind('active_since')}"
                   if active_since else "")
         params: dict = {"bu": bu, "setid": setid, "since": since,
-                        "active_since": active_since}
+                        "asof": asof, "active_since": active_since}
         if bu_all:
             # Across BUs the setid-scoped name join no longer applies (each
             # BU may resolve a different customer setid), so names attach
@@ -1725,7 +1748,7 @@ class ARBilling:
             # currency can be normalized to THAT unit's base, not the
             # scoped one.
             name_col = (f"MAX(N.{_cs['name']})" if _cs["name"] else "NULL")
-            rows, _ = self.db.query(
+            rows, truncated = self.db.query(
                 f"""SELECT H.BILL_TO_CUST_ID AS cust_id,
        {name_col} AS name,
        H.BUSINESS_UNIT AS bu, {cur_sel}, COUNT(*) AS invoices,
@@ -1738,11 +1761,12 @@ class ARBilling:
     ON N.CUST_ID = H.BILL_TO_CUST_ID
  WHERE H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
+   AND H.INVOICE_DT <= {self.db.date_bind('asof')}
  GROUP BY H.BILL_TO_CUST_ID, H.BUSINESS_UNIT{group_cur}{having}""",
                 params, max_rows=50_000,
             )
         else:
-            rows, _ = self.db.query(
+            rows, truncated = self.db.query(
                 f"""SELECT H.BILL_TO_CUST_ID AS cust_id, {tb_name},
        H.BUSINESS_UNIT AS bu,
        {cur_sel}, COUNT(*) AS invoices,
@@ -1752,6 +1776,7 @@ class ARBilling:
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
  WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
+   AND H.INVOICE_DT <= {self.db.date_bind('asof')}
  GROUP BY H.BILL_TO_CUST_ID{tb_group}, H.BUSINESS_UNIT{group_cur}{having}""",
                 params, max_rows=10_000,
             )
@@ -1798,6 +1823,7 @@ class ARBilling:
             return {
                 "business_unit": bu, "window_months": int(months or 12),
                 "since": since, "as_of": asof,
+                "ranking_complete": not truncated,
                 "mixed_currencies": currencies,
                 # business_unit rides along on the ALL ranking, exactly as
                 # it does on the converted path below. Without it a
@@ -1820,6 +1846,9 @@ class ARBilling:
                     + (" Ranked across ALL business units, not only the "
                        "selected one — every row names the unit that "
                        "billed it." if bu_all else "")
+                    + (" THE POPULATION IS INCOMPLETE: the grouped read hit "
+                       "its row cap, so customers past the cut-off are "
+                       "missing entirely." if truncated else "")
                 ),
                 **({"record_notes": record_notes} if record_notes else {}),
             }
@@ -1844,13 +1873,24 @@ class ARBilling:
             "customers": top,
             "total_billed": r2(sum(c["billed"] for c in ranked)),
             "customer_count": len(ranked),
-            "note": ("Finalized (INV) invoices only, by invoice date window. "
+            # A TOP-N built on a cut-off population can name the wrong top
+            # customer, which is a WRONG answer wearing a right one — worse
+            # than a short list. Say whether the ranking can be trusted.
+            "ranking_complete": not truncated,
+            "note": ("Finalized (INV) invoices only, by invoice date window "
+                     f"{since} to {asof} inclusive. "
                      "This is BILLING volume, not open AR — see get_ar_aging "
                      "for what is owed."
                      + (" Ranked across ALL business units, not only the "
                         "selected one — business_units on each row names "
                         "which billed that customer." if bu_all else "")),
         }
+        if truncated:
+            out["note"] += (
+                " THE RANKING IS NOT RELIABLE: the grouped read hit its row "
+                "cap, so customers past the cut-off were never counted and "
+                "one of them may bill more than anyone listed here. Narrow "
+                "the window (months=) or the business unit and ask again.")
         if bu_all:
             out["scope"] = ("ALL business units — cross-unit ranking was "
                             "requested in the question; each customer row "

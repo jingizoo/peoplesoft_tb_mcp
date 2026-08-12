@@ -380,7 +380,11 @@ def get_top_billing_customers(
     active_within_months=N keeps only customers with an invoice in the last
     N months — the tool-level meaning of "still buying / active".
     Mixed currencies are never summed — pass display_currency to rank on
-    converted totals."""
+    converted totals.
+    The window is CALENDAR months, closed at both ends: invoices dated after
+    as_of_date are outside it. Check ranking_complete — when it is false the
+    grouped read hit its row cap, customers past the cut-off were never
+    counted, and the list must NOT be presented as "the top N"."""
     return _safe(
         ar.top_billing_customers, business_unit=business_unit, n=n,
         months=months, as_of_date=as_of_date, display_currency=display_currency,
