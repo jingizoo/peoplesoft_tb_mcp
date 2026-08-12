@@ -235,6 +235,14 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px;
   font-size:12px;cursor:pointer;color:var(--muted)}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
+/* Derived follow-ups sit under the answer, one per line, each with the
+   figure that earned it. A row of bare chips reads as a guess; the
+   reason is what makes it checkable. */
+.followups{align-self:flex-start;max-width:min(760px,92%);display:flex;flex-direction:column;gap:8px;padding:2px 0 4px}
+.followups .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:650}
+.followup{display:flex;flex-direction:column;gap:3px}
+.followup .chip{align-self:flex-start;text-align:left}
+.followup-why{font-size:11.5px;color:var(--muted);line-height:1.5;padding-left:2px}
 .rpt-sub td{font-weight:700;border-top:2px solid var(--line)}
 
 /* drawer */
@@ -2829,6 +2837,7 @@ async function send(messageOverride,appendUser){
         try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({turn_id:fb.dataset.turn,verdict:'bad'})}); }catch(e){} };
       msgs.append(b);
+      renderFollowUps(msgs,j.suggestions);
     }
   }catch(e){
     clearInterval(poll);
@@ -2840,6 +2849,26 @@ async function send(messageOverride,appendUser){
     msgs.append(el('div','msg err',esc(m2)));
   }
   msgs.scrollTop=msgs.scrollHeight;
+}
+
+// Follow-ups the server derived from THIS turn's results. Distinct from
+// the starter chips above the composer, which are fixed and pinned to eval
+// cases: these carry the figure that earned them, so a person can judge
+// whether the next question is worth asking before they ask it. Nothing is
+// suggested that no tool can answer.
+function renderFollowUps(msgs,list){
+  if(!Array.isArray(list)||!list.length) return;
+  const wrap=el('div','followups');
+  wrap.append(el('div','who','Worth looking at next — each from a figure above'));
+  list.forEach(s=>{
+    const item=el('div','followup');
+    const c=el('button','chip',esc(s.question)); c.type='button';
+    c.onclick=()=>{ $('#q').value=s.question; send(); };
+    item.append(c);
+    if(s.because) item.append(el('div','followup-why',esc(s.because)));
+    wrap.append(item);
+  });
+  msgs.append(wrap);
 }
 
 /* ---------- csv ---------- */

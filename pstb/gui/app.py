@@ -605,6 +605,43 @@ _activity: dict = {}                    # session_id -> live turn activity
 _activity_lock = threading.Lock()
 _ACTIVITY_MAX_EVENTS = 60
 
+# session_id -> the last turn's suggested next questions. Kept beside the
+# session rather than inside the provider history on purpose: suggestions
+# are a property of the RESULTS, not of the conversation, and a Clear that
+# wipes the history must not leave a stale "you should look at C1004"
+# pointing at evidence the page no longer shows.
+_suggestions: dict = {}
+_suggestions_lock = threading.Lock()
+_SUGGESTION_SESSIONS = 200
+
+
+def _suggestions_store(session_id: str, value: list) -> None:
+    with _suggestions_lock:
+        _suggestions[session_id] = value
+        if len(_suggestions) > _SUGGESTION_SESSIONS:
+            for key in list(_suggestions)[:len(_suggestions)
+                                          - _SUGGESTION_SESSIONS // 2]:
+                if key != session_id:
+                    _suggestions.pop(key, None)
+
+
+def _suggestions_for_turn(payloads, question: str, scope: dict) -> list:
+    """Never let the follow-ups cost the answer.
+
+    The person already has their result by the time this runs; a rule that
+    trips over an unfamiliar payload shape must lose its suggestion and
+    nothing else.
+    """
+    try:
+        from ..suggest import suggestions_for
+        return suggestions_for(
+            payloads, question=question,
+            business_unit=str((scope or {}).get("business_unit") or ""))
+    except Exception as e:                        # noqa: BLE001
+        print(f"[pstb] suggestions skipped: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return []
+
 
 def _activity_begin(session_id: str, turn: str, phase: str = "") -> dict | None:
     """Claim the session's activity slot for ONE turn.
@@ -1839,6 +1876,9 @@ async def chat(payload: dict, request: Request = None):
     from ..client.prompt import system_prompt
 
     calls: list = []
+    # Hoisted so the success return can read it even if the turn
+    # never reached the block that fills it.
+    turn_payloads: list = []
     # Owned OUTSIDE the try so a failed turn cannot leak it. On the
     # fallback path this stack holds an MCP subprocess — a Python process
     # plus its database logon — and closing it only on the success path
@@ -2094,6 +2134,9 @@ async def chat(payload: dict, request: Request = None):
                     "tool": tool, "args": args_preview})
 
             prior_payloads = list(provider_entry.payloads)
+            # THIS turn's results only. Suggestions built from the whole
+            # 12-payload window would keep offering follow-ups to a question
+            # asked four turns ago, which reads as the page not listening.
 
             def _observe_and_record(name, args, out, ms, ok):
                 provider_entry.busy_tool = ""
@@ -2103,6 +2146,7 @@ async def chat(payload: dict, request: Request = None):
                 if ok and isinstance(out, str):
                     provider_entry.payloads.append((name, out))
                     del provider_entry.payloads[:-12]
+                    turn_payloads.append((name, out))
                 observe_tool(name, args, out, ms, ok)
 
             try:
@@ -2163,8 +2207,10 @@ async def chat(payload: dict, request: Request = None):
         if per_turn is not None:
             with contextlib.suppress(Exception):
                 await per_turn.aclose()
+    follow_ups = _suggestions_for_turn(turn_payloads, message, active_scope)
+    _suggestions_store(session_id, follow_ups)
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
-            "scope": active_scope,
+            "scope": active_scope, "suggestions": follow_ups,
             "turn_id": getattr(agent_turn, "last_turn_id", None)}
 
 
@@ -2271,10 +2317,35 @@ def activity(session_id: str = "", turn: str = ""):
                 "stale": False}
 
 
+@app.get("/api/suggestions")
+def suggestions(session_id: str = ""):
+    """The last turn's follow-ups for one session.
+
+    NOT a reload restore: a fresh page deliberately mints a fresh session
+    (index.html:389), because keeping the id would retain invisible model
+    context after the messages themselves vanished from the screen — and a
+    follow-up pointing at figures no longer displayed is exactly the
+    unverifiable suggestion this feature exists to avoid.
+
+    The browser gets its follow-ups inline on the /api/chat response and
+    does not call this. It exists for anything ELSE holding a live session
+    id — a script, a second surface — that wants the next questions
+    without re-asking the first one.
+    """
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return {"suggestions": []}
+    with _suggestions_lock:
+        return {"suggestions": list(_suggestions.get(session_id) or [])}
+
+
 @app.post("/api/chat/reset")
 async def chat_reset(payload: dict):
     session_id = _session_id(payload or {})
     cleared = await _provider_sessions.reset_session(session_id)
+    # Clear means clear. A follow-up left pointing at evidence the page no
+    # longer shows is a suggestion nobody can check.
+    with _suggestions_lock:
+        _suggestions.pop(session_id, None)
     return {"ok": True, "histories_cleared": cleared}
 
 
