@@ -124,11 +124,16 @@ _TOOL_SCOPE_ARGS = {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
     },
-    "get_top_billing_customers": {"business_unit": "business_unit"},
-    "get_ar_aging": {"business_unit": "business_unit"},
-    "get_customer_ar": {"business_unit": "business_unit"},
-    "search_customers": {"business_unit": "business_unit"},
-    "get_billing_workbench": {"business_unit": "business_unit"},
+    "get_top_billing_customers": {"business_unit": "business_unit",
+                                "as_of_date": "as_of_date"},
+    "get_ar_aging": {"business_unit": "business_unit",
+                   "as_of_date": "as_of_date"},
+    "get_customer_ar": {"business_unit": "business_unit",
+                      "as_of_date": "as_of_date"},
+    "search_customers": {"business_unit": "business_unit",
+                       "as_of_date": "as_of_date"},
+    "get_billing_workbench": {"business_unit": "business_unit",
+                            "as_of_date": "as_of_date"},
     "run_report": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
@@ -150,22 +155,34 @@ _TOOL_SCOPE_ARGS = {
         "business_unit": "business_unit", "fiscal_year": "fiscal_year",
         "period": "period",
     },
-    "get_invoice_lifecycle": {"business_unit": "business_unit"},
+    "get_invoice_lifecycle": {"business_unit": "business_unit",
+                            "as_of_date": "as_of_date"},
     "get_dso_trend": {"business_unit": "business_unit",
                       "fiscal_year": "fiscal_year"},
-    "get_cash_outlook": {"business_unit": "business_unit"},
-    "get_vendor_intelligence": {"business_unit": "business_unit"},
-    "get_customer_intelligence": {"business_unit": "business_unit"},
-    "get_customer_financial_360": {"business_unit": "business_unit"},
-    "get_vendor_payables_network": {"business_unit": "business_unit"},
-    "search_vendors": {"business_unit": "business_unit"},
+    "get_cash_outlook": {"business_unit": "business_unit",
+                       "as_of_date": "as_of_date"},
+    "get_vendor_intelligence": {"business_unit": "business_unit",
+                              "as_of_date": "as_of_date"},
+    "get_customer_intelligence": {"business_unit": "business_unit",
+                                "as_of_date": "as_of_date"},
+    "get_customer_financial_360": {"business_unit": "business_unit",
+                                 "as_of_date": "as_of_date"},
+    "get_vendor_payables_network": {"business_unit": "business_unit",
+                                  "as_of_date": "as_of_date"},
+    "search_vendors": {"business_unit": "business_unit",
+                     "as_of_date": "as_of_date"},
     "get_invoice_totals": {"business_unit": "business_unit",
                            "fiscal_year": "fiscal_year"},
-    "get_duplicate_payments": {"business_unit": "business_unit"},
-    "get_open_payables": {"business_unit": "business_unit"},
-    "get_vendor_payments": {"business_unit": "business_unit"},
-    "get_asset_register": {"business_unit": "business_unit"},
-    "get_project_costs": {"business_unit": "business_unit"},
+    "get_duplicate_payments": {"business_unit": "business_unit",
+                             "as_of_date": "as_of_date"},
+    "get_open_payables": {"business_unit": "business_unit",
+                        "as_of_date": "as_of_date"},
+    "get_vendor_payments": {"business_unit": "business_unit",
+                          "as_of_date": "as_of_date"},
+    "get_asset_register": {"business_unit": "business_unit",
+                         "as_of_date": "as_of_date"},
+    "get_project_costs": {"business_unit": "business_unit",
+                        "as_of_date": "as_of_date"},
 }
 
 # Tools that understand business_unit="ALL" as "every unit, each row
@@ -261,13 +278,22 @@ _BU_ALL_VALUES = {"ALL", "*"}
 # business_unit/ledger are HARD: answering from the wrong company or ledger is
 # the failure the scope bar exists to prevent, so the model may never change
 # them. fiscal_year/period are SOFT defaults the user's question may override.
-_SOFT_SCOPE_FIELDS = {"fiscal_year", "period"}
+# Time is a DEFAULT, not a lock: "what does C1001 owe today" while the
+# chip reads P6 is a legitimate question. An explicit tool argument wins,
+# and the resolved date behaves the same way as the period it came from.
+_SOFT_SCOPE_FIELDS = {"fiscal_year", "period", "as_of_date"}
 
 _SCOPE_ALIASES = {
     "business_unit": ("business_unit", "bu"),
     "ledger": ("ledger",),
     "fiscal_year": ("fiscal_year", "fy"),
     "period": ("period", "per"),
+    # The selected period, resolved to the DATE the subledger tools
+    # actually take. Ledger tools filter by FISCAL_YEAR and ACCOUNTING_
+    # PERIOD; AR, Billing and AP filter by a date, so the chip's period
+    # reached the ledger and stopped at the boundary. Someone could select
+    # FY2025 P12 and read this month's receivables beside it.
+    "as_of_date": ("as_of_date", "as_of"),
 }
 
 _POLICY_QUERY = re.compile(
@@ -549,9 +575,19 @@ def financial_tool_is_relevant(tool_name: str, question: str) -> bool:
     return bool(question_domains) and question_domains.issubset(tool_domains)
 
 
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _scope_value(field: str, value):
     if value in (None, ""):
         return None
+    if field == "as_of_date":
+        value = str(value).strip()[:10]
+        if not value:
+            return None
+        if not _ISO_DATE.match(value):
+            raise ValueError("as_of_date must be YYYY-MM-DD")
+        return value
     if field in ("business_unit", "ledger"):
         value = str(value).strip()
         return value or None

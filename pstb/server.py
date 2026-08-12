@@ -560,15 +560,23 @@ def get_customer_ar(
 
 @mcp.tool()
 def search_customers(
-    query: str = "", limit: int = 25, business_unit: str = ""
+    query: str = "", limit: int = 25, business_unit: str = "",
+    display_currency: str = "", as_of_date: str = ""
 ) -> dict:
-    """Find AR customers by name or ID; returns id, name, active/inactive status,
-    and open balance. Empty query lists customers."""
+    """Find AR customers by name or ID; returns id, name, active/inactive
+    status, and open balance CONVERTED to one currency (the unit's base
+    unless display_currency says otherwise), with balances_by_currency
+    beside it when the customer bills in more than one. Empty query lists
+    customers. If the payload reports belongs_to_a_corporate_family or
+    heads_a_corporate_family, the balance shown is that legal entity
+    ALONE — say so, and use get_customer_financial_360 for the group."""
     return _safe(
         ar.search_customers,
         query=query,
         limit=limit,
         business_unit=business_unit,
+        display_currency=display_currency,
+        as_of_date=as_of_date,
     )
 
 

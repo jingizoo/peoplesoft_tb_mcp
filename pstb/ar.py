@@ -844,10 +844,14 @@ class ARBilling:
         return out
 
     def search_customers(
-        self, query: str = "", limit: int = 25, business_unit: str = ""
+        self, query: str = "", limit: int = 25, business_unit: str = "",
+        display_currency: str = "", as_of_date: str = ""
     ) -> dict:
         bu = self._bu(business_unit)
         setid = self.e.resolve_setid(bu, "CUSTOMER")
+        asof = self._asof(as_of_date)
+        base = self.e.base_currency_for(bu) or "USD"
+        disp = (display_currency or "").strip().upper() or base
         p = self.db.prefix
         params = {
             "setid": setid, "bu": bu,
@@ -866,23 +870,66 @@ class ARBilling:
                   else "NULL AS corporate_parent")
         # Withdraw the name predicate rather than let it match nothing.
         name_pred = f"UPPER(C.{cs['name']}) LIKE :q OR " if cs["name"] else ""
+        # One row per (customer, currency), not one per customer. Summing
+        # BAL_AMT across currencies is adding euros to dollars: this search
+        # reported C1006 at 56,500.00 while the aging beside it, which does
+        # convert, reported 56,760.87 USD — two screens, two answers, no
+        # way for the reader to tell which one to believe. The item shape
+        # decides whether the column even exists here.
+        shape = self._item_shape()
+        cur_c = shape["currency"]
+        cur_sel = f"I.{cur_c}" if cur_c else "''"
+        cur_grp = f", I.{cur_c}" if cur_c else ""
         sql = f"""SELECT C.CUST_ID AS cust_id, {c_name},
-       {c_stat}, {c_corp}, COALESCE(B.bal, 0) AS open_balance
+       {c_stat}, {c_corp}, B.currency AS currency,
+       COALESCE(B.bal, 0) AS bal
   FROM {p}PS_CUSTOMER C
-  LEFT JOIN (SELECT CUST_ID, SUM(BAL_AMT) AS bal FROM {p}PS_ITEM
+  LEFT JOIN (SELECT CUST_ID, {cur_sel} AS currency, SUM(BAL_AMT) AS bal
+               FROM {p}PS_ITEM I
               WHERE BUSINESS_UNIT = :bu AND ITEM_STATUS = 'O'
-              GROUP BY CUST_ID) B ON B.CUST_ID = C.CUST_ID
+              GROUP BY CUST_ID{cur_grp}) B ON B.CUST_ID = C.CUST_ID
  WHERE C.SETID = :setid
    AND ({name_pred}UPPER(C.CUST_ID) LIKE :qa)
  ORDER BY C.CUST_ID"""
-        rows, truncated = self.db.query(sql, params, max_rows=max(int(limit or 25), 1))
+        # A customer with two currencies is now two rows; ask for enough of
+        # them that the limit still means customers.
+        raw, truncated = self.db.query(
+            sql, params, max_rows=max(int(limit or 25), 1) * 6)
+        fx_cache: dict = {}
+        by_cust: dict = {}
+        for r in raw:
+            cid = str(r["cust_id"])
+            row = by_cust.setdefault(cid, {
+                "cust_id": cid, "name": r.get("name"),
+                "status": r.get("status"),
+                "corporate_parent": r.get("corporate_parent"),
+                "open_balance": 0.0, "currency": disp,
+                "balances_by_currency": {}})
+            amount = float(r["bal"] or 0)
+            if not amount and r.get("currency") is None:
+                continue                      # LEFT JOIN miss: no open items
+            cur = (str(r.get("currency") or "").upper() or base)
+            # Fails closed on a missing rate, exactly as aging does. A
+            # search that quietly drops the euros would be the same bug
+            # wearing a smaller number.
+            rate = self._rate_to(cur, disp, asof, fx_cache, base=base)
+            row["open_balance"] += amount * rate
+            row["balances_by_currency"][cur] = r2(
+                row["balances_by_currency"].get(cur, 0.0) + amount)
+        rows = []
         in_a_group = []
-        for r in rows:
-            r["open_balance"] = r2(r["open_balance"])
-            parent = str(r.get("corporate_parent") or "")
-            r["corporate_parent"] = parent
-            if parent and parent != r["cust_id"]:
-                in_a_group.append(r["cust_id"])
+        for cid, row in list(by_cust.items())[:max(int(limit or 25), 1)]:
+            row["open_balance"] = r2(row["open_balance"])
+            parent = str(row.get("corporate_parent") or "")
+            row["corporate_parent"] = parent
+            if len(row["balances_by_currency"]) < 2:
+                # One currency is the ordinary case; a breakdown of one is
+                # noise on every row of every search.
+                row.pop("balances_by_currency")
+            if parent and parent != cid:
+                in_a_group.append(cid)
+            rows.append(row)
+        truncated = truncated or len(by_cust) > len(rows)
         # Pointing UP is free — the row carries its own parent. Pointing
         # DOWN is not: whether C1001 owns anything lives in rows this WHERE
         # clause excluded. Searching the parent by name and being told
@@ -894,7 +941,13 @@ class ARBilling:
         for r in rows:
             r["heads_a_corporate_family"] = r["cust_id"] in heads
         out = {"customers": rows, "count": len(rows), "truncated": truncated,
-               "note": "status A=active, I=inactive; open_balance sums open items"}
+               "display_currency": disp, "as_of": asof,
+               "note": f"status A=active, I=inactive; open_balance is open "
+                       f"items converted server-side to {disp}. A customer "
+                       "billing in more than one currency also carries "
+                       "balances_by_currency with the unconverted parts."}
+        if fx_cache:
+            out["fx_applied"] = sorted(n for _, n in fx_cache.values())
         if in_a_group or heads:
             out["belongs_to_a_corporate_family"] = in_a_group
             out["heads_a_corporate_family"] = sorted(heads)
@@ -1857,17 +1910,50 @@ class ARBilling:
                 record_notes.append(f"PS_BI_HDR here has no {c_}; "
                                     f"{what} are not shown.")
 
+        # Grouped by currency as well as status. Summing INVOICE_AMOUNT
+        # across currencies produced a status total nobody could interpret
+        # — the finalized figure disagreed with the currency-aware billing
+        # ranking beside it, and neither screen said why.
+        base = self.e.base_currency_for(bu) or "USD"
+        disp = base
+        has_cur = (not bi) or ("BI_CURRENCY_CD" in bi)
+        cur_sel = "BI_CURRENCY_CD" if has_cur else "''"
+        cur_grp = ", BI_CURRENCY_CD" if has_cur else ""
+        if not has_cur:
+            record_notes.append("PS_BI_HDR here has no BI_CURRENCY_CD; "
+                                "billing amounts are assumed to be in the "
+                                f"unit's base currency ({base}).")
         rows, _ = self.db.query(
-            f"""SELECT BILL_STATUS AS status, COUNT(*) AS n,
+            f"""SELECT BILL_STATUS AS status, {cur_sel} AS currency,
+       COUNT(*) AS n,
        {'SUM(INVOICE_AMOUNT)' if has_amt else 'SUM(0)'} AS amount
-  FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu GROUP BY BILL_STATUS""",
-            {"bu": bu}, max_rows=25,
+  FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu
+ GROUP BY BILL_STATUS{cur_grp}""",
+            {"bu": bu}, max_rows=100,
         )
-        statuses = [
-            {**r, "amount": r2(r["amount"] or 0),
-             "descr": BILL_STATUS_DESCR.get(r["status"], r["status"])}
-            for r in rows
-        ]
+        bill_fx: dict = {}
+        merged: dict = {}
+        for r in rows:
+            st = str(r["status"])
+            cur = (str(r.get("currency") or "").upper() or base)
+            # Fails closed on a missing rate, like every other converted
+            # figure in this module.
+            rate = self._rate_to(cur, disp, asof, bill_fx, base=base)
+            entry = merged.setdefault(st, {
+                "status": st, "n": 0, "amount": 0.0, "currency": disp,
+                "amounts_by_currency": {},
+                "descr": BILL_STATUS_DESCR.get(st, st)})
+            entry["n"] += int(r["n"] or 0)
+            entry["amount"] += float(r["amount"] or 0) * rate
+            entry["amounts_by_currency"][cur] = r2(
+                entry["amounts_by_currency"].get(cur, 0.0)
+                + float(r["amount"] or 0))
+        statuses = []
+        for entry in merged.values():
+            entry["amount"] = r2(entry["amount"])
+            if len(entry["amounts_by_currency"]) < 2:
+                entry.pop("amounts_by_currency")
+            statuses.append(entry)
 
         pend, pend_trunc = self.db.query(
             f"""SELECT INVOICE AS invoice, BILL_STATUS AS status,
@@ -1957,6 +2043,12 @@ class ARBilling:
             "business_unit": bu,
             "as_of": asof,
             "statuses": statuses,
+            # Say which currency the status amounts are in, and which rate
+            # got them there. A converted figure with no rate beside it is
+            # a figure nobody can check.
+            "display_currency": disp,
+            **({"fx_applied": sorted(n for _, n in bill_fx.values())}
+               if bill_fx else {}),
             "stuck_invoices": stuck,
             "interface": interface,
             "interface_errors": errs,

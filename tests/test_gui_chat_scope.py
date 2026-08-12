@@ -73,8 +73,41 @@ class ScopeValidationTests(unittest.TestCase):
                 "ledger": "ACTUALS",
                 "fiscal_year": 2026,
                 "period": 3,
+                # The selected period resolved to a date, because AR,
+                # Billing and AP filter on one. Without it the chip read
+                # P3 and the receivables beside it read today.
+                "as_of_date": "2026-03-31",
             },
         )
+
+    def test_the_period_reaches_the_tools_that_take_a_DATE(self) -> None:
+        from pstb.guards import apply_request_scope
+        scope = gui._validated_scope(
+            {"business_unit": "CA001", "ledger": "ACTUALS"}, CATALOG)
+        for tool in ("get_ar_aging", "get_billing_workbench",
+                     "get_customer_financial_360", "get_open_payables"):
+            self.assertEqual(
+                apply_request_scope(tool, {}, scope).get("as_of_date"),
+                "2026-03-31", tool)
+
+    def test_an_explicit_date_still_wins_over_the_chip(self) -> None:
+        # Time is a default, not a cage: "what do they owe TODAY" while the
+        # chip reads P3 is a legitimate question.
+        from pstb.guards import apply_request_scope
+        scope = gui._validated_scope(
+            {"business_unit": "CA001", "ledger": "ACTUALS"}, CATALOG)
+        self.assertEqual(
+            apply_request_scope("get_ar_aging", {"as_of_date": "2026-08-01"},
+                                scope)["as_of_date"], "2026-08-01")
+
+    def test_a_calendar_that_cannot_answer_costs_only_the_date(self) -> None:
+        from unittest.mock import patch
+        with patch.object(gui.engine, "list_periods",
+                          side_effect=Exception("ORA-00942")):
+            scope = gui._validated_scope(
+                {"business_unit": "CA001", "ledger": "ACTUALS"}, CATALOG)
+        self.assertNotIn("as_of_date", scope)
+        self.assertEqual(scope["period"], 3)
 
     def test_unknown_ledger_and_out_of_range_year_are_rejected(self):
         with self.assertRaises(HTTPException) as ledger_error:
