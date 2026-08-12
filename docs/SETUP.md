@@ -417,37 +417,33 @@ A ~50-question catalog is in [QUESTIONS.md](QUESTIONS.md).
 ```
 
 Windows: `.venv\Scripts\python -m pstb.gui --open`. Opens
-http://127.0.0.1:8000 (add `--port 8777` to change it).
+http://<this-host>:8016 (`--port` to change it).
 
-### Letting other people reach it
+### Who can reach it
 
-By default the app binds 127.0.0.1 and answers only a caller on that
-machine. `--host 0.0.0.0` on its own is refused, and that is deliberate:
-nothing this app serves is authenticated — every balance, every customer,
-the ad-hoc SQL tool — so with no other control the bind is the whole access
-story. There are two supported ways to widen it.
+**The default is the shared box.** `python -m pstb.gui` binds `0.0.0.0` on
+port 8016, so colleagues open `http://<this-host>:8016` and nothing else
+has to be arranged. There is no token unless you set one.
 
-**One person, from their own laptop — forward the port.** Nothing to
-configure, and the ledger never leaves loopback:
+Every routable start prints what that exposes: anyone who can route to the
+host can read every balance, every customer and use the ad-hoc SQL tool,
+over cleartext HTTP. **Keep it inside the VPN.**
+
+`--share` is still accepted and does nothing. It used to be a required
+acknowledgement, which was worth it while loopback was the default — a
+routable bind could then only happen on purpose. Once the shared bind is
+the default, that flag would refuse the intended command, and a gate that
+fires on the intended path is a gate people delete rather than read. The
+disclosure it used to guard is printed either way.
+
+**To keep it on this machine only**, ask for loopback and forward the port:
 
 ```bash
-ssh -L 8000:localhost:8000 <this-host>
+.venv/bin/python -m pstb.gui --host 127.0.0.1
+ssh -L 8016:localhost:8016 <this-host>     # from your laptop
 ```
 
-then open http://localhost:8000 on your laptop.
-
-**A team, from the network — `--share`.** This binds the routable address
-and serves the page at a plain URL:
-
-```bash
-.venv/bin/python -m pstb.gui --host 0.0.0.0 --port 8016 --share
-```
-
-Colleagues just open `http://<this-host>:8016`. **No token, no link to
-paste** — the flag is there so binding the network is a deliberate act, not
-so the app can demand a credential. It prints what that exposes: anyone who
-can route to the host can read every balance, every customer and use the
-ad-hoc SQL tool, over cleartext HTTP. Keep it inside the VPN.
+then open http://localhost:8016.
 
 Two things stay true whatever you choose:
 
@@ -455,9 +451,8 @@ Two things stay true whatever you choose:
   settings and rotates credentials — answers only from the machine itself
   (SSH tunnel). Letting colleagues read the dashboards must not also let
   them rotate the Oracle password.
-- **A routable bind without `--share` is still refused**, because that one
-  is almost always a typo rather than a decision. The refusal names both
-  the flag and the tunnel.
+- **The Host check and the optional token are unaffected.** `--share` never
+  controlled either of them.
 
 **If you do want a token**, set `PSTB_AUTH_TOKEN` and restart; every request
 then needs it, including from `127.0.0.1`, and the startup banner prints a
@@ -541,7 +536,7 @@ in testing, a small local model produced incorrect prose next to a correct
 table.
 
 **Security:** the UI has no login and no per-user authorization. Bind it to
-`127.0.0.1` (the default) and treat it as a single-user tool until an
+`--host 127.0.0.1` and treat it as a single-user tool until an
 authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
 
 ## 6. Point it at a real PeopleSoft database

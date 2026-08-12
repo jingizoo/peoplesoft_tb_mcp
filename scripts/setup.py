@@ -1057,10 +1057,11 @@ def step_summary(state, preflight_ok):
     print("  Start the web UI:")
     print("      {0} -m pstb.gui".format(py))
     print("")
-    print("  It listens on 127.0.0.1:8000. From your laptop:")
-    print("      ssh -L 8000:127.0.0.1:8000 you@{0}".format(
+    print("  It listens on 0.0.0.0:8016 — colleagues can open it directly.")
+    print("  To keep it to this machine, add --host 127.0.0.1, then:")
+    print("      ssh -L 8016:127.0.0.1:8016 you@{0}".format(
         platform.node() or "appserver"))
-    print("      then open http://127.0.0.1:8000")
+    print("      then open http://127.0.0.1:8016")
     print("")
     print("  " + yellow("Do not pass --host 0.0.0.0")
           + ": there is no login, so that would")

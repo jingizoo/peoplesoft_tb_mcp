@@ -26,7 +26,7 @@ python -m pstb.client.chat --provider gemini   # chat via Gemini on Vertex AI
 python -m pstb.client.chat --provider claude   # chat via Claude on the Anthropic API
 python -m pstb.client.chat --ask "..."         # one-shot question
 python -m pstb.server                          # run the server standalone
-python -m pstb.gui --open                      # web UI on 127.0.0.1:8000
+python -m pstb.gui --open                      # web UI on 0.0.0.0:8016
 ```
 
 macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
