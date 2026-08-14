@@ -920,6 +920,51 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
                                     str(ROOT / "config.example.yaml")),
           _r.stdout.strip() or _r.stderr.strip()[:80])
 
+    print("== process graph: how work is done here ==")
+    # Built into a scratch file, never the deployment's own: a smoke run must
+    # not overwrite a graph an administrator built and the GUI is reading.
+    import tempfile as _pgtf
+    from pstb import procgraph as _pg
+    from pstb.wiki import make_wiki as _pgwiki
+    _pgdir = _pgtf.mkdtemp(prefix="pstb_pg_")
+    _pgfile = Path(_pgdir) / "pg.db"
+    _pg_cur = _pg.harvest_record_map(engine)
+    _pg_recs = sorted({n["name"] for n in _pg_cur.nodes.values()
+                       if n["kind"] in ("record", "setup")})
+    _pg_mods = sorted({n["name"] for n in _pg_cur.nodes.values()
+                       if n["kind"] == "module"})
+    _pg_pt = _pg.harvest_peopletools(engine.db)
+    _pg.write_graph(_pgfile, [
+        _pg_cur, _pg_pt, _pg.harvest_scopes(engine),
+        _pg.harvest_joins(engine, _pg_recs),
+        _pg.harvest_wiki(_pgwiki(cfg), _pg_recs, _pg_mods)])
+    _pgg = _pg.ProcessGraph(_pgfile)
+    check("process graph builds from this instance's own metadata",
+          _pgg.describe()["available"]
+          and any(k["kind"] == "page" for k in _pgg.describe()["node_kinds"]),
+          str(_pgg.describe().get("node_kinds"))[:120])
+    _pgt = _pgg.trace("how do we do invoicing")
+    _pglayers = {lay["layer"]: [i["name"] for i in lay["items"]]
+                 for lay in _pgt.get("layers", [])}
+    check("a process question returns the menu path, the pages AND the records",
+          bool(_pglayers.get("navigation")) and bool(_pglayers.get("page"))
+          and "PS_BI_HDR" in _pglayers.get("record", []),
+          str(sorted(_pglayers))[:140])
+    check("record names are canonical — no BI_HDR/PS_BI_HDR split",
+          all(n.startswith("PS_") for n in _pglayers.get("record", [])
+              + _pglayers.get("setup", [])),
+          str(_pglayers.get("record"))[:120])
+    _pgin = _pgg.trace("how do we do invoicing for India")
+    check("a country with no business unit says so instead of localising",
+          bool(_pgin["scope_applied"])
+          and "No business unit" in (_pgin["scope_applied"][0].get("note") or ""),
+          str(_pgin.get("scope_applied"))[:140])
+    check("the process graph carries structure, never amounts",
+          all(tok not in str(_pgt) for tok in
+              ("302835", "908846", "ACME Industrial", "456001122")),
+          "an amount or a party name reached a structure index")
+    _sh.rmtree(_pgdir, ignore_errors=True)
+
     print("== source registry: ask-anything on a second database ==")
     from pstb.sources import SourceRegistry
     from pstb.config import DbCfg

@@ -45,6 +45,11 @@ modules = ModulePacks(engine)
 vendor_network = VendorNetwork(modules)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
+from .procgraph import ProcessGraph, graph_path
+# Opened per call against a local file, so a graph built or rebuilt after
+# this process started is picked up without a restart — the build script is
+# run by an administrator, not by the server.
+process_graph = ProcessGraph(graph_path(cfg))
 from .psquery import QueryCatalog
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
@@ -341,6 +346,37 @@ def get_record_map() -> dict:
     names the curated tool to prefer over raw SQL. CALL THIS BEFORE run_sql
     whenever unsure which record answers a question."""
     return _safe(engine.get_record_map)
+
+
+@mcp.tool()
+def trace_process(question: str, hops: int = 3, limit: int = 40) -> dict:
+    """HOW something is DONE here, end to end — the answer to "how do we do
+    invoicing", "how do we pay a supplier", "what is our close process",
+    "where is customer credit maintained". Returns the chain this
+    installation actually has, in the order a person meets it: the menu
+    NAVIGATION, the COMPONENT and PAGES a user opens, the RECORDS those
+    pages write, the setup tables that govern them, the tools here that can
+    query them, and the written procedure that describes them. A qualifier
+    like "for India" or "for US001" is resolved to business units and
+    reported in scope_applied — pass those units to the financial tools
+    afterwards. This holds NO amounts: it explains structure, and every
+    figure still comes from a financial tool. Read from a graph built
+    offline by scripts/build_process_graph.py; if it reports available:
+    false, say the graph has not been built and name that script."""
+    return _safe(process_graph.trace, question=question, hops=hops,
+                 limit=limit)
+
+
+@mcp.tool()
+def describe_process_graph() -> dict:
+    """What the process graph covers and when it was built: which sources
+    were harvested, which were DEGRADED (a metadata table this account
+    cannot read leaves a hole), how many nodes of each kind, and the build
+    notes. Call this when trace_process returns less than expected, or when
+    asked how the agent knows the process — the answer is "from this
+    instance's own metadata at build time", and the notes say what was
+    missing."""
+    return _safe(process_graph.describe)
 
 
 @mcp.tool()

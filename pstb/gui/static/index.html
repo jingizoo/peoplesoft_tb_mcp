@@ -1662,6 +1662,7 @@ function renderToolResult(name,data,args){
     if(name==='get_customer_intelligence') return renderCustomerIntel(data);
     if(name==='get_customer_financial_360') return renderCustomer360(data);
     if(name==='get_vendor_payables_network') return renderVendorNetwork(data);
+    if(name==='trace_process') return renderProcess(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
@@ -1780,6 +1781,61 @@ function renderCustomerIntel(d){
 // four states a receivable can be in — owed, disputed, billed-not-finalized,
 // paid-but-not-applied — sit next to each other. Split across four screens
 // they are four normal-looking numbers; together they are the answer.
+// A process is a SEQUENCE, so it is drawn as one: the layers in the order a
+// person meets them, each row carrying how it was reached. The "reached by"
+// column is the honest part — a page linked by PSPNLFIELD and a record
+// linked by a shared column name look identical in a list, and only one of
+// them is a fact about this instance.
+function renderProcess(d){
+  const frag=document.createDocumentFragment();
+  if(d.available===false){
+    const c=el('div','card');
+    c.append(el('h2',null,'No process graph <span class="badge bad">not built</span>'));
+    c.append(el('div','pad','<p>'+esc(d.detail||'')+'</p><p>Build it with:</p>'+
+      '<pre class="mono">'+esc(d.how_to_build||'python scripts/build_process_graph.py')+'</pre>'));
+    frag.append(c); return frag;
+  }
+  (d.scope_applied||[]).forEach(s=>{
+    const c=el('div','card');
+    c.append(el('h2',null,'Scope <span class="sub">'+esc(s.facet||'')+'</span>'));
+    const units=(s.business_units||[]).length
+      ? '<p>Business units: <b>'+s.business_units.map(esc).join(', ')+'</b></p>'
+      : '';
+    c.append(el('div','pad','<p><b>'+esc(s.name||s.value||'')+'</b></p>'+units+
+      (s.note?'<p class="warn">'+esc(s.note)+'</p>':'')+
+      (s.next_step?'<p style="color:var(--muted)">'+esc(s.next_step)+'</p>':'')));
+    frag.append(c);
+  });
+  if(!(d.layers||[]).length){
+    const c=el('div','card');
+    c.append(el('h2',null,'Nothing matched'));
+    c.append(el('div','pad','<p>'+esc(d.detail||'')+'</p>'+
+      ((d.known_modules||[]).length
+        ? '<p>Modules in this graph: <b>'+d.known_modules.map(esc).join(', ')+'</b></p>' : '')));
+    frag.append(c); return frag;
+  }
+  const c=el('div','card');
+  c.append(el('h2',null,'How this is done here'+
+    (d.question?'<span class="sub">'+esc(d.question)+'</span>':'')));
+  const sc=el('div','scroll');
+  (d.layers||[]).forEach(layer=>{
+    const t=el('table');
+    t.innerHTML='<thead><tr><th colspan="3">'+esc(layer.layer.toUpperCase())+
+      ' <span class="sub">'+esc(layer.meaning||'')+'</span></th></tr>'+
+      '<tr><th>Name</th><th>What it is</th><th>Reached by</th></tr></thead><tbody>'+
+      (layer.items||[]).map(i=>'<tr><td class="mono">'+esc(i.name)+'</td><td>'+
+        esc(i.label||i.role||'')+'</td><td class="sub">'+
+        esc((i.reached_by||'').replace(/_/g,' '))+'</td></tr>').join('')+
+      (layer.also_reachable
+        ? '<tr><td colspan="3" class="sub">'+esc(layer.note||'')+'</td></tr>' : '')+
+      '</tbody>';
+    sc.append(t);
+  });
+  c.append(sc);
+  if(d.basis) c.append(el('div','pad','<p style="color:var(--muted)">'+esc(d.basis)+'</p>'));
+  frag.append(c);
+  return frag;
+}
 function renderCustomer360(d){
   if(d.scope_status) return noData(d);
   const frag=document.createDocumentFragment();

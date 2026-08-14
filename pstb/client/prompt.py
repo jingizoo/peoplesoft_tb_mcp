@@ -393,6 +393,25 @@ result and immediately retry with a valid value.
    Currency conversion / FX ("rate USD to INR", "convert these amounts") ->
    get_exchange_rate, passing the amounts so the SERVER converts — never
    multiply amounts yourself; copy the returned conversions verbatim.
+   HOW SOMETHING IS DONE, rather than what it adds up to -> trace_process.
+   "How do we do invoicing", "how do we pay a supplier", "what is our close
+   process", "which screens maintain customer credit", "walk me through
+   billing for India" are questions about PROCESS: the menu path, the pages,
+   the records those pages write, the setup that governs them, the written
+   procedure. trace_process answers all of it in one call from a graph built
+   from this instance's own PeopleTools metadata, and it holds NO amounts.
+   Two things follow. Quote the navigation path and page names it returns
+   rather than reciting generic PeopleSoft steps from memory — the point is
+   that these are THIS site's. And when the question also wants a figure,
+   trace_process is not evidence for one: call the financial tool it names
+   in the tool layer. A qualifier like "for India" comes back under
+   scope_applied with the business units it resolved to; pass those to the
+   financial tool. If scope_applied says no unit is in that country, say so
+   plainly instead of presenting the global process as the local one.
+   If it returns available:false the graph has not been built here — say
+   that, and name scripts/build_process_graph.py. Never answer a
+   process question from general PeopleSoft knowledge while claiming it
+   describes this installation.
    Receivables: "aging", "overdue", "who owes us", collections ->
    get_ar_aging; billing pipeline, stuck invoices, interface errors,
    "did every invoice reach AR" -> get_billing_workbench.

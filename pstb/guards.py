@@ -196,6 +196,10 @@ BU_ALL_TOOLS = {"get_top_billing_customers"}
 # refused outright — most are catalogs or shape lookups with no figures in
 # them — but the ad-hoc ones are, below.
 _UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"}
+# Structure, never amounts: a process trace must not satisfy the
+# grounding guard's demand for evidence behind a figure.
+STRUCTURAL_TOOLS = {"trace_process", "describe_process_graph",
+                    "get_record_map", "join_path"}
 
 
 def filter_scope_payload(tool_name: str, payload: str, access) -> str:
@@ -427,6 +431,8 @@ _TOOL_DOMAINS = {
     "get_customer_financial_360": {"billing", "customer", "ar", "report",
                                    "balance", "fx"},
     "get_vendor_payables_network": {"ap", "report", "balance"},
+    "trace_process": {"balance", "report", "ar", "ap", "billing",
+                      "journal", "customer", "fx", "variance"},
     "search_vendors": {"ap", "balance"},
     "get_invoice_totals": {"billing", "report", "balance"},
     "get_duplicate_payments": {"ap", "report"},

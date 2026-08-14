@@ -343,6 +343,94 @@ def _from_payables(p: dict, ctx: Context) -> list:
         amount=overdue, severity=FOLLOW_UP)]
 
 
+# The follow-up question for a tool the process trace surfaced: a scoped
+# form when the trace resolved a business unit, and otherwise a generic
+# wording the eval suite already proves routes correctly — an invented
+# phrasing that fails when clicked teaches the person the thing cannot be
+# asked. Only tools answerable FROM A UNIT ALONE belong here; one whose
+# question needs an account or a customer id has no honest generic form.
+# Keys are as the graph stores tool names (uppercase).
+_PROCESS_TOOL_ASKS = {
+    "GET_AR_AGING": (
+        "Show the AR aging in {u} as of today",
+        "Show the AR aging"),
+    "GET_BILLING_WORKBENCH": (
+        "Where is the billing delay in {u} today?",
+        "Where is the billing delay?"),
+    "GET_TOP_BILLING_CUSTOMERS": (
+        "Who are the top billing customers in {u} this year?",
+        "Who are our top 5 billing customers across all business units in "
+        "USD?"),
+    "GET_CUSTOMER_INTELLIGENCE": (
+        "Who are the top customers in {u} and what do they buy?",
+        "Who are my top customers, where are they based and what do they "
+        "buy?"),
+    "GET_TRIAL_BALANCE": (
+        "Does the trial balance in {u} balance?",
+        "Does the trial balance balance?"),
+    "GET_OPEN_PAYABLES": (
+        "How much do we owe suppliers in {u} right now?",
+        "How much do we owe our vendors right now?"),
+    "GET_CASH_OUTLOOK": (
+        "What is the cash outlook in {u} for the next 8 weeks?",
+        "What is our cash outlook for the next 8 weeks?"),
+    "GET_DSO_TREND": (
+        "How is DSO trending in {u} this year?",
+        "Show the DSO trend for this year"),
+}
+
+
+def _from_process(p: dict, ctx: Context) -> list:
+    """A process answer ends where the numbers begin. Point across the gap.
+
+    trace_process explains structure and holds no amounts, so the natural
+    follow-up is always the FIGURE the structure leads to: the trace names
+    the tools that answer from this process's records, and the scope names
+    the unit to ask them about. Both facts are in the payload — the
+    suggestion just puts them in one clickable sentence.
+
+    The scope refusal is evidence too. "No unit operates in that country"
+    earns exactly one next question — what units DO exist — and nothing
+    else: recommending a figure for a scope that resolved to nothing would
+    build on the refusal.
+    """
+    layers = {lay.get("layer"): lay.get("items") or []
+              for lay in p.get("layers") or []}
+    scopes = p.get("scope_applied") or []
+    units = [u for s in scopes for u in (s.get("business_units") or [])]
+
+    # Only a refusal when NOTHING resolved: a second, partial-word country
+    # match beside a resolved one must not turn the answer into a refusal.
+    empty = [s for s in scopes if s.get("facet") == "country"
+             and not s.get("business_units")]
+    if empty and not units:
+        where = str(empty[0].get("name") or empty[0].get("value") or "")
+        return [Suggestion(
+            question="What business units and ledgers exist?",
+            because=f"No business unit records its country as {where}; the "
+                    "scope list shows where this installation actually "
+                    "operates.",
+            kind="scope_unresolved", answered_by="list_financial_scopes",
+            evidence_from="trace_process", severity=FOLLOW_UP)]
+
+    unit = units[0] if units else ""
+    for item in layers.get("tool", []):
+        asks = _PROCESS_TOOL_ASKS.get(str(item.get("name") or ""))
+        if not asks:
+            continue
+        scoped, generic = asks
+        return [Suggestion(
+            question=scoped.format(u=unit) if unit else generic,
+            because="The trace names this tool as one that answers from "
+                    "this process's own records"
+                    + (f", and the scope resolved to {unit}" if unit
+                       else "") + ".",
+            kind="process_to_figures",
+            answered_by=str(item["name"]).lower(),
+            evidence_from="trace_process", severity=FOLLOW_UP)]
+    return []                     # the layer is ranked; one is a pointer
+
+
 RULES: dict = {
     "get_customer_financial_360": _from_customer_360,
     "get_ar_aging": _from_ar_aging,
@@ -352,6 +440,7 @@ RULES: dict = {
     "get_invoice_lifecycle": _from_lifecycle,
     "get_duplicate_payments": _from_duplicates,
     "get_open_payables": _from_payables,
+    "trace_process": _from_process,
 }
 
 # The subject a tool's question is ABOUT, so a suggestion is not offered
