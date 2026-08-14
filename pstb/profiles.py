@@ -58,7 +58,14 @@ _NEVER_MASK = (
     "CURRENCY_CD", "BASE_CURRENCY", "FISCAL_YEAR", "ACCOUNTING_PERIOD",
     "RECNAME", "FIELDNAME", "TREE_NAME", "BANK_CD", "BANK_ACCT_KEY",
 )
-_ID_LIKE = re.compile(r"(_ID|_CD|_KEY|_NBR|_NO|_NUM|ID|CODE|STATUS|FLAG|TYPE)$")
+# Customizations rarely keep the delivered long suffixes.  X_APPR_STAT,
+# HOLD_STS, ERROR_FLG and ACTIVE_IND are exactly the low-cardinality columns
+# whose values distinguish a live transaction record from a staging shell.
+# Treat them like STATUS/FLAG for profiling; the distinct-value cap below is
+# still the noise and data-volume guard.
+_ID_LIKE = re.compile(
+    r"(_ID|_CD|_KEY|_NBR|_NO|_NUM|_STAT|_STS|_FLG|_IND|"
+    r"ID|CODE|STATUS|FLAG|TYPE)$")
 
 # A column with more distinct values than this is not a status/type flag, so
 # listing its values would be noise rather than a fit signal.

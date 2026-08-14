@@ -25,6 +25,7 @@ What is pinned here is the part that is easy to get subtly wrong:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -198,10 +199,12 @@ class CanonicalRecordTests(_Built):
                 "SELECT name FROM nodes WHERE kind IN ('record','setup')")}
         finally:
             con.close()
-        bare = {n for n in names if not n.startswith("PS_")}
-        self.assertEqual(bare, set(),
-                         f"un-prefixed record nodes survived: {sorted(bare)}")
         self.assertIn("PS_BI_HDR", names)
+        self.assertNotIn("BI_HDR", names)
+        # Prefix is not the identity rule: delivered PeopleTools objects such
+        # as PSTREENODE legitimately have no PS_, while unresolved custom
+        # logical records remain unguessed.  Only catalog evidence decides.
+        self.assertIn("PSTREENODE", names)
 
     def test_the_page_layer_reaches_the_data_layer(self) -> None:
         # The whole point of merging: a page must connect to the record the
@@ -209,6 +212,55 @@ class CanonicalRecordTests(_Built):
         out = self.g.trace("invoicing")
         self.assertIn("PS_BI_HDR", self.names(out, "record"))
         self.assertTrue(self.names(out, "page"))
+
+
+class CustomPhysicalRecordTests(unittest.TestCase):
+    def test_company_physical_names_are_preserved_without_inventing_ps(self):
+        class Catalog:
+            prefix = ""
+            dialect = "sqlite"
+
+            def columns(self, table):
+                return ({"RECNAME", "RECDESCR", "RECTYPE", "SQLTABLENAME"}
+                        if table == "PSRECDEFN" else set())
+
+            def query(self, sql, params=None, max_rows=None):
+                if "FROM PSRECDEFN" in sql:
+                    return ([
+                        {"recname": "Z_AR_STAGE", "recdescr": "AR stage",
+                         "rectype": 0, "sqltablename": ""},
+                        {"recname": "Y_AR_QUEUE", "recdescr": "AR queue",
+                         "rectype": 0,
+                         "sqltablename": "CORP_AR_QUEUE"},
+                    ], False)
+                if "sqlite_master" in sql:
+                    return ([
+                        {"table_name": "ACME_Z_AR_STAGE",
+                         "object_type": "table"},
+                        {"table_name": "CORP_AR_QUEUE",
+                         "object_type": "table"},
+                    ], False)
+                raise AssertionError(sql)
+
+        h = pg.harvest_peopletools(Catalog())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "custom.db"
+            pg.write_graph(path, [h])
+            con = sqlite3.connect(str(path))
+            try:
+                rows = con.execute(
+                    "SELECT name, attrs FROM nodes WHERE kind = 'record'"
+                ).fetchall()
+            finally:
+                con.close()
+            found = {name: json.loads(attrs) for name, attrs in rows}
+            self.assertEqual(found["ACME_Z_AR_STAGE"]["record"],
+                             "Z_AR_STAGE")
+            self.assertEqual(found["ACME_Z_AR_STAGE"]["table"],
+                             "ACME_Z_AR_STAGE")
+            self.assertEqual(found["CORP_AR_QUEUE"]["record"],
+                             "Y_AR_QUEUE")
+            self.assertNotIn("PS_Z_AR_STAGE", found)
 
 
 class RetrievalTests(_Built):

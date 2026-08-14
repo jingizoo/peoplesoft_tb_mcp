@@ -424,6 +424,13 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # looking" structurally impossible for tool-needing questions. Other
     # providers simply carry the attribute.
     provider.expect_tool_call = intent != "general"
+    set_routing = getattr(provider, "set_routing_question", None)
+    if callable(set_routing):
+        # Gemini 2.5 Pro sees the full MCP surface after the first result, but
+        # its forced first call is shortlisted to the question's broad
+        # accounting domain. This reduces tool-name competition without
+        # preventing discovery or a cross-module chain.
+        set_routing(user_text)
     financial_fact_required = (
         intent == "data" and bool(required_financial_domains)
     )

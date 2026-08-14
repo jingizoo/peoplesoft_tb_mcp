@@ -341,27 +341,42 @@ class Relationships:
             f"AND H.INVOICE_DT <= {self.db.date_bind('asof')} "
             f"GROUP BY H.BILL_STATUS{cur_grp} ORDER BY H.BILL_STATUS",
             {"bu": bu, "since": since, "asof": asof, **binds}, max_rows=200)
-        from .ar import BILL_STATUS_DESCR, NOT_FINAL
+        from .ar import BILL_STATUS_DESCR
+        sem = self.ar._billing_invoiced_semantics()
+        finalized = set(sem["values"])
         by_status = [{
             "status": str(r["status"] or ""),
             "meaning": BILL_STATUS_DESCR.get(str(r["status"] or ""), ""),
-            "finalized": str(r["status"] or "") not in NOT_FINAL,
+            "finalized": str(r["status"] or "") in finalized,
+            "class": (
+                "finalized" if str(r["status"] or "") in finalized else
+                ("terminal" if str(r["status"] or "") in
+                 self.ar._BILL_TERMINAL else "pipeline")),
             "currency": str(r["currency"] or ""),
             "bills": int(r["bills"] or 0),
             "amount": r2(float(r["amount"] or 0)),
             "oldest_bill_date": str(r["oldest"] or "")[:10],
         } for r in rows]
 
-        st_expr, st_binds = self._in("s", NOT_FINAL)
+        # Negative classification preserves the old all-history detail read
+        # while allowing any custom status: everything that is neither a
+        # governed finalized code nor a terminal cancellation is pipeline.
+        # This also finds an old pipeline status absent from the summary
+        # window above.
+        fin_expr, fin_binds = self._in("f", sem["values"])
+        term_expr, term_binds = self._in(
+            "t", sorted(self.ar._BILL_TERMINAL))
         rows, _ = self.db.query(
             f"SELECT H.INVOICE AS invoice, H.BILL_STATUS AS status, "
             f"H.BILL_TO_CUST_ID AS cust_id, H.INVOICE_DT AS invoice_dt, "
             f"H.INVOICE_AMOUNT AS amount, {cur_sel} "
             f"FROM {p}PS_BI_HDR H WHERE H.BUSINESS_UNIT = :bu "
-            f"AND H.BILL_TO_CUST_ID IN {expr} AND H.BILL_STATUS IN {st_expr} "
+            f"AND H.BILL_TO_CUST_ID IN {expr} "
+            f"AND H.BILL_STATUS NOT IN {fin_expr} "
+            f"AND H.BILL_STATUS NOT IN {term_expr} "
             f"AND H.INVOICE_DT <= {self.db.date_bind('asof')} "
             "ORDER BY H.INVOICE_DT",
-            {"bu": bu, "asof": asof, **binds, **st_binds},
+            {"bu": bu, "asof": asof, **binds, **fin_binds, **term_binds},
             max_rows=BILL_DETAIL_CAP + 1)
         in_flight = [{
             "invoice": str(r["invoice"]),
@@ -374,7 +389,15 @@ class Relationships:
         } for r in rows[:BILL_DETAIL_CAP]]
         return {"by_status": by_status, "not_yet_finalized": in_flight,
                 "truncated": len(rows) > BILL_DETAIL_CAP,
-                "basis": f"Bills dated {since} to {asof}. A bill's STATUS is "
+                "population": {"concept": "finalized billing",
+                               "predicate": sem["predicate"],
+                               "source": sem["source"],
+                               "meaning": sem["meaning"]},
+                **({"record_notes": sem["notes"]} if sem["notes"] else {}),
+                "basis": f"Bills dated {since} to {asof}. Finalized means "
+                         f"{sem['predicate']} ({sem['source']}); cancelled "
+                         "bills are terminal, never finalized or pipeline. "
+                         "A bill's STATUS is "
                          "current state — PeopleSoft does not keep the status "
                          "it held on an earlier day — so this is: of the "
                          "bills raised in that window, which are still not "

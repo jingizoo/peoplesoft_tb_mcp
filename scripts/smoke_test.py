@@ -1029,10 +1029,15 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
           bool(_pglayers.get("navigation")) and bool(_pglayers.get("page"))
           and "PS_BI_HDR" in _pglayers.get("record", []),
           str(sorted(_pglayers))[:140])
-    check("record names are canonical — no BI_HDR/PS_BI_HDR split",
-          all(n.startswith("PS_") for n in _pglayers.get("record", [])
-              + _pglayers.get("setup", [])),
-          str(_pglayers.get("record"))[:120])
+    _pgnames = set(_pglayers.get("record", []) +
+                   _pglayers.get("setup", []))
+    _pgsplits = sorted(n for n in _pgnames
+                       if n.startswith("PS_") and n[3:] in _pgnames)
+    check("record names are canonical — no logical/physical split",
+          not _pgsplits and "PS_BI_HDR" in _pgnames
+          and "BI_HDR" not in _pgnames,
+          "split pairs=" + str(_pgsplits) + " records=" +
+          str(sorted(_pgnames))[:120])
     _pgin = _pgg.trace("how do we do invoicing for India")
     check("a country with no business unit says so instead of localising",
           bool(_pgin["scope_applied"])
@@ -1104,7 +1109,8 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     from pstb.client.prompt import system_prompt as _sp
     _p = _sp(cfg, surface="gui")
     check("the agent is not framed as GL-only",
-          "General Ledger analyst" not in _p and "FINANCE analyst" in _p)
+          "General Ledger analyst" not in _p
+          and "controller-grade PeopleSoft finance analyst" in _p)
     check("prompt forbids claiming module lockout before checking",
           "NEVER tell the user you lack access to a module" in _p)
 

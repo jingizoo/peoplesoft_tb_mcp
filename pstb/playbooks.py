@@ -253,6 +253,11 @@ def _step_accrual_candidates(ctx: dict) -> tuple:
     rni = ctx.get("rni")
     if not isinstance(rni, dict):
         return "skipped", f"received-not-invoiced could not run: {rni}", {}
+    if rni.get("evaluated") is False:
+        return ("skipped",
+                rni.get("reason") or
+                "received-not-invoiced was not evaluated as of the period",
+                rni)
     mode = (" — SAMPLE procurement fixtures, not live data"
             if ctx.get("coupa_mode") == "fixtures" else "")
     lines = rni.get("lines") or []
@@ -269,6 +274,11 @@ def _step_voucher_pipeline(ctx: dict) -> tuple:
     pay = ctx.get("payables")
     if not isinstance(pay, dict):
         return "skipped", f"open payables could not run: {pay}", {}
+    if pay.get("point_in_time_complete") is False:
+        return ("skipped",
+                "voucher pipeline is not a complete period-end population: "
+                + str(pay.get("point_in_time_reason") or
+                      "current-state status cannot be reconstructed"), pay)
     exceptions = pay.get("pipeline_exceptions") or []
     if not exceptions:
         return "ok", "no vouchers stuck in recycle or unposted", pay
@@ -340,12 +350,20 @@ def _step_duplicates(ctx: dict) -> tuple:
         return "skipped", f"duplicate scan could not run: {dup}", {}
     exact = dup.get("exact_invoice_duplicates") or []
     near = dup.get("same_amount_pairs") or []
+    confirmed = dup.get("confirmed_duplicate_payments") or []
     if not exact and not near:
-        return "ok", "no duplicate vendor payments in the window", {}
+        return "ok", "no duplicate voucher candidates in the window", {}
     parts = []
+    if confirmed:
+        parts.append(
+            f"{len(confirmed)} confirmed duplicate-payment group(s) with "
+            f"{_fmt(dup.get('confirmed_duplicate_exposure'))} excess "
+            "disbursement exposure")
     if exact:
-        parts.append(f"{len(exact)} same-invoice duplicate(s) totalling "
-                     f"{_fmt(dup.get('exact_total'))}")
+        parts.append(f"{len(exact)} same-invoice duplicate-voucher "
+                     f"candidate(s) totalling {_fmt(dup.get('exact_total'))}"
+                     + (" (none confirmed paid twice)" if not confirmed
+                        else ""))
     if near:
         parts.append(f"{len(near)} same-amount pair(s) worth eyes")
     return ("attention", " and ".join(parts), dup)
@@ -379,7 +397,8 @@ PLAYBOOKS: dict = {
         "description": (
             "The first question of the day, answered from exceptions only: "
             "billing interface errors and stuck invoices, finalized bills "
-            "that never reached AR, duplicate vendor payments, vouchers "
+            "that never reached AR, duplicate voucher candidates with "
+            "separate payment evidence, vouchers "
             "invisible to payment runs, journals posted into the closed "
             "period, and whether the next two weeks' due-dates squeeze "
             "cash. Every step is a genuine exception check — a quiet day "
@@ -395,7 +414,7 @@ PLAYBOOKS: dict = {
             Step("orphans", "Finalized invoices reached AR",
                  "billed but not in AR is revenue nobody is collecting",
                  _step_orphans),
-            Step("duplicates", "Duplicate vendor payments",
+            Step("duplicates", "Duplicate voucher/payment evidence",
                  "the audit question every close asks", _step_duplicates),
             Step("ap_pipeline", "Vouchers stuck in the pipeline",
                  "owed but invisible to payment runs", _step_ap_pipeline),
@@ -538,8 +557,18 @@ class PlaybookRunner:
                      "needing attention; never re-run the steps yourself."),
         }
 
+    def _period_end(self, fiscal_year: int, period: int) -> Optional[str]:
+        """Calendar end for one requested period, or None if unavailable."""
+        try:
+            rows = self.e.list_periods(int(fiscal_year))["periods"]
+            return next((str(r["end_dt"])[:10] for r in rows
+                         if int(r["period"]) == int(period)), None)
+        except Exception:                              # shape/grant/calendar gap
+            return None
+
     def _context(self, bu: str, ledger: str, fy: int, period: int,
-                 inputs: Optional[tuple] = None) -> dict:
+                 inputs: Optional[tuple] = None,
+                 period_end_payables: bool = False) -> dict:
         """Gather every input once. Steps read this rather than querying, so
         a playbook costs one pass over the tools it wraps.
 
@@ -550,8 +579,16 @@ class PlaybookRunner:
         with a traceback. One unreadable input must cost the steps that need
         it, not the seven checks that do not.
         """
+        period_end = self._period_end(fy, period)
+        today = dt.date.today().isoformat()
+        effective_as_of = (min(period_end, today) if period_end else today)
         ctx: dict = {"business_unit": bu, "ledger": ledger,
-                     "fiscal_year": fy, "period": period}
+                     "fiscal_year": fy, "period": period,
+                     "period_end": period_end,
+                     "requested_as_of": period_end,
+                     "data_as_of": effective_as_of,
+                     "period_has_ended": bool(period_end
+                                              and period_end <= today)}
 
         def gather(key: str, fn, on_error) -> tuple:
             """(key, value, elapsed_ms) — run in a worker thread below."""
@@ -567,6 +604,97 @@ class PlaybookRunner:
                 return self.e.last_posted_period(bu, ledger)
             except Exception:                          # noqa: BLE001
                 return None, None
+
+        def period_ap_tie() -> dict:
+            """Run Coupa→AP through the available cut-off, never future data."""
+            if not period_end:
+                return {"evaluated": False,
+                        "reason": ("No fiscal-calendar end date is available "
+                                   "for the requested AP period.")}
+            asof_date = dt.date.fromisoformat(effective_as_of)
+            result = self.coupa.ap_tie(self.e.db, today=asof_date)
+            if period_end > today:
+                return {
+                    "source": result.get("source", "coupa+peoplesoft")
+                    if isinstance(result, dict) else "coupa+peoplesoft",
+                    "evaluated": False,
+                    "reason": (f"FY{fy} period {period} ends {period_end}; "
+                               f"only current data through {today} exists, "
+                               "so period-end AP completeness cannot yet be "
+                               "concluded."),
+                    "requested_as_of": period_end,
+                    "current_state_as_of": today,
+                    "current_state": result,
+                }
+            if isinstance(result, dict):
+                result["requested_as_of"] = period_end
+            return result
+
+        def period_rni() -> dict:
+            """Coupa PO-line RNI is a snapshot unless event dates are exposed."""
+            current = self.coupa.received_not_invoiced()
+            if not period_end:
+                return {"evaluated": False,
+                        "reason": ("No fiscal-calendar end date is available "
+                                   "for the requested AP period."),
+                        "current_state_as_of": today,
+                        "current_state": current}
+            if period_end != today:
+                direction = ("has not ended" if period_end > today else
+                             "is historical")
+                return {
+                    "source": current.get("source", "coupa")
+                    if isinstance(current, dict) else "coupa",
+                    "evaluated": False,
+                    "reason": (f"FY{fy} period {period} {direction} "
+                               f"(end {period_end}). This Coupa RNI view "
+                               "exposes current PO-line balances without "
+                               "receipt/invoice event dates, so its "
+                               f"{today} snapshot cannot be labelled a "
+                               "period-end accrual population."),
+                    "requested_as_of": period_end,
+                    "current_state_as_of": today,
+                    "current_state": current,
+                }
+            if isinstance(current, dict):
+                current["evaluated"] = True
+                current["requested_as_of"] = period_end
+            return current
+
+        def period_payables() -> dict:
+            result = self.modules.open_payables(
+                business_unit=bu, as_of_date=effective_as_of)
+            if not period_end and isinstance(result, dict):
+                result["point_in_time_complete"] = False
+                result["point_in_time_reason"] = (
+                    "No fiscal-calendar end date is available for the "
+                    "requested AP period.")
+            elif period_end > today and isinstance(result, dict):
+                result["point_in_time_complete"] = False
+                result["point_in_time_reason"] = (
+                    f"The requested period ends {period_end}; this is only "
+                    f"the current voucher state through {today}.")
+            if isinstance(result, dict):
+                result["requested_as_of"] = period_end
+                result["data_as_of"] = effective_as_of
+            return result
+
+        def current_payables() -> dict:
+            """Daily operations need today's queue, not the close population.
+
+            AP completeness deliberately uses ``period_payables`` above and
+            fails closed when a historical open population cannot be rebuilt.
+            The daily brief has a different question: what needs action now.
+            Use the runner's current date; unlike a close playbook this view
+            must not inherit the selected/latest accounting period end.
+            """
+            current_as_of = today
+            result = self.modules.open_payables(
+                business_unit=bu, as_of_date=current_as_of)
+            if isinstance(result, dict):
+                result["requested_as_of"] = current_as_of
+                result["data_as_of"] = current_as_of
+            return result
 
         # The four inputs are INDEPENDENT — integrity reads the ledger, aging
         # reads AR, the workbench reads billing — yet they ran in sequence,
@@ -597,12 +725,12 @@ class PlaybookRunner:
                               business_unit=bu), str),
             "latest_posted": ("latest_posted", latest,
                               lambda msg: (None, None)),
-            "rni": ("rni", lambda: self.coupa.received_not_invoiced(), str),
-            "ap_tie": ("ap_tie",
-                       lambda: self.coupa.ap_tie(self.e.db), str),
+            "rni": ("rni", period_rni, str),
+            "ap_tie": ("ap_tie", period_ap_tie, str),
             "payables": ("payables",
-                         lambda: self.modules.open_payables(
-                             business_unit=bu), str),
+                          period_payables if period_end_payables
+                          else current_payables,
+                          str),
             "late_posts": ("late_posts",
                            lambda: self._late_posts(bu, fy, period), str),
             "duplicates": ("duplicates",
@@ -675,8 +803,10 @@ class PlaybookRunner:
             lfy, lper = self.e.last_posted_period(bu, led)
             if lfy:
                 fy, per = lfy, lper
-        ctx = self._context(bu, led, fy, per,
-                            inputs=spec.get("context"))
+        ctx = self._context(
+            bu, led, fy, per,
+            inputs=spec.get("context"),
+            period_end_payables=(name == "ap_completeness"))
 
         results = []
         for step in spec["steps"]:
@@ -711,12 +841,20 @@ class PlaybookRunner:
                 f"the {worst} input took {slowest / 1000:.0f}s — that is the "
                 "query to tune, not the playbook. Run "
                 "scripts/diagnose_db.py to see its individual statements.")
+        result_as_of = (ctx.get("requested_as_of")
+                        if name == "ap_completeness"
+                        else dt.date.today().isoformat())
         return {
             "playbook": name,
             "title": spec["title"],
             "business_unit": bu, "ledger": led,
             "fiscal_year": fy, "period": per,
-            "as_of": dt.date.today().isoformat(),
+            "as_of": result_as_of,
+            **({"data_as_of": ctx.get("data_as_of"),
+                "period_has_ended": ctx.get("period_has_ended"),
+                "as_of_basis": ("requested fiscal-period end; inputs that "
+                                "cannot reproduce that date are skipped")}
+               if name == "ap_completeness" else {}),
             "verdict": verdict,
             "summary": summary,
             **out_timing,
@@ -729,5 +867,9 @@ class PlaybookRunner:
                 "found something; 'incomplete' means a step COULD NOT RUN and "
                 "must never be read as a pass. Figures come from the same "
                 "curated tools as the individual questions."
+                + (" AP completeness is pinned to the requested fiscal-"
+                   "period end; a current-state-only source is marked "
+                   "incomplete rather than presented as period-end data."
+                   if name == "ap_completeness" else "")
             ),
         }

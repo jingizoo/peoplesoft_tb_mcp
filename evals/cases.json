@@ -630,6 +630,207 @@
       }
     },
     {
+      "id": "billing-finalized-population",
+      "question": "Give me total finalized invoice amount",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_invoice_totals"
+        ],
+        "not_tool": [
+          "get_billing_workbench",
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "A controller asking for finalized invoices needs the governed billed population. Pipeline and cancelled statuses must not be reconstructed from a raw status dump."
+      }
+    },
+    {
+      "id": "ar-aging-gl-control",
+      "question": "Show AR aging and reconcile it to the GL control account",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_ar_aging"
+        ],
+        "not_tool": [
+          "get_account_balance",
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "The curated aging already carries its controlled GL tie basis. Two independent calls invite unlike dates or populations to be compared."
+      }
+    },
+    {
+      "id": "ar-overdue-or-disputed",
+      "question": "Which customers are overdue or in dispute?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_ar_aging"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "Overdue and disputed are attributes of the open-item population; the aging tool computes both on one disclosed as-of basis."
+      }
+    },
+    {
+      "id": "billing-stuck-before-ar",
+      "question": "Where is billing stuck before AR?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_billing_workbench",
+          "get_invoice_lifecycle"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "A handoff-control question needs the governed lifecycle or workbench, including interface errors and finalized bills missing from AR."
+      }
+    },
+    {
+      "id": "ap-open-as-of-cutoff",
+      "question": "How much did we owe vendors at the selected period end?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_open_payables"
+        ],
+        "tool_args_contain": {
+          "as_of_date": "2026-06-30"
+        },
+        "not_refused": true,
+        "_why": "A period-end AP question must resolve the selected FY2026 period 6 to its 2026-06-30 cutoff and carry that date into the curated tool; silently using today's open vouchers changes the population."
+      }
+    },
+    {
+      "id": "ap-payments-as-of-cutoff",
+      "question": "Which vendors had we paid through June 30, 2026?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_vendor_payments"
+        ],
+        "tool_args_contain": {
+          "as_of_date": "2026-06-30"
+        },
+        "not_refused": true,
+        "_why": "Payment activity after the requested date must not leak into a period-end disbursement answer."
+      }
+    },
+    {
+      "id": "ap-confirmed-duplicate-payments",
+      "question": "Any confirmed duplicate vendor payments?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_duplicate_payments"
+        ],
+        "answer_contains": [
+          "confirmed"
+        ],
+        "not_refused": true,
+        "_why": "Repeated vendor invoice data is only a duplicate-voucher candidate. The answer must address the requested confirmed-disbursement population, which requires distinct non-void payment evidence."
+      }
+    },
+    {
+      "id": "ap-accrual-readiness",
+      "question": "What should we accrue for AP at month-end?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook",
+          "get_coupa_rni",
+          "coupa_to_ap_tie",
+          "get_open_payables"
+        ],
+        "not_refused": true,
+        "_why": "An accrual question is a completeness review, not a general-chat request. It must reach the AP evidence chain and distinguish booked payables from receipts/invoices not yet in AP."
+      }
+    },
+    {
+      "id": "gl-close-readiness",
+      "question": "Are we ready to close GL?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "run_playbook"
+        ],
+        "not_tool": [
+          "get_trial_balance"
+        ],
+        "not_refused": true,
+        "_why": "GL close readiness is a composed control conclusion. A balanced trial balance alone is not sufficient evidence that the ledger is ready to close."
+      }
+    },
+    {
+      "id": "custom-billing-record-no-prefix",
+      "question": "Find the custom billing-interface record for rejected rows; do not assume it starts with PS_.",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "search_records"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "The first step for an unfamiliar custom object is evidence-based PeopleTools/catalog discovery. A physical table prefix must never be manufactured from a delivered naming convention."
+      }
+    },
+    {
       "id": "explain-why-it-moved",
       "question": "Our asset accounts 1000-1999 are up versus last year end. What drove it, and does the breakdown add up?",
       "scope": {

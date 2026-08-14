@@ -235,6 +235,14 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .chip{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px;
   font-size:12px;cursor:pointer;color:var(--muted)}
 .chip:hover{border-color:var(--accent);color:var(--accent)}
+.starter-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;
+  padding:0 18px 12px}
+.starter-group{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+.starter-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);margin:0 2px 8px}
+.starter-group .chips{padding:0;display:flex;align-items:flex-start}
+.starter-group .chip{text-align:left;background:var(--bg)}
+@media(max-width:850px){.starter-groups{grid-template-columns:1fr}}
 .msg-actions{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
 /* .csvbtn carries margin-left:auto to sit at the right of a card
    summary; in these two rows it would shove the first button off
@@ -1562,16 +1570,200 @@ function renderRecords(d){
   const rows=d.records||[];
   if(!rows.length){ c.append(el('div','pad','No matching records.')); return c; }
   const t=el('table');
-  t.innerHTML='<thead><tr><th>Record</th><th>Table to query</th><th>Description</th>'+
-    '<th>Kind</th><th class="num">Approx rows</th><th>Matched on</th></tr></thead><tbody>'+
+  t.innerHTML='<thead><tr><th>App Designer record</th><th>Physical table to query</th><th>Description / taught meaning</th>'+
+    '<th>Kind</th><th class="num">Approx rows</th><th>Why it matched</th></tr></thead><tbody>'+
     rows.map(r=>'<tr><td class="mono">'+esc(r.record)+'</td><td class="mono">'+
-      esc(r.table)+'</td><td>'+esc(r.descr||'')+'</td><td><span class="badge dim">'+
+      (r.table?esc(r.table):'<span class="badge warn">unresolved — do not guess</span>')+
+      '</td><td>'+esc(r.descr||'')+
+      (r.taught?'<div class="sub"><b>'+esc(r.taught_status||'taught here')+':</b> '+
+        esc(r.taught)+'</div>':'')+
+      (r.note?'<div class="sub">'+esc(r.note)+'</div>':'')+
+      '</td><td><span class="badge dim">'+
       esc(r.kind)+'</span></td><td class="num">'+
       (r.approx_rows==null?'—':r.approx_rows.toLocaleString())+'</td><td>'+
       esc(r.matched_on)+(r.matched_field?' ('+esc(r.matched_field)+')':'')+
+      ((r.matched_terms||[]).length?'<div class="sub">terms: '+
+        r.matched_terms.map(esc).join(', ')+' · relevance '+esc(r.relevance??'')+'</div>':'')+
       '</td></tr>').join('')+'</tbody>';
   const sc=el('div'); sc.style.maxHeight='340px'; sc.style.overflow='auto';
   sc.append(t); c.append(sc);
+  return c;
+}
+function renderRecordDescription(d){
+  const c=el('div','card');
+  const physical=d.table||'';
+  c.append(el('h2',null,'Record '+esc(d.record||'')+
+    (physical?'<span class="sub">physical table '+esc(physical)+'</span>':
+      '<span class="badge warn">physical table unresolved</span>')));
+  if(d.taught_here){
+    c.append(el('div','pad','<span class="badge warn">site note · '+
+      esc(d.taught_status||'pending review')+'</span> '+esc(d.taught_here)+
+      (d.taught_note?'<div class="sub">'+esc(d.taught_note)+'</div>':'')));
+  }
+  const fields=d.fields||[], columns=d.columns||[];
+  c.append(el('div','pad','<b>'+esc(d.descr||d.kind||'PeopleTools record')+'</b> · '+
+    fields.length+' PeopleTools field'+(fields.length===1?'':'s')+' · '+
+    columns.length+' physical column'+(columns.length===1?'':'s')));
+  const rows=[...new Set([...fields,...columns])].map(name=>({
+    field:name, in_peopletools:fields.includes(name)?'yes':'',
+    in_physical_table:columns.includes(name)?'yes':''
+  }));
+  if(rows.length) c.append(genericTable(rows));
+  if(!physical) c.append(el('div','pad warn','No catalog-backed table was resolved. '+
+    'Use compare/profile or configure the mapping; never add a prefix by convention.'));
+  return c;
+}
+function valueCountSummary(v){
+  return Object.entries(v||{}).slice(0,8).map(([k,n])=>esc(k)+': '+esc(n)).join(' · ');
+}
+function renderRecordProfile(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'Record profile · '+esc(d.table||'')+
+    '<span class="sub">'+esc(d.sampled_rows||0)+' sampled rows · '+
+    esc(d.column_count||0)+' columns</span>'));
+  c.append(el('div','pad','<span class="badge '+(d.readable?'ok':'bad')+'">'+
+    (d.readable?'readable':'not readable')+'</span> <span class="badge '+
+    (d.populated?'ok':'warn')+'">'+(d.populated?'populated':'empty')+'</span>'));
+  const rows=(d.columns||[]).map(name=>({
+    column:name,
+    fill_percent:(d.fill_percent||{})[name],
+    observed_values:valueCountSummary((d.value_counts||{})[name]),
+    status:(d.always_null||[]).includes(name)?'always null in sample':''
+  }));
+  if(rows.length) c.append(genericTable(rows));
+  if((d.sample||[]).length){
+    c.append(el('h2',null,'Sample rows <span class="sub">shape evidence, not totals</span>'));
+    c.append(genericTable(d.sample));
+  }
+  if(d.note) c.append(el('div','pad sub',esc(d.note)));
+  return c;
+}
+function renderRecordCompare(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'Record comparison <span class="sub">choose from measured contents, not the name alone</span>'));
+  const rows=(d.candidates||[]).map(p=>({
+    table:p.table,
+    readable:p.readable?'yes':'no',
+    populated:p.populated?'yes':'no',
+    sampled_rows:p.sampled_rows||0,
+    columns:p.column_count||0,
+    status_evidence:Object.entries(p.value_counts||{}).slice(0,4)
+      .map(([k,v])=>k+' {'+Object.keys(v||{}).slice(0,5).join(', ')+'}').join(' · '),
+    always_null:(p.always_null||[]).join(', ')
+  }));
+  if(rows.length) c.append(genericTable(rows));
+  else c.append(el('div','pad','No candidate profile was readable.'));
+  if(d.note) c.append(el('div','pad sub',esc(d.note)));
+  return c;
+}
+function compactEvidence(v){
+  if(v===null||v===undefined) return '—';
+  if(typeof v!=='object') return esc(v);
+  return Object.entries(v).slice(0,8).map(([k,x])=>
+    esc(k.replace(/_/g,' '))+': '+esc(typeof x==='object'?JSON.stringify(x):x)).join('<br>');
+}
+function renderAnomalies(d){
+  const frag=document.createDocumentFragment(), c=el('div','card');
+  const incomplete=(d.checks_incomplete||[]), config=(d.configuration_errors||[]);
+  const isIncomplete=d.status==='checks_incomplete'||incomplete.length||config.length;
+  c.append(el('h2',null,'Transaction & process anomalies <span class="sub">'+
+    esc(d.business_unit||'')+' · '+esc(d.as_of_date||d.as_of||'')+' · '+
+    esc(d.history_months||'')+'-month baseline</span>'));
+  c.append(el('div','pad','<span class="badge '+(isIncomplete?'warn':'ok')+'">'+
+    (isIncomplete?'incomplete evidence':((d.alerts||[]).length?'alerts found':'no alerts'))+
+    '</span> '+(isIncomplete?'A quiet result is not a clean control conclusion.':'')));
+  [...incomplete,...config].forEach(x=>c.append(el('div','pad warn',
+    esc(typeof x==='string'?x:(x.reason||x.error||JSON.stringify(x))))));
+  const rank={critical:0,high:1,medium:2,low:3};
+  const alerts=[...(d.alerts||[])].sort((a,b)=>(rank[a.severity]??9)-(rank[b.severity]??9));
+  if(!alerts.length){
+    c.append(el('div','pad',isIncomplete?'No alert can be concluded from the complete evidence available.':'No material anomaly crossed the configured thresholds.'));
+  }else{
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Severity</th><th>Subject</th><th>Observed</th><th>Expected</th><th>Confidence</th><th>Explanation</th></tr></thead><tbody>'+
+      alerts.map(a=>'<tr><td><span class="badge '+
+        (a.severity==='critical'||a.severity==='high'?'bad':'warn')+'">'+esc(a.severity)+
+        '</span></td><td><b>'+esc(a.subject||a.process||a.table||a.relationship||a.kind||'')+
+        '</b><div class="sub">'+esc((a.kind||'').replace(/_/g,' '))+'</div></td><td>'+compactEvidence(a.observed)+
+        '</td><td>'+compactEvidence(a.expected)+'</td><td>'+esc(a.confidence||'')+
+        (a.confidence_score!==undefined?'<div class="sub">'+esc(a.confidence_score)+'</div>':'')+
+        '</td><td>'+esc(a.explanation||'')+'</td></tr>').join('')+'</tbody>';
+    const sc=el('div');sc.style.maxHeight='440px';sc.style.overflow='auto';sc.append(t);c.append(sc);
+  }
+  frag.append(c); return frag;
+}
+function renderOpenPayables(d){
+  if(d.scope_status&&d.scope_status!=='ok') return noData(d);
+  const frag=document.createDocumentFragment(), c=el('div','card');
+  c.append(el('h2',null,'Open payables <span class="sub">'+esc(d.business_unit||'')+
+    ' · as of '+esc(d.as_of||'')+'</span>'));
+  c.append(tiles([
+    ['Open',money(d.open_total),String(d.voucher_count||0)+' vouchers','cr'],
+    ['Overdue',money(d.overdue_total),'due before as-of','cr'],
+    ['Due in 7 days',money(d.due_within_7_days),'from as-of',''],
+    ['Point-in-time',d.point_in_time_complete?'Complete':'Limited',
+      d.point_in_time_complete?'reconstructible':'current status used',d.point_in_time_complete?'':'cr']
+  ]));
+  if(!d.point_in_time_complete) c.append(el('div','pad','<span class="badge warn">historical limitation</span> '+
+    esc(d.point_in_time_reason||'Current status cannot fully reconstruct the prior-date population.')));
+  if((d.mixed_currencies||[]).length) c.append(el('div','pad','<span class="badge warn">mixed currencies</span> '+
+    esc(d.currency_note||'Totals are face amounts and are not converted.')));
+  if((d.by_vendor||[]).length) c.append(genericTable(d.by_vendor));
+  if((d.pipeline_exceptions||[]).length){
+    c.append(el('h2',null,'Pipeline exceptions <span class="badge warn">action</span>'));
+    c.append(genericTable(d.pipeline_exceptions));
+  }
+  c.append(el('div','pad sub',esc((d.as_of_basis||'')+' · '+(d.status_basis||'')+
+    (d.note?' · '+d.note:''))));
+  frag.append(c); return frag;
+}
+function renderVendorPayments(d){
+  if(d.scope_status&&d.scope_status!=='ok') return noData(d);
+  const c=el('div','card');
+  c.append(el('h2',null,'Vendor payments <span class="sub">'+esc(d.business_unit||'')+
+    ' · '+esc(d.since||'')+' through '+esc(d.as_of||'')+'</span>'));
+  c.append(tiles([
+    ['Paid',money(d.total_paid),String(d.vendor_count||0)+' vendors','cr'],
+    ['Window',String(d.window_months||'')+' months','inclusive through as-of','']
+  ]));
+  if((d.vendors||[]).length) c.append(genericTable(d.vendors));
+  else c.append(el('div','pad','No non-void payments matched this period and scope.'));
+  if(d.note) c.append(el('div','pad sub',esc(d.note)));
+  return c;
+}
+function renderDuplicatePayments(d){
+  if(d.scope_status&&d.scope_status!=='ok') return noData(d);
+  const c=el('div','card'), confirmed=d.confirmed_duplicate_payments||[],
+    candidates=d.duplicate_voucher_candidates||d.exact_invoice_duplicates||[];
+  c.append(el('h2',null,'Duplicate disbursement review <span class="sub">'+
+    esc(d.business_unit||'')+' · through '+esc(d.as_of||'')+'</span>'));
+  c.append(tiles([
+    ['Confirmed duplicate payments',String(d.confirmed_duplicate_payment_count||confirmed.length),
+      money(d.confirmed_duplicate_payment_total||0)+' paid','cr'],
+    ['Confirmed excess exposure',money(d.confirmed_duplicate_exposure||0),'payment evidence only','cr'],
+    ['Duplicate-voucher candidates',String(candidates.length),money(d.candidate_gross_total||d.exact_total||0)+' gross',''],
+    ['Same-amount review pairs',String((d.same_amount_pairs||[]).length),'not proof of duplicate cash','']
+  ]));
+  if(confirmed.length){
+    c.append(el('h2',null,'Confirmed <span class="badge bad">two or more payment headers</span>'));
+    c.append(genericTable(confirmed));
+  }
+  if(candidates.length){
+    c.append(el('h2',null,'Voucher candidates <span class="badge warn">not confirmed paid twice</span>'));
+    c.append(genericTable(candidates.map(x=>({
+      vendor:x.vendor||x.vendor_id, invoice:x.invoice_id, vouchers:x.vouchers,
+      candidate_total:x.total, payment_status:x.payment_evidence_status||'',
+      payment_count:(x.payment_evidence||{}).payment_count||0,
+      payment_ids:((x.payment_evidence||{}).payment_ids||[]).join(', ')
+    }))));
+  }
+  if((d.same_amount_pairs||[]).length){
+    c.append(el('h2',null,'Same-amount review list <span class="sub">recurring charges can look like this</span>'));
+    c.append(genericTable(d.same_amount_pairs));
+  }
+  if(!confirmed.length&&!candidates.length&&!(d.same_amount_pairs||[]).length)
+    c.append(el('div','pad','No duplicate-disbursement evidence or review candidates matched.'));
+  if(d.note) c.append(el('div','pad sub',esc(d.note)));
   return c;
 }
 function genericTable(rows){
@@ -1636,6 +1828,22 @@ function compactArgs(args){
   if(line.length>80) line=line.slice(0,80)+'\u2026';
   return line;
 }
+function resultBadge(d){
+  if(!d||typeof d!=='object') return null;
+  const bad=d.scope_status&&d.scope_status!=='ok';
+  if(bad) return {text:'no data',cls:'bad'};
+  if(d.status==='checks_incomplete'||d.verdict==='incomplete'||
+      (d.checks_incomplete||[]).length) return {text:'incomplete',cls:'warn'};
+  if(Array.isArray(d.alerts)) return {text:d.alerts.length+' alert'+(d.alerts.length===1?'':'s'),
+    cls:d.alerts.length?'bad':'ok'};
+  if(d.confirmed_duplicate_payment_count!==undefined)
+    return {text:d.confirmed_duplicate_payment_count+' confirmed',
+      cls:d.confirmed_duplicate_payment_count?'bad':'ok'};
+  if(d.row_count!==undefined) return {text:d.row_count+' row'+(d.row_count===1?'':'s'),cls:'dim'};
+  if(Array.isArray(d.records)) return {text:d.records.length+' match'+(d.records.length===1?'':'es'),cls:'dim'};
+  if(d.readable!==undefined) return {text:d.readable?'readable':'not readable',cls:d.readable?'ok':'bad'};
+  return null;
+}
 function renderToolResult(name,data,args){
   if(!data||typeof data!=='object') return null;
   if(data.error) { const c=el('div','card'); c.append(el('h2',null,esc(name)+' <span class="badge bad">error</span>'),
@@ -1669,6 +1877,9 @@ function renderToolResult(name,data,args){
     if(name==='get_match_exceptions') return renderMatchExceptions(data);
     if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
+    if(name==='get_open_payables') return renderOpenPayables(data);
+    if(name==='get_vendor_payments') return renderVendorPayments(data);
+    if(name==='get_duplicate_payments') return renderDuplicatePayments(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
     if(name==='get_billing_workbench') return renderBilling(data);
@@ -1677,6 +1888,10 @@ function renderToolResult(name,data,args){
     if(name==='run_playbook') return renderPlaybook(data);
     if(name==='run_sql') return renderSql(data);
     if(name==='search_records') return renderRecords(data);
+    if(name==='describe_record') return renderRecordDescription(data);
+    if(name==='profile_record') return renderRecordProfile(data);
+    if(name==='compare_records') return renderRecordCompare(data);
+    if(name==='detect_transaction_anomalies') return renderAnomalies(data);
     if(name==='wiki_get_page'){const c=el('div','card');
       c.append(el('h2',null,esc(data.title||'Wiki page')+'<span class="sub">'+esc(data.id||'')+'</span>'));
       const b=el('div','pad');b.style.whiteSpace='pre-wrap';b.style.maxHeight='320px';b.style.overflow='auto';
@@ -1757,7 +1972,8 @@ function renderCustomerIntel(d){
     ' · last '+d.window_months+' months</span>'));
   const t=el('table');
   t.innerHTML='<thead><tr><th>Customer</th><th>Based in</th><th>Buys</th>'+
-    '<th class="num">Billed</th><th class="num">Share</th><th class="num">Overdue</th><th class="num">Days late</th></tr></thead><tbody>'+
+    '<th class="num">Billed ('+esc(d.display_currency||'')+')</th><th class="num">Share</th><th class="num">Overdue ('+
+    esc(d.display_currency||'')+')</th><th class="num">Days late</th></tr></thead><tbody>'+
     (d.customers||[]).map(cu=>{
       const loc=cu.location?[cu.location.city,cu.location.state,cu.location.country]
         .filter(Boolean).join(', '):'<span class="sub">n/a</span>';
@@ -2012,7 +2228,12 @@ function renderProcess(d){
     t.innerHTML='<thead><tr><th colspan="3">'+esc(layer.layer.toUpperCase())+
       ' <span class="sub">'+esc(layer.meaning||'')+'</span></th></tr>'+
       '<tr><th>Name</th><th>What it is</th><th>Reached by</th></tr></thead><tbody>'+
-      (layer.items||[]).map(i=>'<tr><td class="mono">'+esc(i.name)+'</td><td>'+
+      (layer.items||[]).map(i=>'<tr><td class="mono">'+
+        (layer.layer==='record'&&i.record
+          ? '<b>'+esc(i.record)+'</b>'+(i.table
+            ? '<div class="sub">SQL: '+esc(i.table)+'</div>'
+            : '<div><span class="badge warn">physical table unresolved</span></div>')
+          : esc(i.name))+'</td><td>'+
         esc(i.label||i.role||'')+'</td><td class="sub">'+
         esc((i.reached_by||'').replace(/_/g,' '))+'</td></tr>').join('')+
       (layer.also_reachable
@@ -3160,29 +3381,31 @@ function viewChat(){
     ));
     msgs.append(holder);
   }
-  const chips=el('div','chips');
+  const chips=el('div','starter-groups');
+  const starterGroups=["Billing & AR","Accounts payable","GL & close"].map(label=>{
+    const box=el('div','starter-group');
+    box.append(el('div','starter-label',esc(label)));
+    const row=el('div','chips');box.append(row);chips.append(box);return row;
+  });
   // Every chip below is PINNED to an eval case with the same question
   // text (smoke enforces it), so a suggestion on this page is a promise
   // the suite keeps — never an untested guess.
-  ['What needs my attention today?',
-   'Who are my top customers, where are they based and what do they buy?',
-   'Give me the total invoice amount',
-   'Show the AR aging',
-   'How much do we owe our vendors right now?',
-   'Any duplicate vendor payments?',
+  ['Give me total finalized invoice amount',
+   'Show AR aging and reconcile it to the GL control account',
+   'Which customers are overdue or in dispute?',
+   'Where is billing stuck before AR?',
+   'Find the custom billing-interface record for rejected rows; do not assume it starts with PS_.',
+   'How much did we owe vendors at the selected period end?',
+   'Any confirmed duplicate vendor payments?',
+   'What should we accrue for AP at month-end?',
    'Is AP complete for month-end?',
-   'Did everything approved in Coupa land in AP?',
    'Does the trial balance balance?',
    'Are there unposted journals?',
-   'Are we ready to close the period?',
-   'Who are our top 5 billing customers across all business units in USD?',
-   'How are we tracking against our Coupa budget this year?',
-   'Where is the billing delay?',
-   'Is everything okay after the close?',
-   'What is our cash outlook for the next 8 weeks?',
-   'What is our capitalization threshold?'].forEach(q=>{
+   'Are we ready to close GL?',
+   'What needs my attention today?'].forEach((q,i)=>{
     const c=el('button','chip',esc(q)); c.type='button';
-    c.onclick=()=>{$('#q').value=q;send();}; chips.append(c);
+    c.onclick=()=>{$('#q').value=q;send();};
+    starterGroups[i<5?0:i<9?1:2].append(c);
   });
   const context=el('div','chat-context','<span>Active data context</span>');
   const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
@@ -3299,9 +3522,8 @@ async function send(messageOverride,appendUser){
     const wantChart=/\b(chart|graph|plot|trend|visuali[sz]e)/i.test(m);
     const turnCards=[], turnCardMeta=[];
     (j.tool_calls||[]).forEach(c=>{
-      // Everything arrives WITH the answer, so the sources render COLLAPSED:
-      // the reply is what the user came for, and each card is one click away
-      // behind a header that already says tool, args, status and duration.
+      // Keep supporting evidence compact, but open one primary source below.
+      // A terse Gemini answer must never leave all of its evidence hidden.
       const card=document.createElement('details');
       card.className='tool-card';
       const summary=document.createElement('summary');
@@ -3309,6 +3531,8 @@ async function send(messageOverride,appendUser){
         '<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
         '<span class="args" title="'+esc(JSON.stringify(c.args||{}))+'">'+esc(compactArgs(c.args))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
+      const rb=resultBadge(c.result);
+      if(rb) summary.append(el('span','badge '+rb.cls,esc(rb.text)));
       if(c.ok!==false&&hasTable(c.result))
         summary.append(csvButton(c.tool,c.args||{},c.result));
       // CSV downloads a file; Copy puts it on the clipboard. Different
@@ -3333,6 +3557,12 @@ async function send(messageOverride,appendUser){
       turnCards.push(card);
       if(c.ok!==false) turnCardMeta.push({id:card.id,tool:c.tool,result:c.result});
     });
+    // Prefer an exception/incomplete result; otherwise the last successful
+    // call is normally the completed answer after discovery/chaining.
+    const primaryMeta=[...turnCardMeta].reverse().find(x=>{
+      const b=resultBadge(x.result); return b&&(b.cls==='bad'||b.cls==='warn');
+    })||turnCardMeta[turnCardMeta.length-1];
+    if(primaryMeta){ const primary=$('#'+primaryMeta.id); if(primary) primary.open=true; }
     if(wantChart){
       // The user asked to SEE it — open the first card that drew a chart
       // instead of leaving it behind a collapsed header.

@@ -20,7 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 from pstb.client.chat import agent_turn  # noqa: E402
 from pstb.client.llm_base import LLMResponse, ToolCall  # noqa: E402
-from pstb.client.llm_gemini import call_temperature, tool_mode  # noqa: E402
+from pstb.client.llm_gemini import (call_temperature, routing_tool_names,  # noqa: E402
+                                    tool_mode)
 from pstb.config import Config  # noqa: E402
 
 
@@ -48,12 +49,53 @@ class ToolModeTests(unittest.TestCase):
         self.assertEqual(cfg.llm.gemini_routing_temperature, 0.0)
 
 
+class GeminiShortlistTests(unittest.TestCase):
+    AVAILABLE = {
+        "get_trial_balance", "tb_integrity_check", "run_playbook",
+        "get_open_payables", "get_vendor_payments", "get_duplicate_payments",
+        "get_coupa_rni", "search_records", "describe_record",
+        "profile_record", "compare_records", "run_sql", "explain_query",
+        "wiki_lookup", "wiki_search", "wiki_get_page", "get_asset_register",
+        "get_ar_aging", "get_invoice_totals", "get_billing_workbench",
+        "resolve_period", "list_financial_scopes", "detect_transaction_anomalies",
+    }
+
+    def test_ap_question_gets_ap_and_discovery_not_an_unrelated_module(self):
+        got = set(routing_tool_names(
+            "Any confirmed duplicate vendor payments?", self.AVAILABLE))
+        self.assertIn("get_duplicate_payments", got)
+        self.assertIn("search_records", got)
+        self.assertNotIn("get_asset_register", got)
+
+    def test_gl_close_question_keeps_the_composed_control(self):
+        got = set(routing_tool_names("Are we ready to close GL?",
+                                     self.AVAILABLE))
+        self.assertIn("run_playbook", got)
+        self.assertIn("tb_integrity_check", got)
+        self.assertNotIn("get_coupa_rni", got)
+
+    def test_custom_question_keeps_the_full_discovery_sequence(self):
+        got = set(routing_tool_names(
+            "Which custom record has the approval status field?",
+            self.AVAILABLE))
+        for name in ("search_records", "describe_record", "profile_record",
+                     "compare_records", "run_sql"):
+            self.assertIn(name, got)
+
+    def test_small_talk_is_not_constrained(self):
+        self.assertEqual(routing_tool_names("thanks", self.AVAILABLE), [])
+
+
 class ScriptedProvider:
     name = "test"
     model = "scripted"
 
     def __init__(self, responses):
         self.responses = list(responses)
+        self.routing_questions = []
+
+    def set_routing_question(self, text):
+        self.routing_questions.append(text)
 
     def send_user(self, text):
         return self.responses.pop(0)
@@ -99,6 +141,7 @@ class TurnSetsExpectationTests(unittest.IsolatedAsyncioTestCase):
             {"get_ar_aging": {"scope_status": "ok",
                               "totals": {"total": 1.0}}})
         self.assertTrue(provider.expect_tool_call)
+        self.assertEqual(provider.routing_questions, ["show the AR aging"])
 
     async def test_small_talk_does_not(self) -> None:
         provider = await self._run(

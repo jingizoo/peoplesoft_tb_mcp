@@ -7,9 +7,11 @@ not change what close_readiness gathers or costs.
 """
 from __future__ import annotations
 
+import datetime as dt
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -20,6 +22,12 @@ from pstb.connectors import ConnectorError  # noqa: E402
 from pstb.db import Database  # noqa: E402
 from pstb.engine import TBEngine  # noqa: E402
 from pstb.playbooks import PlaybookRunner  # noqa: E402
+
+
+class _FixedDate(dt.date):
+    @classmethod
+    def today(cls):
+        return cls(2026, 8, 14)
 
 
 class ApCompletenessTests(unittest.TestCase):
@@ -34,21 +42,35 @@ class ApCompletenessTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.db.close()
 
-    def test_the_staged_exceptions_all_surface(self) -> None:
-        out = self.runner.run("ap_completeness")
-        self.assertEqual(out["verdict"], "exceptions_found")
+    def setUp(self) -> None:
+        # The fixture calendar/data is intentionally frozen in FY2026.  Pin
+        # "today" so historical/current-period assertions do not decay as
+        # the wall clock advances.
+        date_patch = patch("pstb.playbooks.dt.date", _FixedDate)
+        date_patch.start()
+        self.addCleanup(date_patch.stop)
+
+    def test_period_end_excludes_later_data_and_marks_snapshots_incomplete(
+            self) -> None:
+        out = self.runner.run("ap_completeness", fiscal_year=2026, period=6)
+        self.assertEqual(out["as_of"], "2026-06-30")
+        self.assertEqual(out["data_as_of"], "2026-06-30")
+        self.assertEqual(out["verdict"], "incomplete")
         by_id = {s["step"]: s for s in out["steps"]}
-        self.assertIn("never reached AP",
-                      by_id["procurement_tie"]["headline"])
-        self.assertIn("12,750.00", by_id["procurement_tie"]["headline"])
-        self.assertIn("accrue", by_id["accruals"]["headline"])
-        self.assertIn("EUR", by_id["accruals"]["headline"],
-                      "accrual totals must stay per currency")
-        self.assertIn("invisible to a payment run",
+        tie = by_id["procurement_tie"]
+        self.assertEqual(tie["status"], "attention")
+        self.assertNotIn("12,750.00", tie["headline"],
+                         "the July Coupa miss must not enter a June close")
+        self.assertNotIn("CINV-2088", str(tie["detail"]))
+        self.assertEqual(tie["detail"]["as_of"], "2026-06-30")
+        self.assertEqual(by_id["accruals"]["status"], "skipped")
+        self.assertIn("historical", by_id["accruals"]["headline"])
+        self.assertEqual(by_id["voucher_pipeline"]["status"], "skipped")
+        self.assertIn("current open/close status",
                       by_id["voucher_pipeline"]["headline"])
 
     def test_fixture_mode_is_disclosed_in_the_finding(self) -> None:
-        out = self.runner.run("ap_completeness")
+        out = self.runner.run("ap_completeness", fiscal_year=2026, period=6)
         tie = next(s for s in out["steps"] if s["step"] == "procurement_tie")
         self.assertIn("SAMPLE", tie["headline"],
                       "a demo verdict must not read as live procurement")
@@ -85,8 +107,20 @@ class ApCompletenessTests(unittest.TestCase):
                          "'AP is complete'")
         skipped = {s["step"] for s in out["steps"]
                    if s["status"] == "skipped"}
-        self.assertEqual(skipped, {"procurement_tie", "accruals"})
+        self.assertEqual(skipped,
+                         {"procurement_tie", "accruals", "voucher_pipeline"})
         self.assertIn("NOT a pass", out["summary"])
+
+    def test_an_unfinished_period_uses_current_data_only_as_disclosed_context(
+            self) -> None:
+        out = self.runner.run("ap_completeness",
+                              fiscal_year=2026, period=8)
+        self.assertFalse(out["period_has_ended"])
+        self.assertEqual(out["as_of"], "2026-08-31")
+        self.assertEqual(out["data_as_of"], "2026-08-14")
+        self.assertEqual(out["verdict"], "incomplete")
+        self.assertTrue(all(s["status"] == "skipped" for s in out["steps"]))
+        self.assertIn("current-state-only", out["note"])
 
     def test_listed_for_discovery(self) -> None:
         names = [p["playbook"]

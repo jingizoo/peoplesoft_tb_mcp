@@ -11,7 +11,80 @@ import json
 import time
 
 from ..config import Config
+from ..guards import evidence_intent, question_financial_domains
 from .llm_base import LLMProvider, LLMResponse, ToolCall, ToolResult, ToolSpec, clean_schema
+
+
+_DISCOVERY_TOOLS = {
+    "search_records", "describe_record", "profile_record", "compare_records",
+    "list_tables", "describe_table", "run_sql", "explain_query", "join_path",
+    "get_record_map", "search_ps_queries", "describe_ps_query", "run_ps_query",
+    "trace_process", "describe_process_graph", "remember_record_fact",
+    "what_do_we_know_about",
+}
+_POLICY_TOOLS = {"wiki_health", "wiki_lookup", "wiki_search", "wiki_get_page",
+                 "list_policy_terms", "resolve_policy_value"}
+_COMMON_FINANCE_TOOLS = {"resolve_period", "list_periods",
+                         "list_financial_scopes", "list_business_units",
+                         "list_ledgers", "detect_transaction_anomalies"}
+_GL_TOOLS = {
+    "get_trial_balance", "get_account_balance", "compare_trial_balance",
+    "explain_balance_change", "get_budget_variance", "drill_to_journals",
+    "tb_integrity_check", "rollup_trial_balance", "search_accounts",
+    "list_reports", "run_report", "list_playbooks", "run_playbook",
+    "list_trees", "get_tree_node_accounts", "get_exchange_rate",
+}
+_BI_AR_TOOLS = {
+    "get_top_billing_customers", "get_invoice_lifecycle",
+    "get_customer_financial_360", "get_dso_trend", "get_cash_outlook",
+    "get_customer_intelligence", "get_invoice_totals", "get_ar_aging",
+    "get_customer_ar", "search_customers", "get_billing_workbench",
+    "get_entity_network", "get_concentration", "get_entity_connection",
+    "get_exchange_rate", "run_playbook",
+}
+_AP_TOOLS = {
+    "search_vendors", "get_vendor_payables_network", "get_match_exceptions",
+    "get_procurement_chain", "get_cash_outlook", "get_vendor_intelligence",
+    "get_open_payables", "get_vendor_payments", "get_duplicate_payments",
+    "get_entity_network", "get_concentration", "get_entity_connection",
+    "get_coupa_invoices", "get_coupa_stuck_approvals", "get_coupa_rni",
+    "get_coupa_supplier_spend", "get_coupa_budget_lines",
+    "coupa_budget_variance", "coupa_to_ap_tie", "run_playbook",
+}
+
+
+def routing_tool_names(question: str, available_names) -> list[str]:
+    """Broad, deterministic first-call shortlist for Gemini 2.5 Pro.
+
+    The full declaration set remains available after the first tool result,
+    so this only reduces first-round ambiguity among the large MCP surface.
+    Every finance group includes discovery/ad-hoc fallbacks; an unfamiliar or
+    cross-domain question gets a union rather than being trapped in one tool.
+    An empty list means "do not constrain Gemini".
+    """
+    available = set(available_names or ())
+    intent = evidence_intent(question)
+    if intent == "general" or not available:
+        return []
+    chosen = set(_COMMON_FINANCE_TOOLS)
+    domains = question_financial_domains(question)
+    if intent in ("policy", "mixed", "technical"):
+        chosen |= _POLICY_TOOLS
+    if intent == "technical":
+        chosen |= _DISCOVERY_TOOLS
+    if domains & {"billing", "ar", "customer", "fx"}:
+        chosen |= _BI_AR_TOOLS | _DISCOVERY_TOOLS
+    if "ap" in domains:
+        chosen |= _AP_TOOLS | _DISCOVERY_TOOLS
+    if domains & {"balance", "journal", "report", "variance"}:
+        chosen |= _GL_TOOLS | _DISCOVERY_TOOLS
+    if not domains and intent not in ("policy", "technical"):
+        return []
+    result = sorted(chosen & available)
+    # A tiny intersection usually means an old/custom server whose tool names
+    # do not match this build. Leaving it unconstrained is safer than forcing
+    # Gemini among one or two accidental matches.
+    return result if len(result) >= 3 else []
 
 
 def tool_mode(force_flag: bool, expect_tools: bool, is_user_turn: bool) -> str:
@@ -105,6 +178,8 @@ class GeminiVertexProvider(LLMProvider):
         )
         self.model = cfg.llm.gemini_model
         self.project = cfg.llm.gemini_project
+        self._available_tool_names = {t.name for t in tools}
+        self._routing_tool_names: list[str] = []
         declarations = []
         for t in tools:
             schema = clean_schema(t.schema)
@@ -155,15 +230,25 @@ class GeminiVertexProvider(LLMProvider):
         kwargs["temperature"] = call_temperature(
             kwargs["temperature"], self._routing_temperature, mode)
         try:
+            call_kwargs = {"mode": mode}
+            if mode == "ANY" and self._routing_tool_names:
+                call_kwargs["allowed_function_names"] = \
+                    self._routing_tool_names
             kwargs["tool_config"] = self.types.ToolConfig(
                 function_calling_config=self.types.FunctionCallingConfig(
-                    mode=mode))
+                    **call_kwargs))
         except (TypeError, AttributeError):
             pass  # older google-genai without ToolConfig — mode stays AUTO
         return self.types.GenerateContentConfig(**kwargs)
 
+    def set_routing_question(self, question: str) -> None:
+        """Set the first-call shortlist; subsequent AUTO rounds see all tools."""
+        self._routing_tool_names = routing_tool_names(
+            question, self._available_tool_names)
+
     def reset(self) -> None:
         self.contents: list = []
+        self._routing_tool_names = []
 
     def _generate(self, config=None) -> LLMResponse:
         # Vertex rate limits (429) and transient 5xx are normal under load;

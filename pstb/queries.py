@@ -499,7 +499,8 @@ def psrecdefn_search(db: Database) -> str:
        RECTYPE AS rectype, SQLTABLENAME AS sqltablename
   FROM {p}PSRECDEFN
  WHERE RECTYPE IN (0, 1, 7)
-   AND (UPPER(RECNAME) LIKE :q OR UPPER(RECDESCR) LIKE :q)
+   AND (UPPER(RECNAME) LIKE :q OR UPPER(RECDESCR) LIKE :q
+        OR UPPER(SQLTABLENAME) LIKE :q)
  ORDER BY RECNAME"""
 
 

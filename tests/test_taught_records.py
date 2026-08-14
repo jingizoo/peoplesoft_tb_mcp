@@ -47,15 +47,34 @@ class TaughtRecordTests(unittest.TestCase):
         return self.memory.propose(text, kind="record", source="test")
 
     def test_an_unknown_custom_record_is_invisible_until_taught(self) -> None:
-        before = self.engine.search_records("interface file")
+        # Use a purpose that is genuinely absent from the sample metadata.
+        # "interface file" is deliberately present in PSRECDEFN and the
+        # natural-language search now correctly finds it regardless of word
+        # order, so it is no longer a valid premise for taught-only lookup.
+        before = self.engine.search_records("zephyr quokka intake")
         self.assertEqual(before["records"], [],
                          "the premise of this feature is that discovery "
                          "cannot find this record on its own")
-        self.teach("TU_FILE_INTFC: holds inbound interface file headers "
-                   "and load status")
-        after = self.engine.search_records("interface file")
-        self.assertIn("TU_FILE_INTFC",
+        self.teach("ACME_TXN_HDR: Zephyr quokka intake headers and load status")
+        after = self.engine.search_records("zephyr quokka intake")
+        self.assertIn("ACME_TXN_HDR",
                       [r["record"] for r in after["records"]])
+
+    def test_taught_company_table_is_never_given_an_invented_ps_prefix(self):
+        self.teach("ACME_TXN_HDR: Phoenix interface header")
+        entry = self.engine.search_records("Phoenix interface")["records"][0]
+        self.assertEqual(entry["record"], "ACME_TXN_HDR")
+        self.assertEqual(entry["table"], "ACME_TXN_HDR")
+        self.assertNotEqual(entry["table"], "PS_ACME_TXN_HDR")
+
+    def test_metadata_search_is_not_word_order_sensitive(self) -> None:
+        forward = self.engine.search_records("file interface")["records"]
+        reverse = self.engine.search_records("interface file")["records"]
+        for found in (forward, reverse):
+            self.assertIn("TU_FILE_INTFC", [r["record"] for r in found])
+            hit = next(r for r in found if r["record"] == "TU_FILE_INTFC")
+            self.assertTrue({"FILE", "INTERFACE"}.issubset(
+                set(hit["matched_terms"])))
 
     def test_it_is_found_by_wording_the_user_did_not_use(self) -> None:
         # "Load status" was in the explanation, not in the question. Matching
