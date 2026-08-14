@@ -53,6 +53,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "explain_balance_change",
     "drill_to_journals",
     "tb_integrity_check",
+    "detect_transaction_anomalies",
     "rollup_trial_balance",
     "get_exchange_rate",
     "get_top_billing_customers",
@@ -123,6 +124,9 @@ _TOOL_SCOPE_ARGS = {
     "tb_integrity_check": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "detect_transaction_anomalies": {
+        "business_unit": "business_unit", "as_of_date": "as_of_date",
     },
     "rollup_trial_balance": {
         "business_unit": "business_unit", "ledger": "ledger",
@@ -432,6 +436,8 @@ _TOOL_DOMAINS = {
                                "customer", "fx", "journal"},
     "drill_to_journals": {"journal", "balance", "variance"},
     "tb_integrity_check": {"balance", "journal"},
+    "detect_transaction_anomalies": {
+        "variance", "journal", "billing", "ar", "ap", "am", "pc"},
     "rollup_trial_balance": {"balance", "report"},
     "get_exchange_rate": {"fx"},
     "get_top_billing_customers": {"billing", "customer", "fx"},
@@ -939,7 +945,7 @@ _SOURCE_OF_TOOL = {
     "peoplesoft_gl": {
         "get_trial_balance", "get_account_balance", "compare_trial_balance",
         "rollup_trial_balance", "drill_to_journals", "tb_integrity_check",
-        "explain_balance_change",
+        "explain_balance_change", "detect_transaction_anomalies",
         "run_report", "get_budget_variance", "get_exchange_rate",
         "get_tree_node_accounts", "search_accounts", "run_sql",
         "run_playbook",

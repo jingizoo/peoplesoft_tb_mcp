@@ -10,7 +10,7 @@ folder).
 ```
 ┌──────────────────────┐   stdio (MCP)   ┌──────────────────────────┐
 │ dynamic chat / REPL  │◄───────────────►│  MCP server (pstb.server) │
-│ GUI + client agent   │    32 tools     │  TB engine + guarded SQL  │
+│ GUI + client agent   │    MCP tools    │  TB engine + guarded SQL  │
 │                      │                 │  + wiki tools             │
 │  LLM providers:      │                 └─────┬──────────────┬─────┘
 │   • Ollama (local)   │                       │              │
@@ -231,14 +231,20 @@ entry like this:
 }
 ```
 
-On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. Same 32 tools,
+On Windows the command is `C:\path\to\.venv\Scripts\python.exe`. The same tools,
 no chat client needed.
 
 ## Tools exposed by the server
 
 `get_trial_balance` · `get_account_balance` · `compare_trial_balance` ·
 `drill_to_journals` · `search_accounts` · `resolve_period` · `list_periods` ·
-`tb_integrity_check` · `rollup_trial_balance` · `list_trees` ·
+`tb_integrity_check` · `detect_transaction_anomalies` (metadata-discovered
+table relationships, daily 3/6-month volume trends, and process performance —
+see [docs/ANOMALY_DETECTION.md](docs/ANOMALY_DETECTION.md)) ·
+`trace_process` / `describe_process_graph` (offline PeopleTools relationship
+graph with configurable 100k-scale build limits and explicit partial coverage;
+see [docs/SETUP.md](docs/SETUP.md#7a-build-the-process-graph-optional-recommended)) ·
+`rollup_trial_balance` · `list_trees` ·
 `list_financial_scopes` · `list_business_units` · `list_ledgers` ·
 `list_reports` · `run_report` · `resolve_timespan` (nVision-style statements —
 see [docs/NVISION.md](docs/NVISION.md)) · `get_ar_aging` · `get_customer_ar` ·

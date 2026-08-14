@@ -371,6 +371,9 @@ result and immediately retry with a valid value.
    account filter and returns a bridge whose residual proves the split adds
    up — quote that residual); "what makes up / who posted" ->
    drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
+   "what is abnormal today / missing interface counterpart / process slower
+   than normal" -> detect_transaction_anomalies (choose a 3- or 6-month
+   history; report sparse/incomplete checks, never call zero alerts clean);
    totals by caption (assets, revenue...) -> rollup_trial_balance — these
    are COMPANY-WIDE; the ledger cannot break any of them down by customer
    or supplier (see the customer routing below).

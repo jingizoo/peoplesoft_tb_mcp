@@ -22,6 +22,7 @@ from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
 from .ar import ARBilling, ARError
+from .anomalies import AnomalyDetector, AnomalyError
 from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
@@ -34,6 +35,7 @@ from .wiki import WikiError, make_wiki
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+anomaly_detector = AnomalyDetector(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 relationships = Relationships(ar)
@@ -113,7 +115,8 @@ def _safe(fn, /, **kw) -> dict:
     try:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
-            PlaybookError, MemoryError_, ModuleError, ConnectorError) as e:
+            PlaybookError, MemoryError_, ModuleError, ConnectorError,
+            AnomalyError) as e:
         # These carry a remedy written for the reader. Passing the message
         # through UNPREFIXED is the point: "ConnectorError: check
         # PSFT_QAS_NODE" reads as a crash, "check PSFT_QAS_NODE" reads as
@@ -319,6 +322,35 @@ def tb_integrity_check(
     return _safe(
         engine.tb_integrity_check,
         business_unit=business_unit, fiscal_year=fiscal_year, period=period, ledger=ledger,
+    )
+
+
+@mcp.tool()
+def detect_transaction_anomalies(
+    as_of_date: str = "",
+    history_months: int = 3,
+    business_unit: str = "",
+    include_inferred: bool = True,
+) -> dict:
+    """Detect TODAY'S TRANSACTION/INTERFACE/PROCESS ANOMALIES for a selected
+    as-of date. Checks daily table volumes against a 3- or 6-calendar-month
+    robust baseline, related-table counterpart mismatches, and operational
+    process duration/success deterioration. Returns observed values, expected
+    baseline/relationship, severity, confidence, and discovery evidence.
+
+    Table names are discovered from the live database/PeopleTools metadata and
+    observed co-activity — no PS_ prefix is assumed. Site rules in the
+    ``anomalies`` config section override inference and are the right choice for
+    custom interfaces or header/line relationships whose semantics metadata
+    cannot prove. Missing/sparse history is disclosed, never called clean.
+    history_months must be 3 or 6. business_unit is applied only where the
+    validated table rule/discovery identifies a scope column."""
+    return _safe(
+        anomaly_detector.detect,
+        as_of_date=as_of_date,
+        history_months=history_months,
+        business_unit=business_unit,
+        include_inferred=include_inferred,
     )
 
 

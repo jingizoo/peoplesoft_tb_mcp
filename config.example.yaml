@@ -133,3 +133,62 @@ tools:
                           # dates and amounts are not. Set to 0 to send no rows
                           # at all — shape, fill rates and status-code counts
                           # still come back, so record selection keeps working.
+
+# Offline process-graph build limits. Catalogs are fetched in keyset pages,
+# so the 100k installation-wide defaults do not become one giant DB result.
+# Reaching a catalog limit writes an explicitly PARTIAL graph; exceeding a
+# finished-graph or memory limit preserves the prior artifact and fails.
+process_graph:
+  max_records: 100000
+  max_pages: 100000
+  max_page_fields: 100000
+  max_components: 100000
+  max_navigation: 100000
+  max_queries: 100000
+  query_page_size: 5000
+  max_nodes: 100000
+  max_edges: 100000
+  memory_budget_mb: 512
+  write_batch_size: 2000
+
+# Daily transaction/interface and operational-process anomaly detection.
+# Physical table names are read from the live catalog; no PS_ prefix is
+# assumed. Inference is deliberately bounded and will not auto-scan a large,
+# unindexed table. Explicit rules are recommended for important custom flows.
+anomalies:
+  infer_tables: true
+  infer_processes: true
+  candidate_limit: 20
+  max_unindexed_rows: 50000  # optimizer estimate above this needs an explicit rule
+  material_count: 10        # minimum absolute row-count deviation
+  material_pct: 0.50        # and at least 50% away from baseline
+  z_threshold: 3.5          # robust median/MAD z score
+  table_rules: []
+  relationship_rules: []
+  process_rules: []
+  # Example using company-prefixed physical tables (names are illustrative):
+  # table_rules:
+  #   - name: invoice interface headers
+  #     table: ACME_INV_HDR
+  #     date_column: CREATED_DTTM
+  #     scope_column: BUSINESS_UNIT
+  #   - name: invoice interface distributions
+  #     table: FIN_INV_DIST
+  #     date_column: CREATED_DTTM
+  #     scope_column: BUSINESS_UNIT
+  # relationship_rules:
+  #   - name: invoice header must create distributions
+  #     left_table: ACME_INV_HDR
+  #     right_table: FIN_INV_DIST
+  #     direction: left_requires_right
+  #     minimum_trigger_count: 10
+  #     explanation: accepted interface headers should create distribution rows
+  # process_rules:
+  #   - name: invoice loader
+  #     table: ACME_PROCESS_RUN
+  #     date_column: START_DTTM
+  #     start_column: START_DTTM
+  #     end_column: END_DTTM
+  #     process_name_column: PROCESS_NAME
+  #     status_column: RUN_STATUS
+  #     success_values: [SUCCESS]

@@ -758,6 +758,38 @@ SELECT on the four `PSPNL*`/`PSPRSM*` tables above to get the full chain.
 Without a build, `trace_process` answers that the graph has not been built
 and names the script — nothing else degrades.
 
+Large catalogs are read with keyset pagination rather than one materialized
+query. The shipped build limits are 100,000 rows for each PeopleTools source,
+100,000 finished nodes, 100,000 finished edges, and a 512 MiB estimated-memory
+budget. They are deployment settings, not query-time answer limits:
+
+```yaml
+process_graph:
+  max_records: 100000
+  max_pages: 100000
+  max_page_fields: 100000
+  max_components: 100000
+  max_navigation: 100000
+  max_queries: 100000
+  query_page_size: 5000
+  max_nodes: 100000
+  max_edges: 100000
+  memory_budget_mb: 512
+  write_batch_size: 2000
+```
+
+Use `--row-limit`, `--page-size`, `--max-nodes`, `--max-edges`, or
+`--memory-mb` for a one-build override. A source that reaches its catalog
+limit is kept but marked `PARTIAL`/`DEGRADED`; `describe_process_graph`
+returns structured `limit_hits`. A finished graph that exceeds the global
+node, edge, or memory guard is not written: the prior `process_graph.db`
+remains in place and the command explains which setting to review. Absolute
+hard ceilings still prevent an accidental unbounded catalog mirror.
+
+Question-time traversal remains deliberately small (`3` hops, `12` seeds,
+`400` visited nodes, and `40` results per layer). Those response limits keep
+chat output relevant and are independent of how large the offline index is.
+
 ## 7b. When a query hangs
 
 If the UI or chat sits on a tool call and never returns, time each database

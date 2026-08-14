@@ -42,6 +42,12 @@ routes through. Use these as acceptance tests when trying a new model.
 30. Did beginning balances roll correctly from last year's close? *(RE roll)*
 31. Is the ledger clean enough to close?
 
+## Transaction/process anomalies → `detect_transaction_anomalies`
+
+31a. Which transaction or interface volumes are abnormal today versus the last three months?
+31b. Did one related interface table receive rows while its expected counterpart received none?
+31c. Which operational processes are significantly slower today than their six-month baseline?
+
 ## Rollups & captions → `rollup_trial_balance`, `list_trees`
 32. What are total assets as of period 6?
 33. Summarize the TB by financial-statement caption.
