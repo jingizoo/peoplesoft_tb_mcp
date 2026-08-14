@@ -29,11 +29,12 @@ question time: a full-text hit to find the seeds, then a bounded walk. Cost
 at question time is a handful of indexed reads against a local file.
 
 WHY SQLITE AND NOT A GRAPH DATABASE. The traversals are shallow (3-4 hops
-from a seed) and the whole graph is tens of thousands of rows at most —
-neither needs a graph engine. SQLite is already a dependency, gives FTS5 for
-seed matching and indexed adjacency for the walk, rebuilds atomically, and
-adds no service to operate. The financial system of record stays where it
-is; this is a derived, refreshable INDEX over it and holds no amounts.
+from a seed) and the whole graph is about a hundred thousand nodes/edges by
+default — neither needs a graph engine. SQLite is already a dependency,
+gives FTS5 for seed matching and indexed adjacency for the walk, rebuilds
+atomically, and adds no service to operate. The financial system of record
+stays where it is; this is a derived, refreshable INDEX over it and holds no
+amounts.
 
 WHAT IS IN IT, AND WHAT IS NOT. Structure only: record names, page names,
 component and navigation names, module membership, document titles, and the
@@ -57,27 +58,94 @@ as "invoicing touches no pages".
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA_VERSION = 1
 DEFAULT_FILENAME = "process_graph.db"
 
-# Build-time caps. A real PeopleTools catalog has tens of thousands of pages
-# and hundreds of thousands of page fields; the graph is meant to be an index
-# a person can read the output of, not a mirror of PSPNLFIELD.
-MAX_RECORDS = 4_000
-MAX_PAGES = 6_000
-MAX_PAGE_FIELDS = 60_000
-MAX_COMPONENTS = 4_000
-MAX_NAV = 6_000
-MAX_QUERIES = 2_000
-MAX_DOCS = 2_000
+# Build-time defaults. These used to be unrelated 2k/4k/6k ceilings (except
+# PSPNLFIELD at 60k), so a normal large PeopleTools installation quietly wrote
+# a graph missing everything after the alphabetical cutoff. 100k is large
+# enough for the intended installation-wide index; absolute ceilings below
+# remain as a guard against turning it into an unbounded catalog mirror.
+MAX_RECORDS = 100_000
+MAX_PAGES = 100_000
+MAX_PAGE_FIELDS = 100_000
+MAX_COMPONENTS = 100_000
+MAX_NAV = 100_000
+MAX_QUERIES = 100_000
+MAX_DOCS = 100_000
 MAX_FIELDS_PER_RECORD = 40
+
+HARD_MAX_CATALOG_ROWS = 1_000_000
+HARD_MAX_NODES = 1_000_000
+HARD_MAX_EDGES = 2_000_000
+HARD_MAX_MEMORY_MB = 2_048
+HARD_MAX_PAGE_SIZE = 25_000
+
+
+@dataclass(frozen=True)
+class GraphBuildLimits:
+    """Configurable build ceilings, validated against absolute safeguards."""
+
+    max_records: int = MAX_RECORDS
+    max_pages: int = MAX_PAGES
+    max_page_fields: int = MAX_PAGE_FIELDS
+    max_components: int = MAX_COMPONENTS
+    max_navigation: int = MAX_NAV
+    max_queries: int = MAX_QUERIES
+    query_page_size: int = 5_000
+    max_nodes: int = 100_000
+    max_edges: int = 100_000
+    memory_budget_mb: int = 512
+    write_batch_size: int = 2_000
+
+    @classmethod
+    def from_config(cls, cfg=None, **overrides):
+        source = cfg or object()
+        values = {
+            name: overrides.get(name, getattr(source, name, field.default))
+            for name, field in cls.__dataclass_fields__.items()
+        }
+        try:
+            limits = cls(**{k: int(v) for k, v in values.items()})
+        except (TypeError, ValueError) as e:
+            raise ProcessGraphError(
+                f"process_graph limits must be whole numbers: {e}") from e
+        limits.validate()
+        return limits
+
+    def validate(self) -> None:
+        catalog = {
+            "max_records": self.max_records, "max_pages": self.max_pages,
+            "max_page_fields": self.max_page_fields,
+            "max_components": self.max_components,
+            "max_navigation": self.max_navigation,
+            "max_queries": self.max_queries,
+        }
+        for name, value in catalog.items():
+            _bounded_limit(name, value, HARD_MAX_CATALOG_ROWS)
+        _bounded_limit("query_page_size", self.query_page_size,
+                       HARD_MAX_PAGE_SIZE)
+        _bounded_limit("max_nodes", self.max_nodes, HARD_MAX_NODES)
+        _bounded_limit("max_edges", self.max_edges, HARD_MAX_EDGES)
+        _bounded_limit("memory_budget_mb", self.memory_budget_mb,
+                       HARD_MAX_MEMORY_MB)
+        _bounded_limit("write_batch_size", self.write_batch_size, 25_000)
+
+
+def _bounded_limit(name: str, value: int, hard_max: int) -> None:
+    if value < 1 or value > hard_max:
+        raise ProcessGraphError(
+            f"process_graph.{name} must be between 1 and {hard_max:,}; "
+            f"received {value:,}")
 
 # Query-time caps. The walk is bounded by all three: whichever binds first.
 MAX_HOPS = 3
@@ -239,6 +307,8 @@ class Harvest:
         self.edges: dict = {}
         self.notes: list = []
         self.ok = True
+        self.partial = False
+        self.limit_hits: list = []
 
     def node(self, kind: str, name: str, label: str = "", module: str = "",
              **attrs) -> str:
@@ -276,6 +346,17 @@ class Harvest:
         if not ok:
             self.ok = False
 
+    def limit(self, table: str, cap: int, rows_kept: int) -> None:
+        """Record a deliberate partial harvest as degraded, not healthy."""
+        hit = {"table": table, "limit": int(cap), "rows_kept": int(rows_kept)}
+        self.limit_hits.append(hit)
+        self.partial = True
+        self.note(
+            f"{table} reached the configured {cap:,}-row limit; {rows_kept:,} "
+            "rows were kept and this source is PARTIAL. Raise the matching "
+            "process_graph limit and rebuild if later catalog entries "
+            "are required.", ok=False)
+
 
 # --------------------------------------------------------------- harvesters
 def _probe(db, table: str) -> set:
@@ -290,7 +371,7 @@ def _probe(db, table: str) -> set:
         return set()
 
 
-def harvest_peopletools(db) -> Harvest:
+def harvest_peopletools(db, limits: GraphBuildLimits | None = None) -> Harvest:
     """The layer nothing else in this app reads: pages, components, menus.
 
     PSRECDEFN and PSRECFIELD were already used for record search. The rest of
@@ -299,25 +380,74 @@ def harvest_peopletools(db) -> Harvest:
     component sits in the navigation a user actually clicks) — was not, and
     it is exactly the "how do I DO this" half of the question.
     """
+    limits = limits or GraphBuildLimits()
+    limits.validate()
     h = Harvest("peopletools")
     p = getattr(db, "prefix", "")
 
     def rows(table: str, cols: str, order: str, cap: int,
              where: str = "") -> list:
-        try:
+        """Read an ordered catalog with portable keyset pagination.
+
+        ``Database.query`` intentionally returns at most ``max_rows`` and a
+        truncation flag. Passing the installation-wide cap there made that
+        safety feature an accidental one-shot graph limit. Keyset pages keep
+        each query and result allocation small without OFFSET's increasingly
+        expensive rescans on large PeopleTools catalogs.
+        """
+        keys = [part.strip().split()[0] for part in order.split(",")]
+        out = []
+        after = None
+        while len(out) < cap:
+            clauses = [f"({where})"] if where else []
+            params = {}
+            if after is not None:
+                alternatives = []
+                for i, key in enumerate(keys):
+                    equal = [f"{keys[j]} = :pg{j}" for j in range(i)]
+                    alternatives.append("(" + " AND ".join(
+                        equal + [f"{key} > :pg{i}"]) + ")")
+                clauses.append("(" + " OR ".join(alternatives) + ")")
+                params = {f"pg{i}": value
+                          for i, value in enumerate(after)}
             sql = f"SELECT {cols} FROM {p}{table}"
-            if where:
-                sql += f" WHERE {where}"
-            out, truncated = db.query(f"{sql} ORDER BY {order}", {},
-                                      max_rows=cap)
-            if truncated:
-                h.note(f"{table} is larger than the {cap}-row cap; the graph "
-                       "covers the first rows by name and is incomplete.")
-            return out
-        except Exception as e:                          # noqa: BLE001
-            h.note(f"{table} could not be read ({type(e).__name__}); that "
-                   "layer is missing from the graph.", ok=False)
-            return []
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            page_size = min(limits.query_page_size, cap - len(out))
+            try:
+                page, truncated = db.query(
+                    f"{sql} ORDER BY {order}", params, max_rows=page_size)
+            except Exception as e:                      # noqa: BLE001
+                if out:
+                    h.partial = True
+                    h.note(
+                        f"{table} failed after {len(out):,} rows "
+                        f"({type(e).__name__}); those rows were kept but "
+                        "this layer is PARTIAL.", ok=False)
+                else:
+                    h.note(
+                        f"{table} could not be read ({type(e).__name__}); "
+                        "that layer is missing from the graph.", ok=False)
+                return out
+            if not page:
+                break
+            out.extend(page)
+            if not truncated:
+                break
+            if len(out) >= cap:
+                h.limit(table, cap, len(out))
+                break
+            next_after = tuple(page[-1].get(key.lower()) for key in keys)
+            if any(value is None for value in next_after) or \
+                    next_after == after:
+                h.partial = True
+                h.note(
+                    f"{table} pagination stopped after {len(out):,} rows "
+                    "because its ordering key was null or did not advance; "
+                    "this layer is PARTIAL.", ok=False)
+                break
+            after = next_after
+        return out
 
     # Records. RECTYPE tells a table from a view from a derived work record,
     # which is what separates "where the data lives" from "what the page uses
@@ -330,7 +460,8 @@ def harvest_peopletools(db) -> Harvest:
         for opt in ("RECDESCR", "RECTYPE", "SQLTABLENAME"):
             if opt in rec_cols:
                 sel.append(opt)
-        for r in rows("PSRECDEFN", ", ".join(sel), "RECNAME", MAX_RECORDS):
+        for r in rows("PSRECDEFN", ", ".join(sel), "RECNAME",
+                      limits.max_records):
             name = _norm(r.get("recname"))
             if not name:
                 continue
@@ -349,8 +480,11 @@ def harvest_peopletools(db) -> Harvest:
     # that this screen reads this table.
     pnl_cols = _probe(db, "PSPNLDEFN")
     if pnl_cols:
-        sel = ["PNLNAME"] + [c for c in ("DESCR",) if c in pnl_cols]
-        for r in rows("PSPNLDEFN", ", ".join(sel), "PNLNAME", MAX_PAGES):
+        sel = [c for c in ("MARKET", "PNLNAME", "DESCR")
+               if c in pnl_cols]
+        pnl_order = "PNLNAME, MARKET" if "MARKET" in pnl_cols else "PNLNAME"
+        for r in rows("PSPNLDEFN", ", ".join(sel), pnl_order,
+                      limits.max_pages):
             if _norm(r.get("pnlname")):
                 h.node("page", r["pnlname"], label=str(r.get("descr") or ""))
     else:
@@ -361,7 +495,7 @@ def harvest_peopletools(db) -> Harvest:
     fld_cols = _probe(db, "PSPNLFIELD")
     if fld_cols and "RECNAME" in fld_cols and "PNLNAME" in fld_cols:
         for r in rows("PSPNLFIELD", "DISTINCT PNLNAME, RECNAME",
-                      "PNLNAME, RECNAME", MAX_PAGE_FIELDS,
+                      "PNLNAME, RECNAME", limits.max_page_fields,
                       where="RECNAME IS NOT NULL AND RECNAME <> ' '"):
             page, rec = _norm(r.get("pnlname")), _norm(r.get("recname"))
             if not page or not rec:
@@ -376,20 +510,27 @@ def harvest_peopletools(db) -> Harvest:
     # navigation a person is actually told to follow.
     grp_cols = _probe(db, "PSPNLGROUP")
     if grp_cols and "PNLGRPNAME" in grp_cols and "PNLNAME" in grp_cols:
-        for r in rows("PSPNLGROUP", "DISTINCT PNLGRPNAME, PNLNAME",
-                      "PNLGRPNAME, PNLNAME", MAX_COMPONENTS):
+        grp_sel = ["PNLGRPNAME"]
+        if "MARKET" in grp_cols:
+            grp_sel.append("MARKET")
+        grp_sel.append("PNLNAME")
+        for r in rows("PSPNLGROUP", "DISTINCT " + ", ".join(grp_sel),
+                      ", ".join(grp_sel), limits.max_components):
             comp, page = _norm(r.get("pnlgrpname")), _norm(r.get("pnlname"))
             if comp and page:
                 h.edge(h.node("component", comp), h.node("page", page),
                        "component_has_page", evidence="PSPNLGROUP")
     prsm_cols = _probe(db, "PSPRSMDEFN")
     if prsm_cols and "PORTAL_OBJNAME" in prsm_cols:
-        sel = ["PORTAL_OBJNAME"]
+        sel = (["PORTAL_NAME"] if "PORTAL_NAME" in prsm_cols else [])
+        sel.append("PORTAL_OBJNAME")
         for opt in ("PORTAL_LABEL", "PORTAL_URI_SEG2", "PORTAL_PRNTOBJNAME"):
             if opt in prsm_cols:
                 sel.append(opt)
-        for r in rows("PSPRSMDEFN", ", ".join(sel), "PORTAL_OBJNAME",
-                      MAX_NAV):
+        nav_order = ("PORTAL_NAME, PORTAL_OBJNAME"
+                     if "PORTAL_NAME" in prsm_cols else "PORTAL_OBJNAME")
+        for r in rows("PSPRSMDEFN", ", ".join(sel), nav_order,
+                      limits.max_navigation):
             obj = _norm(r.get("portal_objname"))
             comp = _norm(r.get("portal_uri_seg2"))
             label = str(r.get("portal_label") or "")
@@ -409,11 +550,17 @@ def harvest_peopletools(db) -> Harvest:
     if q_cols and "QRYNAME" in q_cols and "RECNAME" in q_cols:
         descrs = {}
         if d_cols and "DESCR" in d_cols:
-            for r in rows("PSQRYDEFN", "QRYNAME, DESCR", "QRYNAME",
-                          MAX_QUERIES):
+            qdef_sel = (["OPRID"] if "OPRID" in d_cols else [])
+            qdef_sel += ["QRYNAME", "DESCR"]
+            qdef_order = ("OPRID, QRYNAME" if "OPRID" in d_cols
+                          else "QRYNAME")
+            for r in rows("PSQRYDEFN", ", ".join(qdef_sel), qdef_order,
+                          limits.max_queries):
                 descrs[_norm(r.get("qryname"))] = str(r.get("descr") or "")
-        for r in rows("PSQRYRECORD", "DISTINCT QRYNAME, RECNAME",
-                      "QRYNAME, RECNAME", MAX_QUERIES):
+        qrec_sel = (["OPRID"] if "OPRID" in q_cols else [])
+        qrec_sel += ["QRYNAME", "RECNAME"]
+        for r in rows("PSQRYRECORD", "DISTINCT " + ", ".join(qrec_sel),
+                      ", ".join(qrec_sel), limits.max_queries):
             qn, rec = _norm(r.get("qryname")), _norm(r.get("recname"))
             if qn and rec:
                 h.edge(h.node("query", qn, label=descrs.get(qn, "")),
@@ -716,18 +863,53 @@ def _searchable(node: dict) -> str:
     return " ".join(b for b in bits if b)
 
 
-def write_graph(path, harvests, meta=None) -> dict:
-    """Write every harvest into one SQLite file, atomically.
+def _estimated_working_bytes(nodes: dict, edges: dict, notes: list) -> int:
+    """Conservative build-memory estimate without another full allocation."""
+    total = 0
+    for node in nodes.values():
+        text = (node.get("id"), node.get("kind"), node.get("name"),
+                node.get("label"), node.get("module"), node.get("source"))
+        attrs = json.dumps(node.get("attrs") or {}, sort_keys=True)
+        total += 480 + 4 * sum(len(str(v or "").encode("utf-8"))
+                               for v in (*text, attrs))
+    for edge in edges.values():
+        text = (edge.get("src"), edge.get("dst"), edge.get("kind"),
+                edge.get("evidence"), edge.get("source"))
+        total += 400 + 4 * sum(len(str(v or "").encode("utf-8"))
+                               for v in text)
+    total += sum(160 + 4 * (len(str(source).encode("utf-8"))
+                            + len(str(note).encode("utf-8")))
+                 for source, note, _ in notes)
+    return total
 
-    Atomic because the alternative is a half-written graph being read by a
-    live GUI mid-rebuild: build beside the target, then rename over it.
+
+def _estimated_harvest_bytes(harvests) -> int:
+    """Estimate inputs before allocating a second merged graph representation.
+
+    Duplicate nodes/edges are intentionally counted once per harvest.  That
+    makes this a conservative preflight while requiring no merged dictionary
+    (the allocation the guard exists to prevent).
     """
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".building")
-    if tmp.exists():
-        tmp.unlink()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    return sum(
+        _estimated_working_bytes(
+            h.nodes, h.edges,
+            [(h.source, note, 1 if h.ok else 0) for note in h.notes])
+        for h in harvests)
 
+
+def _enforce_memory_budget(estimated_bytes: int,
+                           limits: GraphBuildLimits) -> None:
+    budget_bytes = limits.memory_budget_mb * 1024 * 1024
+    if estimated_bytes > budget_bytes:
+        raise ProcessGraphError(
+            f"Process graph build is estimated to need "
+            f"{estimated_bytes / 1024 / 1024:.1f} MiB, exceeding "
+            f"process_graph.memory_budget_mb={limits.memory_budget_mb:,}. "
+            "The existing graph was not replaced. Raise the budget (up to "
+            f"{HARD_MAX_MEMORY_MB:,} MiB) or reduce the selected sources.")
+
+
+def _merge_harvests(harvests) -> tuple[dict, dict, list]:
     nodes: dict = {}
     edges: dict = {}
     notes: list = []
@@ -748,6 +930,41 @@ def write_graph(path, harvests, meta=None) -> dict:
             if cur is None or edge["weight"] > cur["weight"]:
                 edges[key] = edge
         notes.extend((h.source, n, 1 if h.ok else 0) for n in h.notes)
+    return nodes, edges, notes
+
+
+def _executemany_batched(con, sql: str, values, size: int) -> None:
+    """Serialize only one bounded insert batch at a time."""
+    iterator = iter(values)
+    while True:
+        batch = list(itertools.islice(iterator, size))
+        if not batch:
+            return
+        con.executemany(sql, batch)
+
+
+def write_graph(path, harvests, meta=None,
+                limits: GraphBuildLimits | None = None) -> dict:
+    """Write every harvest into one SQLite file, atomically.
+
+    Atomic because the alternative is a half-written graph being read by a
+    live GUI mid-rebuild: build beside the target, then rename over it.
+    """
+    limits = limits or GraphBuildLimits()
+    limits.validate()
+    harvests = list(harvests)
+    # Enforce the budget while the graph still exists only in harvester-owned
+    # dictionaries.  The former check happened after allocating merged and
+    # canonical dictionaries, so it could detect an unsafe build only after
+    # incurring the peak it was meant to prevent.
+    _enforce_memory_budget(_estimated_harvest_bytes(harvests), limits)
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".building")
+    if tmp.exists():
+        tmp.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    nodes, edges, notes = _merge_harvests(harvests)
 
     # An edge to a node no harvester declared would make the walk return an
     # id with no name behind it. Declare the stub rather than drop the edge:
@@ -760,29 +977,60 @@ def write_graph(path, harvests, meta=None) -> dict:
                               "label": "", "module": "", "source": "implied",
                               "attrs": {}}
     nodes, edges = _canonicalise(nodes, edges)
+    if len(nodes) > limits.max_nodes:
+        raise ProcessGraphError(
+            f"Process graph would contain {len(nodes):,} nodes, exceeding "
+            f"process_graph.max_nodes={limits.max_nodes:,}. The existing "
+            "graph was not replaced. Raise that configured limit (up to "
+            f"{HARD_MAX_NODES:,}) or reduce the selected sources.")
+    if len(edges) > limits.max_edges:
+        raise ProcessGraphError(
+            f"Process graph would contain {len(edges):,} edges, exceeding "
+            f"process_graph.max_edges={limits.max_edges:,}. The existing "
+            "graph was not replaced. Raise that configured limit (up to "
+            f"{HARD_MAX_EDGES:,}) or reduce the selected sources.")
+    estimated_bytes = _estimated_working_bytes(nodes, edges, notes)
+    # Canonicalisation and implied stubs can grow the graph relative to raw
+    # harvests, so retain an exact post-merge check as a second line of safety.
+    _enforce_memory_budget(estimated_bytes, limits)
 
-    con = sqlite3.connect(str(tmp))
+    con = None
     try:
+        con = sqlite3.connect(str(tmp))
+        # The target is a disposable scratch artifact until os.replace. Keep
+        # SQLite's own transient memory bounded and avoid journaling a file
+        # that no reader can see yet.
+        con.execute("PRAGMA journal_mode=OFF")
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("PRAGMA temp_store=FILE")
         con.executescript(_DDL)
         fts = _try_fts(con)
-        con.executemany(
+        _executemany_batched(
+            con,
             "INSERT INTO nodes (id, kind, name, label, module, source, attrs)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(n["id"], n["kind"], n["name"], n.get("label") or "",
+            ((n["id"], n["kind"], n["name"], n.get("label") or "",
               n.get("module") or "", n["source"],
               json.dumps(n.get("attrs") or {}, sort_keys=True))
-             for n in nodes.values()])
-        con.executemany(
+             for n in nodes.values()), limits.write_batch_size)
+        _executemany_batched(
+            con,
             "INSERT INTO edges (src, dst, kind, weight, evidence, source) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            [(e["src"], e["dst"], e["kind"], e["weight"],
-              e.get("evidence") or "", e["source"]) for e in edges.values()])
-        con.executemany("INSERT INTO notes (source, note, ok) VALUES (?,?,?)",
-                        notes)
+            ((e["src"], e["dst"], e["kind"], e["weight"],
+              e.get("evidence") or "", e["source"])
+             for e in edges.values()), limits.write_batch_size)
+        _executemany_batched(
+            con, "INSERT INTO notes (source, note, ok) VALUES (?,?,?)",
+            iter(notes), limits.write_batch_size)
         if fts:
-            con.executemany(
+            _executemany_batched(
+                con,
                 "INSERT INTO node_fts (id, text) VALUES (?, ?)",
-                [(n["id"], _searchable(n)) for n in nodes.values()])
+                ((n["id"], _searchable(n)) for n in nodes.values()),
+                limits.write_batch_size)
+        limit_hits = [dict(source=h.source, **hit)
+                      for h in harvests for hit in h.limit_hits]
         info = {
             "schema_version": str(SCHEMA_VERSION),
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -792,14 +1040,23 @@ def write_graph(path, harvests, meta=None) -> dict:
             "sources": ",".join(sorted({h.source for h in harvests})),
             "degraded": ",".join(sorted({h.source for h in harvests
                                          if not h.ok})),
+            "partial": "yes" if any(h.partial for h in harvests) else "no",
+            "limit_hits": json.dumps(limit_hits, sort_keys=True),
+            "estimated_build_mb": f"{estimated_bytes / 1024 / 1024:.1f}",
         }
         info.update({k: str(v) for k, v in (meta or {}).items()})
         con.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
                         list(info.items()))
         con.commit()
-    finally:
         con.close()
-    os.replace(str(tmp), str(path))
+        con = None
+        os.replace(str(tmp), str(path))
+    except Exception:
+        if con is not None:
+            con.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
     return {**info, "path": str(path),
             "notes": [{"source": s, "note": n} for s, n, _ in notes]}
 
@@ -933,12 +1190,20 @@ class ProcessGraph:
         finally:
             con.close()
         degraded = [s for s in (meta.get("degraded") or "").split(",") if s]
+        partial = meta.get("partial") == "yes"
+        try:
+            limit_hits = json.loads(meta.get("limit_hits") or "[]")
+        except (TypeError, ValueError):
+            limit_hits = []
         return {
             "available": True, "path": self.path.name,
             "built_at": meta.get("built_at", ""),
             "schema_version": meta.get("schema_version", ""),
             "sources": [s for s in (meta.get("sources") or "").split(",") if s],
             "sources_degraded": degraded,
+            "partial": partial,
+            "limit_hits": limit_hits,
+            "estimated_build_mb": meta.get("estimated_build_mb", ""),
             "seed_search": ("full text" if meta.get("fts") == "yes"
                             else "substring (FTS5 unavailable here)"),
             "node_kinds": kinds, "edge_kinds": edges,
@@ -947,6 +1212,9 @@ class ProcessGraph:
                 "This graph is a snapshot of structure taken at build time. "
                 "It answers what connects to what, never what anything is "
                 "worth — every amount still comes from a financial tool."
+                + (" PARTIAL: one or more catalog limits were reached; "
+                   "limit_hits identifies the retained rows and configured "
+                   "ceiling." if partial else "")
                 + (f" Degraded sources: {', '.join(degraded)}."
                    if degraded else "")),
         }

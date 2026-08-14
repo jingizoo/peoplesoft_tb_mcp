@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -70,6 +71,7 @@ class _Built(unittest.TestCase):
             pg.harvest_joins(eng, records),
             pg.harvest_wiki(make_wiki(eng.cfg), records, modules),
         ]
+        eng.db.close()
         cls.g = _build(cls.dir / "pg.db", cls.harvests)
 
     def names(self, out, layer) -> list:
@@ -97,7 +99,9 @@ class HarvestTests(_Built):
                     else super().columns(table)
 
         cfg = load_config(str(ROOT / "config.yaml"))
-        h = pg.harvest_peopletools(NoPages(cfg))
+        db = NoPages(cfg)
+        h = pg.harvest_peopletools(db)
+        db.close()
         self.assertTrue(any("PSPNLDEFN" in n for n in h.notes),
                         f"a missing page catalog must be reported: {h.notes}")
         self.assertTrue(h.nodes, "the records should still have been read")
@@ -112,8 +116,62 @@ class HarvestTests(_Built):
                 return super().query(sql, params, **kw)
 
         cfg = load_config(str(ROOT / "config.yaml"))
-        h = pg.harvest_peopletools(NoRecords(cfg))
+        db = NoRecords(cfg)
+        h = pg.harvest_peopletools(db)
+        db.close()
         self.assertFalse(h.ok, "a refused catalog read is degraded, not fine")
+
+    def test_large_catalogs_are_keyset_paginated_past_the_old_cap(self) -> None:
+        class Catalog:
+            prefix = ""
+
+            def __init__(self, size):
+                self.names = [f"REC_{i:05d}" for i in range(size)]
+                self.calls = 0
+
+            def columns(self, table):
+                return {"RECNAME"} if table == "PSRECDEFN" else set()
+
+            def query(self, sql, params=None, max_rows=None):
+                self.calls += 1
+                after = (params or {}).get("pg0")
+                rows = [n for n in self.names if after is None or n > after]
+                cap = int(max_rows)
+                return ([{"recname": n} for n in rows[:cap]],
+                        len(rows) > cap)
+
+        db = Catalog(12_345)
+        limits = pg.GraphBuildLimits(max_records=20_000,
+                                     query_page_size=1_000)
+        h = pg.harvest_peopletools(db, limits)
+        records = [n for n in h.nodes.values() if n["kind"] == "record"]
+        self.assertEqual(len(records), 12_345)
+        self.assertGreater(db.calls, 5)
+        self.assertFalse(h.partial, h.notes)
+
+    def test_a_catalog_ceiling_is_reported_as_partial_and_degraded(self):
+        class Catalog:
+            prefix = ""
+
+            def columns(self, table):
+                return {"RECNAME"} if table == "PSRECDEFN" else set()
+
+            def query(self, sql, params=None, max_rows=None):
+                after = (params or {}).get("pg0")
+                names = [f"REC_{i:05d}" for i in range(6_000)]
+                rows = [n for n in names if after is None or n > after]
+                cap = int(max_rows)
+                return ([{"recname": n} for n in rows[:cap]],
+                        len(rows) > cap)
+
+        h = pg.harvest_peopletools(
+            Catalog(), pg.GraphBuildLimits(max_records=5_000,
+                                            query_page_size=1_000))
+        self.assertEqual(len(h.nodes), 5_000)
+        self.assertTrue(h.partial)
+        self.assertFalse(h.ok)
+        self.assertEqual(h.limit_hits[0]["table"], "PSRECDEFN")
+        self.assertIn("PARTIAL", " ".join(h.notes))
 
     def test_it_holds_no_amounts_and_no_party_names(self) -> None:
         # The security line this whole module sits on. Every value that got
@@ -258,6 +316,17 @@ class DescribeTests(_Built):
             self.assertFalse(out["available"])
             self.assertIn("build_process_graph", out["how_to_build"])
 
+    def test_partial_builds_expose_structured_limit_hits(self) -> None:
+        h = pg.Harvest("peopletools")
+        h.node("page", "ONE")
+        h.limit("PSPNLDEFN", 100_000, 100_000)
+        target = self.dir / "partial.db"
+        pg.write_graph(target, [h])
+        out = pg.ProcessGraph(target).describe()
+        self.assertTrue(out["partial"])
+        self.assertEqual(out["limit_hits"][0]["table"], "PSPNLDEFN")
+        self.assertIn("PARTIAL", out["coverage_note"])
+
 
 class RecommendationTests(_Built):
     """A process answer must hand over a next question, not end cold.
@@ -357,6 +426,92 @@ class WriteTests(unittest.TestCase):
         self.assertIn("PS_GHOST",
                       [i["name"] for lay in out["layers"]
                        for i in lay["items"]])
+
+    def test_the_default_writer_supports_100k_nodes_and_edges(self):
+        h = pg.Harvest("scale")
+        prior = None
+        for i in range(100_000):
+            current = h.node("page", f"PAGE_{i:06d}")
+            if prior is not None:
+                h.edge(prior, current, "component_has_page")
+            prior = current
+        d = Path(tempfile.mkdtemp())
+        target = d / "large.db"
+        info = pg.write_graph(target, [h])
+        self.assertEqual(info["nodes"], "100000")
+        self.assertEqual(info["edges"], "99999")
+        con = sqlite3.connect(str(target))
+        try:
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM nodes").fetchone()[0], 100_000)
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM edges").fetchone()[0], 99_999)
+        finally:
+            con.close()
+
+    def test_global_limit_failure_preserves_the_existing_graph(self) -> None:
+        d = Path(tempfile.mkdtemp())
+        target = d / "pg.db"
+        old = pg.Harvest("old")
+        old.node("page", "OLD")
+        pg.write_graph(target, [old])
+        replacement = pg.Harvest("new")
+        for name in ("A", "B", "C"):
+            replacement.node("page", name)
+        with self.assertRaisesRegex(pg.ProcessGraphError, "max_nodes=2"):
+            pg.write_graph(target, [replacement],
+                           limits=pg.GraphBuildLimits(max_nodes=2))
+        con = sqlite3.connect(str(target))
+        try:
+            self.assertEqual(con.execute(
+                "SELECT name FROM nodes").fetchall(), [("OLD",)])
+        finally:
+            con.close()
+        self.assertFalse((d / "pg.db.building").exists())
+
+    def test_memory_budget_stops_an_oversized_build_before_writing(self):
+        h = pg.Harvest("large-label")
+        h.node("page", "ONE", label="x" * 300_000)
+        d = Path(tempfile.mkdtemp())
+        target = d / "pg.db"
+        with self.assertRaisesRegex(pg.ProcessGraphError,
+                                    "memory_budget_mb=1"):
+            pg.write_graph(target, [h], limits=pg.GraphBuildLimits(
+                memory_budget_mb=1))
+        self.assertFalse(target.exists())
+        self.assertFalse((d / "pg.db.building").exists())
+
+    def test_memory_budget_is_checked_before_merge_allocation(self):
+        h = pg.Harvest("large-label")
+        h.node("page", "ONE", label="x" * 300_000)
+        d = Path(tempfile.mkdtemp())
+        target = d / "pg.db"
+        with mock.patch.object(pg, "_merge_harvests",
+                               wraps=pg._merge_harvests) as merge:
+            with self.assertRaisesRegex(pg.ProcessGraphError,
+                                        "memory_budget_mb=1"):
+                pg.write_graph(target, [h], limits=pg.GraphBuildLimits(
+                    memory_budget_mb=1))
+        merge.assert_not_called()
+        self.assertFalse(target.exists())
+
+    def test_absolute_safeguards_reject_unbounded_configuration(self):
+        with self.assertRaisesRegex(pg.ProcessGraphError, "max_nodes"):
+            pg.GraphBuildLimits(max_nodes=pg.HARD_MAX_NODES + 1).validate()
+
+    def test_build_limits_load_from_deployment_config(self) -> None:
+        d = Path(tempfile.mkdtemp())
+        config = d / "config.yaml"
+        config.write_text(
+            "process_graph:\n"
+            "  max_records: 123456\n"
+            "  max_nodes: 234567\n"
+            "  memory_budget_mb: 768\n")
+        limits = pg.GraphBuildLimits.from_config(
+            load_config(str(config)).process_graph)
+        self.assertEqual(limits.max_records, 123_456)
+        self.assertEqual(limits.max_nodes, 234_567)
+        self.assertEqual(limits.memory_budget_mb, 768)
 
 
 class StemTests(unittest.TestCase):

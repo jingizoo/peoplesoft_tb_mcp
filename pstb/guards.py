@@ -53,6 +53,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "explain_balance_change",
     "drill_to_journals",
     "tb_integrity_check",
+    "detect_transaction_anomalies",
     "rollup_trial_balance",
     "get_exchange_rate",
     "get_top_billing_customers",
@@ -123,6 +124,9 @@ _TOOL_SCOPE_ARGS = {
     "tb_integrity_check": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "detect_transaction_anomalies": {
+        "business_unit": "business_unit", "as_of_date": "as_of_date",
     },
     "rollup_trial_balance": {
         "business_unit": "business_unit", "ledger": "ledger",
@@ -432,6 +436,11 @@ _TOOL_DOMAINS = {
                                "customer", "fx", "journal"},
     "drill_to_journals": {"journal", "balance", "variance"},
     "tb_integrity_check": {"balance", "journal"},
+    "detect_transaction_anomalies": {
+        # Operational telemetry can ground an anomaly/variance statement, but
+        # a clean broad scan is not evidence for an AR/AP/asset/project policy
+        # conclusion about a specific balance or transaction.
+        "variance"},
     "rollup_trial_balance": {"balance", "report"},
     "get_exchange_rate": {"fx"},
     "get_top_billing_customers": {"billing", "customer", "fx"},
@@ -944,6 +953,7 @@ _SOURCE_OF_TOOL = {
         "get_tree_node_accounts", "search_accounts", "run_sql",
         "run_playbook",
     },
+    "peoplesoft_operations": {"detect_transaction_anomalies"},
     "peoplesoft_ar": {
         "get_ar_aging", "get_customer_ar", "get_invoice_totals",
         "get_top_billing_customers", "get_billing_workbench",
@@ -983,6 +993,7 @@ _TOOL_SOURCE = {tool: label
 _SYSTEM_OF = {
     "peoplesoft_gl": "peoplesoft", "peoplesoft_ar": "peoplesoft",
     "peoplesoft_ap": "peoplesoft", "peoplesoft_query": "peoplesoft",
+    "peoplesoft_operations": "peoplesoft",
     "coupa": "coupa", "wiki": "wiki",
 }
 
@@ -992,6 +1003,7 @@ SOURCE_LABELS = {
     "peoplesoft_ar": "PeopleSoft receivables and billing",
     "peoplesoft_ap": "PeopleSoft payables",
     "peoplesoft_query": "an existing PeopleSoft query (QAS)",
+    "peoplesoft_operations": "PeopleSoft operational transaction/process telemetry",
     "coupa": "Coupa procurement",
     "wiki": "a policy wiki page",
 }

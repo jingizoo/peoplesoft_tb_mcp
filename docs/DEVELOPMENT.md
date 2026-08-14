@@ -66,6 +66,16 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   receivables health) composed from curated tools and run
   server-side. The SEQUENCE lives in Python so the model cannot
   reorder or forget a step; it triggers and narrates only.
+- `pstb/anomalies.py` — read-only, metadata-led daily volume, related-table,
+  and process-performance anomaly detection. Physical names come from the
+  live catalog/PeopleTools metadata rather than a prefix convention; robust
+  weekday-aware/active-day baselines disclose sparse or incomplete evidence;
+  caller business-unit scope and per-feed freshness are enforced in-module.
+- `pstb/procgraph.py` — offline process-relationship index. PeopleTools
+  catalogs are keyset-paginated to configurable 100k defaults; SQLite writes
+  are batched and atomic, with explicit partial-source metadata and guarded
+  node/edge/memory ceilings. Memory is preflighted before merge allocation;
+  query-time walks stay separately bounded.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
   PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
 - `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py`,

@@ -132,6 +132,67 @@ class ToolsCfg:
 
 
 @dataclass
+class ProcessGraphCfg:
+    """Offline PeopleTools process-graph build ceilings.
+
+    The graph reader remains intentionally small per question; these limits
+    govern only the rare metadata harvest and atomic SQLite rebuild.
+    """
+    max_records: int = 100_000
+    max_pages: int = 100_000
+    max_page_fields: int = 100_000
+    max_components: int = 100_000
+    max_navigation: int = 100_000
+    max_queries: int = 100_000
+    query_page_size: int = 5_000
+    max_nodes: int = 100_000
+    max_edges: int = 100_000
+    memory_budget_mb: int = 512
+    write_batch_size: int = 2_000
+
+
+@dataclass
+class AnomalyCfg:
+    """Bounded, read-only transaction/process anomaly settings.
+
+    Rules stay as dictionaries because record names and shapes are inherently
+    deployment-specific.  The detector validates every configured identifier
+    against the live catalog before placing it in SQL.
+    """
+    infer_tables: bool = True
+    infer_processes: bool = True
+    table_rules: list = field(default_factory=list)
+    relationship_rules: list = field(default_factory=list)
+    process_rules: list = field(default_factory=list)
+    candidate_limit: int = 20
+    process_candidate_limit: int = 8
+    max_inferred_relations: int = 20
+    catalog_object_cap: int = 5000
+    catalog_column_cap: int = 50000
+    metadata_row_cap: int = 20000
+    metadata_cache_seconds: int = 900
+    process_result_cap: int = 5000
+    max_unindexed_rows: int = 50000
+    min_history_days: int = 28
+    min_active_days: int = 12
+    # A zero on the as-of date is not evidence of a miss until this many
+    # whole days have elapsed.  Sites with intraday-complete feeds can set 0;
+    # overnight/batch feeds normally keep the one-day default.  Individual
+    # table and relationship sides may override this in their rules.
+    freshness_lag_days: int = 1
+    min_relation_days: int = 8
+    min_process_history_days: int = 8
+    min_process_runs: int = 3
+    material_count: int = 10
+    material_pct: float = 0.5
+    process_material_pct: float = 0.5
+    min_duration_increase_seconds: float = 30.0
+    success_rate_drop: float = 0.2
+    z_threshold: float = 3.5
+    min_relation_confidence: float = 0.55
+
+
+@dataclass
 class PsApiCfg:
     """Query Access Service credentials and limits.
 
@@ -196,6 +257,8 @@ class Config:
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
+    process_graph: ProcessGraphCfg = field(default_factory=ProcessGraphCfg)
+    anomalies: AnomalyCfg = field(default_factory=AnomalyCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
 
     @classmethod
@@ -377,6 +440,8 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.llm, data.get("llm"))
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
+        _apply_section(cfg.process_graph, data.get("process_graph"))
+        _apply_section(cfg.anomalies, data.get("anomalies"))
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))
         if isinstance(data.get("semantics"), dict):

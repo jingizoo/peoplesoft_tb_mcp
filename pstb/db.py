@@ -289,6 +289,36 @@ class Database:
                                     for c in sorted(
                                         cols, key=lambda x: x.get("seqno", 0))],
                     })
+            elif self.dialect == "sqlserver":
+                schema = self.cfg.db.schema.strip().rstrip(".").upper()
+                where = "UPPER(T.name) = :t"
+                params = {"t": table.upper()}
+                if schema:
+                    where += " AND UPPER(S.name) = :o"
+                    params["o"] = schema
+                rows, _ = self.query(
+                    "SELECT I.name AS name, C.name AS col, "
+                    "IC.key_ordinal AS pos, I.is_unique AS uniq "
+                    "FROM sys.tables T JOIN sys.schemas S "
+                    "ON S.schema_id = T.schema_id "
+                    "JOIN sys.indexes I ON I.object_id = T.object_id "
+                    "JOIN sys.index_columns IC ON IC.object_id = I.object_id "
+                    "AND IC.index_id = I.index_id "
+                    "JOIN sys.columns C ON C.object_id = IC.object_id "
+                    "AND C.column_id = IC.column_id "
+                    f"WHERE {where} AND I.index_id > 0 "
+                    "AND I.is_hypothetical = 0 AND IC.key_ordinal > 0 "
+                    "ORDER BY I.name, IC.key_ordinal",
+                    params, max_rows=500)
+                by_name: dict = {}
+                for r in rows:
+                    name = str(r["name"]).upper()
+                    entry = by_name.setdefault(
+                        name,
+                        {"name": name,
+                         "unique": bool(r.get("uniq")), "columns": []})
+                    entry["columns"].append(str(r["col"]).upper())
+                out = list(by_name.values())
         except Exception:
             return []
         with self._catalog_lock:
