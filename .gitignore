@@ -34,3 +34,7 @@ config.local.yaml.bak-*
 # Built by scripts/build_process_graph.py from this instance metadata.
 process_graph.db
 process_graph.db.building
+
+# Built by scripts/build_entity_graph.py — derived business data.
+entity_graph.db
+entity_graph.db.building

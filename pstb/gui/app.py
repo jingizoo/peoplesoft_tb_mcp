@@ -57,11 +57,13 @@ ar = ARBilling(engine)
 relationships = Relationships(ar)
 from ..modules import ModulePacks as _MP
 vendor_network = VendorNetwork(_MP(engine))
+from ..entitygraph import EntityGraph as _EG, graph_path as _eg_path
 from ..procgraph import ProcessGraph as _PG, graph_path as _pg_path
 from ..procurement import Procurement as _Proc
 # Opened per call against a local file, so a graph rebuilt by an
 # administrator is picked up without restarting the server.
 process_graph = _PG(_pg_path(cfg))
+entity_graph = _EG(_eg_path(cfg))
 procurement = _Proc(_MP(engine))
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
@@ -1836,6 +1838,32 @@ def procurement_chain_view(reference: str, business_unit: str = "",
                            as_of_date: str = ""):
     return _guard(procurement.procurement_chain, reference=reference,
                   business_unit=business_unit, as_of_date=as_of_date)
+
+
+@app.get("/api/entity-network")
+def entity_network_view(entity: str, kind: str = "",
+                        business_unit: str = "", limit: int = 40):
+    return _guard(entity_graph.neighbourhood, entity=entity, kind=kind,
+                  business_unit=business_unit, limit=limit)
+
+
+@app.get("/api/concentration")
+def concentration_view(kind: str = "customer", by: str = "",
+                       business_unit: str = "", limit: int = 10):
+    return _guard(entity_graph.concentration, kind=kind, by=by,
+                  business_unit=business_unit, limit=limit)
+
+
+@app.get("/api/entity-connection")
+def entity_connection_view(source: str, target: str,
+                           business_unit: str = "", hops: int = 3):
+    return _guard(entity_graph.connection, source=source, target=target,
+                  business_unit=business_unit, hops=hops)
+
+
+@app.get("/api/entity-graph")
+def entity_graph_view():
+    return _guard(entity_graph.describe)
 
 
 @app.get("/api/process")

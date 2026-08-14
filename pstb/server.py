@@ -47,6 +47,8 @@ from .procurement import Procurement
 procurement = Procurement(modules)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
+from .entitygraph import EntityGraph, graph_path as _eg_path
+entity_graph = EntityGraph(_eg_path(cfg))
 from .procgraph import ProcessGraph, graph_path
 # Opened per call against a local file, so a graph built or rebuilt after
 # this process started is picked up without a restart — the build script is
@@ -367,6 +369,62 @@ def trace_process(question: str, hops: int = 3, limit: int = 40) -> dict:
     false, say the graph has not been built and name that script."""
     return _safe(process_graph.trace, question=question, hops=hops,
                  limit=limit)
+
+
+@mcp.tool()
+def get_entity_network(entity: str = "", kind: str = "",
+                       business_unit: str = "", limit: int = 40) -> dict:
+    """ONE actor and everything it trades with: a customer's products and
+    units, a product's customers, a supplier's units, a unit's customers.
+    entity takes an id OR a name (ambiguity comes back as a question).
+    Use for "which customers buy LIC-SAAS", "what does ACME actually buy",
+    "who supplies us in US001". Amounts are a DERIVED WEIGHT stamped as_of
+    the graph build, not the ledger — quote them as of that date and use
+    the tool named in next_steps for a live figure. Only flows in business
+    units this user is granted are returned, and the payload says so when
+    it withheld any."""
+    return _safe(entity_graph.neighbourhood, entity=entity, kind=kind,
+                 business_unit=business_unit, limit=limit)
+
+
+@mcp.tool()
+def get_concentration(kind: str = "customer", by: str = "",
+                      business_unit: str = "", limit: int = 10) -> dict:
+    """Who carries the weight, and what depends on a single partner. kind
+    is customer, product, supplier or business_unit. Returns a ranked list
+    with each actor's SHARE of the visible population, the top-N share, and
+    single_partner — actors with exactly one counterparty, which is a
+    dependency rather than a statistic (a product with one customer
+    disappears with that customer). Use for "customer concentration", "how
+    exposed are we to one product", "revenue concentration risk". Shares are
+    of what THIS caller can see, stated in the payload; amounts are as of
+    the graph build."""
+    return _safe(entity_graph.concentration, kind=kind, by=by,
+                 business_unit=business_unit, limit=limit)
+
+
+@mcp.tool()
+def get_entity_connection(source: str = "", target: str = "",
+                          business_unit: str = "", hops: int = 3) -> dict:
+    """How two actors are connected, with the evidence on every hop. Use for
+    "is this supplier anything to do with that customer", "how is ACME
+    connected to Summit Machining". Each hop is labelled 'recorded
+    hierarchy' (the system says they are related) or 'shared transactions'
+    (they merely trade in the same place) — and every hop carries a `reads`
+    sentence stating the relationship the way the SYSTEM records it, which
+    is not always the direction the path was walked. A path is a CONNECTION,
+    never a conclusion: two actors sharing a business unit share it with
+    everyone else in that unit."""
+    return _safe(entity_graph.connection, source=source, target=target,
+                 business_unit=business_unit, hops=hops)
+
+
+@mcp.tool()
+def describe_entity_graph() -> dict:
+    """What the entity graph covers, when it was built, over what window,
+    and which business units this caller can see in it. Call when the actor
+    tools return less than expected, or to say how fresh their amounts are."""
+    return _safe(entity_graph.describe)
 
 
 @mcp.tool()

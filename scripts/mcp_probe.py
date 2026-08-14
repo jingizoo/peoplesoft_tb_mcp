@@ -61,6 +61,7 @@ async def main() -> None:
                             "recall_site_facts", "list_policy_terms",
                             "coupa_health",
                             "describe_process_graph",
+                            "describe_entity_graph",
                             "list_integration_endpoints"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
