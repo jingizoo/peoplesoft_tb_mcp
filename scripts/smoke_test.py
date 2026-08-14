@@ -920,6 +920,48 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
                                     str(ROOT / "config.example.yaml")),
           _r.stdout.strip() or _r.stderr.strip()[:80])
 
+    print("== entity graph: who deals with whom ==")
+    from pstb import entitygraph as _eg
+    from pstb.security import Access as _EGAccess, access_scope as _egscope
+    _egdir = _tf.mkdtemp(prefix="pstb_eg_")
+    _egfile = Path(_egdir) / "eg.db"
+    _egh = _eg.harvest_entities(engine, months=24, as_of_date="2026-08-14")
+    _eg.write_graph(_egfile, _egh)
+    _egg = _eg.EntityGraph(_egfile)
+    _egkinds = {k["kind"] for k in _egg.describe()["actor_kinds"]}
+    check("the graph holds every actor kind",
+          _egkinds == set(_eg.ACTOR_KINDS), str(sorted(_egkinds)))
+    _egn = _egg.neighbourhood(entity="LIC-SAAS")
+    _egbuys = [g for g in _egn.get("links", []) if g["flow"] == "buys"]
+    check("a product names the customers who bought it",
+          bool(_egn.get("actor")) and bool(_egbuys)
+          and _egbuys[0]["count"] > 1,
+          str(_egn.get("scope_status") or _egn.get("actor"))[:110])
+    _egc = _egg.concentration(kind="product", limit=10)
+    _egusd = [b for b in _egc["by_currency"] if b["currency"] == "USD"][0]
+    check("concentration ranks by share and counts real partners",
+          abs(sum(r["share_pct"] for r in _egusd["ranked"]) - 100.0) < 0.5
+          and any(r["partners"] > 1 for r in _egusd["ranked"]),
+          str([(r["name"], r["share_pct"], r["partners"])
+               for r in _egusd["ranked"][:3]])[:120])
+    _egp = _egg.connection(source="ACME Industrial",
+                           target="ACME Industrial - West")
+    _eghop = (_egp.get("path") or [{}])[0]
+    check("a hierarchy hop reads in the direction the SYSTEM records it",
+          _eghop.get("strength") == "recorded hierarchy"
+          and str(_eghop.get("reads", "")).startswith("ACME Industrial - West"),
+          str(_eghop.get("reads"))[:110])
+    with _egscope(_EGAccess(oprid="NOBODY", units=frozenset())):
+        _egdeny = _egg.concentration(kind="customer")
+    check("a caller granted no unit is answered nothing, not everything",
+          _egdeny.get("scope_status") == "no_visible_units",
+          str(_egdeny)[:110])
+    check("entity answers are stamped with when they were true",
+          _egn.get("as_of") == "2026-08-14"
+          and "NOT the ledger" in _egn.get("basis", ""),
+          str(_egn.get("basis"))[:110])
+    _sh.rmtree(_egdir, ignore_errors=True)
+
     print("== purchase-to-pay: the three-way match ==")
     from pstb.modules import ModulePacks as _MPX
     from pstb.procurement import Procurement as _Proc

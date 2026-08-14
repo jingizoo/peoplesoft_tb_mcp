@@ -1663,6 +1663,9 @@ function renderToolResult(name,data,args){
     if(name==='get_customer_financial_360') return renderCustomer360(data);
     if(name==='get_vendor_payables_network') return renderVendorNetwork(data);
     if(name==='trace_process') return renderProcess(data);
+    if(name==='get_entity_network') return renderEntityNetwork(data);
+    if(name==='get_concentration') return renderConcentration(data);
+    if(name==='get_entity_connection') return renderConnection(data);
     if(name==='get_match_exceptions') return renderMatchExceptions(data);
     if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
@@ -1877,6 +1880,100 @@ function renderProcurementChain(d){
   if(d.basis) c.append(el('div','pad','<p style="color:var(--muted)">'+
     esc(d.basis)+'</p>'));
   frag.append(c); return frag;
+}
+// The actor graph. Three cards, and all three carry the same two caveats
+// visibly: the amounts are dated, and the view may be partial because of
+// row security. A share of a population you cannot fully see is still a
+// useful number — but only if the reader knows that is what it is.
+function egStamp(c,d){
+  const bits=[];
+  if(d.as_of) bits.push('Amounts as of '+esc(d.as_of)+' (graph build, not the ledger)');
+  if(d.restricted_to_granted_units) bits.push('<b>'+esc(d.restriction_note||'')+'</b>');
+  if(bits.length) c.append(el('div','pad','<p style="color:var(--muted)">'+
+    bits.join(' · ')+'</p>'));
+}
+function renderEntityNetwork(d){
+  if(d.available===false||d.scope_status) return noData(d);
+  const c=el('div','card'),a=d.actor||{};
+  c.append(el('h2',null,esc(a.label||a.name||'')+
+    '<span class="sub">'+esc(a.kind||'')+' · '+esc(a.name||'')+'</span>'));
+  const sc=el('div','scroll');
+  (d.links||[]).forEach(g=>{
+    const t=el('table');
+    t.innerHTML='<thead><tr><th colspan="4">'+esc(g.flow.replace(/_/g,' ').toUpperCase())+
+      ' <span class="sub">'+esc(g.meaning||'')+'</span></th></tr>'+
+      '<tr><th>Name</th><th>Kind</th><th class="num">Transactions</th>'+
+      '<th class="num">Amount</th></tr></thead><tbody>'+
+      (g.items||[]).map(i=>'<tr><td>'+esc(i.label||i.name)+'</td><td class="sub">'+
+        esc(i.kind)+'</td><td class="num">'+(i.transactions||0)+'</td><td class="num">'+
+        (i.amounts||[]).map(x=>money(x.amount)+' '+esc(x.currency)).join('<br>')+
+        '</td></tr>').join('')+'</tbody>';
+    sc.append(t);
+  });
+  c.append(sc);
+  if((d.corporate_family||[]).length){
+    const f=el('table');
+    f.innerHTML='<thead><tr><th colspan="2">CORPORATE FAMILY '+
+      '<span class="sub">from the recorded hierarchy, never a name match</span>'+
+      '</th></tr></thead><tbody>'+d.corporate_family.map(x=>
+      '<tr><td>'+esc(x.name||x.id)+'</td><td class="sub">'+esc(x.relation)+
+      '</td></tr>').join('')+'</tbody>';
+    const fs=el('div','scroll'); fs.append(f); c.append(fs);
+  }
+  egStamp(c,d);
+  return c;
+}
+function renderConcentration(d){
+  if(d.available===false||d.scope_status) return noData(d);
+  const frag=document.createDocumentFragment();
+  (d.by_currency||[]).forEach(b=>{
+    const c=el('div','card');
+    c.append(el('h2',null,esc(d.kind)+' concentration <span class="sub">'+
+      esc(b.currency)+' · '+esc(d.measured_by||'')+'</span>'));
+    c.append(tiles([
+      ['Top '+(b.ranked||[]).length+' share',(b.top_n_share_pct!=null?b.top_n_share_pct+'%':'—'),''],
+      ['Population',String(b.population||0),esc(d.kind)+'s visible'],
+      ['Single-partner',String((b.single_partner||[]).length),esc(d.partners_are||'')]
+    ]));
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Name</th><th class="num">Share</th>'+
+      '<th class="num">Amount</th><th class="num">Partners</th>'+
+      '<th>Last seen</th></tr></thead><tbody>'+
+      (b.ranked||[]).map(r=>'<tr><td>'+esc(r.label||r.name)+'</td><td class="num">'+
+        (r.share_pct!=null?r.share_pct+'%':'—')+'</td><td class="num">'+
+        money(r.amount)+'</td><td class="num">'+r.partners+'</td><td class="sub">'+
+        esc(r.last_seen||'')+'</td></tr>').join('')+'</tbody>';
+    const sc=el('div','scroll'); sc.append(t); c.append(sc);
+    if((b.single_partner||[]).length)
+      c.append(el('div','pad','<p class="warn">Depends on a single '+
+        'counterparty: <b>'+b.single_partner.map(x=>esc(x.label||x.name)).join(', ')+
+        '</b></p>'));
+    egStamp(c,d);
+    frag.append(c);
+  });
+  return frag;
+}
+function renderConnection(d){
+  if(d.available===false||d.scope_status) return noData(d);
+  const c=el('div','card');
+  c.append(el('h2',null,esc(d.from)+' → '+esc(d.to)+
+    '<span class="sub">'+(d.connected?d.hops+' hops':'no path found')+'</span>'));
+  if(!d.connected){
+    c.append(el('div','pad','<p>'+esc(d.detail||'')+'</p>'));
+    return c;
+  }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>What the system records</th><th>Strength</th>'+
+    '<th>Unit</th></tr></thead><tbody>'+
+    (d.path||[]).map(h=>'<tr><td>'+esc(h.reads||'')+'</td><td>'+
+      (h.strength==='recorded hierarchy'
+        ? '<b>'+esc(h.strength)+'</b>' : '<span class="sub">'+esc(h.strength)+'</span>')+
+      '</td><td class="mono">'+esc(h.business_unit||'')+'</td></tr>').join('')+
+    '</tbody>';
+  const sc=el('div','scroll'); sc.append(t); c.append(sc);
+  if(d.caution) c.append(el('div','pad','<p class="warn">'+esc(d.caution)+'</p>'));
+  egStamp(c,d);
+  return c;
 }
 function renderProcess(d){
   const frag=document.createDocumentFragment();

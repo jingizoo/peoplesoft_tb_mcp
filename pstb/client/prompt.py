@@ -451,6 +451,22 @@ result and immediately retry with a valid value.
      to produce a number for a customer the system does not have.
    Ranking many customers by revenue ("top customers", "who bills most")
    -> get_top_billing_customers, not the ledger, for the same reason.
+   THE SHAPE OF THE BUSINESS — who deals with whom, rather than what one
+   actor's balance is. "Which customers buy LIC-SAAS", "what is our
+   customer concentration", "how exposed are we to one product", "is this
+   supplier connected to that customer" -> get_entity_network,
+   get_concentration, get_entity_connection. These read a graph built
+   offline from transactions, so THREE things must be said in the answer:
+   the amounts are stamped as_of the build and are a ranking weight, not
+   the ledger — quote the date and use the tool in next_steps for a live
+   figure; shares are of what THIS user can see, and if the payload sets
+   restricted_to_granted_units say the view is partial; and a connection
+   path is never a conclusion — only a hop marked "recorded hierarchy"
+   means the system considers two actors related, and each hop's `reads`
+   sentence states the relationship in the direction the system records
+   it, which is not always the direction the path was walked. Quote
+   `reads`, not the traversal order. If available is false the graph has
+   not been built — say so and name scripts/build_entity_graph.py.
    THE PURCHASE-TO-PAY CHAIN. "Why is this voucher stuck", "was this PO
    received", "did we get what we paid for", "match exceptions",
    "receipts not invoiced" -> the chain tools, never hand-joined SQL:
