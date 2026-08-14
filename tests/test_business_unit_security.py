@@ -160,10 +160,28 @@ class ToolGateTests(unittest.TestCase):
         self.assertEqual(unit_access_block(
             "list_financial_scopes", {}, self.RESTRICTED), "")
 
-    def test_ALL_is_not_a_foreign_unit(self) -> None:
+    def test_ALL_is_refused_because_nothing_downstream_could_narrow_it(self):
+        # This test used to assert the opposite, on the reasoning that "ALL"
+        # names no unit anybody was denied. That reasoning was wrong in one
+        # specific way: ALL means every unit that EXISTS, and the tool it
+        # reaches never asked who was calling — so a US001-only user got
+        # another company's customers and amounts out of the cross-unit
+        # ranking, 200 OK, no warning.
+        #
+        # In-process callers (the GUI's own endpoints) are narrowed by the
+        # bound caller and told they were narrowed. This gate stands in
+        # front of an MCP server in a SEPARATE PROCESS, which cannot know
+        # who is asking and must not learn it from a tool argument the model
+        # writes. So here it refuses, and names the units that would work.
+        why = unit_access_block("get_top_billing_customers",
+                                {"business_unit": "ALL"}, self.RESTRICTED)
+        self.assertTrue(why)
+        self.assertIn("US001", why)
+
+    def test_ALL_is_still_open_to_a_privileged_user(self) -> None:
         self.assertEqual(unit_access_block(
             "get_top_billing_customers", {"business_unit": "ALL"},
-            self.RESTRICTED), "")
+            self.OPEN), "")
 
 
 class WebTests(unittest.TestCase):

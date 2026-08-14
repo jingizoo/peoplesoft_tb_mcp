@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import threading
 import time
+import contextvars
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -110,6 +111,23 @@ class Access:
                     f"PeopleSoft grants this user: {allowed}.")
         return (f"{self.oprid} is not authorised for business unit {bu}. "
                 f"{self.detail or 'No business units are granted to this user.'}")
+
+    def narrow(self, units) -> tuple:
+        """(allowed, dropped) from a candidate unit list.
+
+        The cross-unit counterpart to allows(). A tool that answers ACROSS
+        units cannot be gated by checking one business_unit argument — the
+        argument says "ALL" and means "every unit that exists", which for a
+        restricted user is a superset of what they may see. So the unit list
+        is intersected here and the tool DISCLOSES what it dropped, rather
+        than quietly returning a narrower answer that looks complete.
+        """
+        seen = [str(u or "").strip().upper() for u in units]
+        seen = [u for u in seen if u]
+        if self.all_units:
+            return seen, []
+        allowed = [u for u in seen if u in self.units]
+        return allowed, [u for u in seen if u not in self.units]
 
     def describe(self) -> str:
         if self.privileged:
@@ -339,3 +357,83 @@ class RowSecurity:
             "on_unavailable": ("allow" if self._fail_open() else "refuse"),
             "is_authentication": False,
         }
+
+
+# --------------------------------------------------------------------------
+# WHO IS ASKING, for tools that answer across units.
+#
+# Every other gate in this app checks a business_unit ARGUMENT, and that is
+# enough for a tool that answers about one unit. It is not enough for a tool
+# that answers about all of them: business_unit="ALL" means "every unit that
+# exists", the check skips it as harmless, and a user granted one unit gets
+# rows from every unit. That was live — get_top_billing_customers(
+# business_unit="ALL") returned another company's customers and amounts to a
+# restricted user.
+#
+# The fix cannot be a tool argument. Tool arguments are written by the MODEL,
+# so an "allowed_units" parameter is a grant the model can widen by typing a
+# different value — and the model is steered by the question, which is
+# written by the user. The grant has to arrive by a path the model cannot
+# reach at all.
+#
+# So it arrives here, in a context variable the SERVER sets from the
+# authenticated session before dispatch and clears afterwards. Tools read it;
+# nothing the model emits can change it.
+#
+# Threads: a contextvar is not inherited by a bare threading.Thread, and two
+# tools here fan out over a pool. Read current_access() ONCE at the top of a
+# tool, before any fan-out, and pass the resolved unit list down — which is
+# what the tools below do, and what a new one must do.
+_ACCESS: "contextvars.ContextVar" = contextvars.ContextVar(
+    "pstb_access", default=None)
+
+
+def current_access():
+    """The caller's Access for this request, or None when unrestricted.
+
+    None means "no row security in force" — a terminal session, a script, a
+    deployment with security.enabled false. It must read as UNRESTRICTED and
+    not as "no units", or every tool would answer nothing on the machine of
+    the person who installed it.
+    """
+    return _ACCESS.get()
+
+
+def set_access(access):
+    """Bind the caller for this request. Returns the token to reset with."""
+    return _ACCESS.set(access)
+
+
+def reset_access(token) -> None:
+    try:
+        _ACCESS.reset(token)
+    except ValueError:
+        # Reset from a different context than the set — nothing to undo, and
+        # raising here would fail a request that already succeeded.
+        _ACCESS.set(None)
+
+
+class access_scope:
+    """`with access_scope(access):` around a dispatch."""
+
+    def __init__(self, access):
+        self.access = access
+        self._token = None
+
+    def __enter__(self):
+        self._token = set_access(self.access)
+        return self.access
+
+    def __exit__(self, *exc):
+        reset_access(self._token)
+        return False
+
+
+def allowed_units(candidates) -> tuple:
+    """(allowed, dropped) for the caller in force. Unrestricted -> all."""
+    access = current_access()
+    seen = [str(c or "").strip().upper() for c in candidates]
+    seen = [c for c in seen if c]
+    if access is None:
+        return seen, []
+    return access.narrow(seen)

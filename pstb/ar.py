@@ -1703,6 +1703,23 @@ class ARBilling:
         """
         bu_all = str(business_unit or "").strip().upper() in {"ALL", "*"}
         bu = "ALL" if bu_all else self._bu(business_unit)
+        # "ALL" means every unit that EXISTS, and the argument gate lets it
+        # through as harmless — it is not a unit anyone was denied. For a
+        # restricted caller that was a leak: this ranking returned another
+        # company's customers and amounts. Narrow to the grant HERE, in SQL,
+        # and say the ranking was narrowed. Read once, before anything else,
+        # so no later branch can be reached with a different caller in force.
+        from .security import current_access
+        _access = current_access()
+        ranked_units: list = []
+        if bu_all and _access is not None and not _access.all_units:
+            ranked_units = sorted(_access.units)
+            if not ranked_units:
+                raise ARError(
+                    f"{_access.oprid} is granted no business units, so there "
+                    "is nothing to rank across. "
+                    + (_access.detail or "Ask the PeopleSoft security "
+                       "administrator for a business-unit grant."))
         asof = self._asof(as_of_date)
         since = _months_before(_iso(asof),
                                max(int(months or 12), 1)).isoformat()
@@ -1739,6 +1756,12 @@ class ARBilling:
                   if active_since else "")
         params: dict = {"bu": bu, "setid": setid, "since": since,
                         "asof": asof, "active_since": active_since}
+        unit_pred = ""
+        if ranked_units:
+            marks = {f"ru{i}": u for i, u in enumerate(ranked_units)}
+            params.update(marks)
+            unit_pred = ("   AND H.BUSINESS_UNIT IN ("
+                         + ", ".join(f":{k}" for k in marks) + ")\n")
         if bu_all:
             # Across BUs the setid-scoped name join no longer applies (each
             # BU may resolve a different customer setid), so names attach
@@ -1762,7 +1785,7 @@ class ARBilling:
  WHERE H.BILL_STATUS = 'INV'
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
    AND H.INVOICE_DT <= {self.db.date_bind('asof')}
- GROUP BY H.BILL_TO_CUST_ID, H.BUSINESS_UNIT{group_cur}{having}""",
+{unit_pred} GROUP BY H.BILL_TO_CUST_ID, H.BUSINESS_UNIT{group_cur}{having}""",
                 params, max_rows=50_000,
             )
         else:
@@ -1895,6 +1918,20 @@ class ARBilling:
             out["scope"] = ("ALL business units — cross-unit ranking was "
                             "requested in the question; each customer row "
                             "lists the units it billed under")
+        if ranked_units:
+            # "ALL" did not mean all, for this caller. Saying so is the whole
+            # point: a top-10 that silently excluded half the company reads
+            # exactly like a top-10 of the company.
+            out["units_ranked"] = ranked_units
+            out["restricted_to_granted_units"] = True
+            out["scope"] = (
+                f"the {len(ranked_units)} business units this user is "
+                "granted, NOT every unit — PeopleSoft row security narrowed "
+                "the ranking")
+            out["note"] += (
+                " This ranking covers only the business units this user is "
+                "granted; units they cannot see were excluded and a customer "
+                "billing more elsewhere would not appear.")
         if active_since:
             out["active_within_months"] = int(active_within_months)
             out["active_since"] = active_since

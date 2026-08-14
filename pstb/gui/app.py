@@ -33,7 +33,7 @@ from ..vendors import VendorNetwork
 from ..qlog import QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
-from ..security import RowSecurity, SecurityError
+from ..security import RowSecurity, SecurityError, access_scope
 from ..wiki import WikiError, make_wiki
 from . import console, localguard, progress
 
@@ -414,7 +414,17 @@ async def _row_security_guard(request, call_next):
                 return JSONResponse(status_code=403, content={"error": str(e)})
             request.scope["query_string"] = _with_unit(
                 request.scope.get("query_string") or b"", mine)
-    return await call_next(request)
+    # Bind the caller for the handlers downstream. The unit CHECKS above
+    # cover an argument the request names; this covers the answers that span
+    # units, where there is no single argument to check — "ALL" above is
+    # allowed through precisely because the tools were supposed to narrow it
+    # to this person's units, and until now none of them did.
+    #
+    # A context variable rather than a parameter: on the chat path the tool
+    # arguments are written by the MODEL, so a grant passed as an argument is
+    # one the model can widen by typing a different value.
+    with access_scope(access):
+        return await call_next(request)
 
 
 # How long a turn may hold its conversation before a NEW question stops
