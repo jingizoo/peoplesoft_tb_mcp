@@ -122,7 +122,8 @@ class CrossBuRankingTests(unittest.TestCase):
         con = sqlite3.connect(dst)
         con.execute("INSERT INTO PS_BUS_UNIT_TBL_GL VALUES ('EU001','EUR')")
         con.execute(
-            "INSERT INTO PS_BUS_UNIT_TBL_FS VALUES ('EU001','European Ops')")
+            "INSERT INTO PS_BUS_UNIT_TBL_FS VALUES "
+            "('EU001','European Ops','DEU')")
         cols = [r[1] for r in con.execute("PRAGMA table_info(PS_BI_HDR)")]
 
         def inv(bu, invid, cust, amt, dt_, cur):

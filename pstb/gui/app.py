@@ -57,6 +57,10 @@ ar = ARBilling(engine)
 relationships = Relationships(ar)
 from ..modules import ModulePacks as _MP
 vendor_network = VendorNetwork(_MP(engine))
+from ..procgraph import ProcessGraph as _PG, graph_path as _pg_path
+# Opened per call against a local file, so a graph rebuilt by an
+# administrator is picked up without restarting the server.
+process_graph = _PG(_pg_path(cfg))
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
     wiki = make_wiki(cfg)
@@ -1806,6 +1810,17 @@ def vendor_network_view(vendor_id: str, business_unit: str = "",
                   vendor_id=vendor_id, business_unit=business_unit,
                   include_family=include_family, months=months,
                   as_of_date=as_of_date)
+
+
+@app.get("/api/process")
+def process_view(question: str, hops: int = 3, limit: int = 40):
+    return _guard(process_graph.trace, question=question, hops=hops,
+                  limit=limit)
+
+
+@app.get("/api/process-graph")
+def process_graph_view():
+    return _guard(process_graph.describe)
 
 
 @app.get("/api/vendors")

@@ -732,6 +732,32 @@ deterministic lookups for recurring questions — always read page 12345 for
 "suspense policy" — that mapping file does not exist yet. Labels get you most of
 the way; tell me your space and page ids if you want the explicit binding.
 
+## 7a. Build the process graph (optional, recommended)
+
+"How do we do invoicing?" is a different kind of question from "what is the
+AR balance?" — it asks about the menu path, the pages, the records those
+pages write, and the procedure that describes them. The agent answers it
+from a **process graph** built offline from this instance's own metadata:
+
+```bash
+.venv/bin/python scripts/build_process_graph.py
+```
+
+Run it once after setup and again whenever the instance is customized (new
+pages, new custom records, rewritten procedures). It reads structure only —
+PeopleTools page/component/navigation definitions (`PSPNLDEFN`,
+`PSPNLFIELD`, `PSPNLGROUP`, `PSPRSMDEFN`), the record catalog, saved
+queries, business-unit countries, and the wiki — and writes one local
+SQLite file, `process_graph.db` (git-ignored, no amounts, no customer or
+supplier data). Question-time reads are milliseconds; nothing is added to
+page load.
+
+The build report names every metadata table it could not read and what that
+costs ("pages are missing — answers name records but not screens"). Grant
+SELECT on the four `PSPNL*`/`PSPRSM*` tables above to get the full chain.
+Without a build, `trace_process` answers that the graph has not been built
+and names the script — nothing else degrades.
+
 ## 7b. When a query hangs
 
 If the UI or chat sits on a tool call and never returns, time each database

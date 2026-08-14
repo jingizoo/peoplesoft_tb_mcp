@@ -282,7 +282,15 @@ CREATE TABLE PS_DEPT_TBL (
 -- PS_BUS_UNIT_TBL_GL modelled a shape no real instance has, so a query
 -- reading the name from the wrong record passed here and returned NULL on
 -- every real one.
-CREATE TABLE PS_BUS_UNIT_TBL_FS (BUSINESS_UNIT TEXT, DESCR TEXT);
+-- COUNTRY is what lets "how do we invoice for India" narrow to units
+-- without anything in the code knowing what India is: the process graph
+-- reads the country of each unit from here. Real FSCM carries it; a site
+-- whose copy does not is told so rather than guessed at.
+CREATE TABLE PS_BUS_UNIT_TBL_FS (BUSINESS_UNIT TEXT, DESCR TEXT,
+                                 COUNTRY TEXT);
+-- The instance's own code-to-name table. It is what turns "for India" into
+-- COUNTRY = 'IND' without any code shipping a list of countries.
+CREATE TABLE PS_COUNTRY_TBL (COUNTRY TEXT, DESCR TEXT, DESCRSHORT TEXT);
 CREATE TABLE PS_BUS_UNIT_TBL_GL (BUSINESS_UNIT TEXT, BASE_CURRENCY TEXT);
 -- Ledger setup records. A real instance always has these, and the agent
 -- discovers its BU/ledger catalog from them: they hold one row per business
@@ -343,6 +351,19 @@ CREATE TABLE PS_PYMNT_VCHR_XREF (
 CREATE TABLE PSRECDEFN (
   RECNAME TEXT, RECDESCR TEXT, RECTYPE INTEGER, SQLTABLENAME TEXT);
 CREATE TABLE PSRECFIELD (RECNAME TEXT, FIELDNAME TEXT, FIELDNUM INTEGER);
+-- The PeopleTools layer that says how work is DONE, not where it is stored:
+-- a page, the records that page reads, the component the page belongs to,
+-- and where the portal registry hangs that component in the menu. This is
+-- the chain the process graph walks to answer "how do we do invoicing" —
+-- see pstb/procgraph.py. Real column names, abridged shape.
+CREATE TABLE PSPNLDEFN (PNLNAME TEXT, DESCR TEXT);
+CREATE TABLE PSPNLFIELD (PNLNAME TEXT, FIELDNUM INTEGER, RECNAME TEXT,
+                         FIELDNAME TEXT);
+CREATE TABLE PSPNLGROUP (PNLGRPNAME TEXT, PNLNAME TEXT, ITEMNUM INTEGER,
+                         MARKET TEXT);
+CREATE TABLE PSPRSMDEFN (PORTAL_NAME TEXT, PORTAL_OBJNAME TEXT,
+                         PORTAL_PRNTOBJNAME TEXT, PORTAL_LABEL TEXT,
+                         PORTAL_URI_SEG2 TEXT);
 -- PeopleTools operator definitions and FSCM business-unit row security.
 -- Real shape (abridged): PSOPRDEFN is the user list, and ROWSECCLASS on it
 -- is the permission list PeopleSoft uses for ROW security specifically —
@@ -578,7 +599,18 @@ def main() -> None:
         "INSERT INTO PS_BUS_UNIT_TBL_GL VALUES (?,?)", (BU, CURR)
     )
     con.execute(
-        "INSERT INTO PS_BUS_UNIT_TBL_FS VALUES (?,?)", (BU, "US Operations")
+        "INSERT INTO PS_BUS_UNIT_TBL_FS VALUES (?,?,?)",
+        (BU, "US Operations", "USA")
+    )
+    # A handful of ISO-3 country rows. India is here and NO business unit is
+    # in it on purpose: "how do we invoice for India" must be able to answer
+    # "this system knows India, and no unit here operates there" rather than
+    # silently returning the US process wearing an Indian label.
+    con.executemany(
+        "INSERT INTO PS_COUNTRY_TBL VALUES (?,?,?)",
+        [("USA", "United States", "USA"), ("IND", "India", "India"),
+         ("CAN", "Canada", "Canada"), ("GBR", "United Kingdom", "UK"),
+         ("DEU", "Germany", "Germany"), ("SGP", "Singapore", "Singapore")],
     )
     # PeopleTools catalog rows for the records this sample ships, plus a
     # custom-looking one so description-based discovery is exercised.
@@ -872,6 +904,79 @@ def main() -> None:
          ("ITEM", "BAL_AMT", 2), ("TU_FILE_INTFC", "FILE_ID", 1),
          ("TU_FILE_INTFC", "FILE_PATH", 2)],
     )
+
+    # ---- the "how work is DONE" layer: pages, components, navigation ----
+    # Delivered FSCM names for the flows this sample already carries, so the
+    # process graph has a real chain to walk: a menu path reaches a
+    # component, the component holds pages, and each page names the records
+    # it reads. Abridged (a delivered component has a dozen pages) but not
+    # invented — these are the names a functional consultant would recognise.
+    _pages = [
+        ("BI_HDR", "Bill Header - Info 1", ["BI_HDR", "CUSTOMER"]),
+        ("BI_LINE", "Bill Line", ["BI_LINE", "BI_HDR"]),
+        ("BI_HDR_ADDR", "Bill Header - Address", ["BI_HDR", "CUSTOMER"]),
+        ("BI_IVC_SUMMARY", "Invoice Summary", ["BI_HDR", "BI_LINE"]),
+        ("BI_INTFC_SEARCH", "Billing Interface Search", ["INTFC_BI"]),
+        ("ITEM_MAINT", "Item Maintenance", ["ITEM", "CUSTOMER"]),
+        ("ITEM_LIST", "Item List", ["ITEM"]),
+        ("PAYMENT_WS", "Payment Worksheet", ["PAYMENT", "ITEM"]),
+        ("CUST_GENERAL1", "General Info", ["CUSTOMER"]),
+        ("CUST_BILLTO", "Bill To Options", ["CUSTOMER"]),
+        ("VCHR_EXPRESS1", "Voucher - Invoice Information",
+         ["VOUCHER", "VOUCHER_LINE", "VENDOR"]),
+        ("VCHR_LINE", "Voucher Line", ["VOUCHER_LINE", "DISTRIB_LINE"]),
+        ("PYMNT_EXPRESS", "Express Payment", ["PAYMENT_TBL",
+                                              "PYMNT_VCHR_XREF"]),
+        ("VNDR_ID1", "Supplier Identifying Information", ["VENDOR"]),
+        ("JOURNAL_ENTRY1", "Journal Header", ["JRNL_HEADER"]),
+        ("JOURNAL_ENTRY2", "Journal Lines", ["JRNL_LN", "JRNL_HEADER"]),
+        ("LEDGER_INQ", "Ledger Inquiry", ["LEDGER", "GL_ACCOUNT_TBL"]),
+        ("BUS_UNIT_TBL_FS1", "Business Unit Definition",
+         ["BUS_UNIT_TBL_FS"]),
+    ]
+    con.executemany("INSERT INTO PSPNLDEFN VALUES (?,?)",
+                    [(p, d) for p, d, _ in _pages])
+    con.executemany(
+        "INSERT INTO PSPNLFIELD VALUES (?,?,?,?)",
+        [(page, i + 1, rec, "")
+         for page, _, recs in _pages for i, rec in enumerate(recs)])
+
+    # component -> its pages, and the portal path that reaches the component
+    _components = [
+        ("BI_ENTRY", ["BI_HDR", "BI_LINE", "BI_HDR_ADDR"],
+         "Billing > Maintain Bills > Standard Billing"),
+        ("BI_INVOICE_SUM", ["BI_IVC_SUMMARY"],
+         "Billing > Review Billing Information > Summary"),
+        ("BI_INTFC_CORRECT", ["BI_INTFC_SEARCH"],
+         "Billing > Interface Transactions > Correct Interface Errors"),
+        ("ITEM_MAINTAIN", ["ITEM_MAINT", "ITEM_LIST"],
+         "Accounts Receivable > Customer Accounts > Item Information"),
+        ("PAYMENT_WORKSHEET", ["PAYMENT_WS"],
+         "Accounts Receivable > Payments > Apply Payments"),
+        ("CUSTOMER_GENERAL", ["CUST_GENERAL1", "CUST_BILLTO"],
+         "Customers > Customer Information > General Information"),
+        ("VCHR_EXPRESS", ["VCHR_EXPRESS1", "VCHR_LINE"],
+         "Accounts Payable > Vouchers > Add/Update > Regular Entry"),
+        ("PYMNT_EXPRESS", ["PYMNT_EXPRESS"],
+         "Accounts Payable > Payments > Express Payment"),
+        ("VNDR_ID", ["VNDR_ID1"],
+         "Suppliers > Supplier Information > Add/Update > Supplier"),
+        ("JOURNAL_ENTRY_IE", ["JOURNAL_ENTRY1", "JOURNAL_ENTRY2"],
+         "General Ledger > Journals > Journal Entry > Create/Update"),
+        ("LEDGER_INQUIRY", ["LEDGER_INQ"],
+         "General Ledger > Review Financial Information > Ledger"),
+        ("BUS_UNIT_TBL_FS", ["BUS_UNIT_TBL_FS1"],
+         "Set Up Financials/Supply Chain > Business Unit Related > "
+         "General Ledger > General Ledger Definition"),
+    ]
+    con.executemany(
+        "INSERT INTO PSPNLGROUP VALUES (?,?,?,?)",
+        [(comp, page, i + 1, "GBL")
+         for comp, pages, _ in _components for i, page in enumerate(pages)])
+    con.executemany(
+        "INSERT INTO PSPRSMDEFN VALUES (?,?,?,?,?)",
+        [("EMPLOYEE", f"{comp}_GBL", "PORTAL_ROOT_OBJECT", label, comp)
+         for comp, _, label in _components])
     con.executemany(
         "INSERT INTO PS_BUS_UNIT_LED VALUES (?,?)",
         [(BU, "ACTUALS"), (BU, "BUDGETS")],
