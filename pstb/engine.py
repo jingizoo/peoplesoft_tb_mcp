@@ -2677,6 +2677,19 @@ class TBEngine:
              "payment headers (PYMNT_ID, PYMNT_AMT, PYMNT_DT, bank)", ""),
             ("PS_VENDOR", "reference", "suppliers/vendors", ""),
         ],
+        "purchasing": [
+            ("PS_PO_HDR", "transaction",
+             "purchase order headers (PO_STATUS X = canceled)",
+             "get_procurement_chain / get_match_exceptions"),
+            ("PS_PO_LINE", "transaction", "purchase order lines", ""),
+            ("PS_PO_LINE_SHIP", "transaction",
+             "PO schedules — the ordered qty/price/amount live HERE, "
+             "not on the line", "get_procurement_chain"),
+            ("PS_RECV_HDR", "transaction", "receipt headers", ""),
+            ("PS_RECV_LN_SHIP", "transaction",
+             "receipt shipment lines, pointing at the PO schedule received "
+             "against", "get_match_exceptions"),
+        ],
         "asset_management": [
             ("PS_ASSET", "reference", "asset master", ""),
             ("PS_COST", "transaction", "asset cost rows", ""),

@@ -46,11 +46,12 @@ class _SampleCase(unittest.TestCase):
 class OpenPayablesTests(_SampleCase):
     def test_paid_vouchers_are_not_owed(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
-        # Six fully paid vouchers, eight open — four for the original three
-        # suppliers and four added with the supplier family and the
-        # shared-bank pair.
-        self.assertEqual(out["voucher_count"], 8)
-        self.assertEqual(out["open_total"], 192750.0)
+        # Eleven open: four for the original three suppliers, four added
+        # with the supplier family and the shared-bank pair, and three from
+        # the purchase-to-pay chain (VCHR2002 5,750 + VCHR2003 6,000 +
+        # VCHR2004 12,000 = 23,750, all stuck on match, none yet due).
+        self.assertEqual(out["voucher_count"], 11)
+        self.assertEqual(out["open_total"], 216500.0)
 
     def test_overdue_is_judged_against_as_of(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
@@ -195,7 +196,7 @@ class ShapeFallbackTests(unittest.TestCase):
         tmp, db, m = self._mutated([("PS_VOUCHER", "DUE_DT")])
         try:
             out = m.open_payables(as_of_date="2026-08-04")
-            self.assertEqual(out["open_total"], 192750.0)
+            self.assertEqual(out["open_total"], 216500.0)
             self.assertEqual(out["overdue_total"], 0.0)
             self.assertTrue(any("DUE_DT" in n
                                 for n in out["record_notes"]))
@@ -208,8 +209,10 @@ class ShapeFallbackTests(unittest.TestCase):
         try:
             out = m.open_payables(as_of_date="2026-08-04")
             # The open vouchers have no payment xref, so the fallback
-            # finds the same set — and says how it decided.
-            self.assertEqual(out["voucher_count"], 8)
+            # finds the same set — the three chain vouchers included, since
+            # only the PAID chain voucher carries an xref — and says how it
+            # decided.
+            self.assertEqual(out["voucher_count"], 11)
             self.assertTrue(any("CLOSE_STATUS" in n
                                 for n in out["record_notes"]))
         finally:

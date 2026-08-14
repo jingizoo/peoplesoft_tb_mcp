@@ -139,10 +139,14 @@ class QueryBudgetTests(unittest.TestCase):
         # budgets at all — the exact drift the speed gate exists to stop.
         from pstb.ar import ARBilling
         from pstb.modules import ModulePacks
+        from pstb.procurement import Procurement
         from pstb.relationships import Relationships
         from pstb.vendors import VendorNetwork
         ar = ARBilling(self.engine)
         modules = ModulePacks(self.engine)
+
+        def _procurement():
+            return Procurement(modules)
         for name, budget, fn in [
             ("get_invoice_lifecycle", 4,
              lambda: ar.invoice_lifecycle(business_unit="US001",
@@ -194,6 +198,25 @@ class QueryBudgetTests(unittest.TestCase):
             ("get_customer_financial_360", 11,
              lambda: Relationships(ar).customer_financial_360(
                  cust_id="C1001", business_unit="US001",
+                 as_of_date="2026-08-06")),
+            # The purchase-to-pay tie. The workbench reads voucher lines,
+            # PO headers, schedules, receipts and one receipt-header date
+            # for the never-invoiced aging.
+            ("get_match_exceptions", 5,
+             lambda: _procurement().match_exceptions(
+                 business_unit="US001", as_of_date="2026-08-06")),
+            # By PO id — the hot path a suggestion clicks through to.
+            ("get_procurement_chain", 7,
+             lambda: _procurement().procurement_chain(
+                 reference="PO2003", business_unit="US001",
+                 as_of_date="2026-08-06")),
+            # By supplier NAME: the resolve costs 4 more (vendor search,
+            # family heads, the PO list) and then reads seven orders
+            # instead of one. Budgeted separately so the resolution path
+            # cannot quietly grow inside the cheap number.
+            ("get_procurement_chain(name)", 13,
+             lambda: _procurement().procurement_chain(
+                 reference="Summit Machining Co", business_unit="US001",
                  as_of_date="2026-08-06")),
             # Two entries, because the branches genuinely differ and one
             # cannot cover both. Splitting by a chartfield is FREE — extras

@@ -58,9 +58,11 @@ relationships = Relationships(ar)
 from ..modules import ModulePacks as _MP
 vendor_network = VendorNetwork(_MP(engine))
 from ..procgraph import ProcessGraph as _PG, graph_path as _pg_path
+from ..procurement import Procurement as _Proc
 # Opened per call against a local file, so a graph rebuilt by an
 # administrator is picked up without restarting the server.
 process_graph = _PG(_pg_path(cfg))
+procurement = _Proc(_MP(engine))
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
 try:
     wiki = make_wiki(cfg)
@@ -1810,6 +1812,20 @@ def vendor_network_view(vendor_id: str, business_unit: str = "",
                   vendor_id=vendor_id, business_unit=business_unit,
                   include_family=include_family, months=months,
                   as_of_date=as_of_date)
+
+
+@app.get("/api/match-exceptions")
+def match_exceptions_view(business_unit: str = "", months: int = 12,
+                          as_of_date: str = ""):
+    return _guard(procurement.match_exceptions, business_unit=business_unit,
+                  months=months, as_of_date=as_of_date)
+
+
+@app.get("/api/procurement-chain")
+def procurement_chain_view(reference: str, business_unit: str = "",
+                           as_of_date: str = ""):
+    return _guard(procurement.procurement_chain, reference=reference,
+                  business_unit=business_unit, as_of_date=as_of_date)
 
 
 @app.get("/api/process")

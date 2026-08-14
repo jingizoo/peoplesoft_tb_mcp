@@ -451,6 +451,19 @@ result and immediately retry with a valid value.
      to produce a number for a customer the system does not have.
    Ranking many customers by revenue ("top customers", "who bills most")
    -> get_top_billing_customers, not the ledger, for the same reason.
+   THE PURCHASE-TO-PAY CHAIN. "Why is this voucher stuck", "was this PO
+   received", "did we get what we paid for", "match exceptions",
+   "receipts not invoiced" -> the chain tools, never hand-joined SQL:
+   get_procurement_chain(reference=...) takes a PO id, receiver id,
+   voucher id or supplier name and returns the whole chain tied out —
+   order, receipts, vouchers, payments, with every break carrying both
+   figures. get_match_exceptions(business_unit=...) is the population
+   view: over-order, not-received, no-receipt, never-invoiced, awaiting.
+   Two verdicts come back and they are NOT the same thing: the system's
+   own MATCH_STATUS_VCHR flag, and the arithmetic recomputed from the
+   lines. Quote them separately, and when they disagree say so — an
+   override or a tolerance is itself a finding. A canceled order is
+   never "awaiting receipt"; the payload already excludes it.
    Suppliers work the same way, on the payables side:
      what we owe one supplier / their payment history -> get_open_payables
      or get_vendor_payments;

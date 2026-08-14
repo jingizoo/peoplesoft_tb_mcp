@@ -326,7 +326,36 @@ CREATE TABLE PS_VNDR_BANK_ACCT (
 CREATE TABLE PS_VOUCHER (
   BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, VENDOR_ID TEXT, INVOICE_ID TEXT,
   INVOICE_DT TEXT, DUE_DT TEXT, GROSS_AMT REAL, ENTRY_STATUS TEXT,
-  CLOSE_STATUS TEXT, POST_STATUS TEXT, CURRENCY_CD TEXT);
+  CLOSE_STATUS TEXT, POST_STATUS TEXT, CURRENCY_CD TEXT,
+  MATCH_STATUS_VCHR TEXT);
+-- Purchasing: the order -> receipt -> voucher chain the three-way match
+-- reads. Delivered shapes, abridged: amounts live on the PO SCHEDULE
+-- (PS_PO_LINE_SHIP), not the line; receipt detail lives on the shipment
+-- line (PS_RECV_LN_SHIP), which points back at the PO schedule it received
+-- against; the voucher line points at both. MATCH_STATUS_VCHR above is the
+-- system's own verdict — the match tool recomputes the arithmetic and
+-- reports both, kept apart.
+CREATE TABLE PS_PO_HDR (
+  BUSINESS_UNIT TEXT, PO_ID TEXT, VENDOR_ID TEXT, PO_STATUS TEXT,
+  PO_DT TEXT, CURRENCY_CD TEXT);
+CREATE TABLE PS_PO_LINE (
+  BUSINESS_UNIT TEXT, PO_ID TEXT, LINE_NBR INTEGER, DESCR254_MIXED TEXT);
+CREATE TABLE PS_PO_LINE_SHIP (
+  BUSINESS_UNIT TEXT, PO_ID TEXT, LINE_NBR INTEGER, SCHED_NBR INTEGER,
+  QTY_PO REAL, PRICE_PO REAL, MERCHANDISE_AMT REAL);
+CREATE TABLE PS_RECV_HDR (
+  BUSINESS_UNIT TEXT, RECEIVER_ID TEXT, VENDOR_ID TEXT, RECEIPT_DT TEXT,
+  RECV_STATUS TEXT);
+CREATE TABLE PS_RECV_LN_SHIP (
+  BUSINESS_UNIT TEXT, RECEIVER_ID TEXT, RECV_LN_NBR INTEGER,
+  RECV_SHIP_SEQ_NBR INTEGER, BUSINESS_UNIT_PO TEXT, PO_ID TEXT,
+  LINE_NBR INTEGER, SCHED_NBR INTEGER, QTY_SH_ACCPT_VUOM REAL,
+  MERCHANDISE_AMT REAL);
+CREATE TABLE PS_VOUCHER_LINE (
+  BUSINESS_UNIT TEXT, VOUCHER_ID TEXT, VOUCHER_LINE_NUM INTEGER,
+  BUSINESS_UNIT_PO TEXT, PO_ID TEXT, LINE_NBR INTEGER, SCHED_NBR INTEGER,
+  RECEIVER_ID TEXT, RECV_LN_NBR INTEGER, QTY_VCHR REAL, UNIT_PRICE REAL,
+  MERCHANDISE_AMT REAL, DESCR TEXT);
 -- Asset Management: the register the AM questions read. Delivered AM keys
 -- cost rows by asset and book; category and NBV live on cost/book rows,
 -- not the asset master.
@@ -633,6 +662,12 @@ def main() -> None:
         ("ASSET", "Asset Master", 0, ""),
         ("COST", "Asset Cost and Activity", 0, ""),
         ("PROJECT", "Project Master", 0, ""),
+        ("PO_HDR", "Purchase Order Header", 0, ""),
+        ("PO_LINE", "Purchase Order Line", 0, ""),
+        ("PO_LINE_SHIP", "PO Line Schedule", 0, ""),
+        ("RECV_HDR", "Receipt Header", 0, ""),
+        ("RECV_LN_SHIP", "Receipt Shipment Line", 0, ""),
+        ("VOUCHER_LINE", "AP Voucher Line", 0, ""),
         ("PROJ_RESOURCE", "Project Cost Transactions", 0, ""),
     ]
     con.executemany("INSERT INTO PSRECDEFN VALUES (?,?,?,?)", _recs)
@@ -775,7 +810,11 @@ def main() -> None:
          # leading zero. Literal equality misses it; normalising first
          # does not.
          (SETID, "V1008", "Harborline Transport LLC", "A", SETID, "V1008",
-          "045.600.1122")])
+          "045.600.1122"),
+         # The purchasing supplier. Its identifiers are unique on purpose:
+         # the chain feature must not move the identity-link counts.
+         (SETID, "V1009", "Summit Machining Co", "A", SETID, "V1009",
+          "52-4410077")])
     con.executemany(
         "INSERT INTO PS_VENDOR_ADDR VALUES (?,?,?,?,?,?)",
         [(SETID, "V1001", 1, "Akron", "OH", "USA"),
@@ -785,7 +824,8 @@ def main() -> None:
          (SETID, "V1005", 1, "Toledo", "OH", "USA"),
          (SETID, "V1006", 1, "Reno", "NV", "USA"),
          (SETID, "V1007", 1, "Raleigh", "NC", "USA"),
-         (SETID, "V1008", 1, "Long Beach", "CA", "USA")])
+         (SETID, "V1008", 1, "Long Beach", "CA", "USA"),
+         (SETID, "V1009", 1, "Reno", "NV", "USA")])
     # V1002 and V1007 remit to the SAME account, spelled differently. Two
     # unrelated suppliers, one bank account, and nothing about their names
     # or ids connects them.
@@ -795,7 +835,8 @@ def main() -> None:
          (SETID, "V1002", 1, "053100300", "000123456789"),
          (SETID, "V1003", 1, "121000358", "5590-8811-72"),
          (SETID, "V1007", 1, "053100300", "0000123456789"),
-         (SETID, "V1004", 1, "041000124", "8837-2210-99")])
+         (SETID, "V1004", 1, "041000124", "8837-2210-99"),
+         (SETID, "V1009", 1, "107002192", "7741-0023-10")])
     _vouchers, _payments, _xref = [], [], []
     for i, (vend, amt, mon) in enumerate(
             [("V1001", 12_500.00, 3), ("V1001", 8_200.00, 4),
@@ -805,7 +846,7 @@ def main() -> None:
         pid = f"PAY{i:05d}"
         _vouchers.append((BU, vid, vend, f"INV-{i:04d}",
                           month_end(2026, mon), month_end(2026, mon), amt,
-                          "P", "C", "P", CURR))
+                          "P", "C", "P", CURR, "N"))
         _payments.append((SETID, pid, vend, month_end(2026, mon), amt, CURR, "P"))
         _xref.append((BU, vid, pid, amt))
     # OPEN payables — what the AP questions are actually about. One current,
@@ -813,28 +854,28 @@ def main() -> None:
     # exception queue), across two vendors.
     _vouchers += [
         (BU, "VCHR90001", "V1001", "INV-9001", "2026-07-10", "2026-08-09",
-         18_400.00, "P", "O", "P", CURR),
+         18_400.00, "P", "O", "P", CURR, "N"),
         (BU, "VCHR90002", "V1002", "INV-9002", "2026-06-05", "2026-07-05",
-         27_650.00, "P", "O", "P", CURR),        # past due
+         27_650.00, "P", "O", "P", CURR, "N"),        # past due
         (BU, "VCHR90003", "V1002", "INV-9003", "2026-07-28", "2026-08-27",
-         64_000.00, "P", "O", "P", CURR),        # large, due this month
+         64_000.00, "P", "O", "P", CURR, "N"),        # large, due this month
         (BU, "VCHR90004", "V1003", "INV-9004", "2026-07-20", "2026-08-19",
-         5_150.00, "R", "O", "U", CURR),         # recycle + unposted
+         5_150.00, "R", "O", "U", CURR, "N"),         # recycle + unposted
     ]
     # Payables for the supplier family, so the rollup has something to add
     # and the subsidiaries are not empty rows on a screen.
     _vouchers += [
         (BU, "VCHR90005", "V1004", "INV-9005", "2026-06-18", "2026-07-18",
-         22_300.00, "P", "O", "P", CURR),        # past due, a subsidiary
+         22_300.00, "P", "O", "P", CURR, "N"),        # past due, a subsidiary
         (BU, "VCHR90006", "V1005", "INV-9006", "2026-07-25", "2026-08-24",
-         9_450.00, "P", "O", "P", CURR),
+         9_450.00, "P", "O", "P", CURR, "N"),
         # The lookalike. Its exposure must never be added to Ridgeline's.
         (BU, "VCHR90007", "V1006", "INV-9007", "2026-07-30", "2026-08-29",
-         31_000.00, "P", "O", "P", CURR),
+         31_000.00, "P", "O", "P", CURR, "N"),
         # The shared-bank pair's other half, so the alert lands on a
         # supplier that actually has money moving through it.
         (BU, "VCHR90008", "V1007", "INV-9008", "2026-07-12", "2026-08-11",
-         14_800.00, "P", "O", "P", CURR),
+         14_800.00, "P", "O", "P", CURR, "N"),
     ]
     # A staged duplicate pair (same vendor + invoice number vouchered
     # twice) and a same-amount near-pair — closed, dated MARCH so the AP
@@ -842,13 +883,13 @@ def main() -> None:
     # payments audit needs something real to find.
     _vouchers += [
         (BU, "VCHR80001", "V1001", "INV-DUP01", "2026-03-12", "2026-04-11",
-         7_800.00, "P", "C", "P", CURR),
+         7_800.00, "P", "C", "P", CURR, "N"),
         (BU, "VCHR80002", "V1001", "INV-DUP01", "2026-03-14", "2026-04-13",
-         7_800.00, "P", "C", "P", CURR),
+         7_800.00, "P", "C", "P", CURR, "N"),
         (BU, "VCHR80003", "V1002", "INV-8003", "2026-03-20", "2026-04-19",
-         12_400.00, "P", "C", "P", CURR),
+         12_400.00, "P", "C", "P", CURR, "N"),
         (BU, "VCHR80004", "V1002", "INV-8004", "2026-03-23", "2026-04-22",
-         12_400.00, "P", "C", "P", CURR),
+         12_400.00, "P", "C", "P", CURR, "N"),
     ]
     # Xref rows for the staged duplicates — the close-status FALLBACK
     # decides paid-ness purely from xref EXISTENCE, so these keep a site
@@ -860,7 +901,90 @@ def main() -> None:
                                     ("VCHR80003", 12_400.00),
                                     ("VCHR80004", 12_400.00)], start=1):
         _xref.append((BU, vid, f"PMT8000{i}", amt))
-    con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    # ---- the purchase-to-pay chain, under V1009 only -------------------
+    # Six orders, one deliberate state each, so every branch of the
+    # three-way match has something real to find — and each break's figures
+    # are chosen to be visibly wrong, not rounding noise.
+    #
+    #   PO2001  the CLEAN chain: ordered 8,500 = received = vouchered = paid
+    #   PO2002  PRICE break: received at 25.00, vouchered at 28.75 (+750)
+    #   PO2003  QTY break: 50 vouchered, 30 received (2,400 not received)
+    #   PO2004  NO RECEIPT: vouchered 12,000 against nothing received
+    #   PO2005  NEVER INVOICED: received 2,400 in June, no voucher since
+    #   PO2006  the trap — CANCELED. Nothing received, and it must never
+    #           be reported as "awaiting receipt".
+    #   PO2007  genuinely AWAITING: dispatched, nothing arrived. The pair
+    #           with PO2006 — identical in every column the check reads
+    #           except PO_STATUS, which is the whole point.
+    #
+    # The three open vouchers are due mid-September, so the overdue pin at
+    # 2026-08-04 (49,950.00) does not move; only count and open totals do,
+    # and the tests state the new arithmetic.
+    con.executemany(
+        "INSERT INTO PS_PO_HDR VALUES (?,?,?,?,?,?)",
+        [(BU, "PO2001", "V1009", "D", "2026-06-10", CURR),
+         (BU, "PO2002", "V1009", "D", "2026-07-01", CURR),
+         (BU, "PO2003", "V1009", "D", "2026-07-05", CURR),
+         (BU, "PO2004", "V1009", "D", "2026-07-20", CURR),
+         (BU, "PO2005", "V1009", "D", "2026-06-15", CURR),
+         (BU, "PO2006", "V1009", "X", "2026-05-10", CURR),
+         (BU, "PO2007", "V1009", "D", "2026-07-25", CURR)])
+    con.executemany(
+        "INSERT INTO PS_PO_LINE VALUES (?,?,?,?)",
+        [(BU, "PO2001", 1, "Machined brackets, stainless"),
+         (BU, "PO2002", 1, "Anodized housings"),
+         (BU, "PO2003", 1, "Precision spindles"),
+         (BU, "PO2004", 1, "Line retooling service"),
+         (BU, "PO2005", 1, "Tooling inserts"),
+         (BU, "PO2006", 1, "Prototype fixtures (canceled)"),
+         (BU, "PO2007", 1, "Carbide end mills")])
+    con.executemany(
+        "INSERT INTO PS_PO_LINE_SHIP VALUES (?,?,?,?,?,?,?)",
+        [(BU, "PO2001", 1, 1, 100.0, 85.00, 8_500.00),
+         (BU, "PO2002", 1, 1, 200.0, 25.00, 5_000.00),
+         (BU, "PO2003", 1, 1, 50.0, 120.00, 6_000.00),
+         (BU, "PO2004", 1, 1, 1.0, 12_000.00, 12_000.00),
+         (BU, "PO2005", 1, 1, 40.0, 60.00, 2_400.00),
+         (BU, "PO2006", 1, 1, 10.0, 100.00, 1_000.00),
+         (BU, "PO2007", 1, 1, 25.0, 90.00, 2_250.00)])
+    con.executemany(
+        "INSERT INTO PS_RECV_HDR VALUES (?,?,?,?,?)",
+        [(BU, "RECV3001", "V1009", "2026-06-20", "C"),
+         (BU, "RECV3002", "V1009", "2026-07-08", "C"),
+         (BU, "RECV3003", "V1009", "2026-07-15", "C"),
+         (BU, "RECV3004", "V1009", "2026-06-28", "O")])
+    con.executemany(
+        "INSERT INTO PS_RECV_LN_SHIP VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [(BU, "RECV3001", 1, 1, BU, "PO2001", 1, 1, 100.0, 8_500.00),
+         (BU, "RECV3002", 1, 1, BU, "PO2002", 1, 1, 200.0, 5_000.00),
+         (BU, "RECV3003", 1, 1, BU, "PO2003", 1, 1, 30.0, 3_600.00),
+         (BU, "RECV3004", 1, 1, BU, "PO2005", 1, 1, 40.0, 2_400.00)])
+    _vouchers += [
+        (BU, "VCHR2001", "V1009", "INV-PO-2001", "2026-06-25", "2026-07-25",
+         8_500.00, "P", "C", "P", CURR, "T"),
+        (BU, "VCHR2002", "V1009", "INV-PO-2002", "2026-07-12", "2026-09-10",
+         5_750.00, "P", "O", "P", CURR, "E"),
+        (BU, "VCHR2003", "V1009", "INV-PO-2003", "2026-07-18", "2026-09-15",
+         6_000.00, "P", "O", "P", CURR, "E"),
+        (BU, "VCHR2004", "V1009", "INV-PO-2004", "2026-07-28", "2026-09-20",
+         12_000.00, "P", "O", "P", CURR, "E"),
+    ]
+    con.executemany(
+        "INSERT INTO PS_VOUCHER_LINE VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(BU, "VCHR2001", 1, BU, "PO2001", 1, 1, "RECV3001", 1,
+          100.0, 85.00, 8_500.00, "Machined brackets, stainless"),
+         (BU, "VCHR2002", 1, BU, "PO2002", 1, 1, "RECV3002", 1,
+          200.0, 28.75, 5_750.00, "Anodized housings"),
+         (BU, "VCHR2003", 1, BU, "PO2003", 1, 1, "RECV3003", 1,
+          50.0, 120.00, 6_000.00, "Precision spindles"),
+         (BU, "VCHR2004", 1, BU, "PO2004", 1, 1, "", 0,
+          1.0, 12_000.00, 12_000.00, "Line retooling service")])
+    # The clean chain ends PAID — the payment row keeps V1009 out of every
+    # per-vendor payment pin (those are keyed to other vendors).
+    _payments.append((SETID, "PAY91001", "V1009", "2026-07-20",
+                      8_500.00, CURR, "P"))
+    _xref.append((BU, "VCHR2001", "PAY91001", 8_500.00))
+    con.executemany("INSERT INTO PS_VOUCHER VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     _vouchers)
     # Asset register: two categories, one retirement, one fully-in-service
     # add this year, plus a disposed asset that must not count as in service.

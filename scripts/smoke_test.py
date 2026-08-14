@@ -920,6 +920,43 @@ INSERT INTO PSRECFIELD VALUES ('TU_FILE_INTFC','FILE_ID',1);
                                     str(ROOT / "config.example.yaml")),
           _r.stdout.strip() or _r.stderr.strip()[:80])
 
+    print("== purchase-to-pay: the three-way match ==")
+    from pstb.modules import ModulePacks as _MPX
+    from pstb.procurement import Procurement as _Proc
+    _proc = _Proc(_MPX(engine))
+    _mx = _proc.match_exceptions(business_unit="US001",
+                                 as_of_date="2026-08-14")
+    check("every staged break is found exactly once",
+          _mx["counts"] == {"over_order": 1, "not_received": 1,
+                            "no_receipt": 1, "never_invoiced": 1,
+                            "awaiting_receipt": 1}, str(_mx["counts"]))
+    check("a canceled order is never awaiting receipt",
+          [x["po_id"] for x in _mx["exceptions"]["awaiting_receipt"]]
+          == ["PO2007"],
+          str(_mx["exceptions"]["awaiting_receipt"])[:120])
+    check("the two match verdicts are reported side by side",
+          {f["status"]: f["vouchers"]
+           for f in _mx["system_match_flags"]["counts"]} == {"E": 3, "T": 1}
+          and "recomputed" in _mx["system_match_flags"]["note"],
+          str(_mx["system_match_flags"])[:140])
+    _chain = _proc.procurement_chain(reference="PO2001",
+                                     business_unit="US001",
+                                     as_of_date="2026-08-14")
+    _ct = _chain["chain_totals"][0]
+    check("the clean chain ties at every stage",
+          (_ct["ordered"], _ct["received"], _ct["vouchered"], _ct["paid"])
+          == (8500.0, 8500.0, 8500.0, 8500.0) and not _chain["breaks"],
+          str(_ct))
+    _byname = _proc.procurement_chain(reference="Summit Machining",
+                                      business_unit="US001",
+                                      as_of_date="2026-08-14")
+    check("a supplier NAME resolves to its whole chain, disclosed",
+          _byname["resolved"]["id"] == "V1009"
+          and len(_byname["orders"]) == 7
+          and any("Read 'Summit Machining'" in n
+                  for n in _byname["record_notes"]),
+          str(_byname.get("resolved")))
+
     print("== process graph: how work is done here ==")
     # Built into a scratch file, never the deployment's own: a smoke run must
     # not overwrite a graph an administrator built and the GUI is reading.

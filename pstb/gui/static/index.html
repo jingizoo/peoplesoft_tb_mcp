@@ -1663,6 +1663,8 @@ function renderToolResult(name,data,args){
     if(name==='get_customer_financial_360') return renderCustomer360(data);
     if(name==='get_vendor_payables_network') return renderVendorNetwork(data);
     if(name==='trace_process') return renderProcess(data);
+    if(name==='get_match_exceptions') return renderMatchExceptions(data);
+    if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_ar_aging') return renderAging(data);
     if(name==='get_customer_ar') return renderCustomerAR(data);
@@ -1786,6 +1788,96 @@ function renderCustomerIntel(d){
 // column is the honest part — a page linked by PSPNLFIELD and a record
 // linked by a shared column name look identical in a list, and only one of
 // them is a fact about this instance.
+// The three-way match: two verdicts side by side, never merged — the
+// system's own flag and the recomputed arithmetic disagree exactly when a
+// human typed an override, and that disagreement is the finding.
+function renderMatchExceptions(d){
+  const frag=document.createDocumentFragment();
+  if(d.supported===false){
+    const c=el('div','card');
+    c.append(el('h2',null,'Three-way match <span class="badge bad">unknown</span>'));
+    c.append(el('div','pad','<p>'+esc(d.detail||'')+'</p>'));
+    frag.append(c); return frag;
+  }
+  const KINDS=[['over_order','Vouchered over the order'],
+    ['not_received','Invoiced more than received'],
+    ['no_receipt','No receipt recorded'],
+    ['never_invoiced','Received, never invoiced'],
+    ['awaiting_receipt','Awaiting receipt']];
+  const c=el('div','card');
+  c.append(el('h2',null,'Purchase-to-pay breaks <span class="sub">'+
+    esc(d.business_unit||'')+' · last '+(d.window_months||12)+' months</span>'));
+  c.append(tiles(KINDS.map(([k,label])=>{
+    const t0=(d.totals&&d.totals[k]&&d.totals[k][0])||null;
+    return [label, String((d.counts&&d.counts[k])||0),
+            t0?money(t0.amount)+' '+esc(t0.currency):''];
+  }).slice(0,4)));
+  const sc=el('div','scroll');
+  KINDS.forEach(([k,label])=>{
+    const rows=(d.exceptions&&d.exceptions[k])||[];
+    if(!rows.length) return;
+    const t2=el('table');
+    t2.innerHTML='<thead><tr><th colspan="4">'+esc(label.toUpperCase())+
+      '</th></tr><tr><th>PO</th><th>Voucher</th><th>What the numbers show</th>'+
+      '<th>System flag</th></tr></thead><tbody>'+
+      rows.map(x=>'<tr><td class="mono">'+esc(x.po_id||'')+'</td><td class="mono">'+
+        esc(x.voucher_id||'')+'</td><td>'+esc(x.detail||'')+'</td><td>'+
+        esc(x.system_match_status||'')+'</td></tr>').join('')+'</tbody>';
+    sc.append(t2);
+  });
+  c.append(sc);
+  if(d.system_match_flags&&d.system_match_flags.note)
+    c.append(el('div','pad','<p style="color:var(--muted)">'+
+      esc(d.system_match_flags.note)+'</p>'));
+  frag.append(c); return frag;
+}
+function renderProcurementChain(d){
+  const frag=document.createDocumentFragment();
+  if(d.scope_status){
+    return noData(d);
+  }
+  const c=el('div','card');
+  const who=d.resolved?(d.resolved.kind+' '+(d.resolved.name||d.resolved.id||'')):'';
+  c.append(el('h2',null,'Purchase-to-pay chain <span class="sub">'+esc(who)+'</span>'));
+  (d.chain_totals||[]).forEach(t0=>{
+    c.append(tiles([
+      ['Ordered',money(t0.ordered),esc(t0.currency)],
+      ['Received',money(t0.received),''],
+      ['Vouchered',money(t0.vouchered),''],
+      ['Paid',money(t0.paid),'']
+    ]));
+  });
+  if((d.breaks||[]).length){
+    const bt=el('table');
+    bt.innerHTML='<thead><tr><th colspan="3">BREAKS</th></tr>'+
+      '<tr><th>PO</th><th>Kind</th><th>Detail</th></tr></thead><tbody>'+
+      d.breaks.map(b=>'<tr><td class="mono">'+esc(b.po_id)+'</td><td>'+
+        esc((b.kind||'').replace(/_/g,' '))+'</td><td>'+esc(b.detail||'')+
+        '</td></tr>').join('')+'</tbody>';
+    const sb=el('div','scroll'); sb.append(bt); c.append(sb);
+  }
+  const sc=el('div','scroll');
+  const t3=el('table');
+  t3.innerHTML='<thead><tr><th>PO</th><th>Status</th><th class="num">Ordered</th>'+
+    '<th class="num">Received</th><th class="num">Vouchered</th>'+
+    '<th class="num">Paid</th><th>Documents</th></tr></thead><tbody>'+
+    (d.orders||[]).map(o=>{
+      const docs=[].concat((o.receipts||[]).map(r=>r.receiver_id),
+                          (o.vouchers||[]).map(v=>v.voucher_id)).join(', ');
+      return '<tr><td class="mono">'+esc(o.po_id)+'</td><td>'+
+        esc(o.po_status_meaning||o.po_status||'')+'</td><td class="num">'+
+        (o.ordered_amt!=null?money(o.ordered_amt):'—')+'</td><td class="num">'+
+        (o.received_amt!=null?money(o.received_amt):'—')+'</td><td class="num">'+
+        (o.vouchered_amt!=null?money(o.vouchered_amt):'—')+'</td><td class="num">'+
+        (o.paid_amt!=null?money(o.paid_amt):'—')+'</td><td class="mono">'+
+        esc(docs)+'</td></tr>'+(o.note?'<tr><td colspan="7" class="sub">'+
+        esc(o.note)+'</td></tr>':'');
+    }).join('')+'</tbody>';
+  sc.append(t3); c.append(sc);
+  if(d.basis) c.append(el('div','pad','<p style="color:var(--muted)">'+
+    esc(d.basis)+'</p>'));
+  frag.append(c); return frag;
+}
 function renderProcess(d){
   const frag=document.createDocumentFragment();
   if(d.available===false){
