@@ -43,6 +43,8 @@ coupa = _coupa_mod.from_env()
 playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
 vendor_network = VendorNetwork(modules)
+from .procurement import Procurement
+procurement = Procurement(modules)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
 from .procgraph import ProcessGraph, graph_path
@@ -511,6 +513,40 @@ def get_vendor_payables_network(vendor_id: str = "", business_unit: str = "",
     return _safe(vendor_network.vendor_payables_network, vendor_id=vendor_id,
                  business_unit=business_unit, include_family=include_family,
                  months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_match_exceptions(business_unit: str = "", months: int = 12,
+                         as_of_date: str = "") -> dict:
+    """Every break in the purchase-to-pay tie, computed from the documents
+    and ranked by money: vouchered OVER the order price, invoiced more than
+    was RECEIVED, vouchered with NO receipt at all, received and NEVER
+    invoiced (the accrual nobody booked), and orders still awaiting receipt
+    — with canceled orders excluded, never counted as late. Use for "any
+    match exceptions", "did we get what we paid for", "receipts not
+    invoiced", "three-way match problems". The system's own
+    MATCH_STATUS_VCHR flags are reported BESIDE the recomputed arithmetic,
+    never merged — when they disagree, say so, because the disagreement is
+    an override or a tolerance and worth reading. Amounts are per currency
+    and never summed across."""
+    return _safe(procurement.match_exceptions, business_unit=business_unit,
+                 months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_procurement_chain(reference: str = "", business_unit: str = "",
+                          as_of_date: str = "") -> dict:
+    """ONE purchase-to-pay chain, tied out end to end: the order and its
+    schedules, what was received against them, the vouchers that billed
+    them, and the payments that settled those — with every break named and
+    both figures quoted. reference takes a PO id, a receiver id, a voucher
+    id, OR a supplier (id or name, resolved like every other party tool —
+    ambiguity comes back as a question, not a guess). Use for "why is this
+    voucher stuck", "was this PO received", "show the chain for PO2003",
+    "what is open on Summit Machining's orders". A canceled order is
+    labeled canceled and never reported as awaiting receipt."""
+    return _safe(procurement.procurement_chain, reference=reference,
+                 business_unit=business_unit, as_of_date=as_of_date)
 
 
 @mcp.tool()

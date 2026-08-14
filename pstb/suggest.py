@@ -431,6 +431,45 @@ def _from_process(p: dict, ctx: Context) -> list:
     return []                     # the layer is ranked; one is a pointer
 
 
+def _from_match(p: dict, ctx: Context) -> list:
+    """The workbench found breaks; the chain shows one of them whole.
+
+    Ranked by what each kind costs to ignore: money already out the door
+    (over-order) outranks money not yet accrued (never-invoiced), and both
+    outrank an order that is merely late. One suggestion per payload — the
+    biggest break by amount — because the workbench itself already shows
+    the rest.
+    """
+    if not p.get("supported"):
+        return []
+    exceptions = p.get("exceptions") or {}
+    best = None
+    for kind, weight in (("over_order", 3), ("not_received", 2),
+                         ("no_receipt", 2), ("never_invoiced", 1)):
+        for x in exceptions.get(kind) or ():
+            amount = _num(x.get("over_by") or x.get("not_received_amt")
+                          or x.get("vouchered_amt") or x.get("received_amt"))
+            if amount <= 0:
+                continue
+            score = (weight, amount)
+            if best is None or score > best[0]:
+                best = (score, kind, x, amount)
+    if best is None:
+        return []
+    _, kind, x, amount = best
+    po = str(x.get("po_id") or "")
+    if not po:
+        return []
+    return [Suggestion(
+        question=f"Show the procurement chain for {po}",
+        because=f"{x.get('detail', kind)} on {po} — the chain shows the "
+                "order, receipts, vouchers and payments together.",
+        kind=f"match_{kind}", answered_by="get_procurement_chain",
+        evidence_from="get_match_exceptions",
+        amount=amount, currency=str(x.get("currency") or ""),
+        severity=MONEY_AT_RISK)]
+
+
 RULES: dict = {
     "get_customer_financial_360": _from_customer_360,
     "get_ar_aging": _from_ar_aging,
@@ -441,6 +480,7 @@ RULES: dict = {
     "get_duplicate_payments": _from_duplicates,
     "get_open_payables": _from_payables,
     "trace_process": _from_process,
+    "get_match_exceptions": _from_match,
 }
 
 # The subject a tool's question is ABOUT, so a suggestion is not offered
