@@ -175,6 +175,11 @@ class AnomalyCfg:
     max_unindexed_rows: int = 50000
     min_history_days: int = 28
     min_active_days: int = 12
+    # A zero on the as-of date is not evidence of a miss until this many
+    # whole days have elapsed.  Sites with intraday-complete feeds can set 0;
+    # overnight/batch feeds normally keep the one-day default.  Individual
+    # table and relationship sides may override this in their rules.
+    freshness_lag_days: int = 1
     min_relation_days: int = 8
     min_process_history_days: int = 8
     min_process_runs: int = 3

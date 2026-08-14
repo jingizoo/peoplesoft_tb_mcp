@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -479,6 +480,20 @@ class WriteTests(unittest.TestCase):
                 memory_budget_mb=1))
         self.assertFalse(target.exists())
         self.assertFalse((d / "pg.db.building").exists())
+
+    def test_memory_budget_is_checked_before_merge_allocation(self):
+        h = pg.Harvest("large-label")
+        h.node("page", "ONE", label="x" * 300_000)
+        d = Path(tempfile.mkdtemp())
+        target = d / "pg.db"
+        with mock.patch.object(pg, "_merge_harvests",
+                               wraps=pg._merge_harvests) as merge:
+            with self.assertRaisesRegex(pg.ProcessGraphError,
+                                        "memory_budget_mb=1"):
+                pg.write_graph(target, [h], limits=pg.GraphBuildLimits(
+                    memory_budget_mb=1))
+        merge.assert_not_called()
+        self.assertFalse(target.exists())
 
     def test_absolute_safeguards_reject_unbounded_configuration(self):
         with self.assertRaisesRegex(pg.ProcessGraphError, "max_nodes"):

@@ -784,7 +784,9 @@ limit is kept but marked `PARTIAL`/`DEGRADED`; `describe_process_graph`
 returns structured `limit_hits`. A finished graph that exceeds the global
 node, edge, or memory guard is not written: the prior `process_graph.db`
 remains in place and the command explains which setting to review. Absolute
-hard ceilings still prevent an accidental unbounded catalog mirror.
+hard ceilings still prevent an accidental unbounded catalog mirror. The
+memory guard preflights the raw harvests before allocating the merged graph,
+then validates again after implied-node creation and canonicalization.
 
 Question-time traversal remains deliberately small (`3` hops, `12` seeds,
 `400` visited nodes, and `40` results per layer). Those response limits keep

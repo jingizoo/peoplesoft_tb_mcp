@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from pstb.anomalies import AnomalyDetector, AnomalyError  # noqa: E402
 from pstb.config import Config, load_config  # noqa: E402
 from pstb.db import Database  # noqa: E402
+from pstb.security import Access, access_scope  # noqa: E402
 
 
 class EndToEndCustomTableTests(unittest.TestCase):
@@ -147,6 +148,37 @@ class EndToEndCustomTableTests(unittest.TestCase):
             self.detector.detect("2026-07-01", history_months=12,
                                  include_inferred=False)
 
+    def test_caller_scope_is_enforced_even_for_direct_detector_calls(self) -> None:
+        restricted = Access(oprid="ANALYST", units=frozenset({"US001"}))
+        with access_scope(restricted):
+            out = self.detector.detect(
+                "2026-07-01", history_months=3, include_inferred=False)
+            self.assertEqual(out["business_unit"], "US001")
+            with self.assertRaisesRegex(AnomalyError, "not authorised"):
+                self.detector.detect(
+                    "2026-07-01", history_months=3,
+                    business_unit="EU001", include_inferred=False)
+            with self.assertRaisesRegex(AnomalyError, "all-business-unit"):
+                self.detector.detect(
+                    "2026-07-01", history_months=3,
+                    business_unit="ALL", include_inferred=False)
+
+    def test_scoped_scan_skips_a_table_without_a_scope_predicate(self) -> None:
+        original = self.detector.acfg.table_rules
+        self.detector.acfg.table_rules = [{
+            "table": "ACME_TXN_HDR", "date_column": "CREATED_DTTM"}]
+        self.detector.acfg.relationship_rules = []
+        self.detector.acfg.process_rules = []
+        try:
+            out = self.detector.detect(
+                "2026-07-01", history_months=3,
+                business_unit="US001", include_inferred=False)
+        finally:
+            self.detector.acfg.table_rules = original
+        self.assertEqual(out["tables_evaluated"], [])
+        self.assertTrue(any("no configured/inferred scope column" in reason
+                            for reason in out["checks_incomplete"]))
+
 
 class InferenceAndStatisticsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -211,6 +243,79 @@ class InferenceAndStatisticsTests(unittest.TestCase):
         self.assertEqual(baseline["method"], "same-weekday seasonal baseline")
         self.assertEqual(baseline["median"], 20)
 
+    def test_fresh_zero_is_inconclusive_but_elapsed_zero_is_critical(self) -> None:
+        asof = dt.date(2026, 8, 14)
+        start = asof - dt.timedelta(days=60)
+        counts = {start + dt.timedelta(days=i): 100
+                  for i in range((asof - start).days)}
+        baseline = self.detector._baseline(counts, start, asof)
+        spec = {"table": "ACME_DAILY", "confidence": 1.0,
+                "freshness_lag_days": 1}
+        pending = self.detector._availability(spec, asof, 0, today=asof)
+        self.assertEqual(pending["status"], "pending")
+        self.assertTrue(pending["zero_alerts_suppressed"])
+        self.assertIsNone(self.detector._volume_alert(
+            spec, 0, baseline, asof, pending))
+        rule = {
+            "name": "daily pair", "left_table": "ACME_DAILY",
+            "right_table": "ACME_DETAIL", "direction": "left_requires_right",
+            "source": "configured", "confidence": 1.0,
+            "minimum_trigger_count": 10, "evidence": ["configured"],
+        }
+        histories = {"ACME_DAILY": {asof: 100}, "ACME_DETAIL": {}}
+        self.assertIsNone(self.detector._relation_alert(
+            rule, histories, start, asof,
+            {"ACME_DETAIL": pending}))
+
+        complete = self.detector._availability(
+            spec, asof, 0, today=asof + dt.timedelta(days=1))
+        alert = self.detector._volume_alert(
+            spec, 0, baseline, asof, complete)
+        self.assertEqual(complete["status"], "complete")
+        self.assertEqual(alert["severity"], "critical")
+        relation = self.detector._relation_alert(
+            rule, histories, start, asof,
+            {"ACME_DETAIL": complete})
+        self.assertEqual(relation["severity"], "critical")
+
+    def test_intermittent_activity_uses_active_day_counts_not_raw_zero_z(self) -> None:
+        start, asof = dt.date(2026, 5, 14), dt.date(2026, 8, 14)
+        counts = {start + dt.timedelta(days=i): 100
+                  for i in range((asof - start).days) if i % 4 == 0}
+        baseline = self.detector._baseline(counts, start, asof)
+        self.assertEqual(baseline["status"], "ready")
+        self.assertEqual(baseline["activity_model"], "intermittent")
+        self.assertEqual(baseline["median"], 100)
+        self.assertIn("active-day count baseline", baseline["method"])
+        spec = {"table": "ACME_PERIODIC", "confidence": 1.0}
+        self.assertIsNone(self.detector._volume_alert(
+            spec, 0, baseline, asof,
+            {"status": "complete"}))
+
+    def test_index_requires_its_actual_leading_predicates(self) -> None:
+        class Indexed:
+            @staticmethod
+            def indexes(_table):
+                return [{"name": "BU_DATE", "columns": [
+                    "BUSINESS_UNIT", "CREATED_DTTM"]}]
+
+        self.detector.db = Indexed()
+        safe, _ = self.detector._date_is_indexable(
+            "ACME_TXN", "CREATED_DTTM", set())
+        self.assertFalse(safe)
+        safe, _ = self.detector._date_is_indexable(
+            "ACME_TXN", "CREATED_DTTM", {"BUSINESS_UNIT"})
+        self.assertTrue(safe)
+
+    def test_operational_scan_cannot_ground_specific_ar_policy(self) -> None:
+        from pstb.guards import (_TOOL_SOURCE, financial_tool_domains,
+                                 financial_tool_is_relevant)
+        tool = "detect_transaction_anomalies"
+        self.assertEqual(financial_tool_domains(tool), {"variance"})
+        self.assertFalse(financial_tool_is_relevant(
+            tool, "Are receivables within our AR policy?"))
+        self.assertEqual(_TOOL_SOURCE[tool], "peoplesoft_operations")
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_deployment_yaml_loads_rules_and_thresholds(self) -> None:
@@ -259,10 +364,12 @@ anomalies:
             ], False)
 
         db.query = query
-        indexes = db.indexes("ACME_TXN_HDR")
+        indexes = db.indexes("Acme_Txn_Hdr")
         self.assertEqual(indexes[0]["columns"],
                          ["BUSINESS_UNIT", "CREATED_DTTM"])
-        self.assertEqual(seen["params"], {"t": "ACME_TXN_HDR", "o": "dbo"})
+        self.assertEqual(seen["params"], {"t": "ACME_TXN_HDR", "o": "DBO"})
+        self.assertIn("UPPER(T.name)", seen["sql"])
+        self.assertIn("UPPER(S.name)", seen["sql"])
         self.assertIn("IC.key_ordinal", seen["sql"])
 
 

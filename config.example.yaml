@@ -163,6 +163,9 @@ anomalies:
   material_count: 10        # minimum absolute row-count deviation
   material_pct: 0.50        # and at least 50% away from baseline
   z_threshold: 3.5          # robust median/MAD z score
+  # Suppress zero/missing alerts until a feed is expected to be complete.
+  # Set per table (or per relationship side) when feeds post on different days.
+  freshness_lag_days: 1
   table_rules: []
   relationship_rules: []
   process_rules: []
@@ -172,6 +175,7 @@ anomalies:
   #     table: ACME_INV_HDR
   #     date_column: CREATED_DTTM
   #     scope_column: BUSINESS_UNIT
+  #     freshness_lag_days: 1
   #   - name: invoice interface distributions
   #     table: FIN_INV_DIST
   #     date_column: CREATED_DTTM
@@ -182,6 +186,7 @@ anomalies:
   #     right_table: FIN_INV_DIST
   #     direction: left_requires_right
   #     minimum_trigger_count: 10
+  #     right_freshness_lag_days: 2
   #     explanation: accepted interface headers should create distribution rows
   # process_rules:
   #   - name: invoice loader

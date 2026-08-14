@@ -343,8 +343,10 @@ def detect_transaction_anomalies(
     ``anomalies`` config section override inference and are the right choice for
     custom interfaces or header/line relationships whose semantics metadata
     cannot prove. Missing/sparse history is disclosed, never called clean.
-    history_months must be 3 or 6. business_unit is applied only where the
-    validated table rule/discovery identifies a scope column."""
+    As-of zeroes inside a configurable feed-freshness window are inconclusive,
+    not critical. history_months must be 3 or 6. A blank business_unit resolves
+    to one configured/authorized unit; ALL must be explicit and unrestricted.
+    Scoped runs skip any table without a validated scope column."""
     return _safe(
         anomaly_detector.detect,
         as_of_date=as_of_date,

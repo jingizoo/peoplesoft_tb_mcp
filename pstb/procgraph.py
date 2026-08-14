@@ -883,31 +883,33 @@ def _estimated_working_bytes(nodes: dict, edges: dict, notes: list) -> int:
     return total
 
 
-def _executemany_batched(con, sql: str, values, size: int) -> None:
-    """Serialize only one bounded insert batch at a time."""
-    iterator = iter(values)
-    while True:
-        batch = list(itertools.islice(iterator, size))
-        if not batch:
-            return
-        con.executemany(sql, batch)
+def _estimated_harvest_bytes(harvests) -> int:
+    """Estimate inputs before allocating a second merged graph representation.
 
-
-def write_graph(path, harvests, meta=None,
-                limits: GraphBuildLimits | None = None) -> dict:
-    """Write every harvest into one SQLite file, atomically.
-
-    Atomic because the alternative is a half-written graph being read by a
-    live GUI mid-rebuild: build beside the target, then rename over it.
+    Duplicate nodes/edges are intentionally counted once per harvest.  That
+    makes this a conservative preflight while requiring no merged dictionary
+    (the allocation the guard exists to prevent).
     """
-    limits = limits or GraphBuildLimits()
-    limits.validate()
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".building")
-    if tmp.exists():
-        tmp.unlink()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    return sum(
+        _estimated_working_bytes(
+            h.nodes, h.edges,
+            [(h.source, note, 1 if h.ok else 0) for note in h.notes])
+        for h in harvests)
 
+
+def _enforce_memory_budget(estimated_bytes: int,
+                           limits: GraphBuildLimits) -> None:
+    budget_bytes = limits.memory_budget_mb * 1024 * 1024
+    if estimated_bytes > budget_bytes:
+        raise ProcessGraphError(
+            f"Process graph build is estimated to need "
+            f"{estimated_bytes / 1024 / 1024:.1f} MiB, exceeding "
+            f"process_graph.memory_budget_mb={limits.memory_budget_mb:,}. "
+            "The existing graph was not replaced. Raise the budget (up to "
+            f"{HARD_MAX_MEMORY_MB:,} MiB) or reduce the selected sources.")
+
+
+def _merge_harvests(harvests) -> tuple[dict, dict, list]:
     nodes: dict = {}
     edges: dict = {}
     notes: list = []
@@ -928,6 +930,41 @@ def write_graph(path, harvests, meta=None,
             if cur is None or edge["weight"] > cur["weight"]:
                 edges[key] = edge
         notes.extend((h.source, n, 1 if h.ok else 0) for n in h.notes)
+    return nodes, edges, notes
+
+
+def _executemany_batched(con, sql: str, values, size: int) -> None:
+    """Serialize only one bounded insert batch at a time."""
+    iterator = iter(values)
+    while True:
+        batch = list(itertools.islice(iterator, size))
+        if not batch:
+            return
+        con.executemany(sql, batch)
+
+
+def write_graph(path, harvests, meta=None,
+                limits: GraphBuildLimits | None = None) -> dict:
+    """Write every harvest into one SQLite file, atomically.
+
+    Atomic because the alternative is a half-written graph being read by a
+    live GUI mid-rebuild: build beside the target, then rename over it.
+    """
+    limits = limits or GraphBuildLimits()
+    limits.validate()
+    harvests = list(harvests)
+    # Enforce the budget while the graph still exists only in harvester-owned
+    # dictionaries.  The former check happened after allocating merged and
+    # canonical dictionaries, so it could detect an unsafe build only after
+    # incurring the peak it was meant to prevent.
+    _enforce_memory_budget(_estimated_harvest_bytes(harvests), limits)
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".building")
+    if tmp.exists():
+        tmp.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    nodes, edges, notes = _merge_harvests(harvests)
 
     # An edge to a node no harvester declared would make the walk return an
     # id with no name behind it. Declare the stub rather than drop the edge:
@@ -953,14 +990,9 @@ def write_graph(path, harvests, meta=None,
             "graph was not replaced. Raise that configured limit (up to "
             f"{HARD_MAX_EDGES:,}) or reduce the selected sources.")
     estimated_bytes = _estimated_working_bytes(nodes, edges, notes)
-    budget_bytes = limits.memory_budget_mb * 1024 * 1024
-    if estimated_bytes > budget_bytes:
-        raise ProcessGraphError(
-            f"Process graph build is estimated to need "
-            f"{estimated_bytes / 1024 / 1024:.1f} MiB, exceeding "
-            f"process_graph.memory_budget_mb={limits.memory_budget_mb:,}. "
-            "The existing graph was not replaced. Raise the budget (up to "
-            f"{HARD_MAX_MEMORY_MB:,} MiB) or reduce the selected sources.")
+    # Canonicalisation and implied stubs can grow the graph relative to raw
+    # harvests, so retain an exact post-merge check as a second line of safety.
+    _enforce_memory_budget(estimated_bytes, limits)
 
     con = None
     try:

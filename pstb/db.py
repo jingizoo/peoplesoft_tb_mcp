@@ -290,11 +290,11 @@ class Database:
                                         cols, key=lambda x: x.get("seqno", 0))],
                     })
             elif self.dialect == "sqlserver":
-                schema = self.cfg.db.schema.strip().rstrip(".")
-                where = "T.name = :t"
-                params = {"t": table}
+                schema = self.cfg.db.schema.strip().rstrip(".").upper()
+                where = "UPPER(T.name) = :t"
+                params = {"t": table.upper()}
                 if schema:
-                    where += " AND S.name = :o"
+                    where += " AND UPPER(S.name) = :o"
                     params["o"] = schema
                 rows, _ = self.query(
                     "SELECT I.name AS name, C.name AS col, "
@@ -312,11 +312,12 @@ class Database:
                     params, max_rows=500)
                 by_name: dict = {}
                 for r in rows:
+                    name = str(r["name"]).upper()
                     entry = by_name.setdefault(
-                        str(r["name"]),
-                        {"name": str(r["name"]),
+                        name,
+                        {"name": name,
                          "unique": bool(r.get("uniq")), "columns": []})
-                    entry["columns"].append(str(r["col"]))
+                    entry["columns"].append(str(r["col"]).upper())
                 out = list(by_name.values())
         except Exception:
             return []

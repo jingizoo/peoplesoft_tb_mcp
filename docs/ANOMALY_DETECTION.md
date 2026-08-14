@@ -54,12 +54,14 @@ anomalies:
   material_count: 10
   material_pct: 0.50
   z_threshold: 3.5
+  freshness_lag_days: 1
 
   table_rules:
     - name: invoice interface headers
       table: ACME_INV_HDR
       date_column: CREATED_DTTM
       scope_column: BUSINESS_UNIT
+      freshness_lag_days: 1
     - name: invoice distributions
       table: FIN_INV_DIST
       date_column: CREATED_DTTM
@@ -71,6 +73,7 @@ anomalies:
       right_table: FIN_INV_DIST
       direction: left_requires_right
       minimum_trigger_count: 10
+      right_freshness_lag_days: 2
       confidence: 1.0
       explanation: accepted interface headers should create accounting distributions
 
@@ -89,6 +92,23 @@ anomalies:
 Names are physical table/column names exactly as the catalog exposes them.
 They may be delivered, custom, or company-prefixed. Invalid/unreadable names
 are returned in `configuration_errors`; they are never interpolated and tried.
+
+Every normal invocation resolves to one concrete business unit: an omitted
+argument uses `defaults.business_unit` (or the caller's sole authorized unit),
+and caller row security is enforced inside the detector as well as at the MCP
+boundary. Restricted callers cannot request `ALL`. An unrestricted caller may
+request `business_unit="ALL"` explicitly, but blank never means all units.
+Tables/process records without a usable scope column are skipped with a
+`checks_incomplete` reason during a scoped run; they are never silently scanned
+across units. Configure `scope_column` for any custom key that represents the
+selected business-unit scope.
+
+`freshness_lag_days` is the number of days after the selected date before a
+zero may be interpreted as missing. It defaults to 1, may be overridden on a
+table, or on a relationship side with `left_freshness_lag_days` /
+`right_freshness_lag_days`. Until `available_on`, zero-based volume and
+counterpart alerts are suppressed, the table reports `availability: pending`,
+and the overall result is `checks_incomplete` with a plain-language reason.
 
 Relationship directions are:
 
@@ -111,6 +131,9 @@ The baseline is robust rather than mean/standard-deviation only:
 - the same weekday is preferred when at least eight observations and enough
   active days exist, avoiding routine weekend/weekday false positives;
 - otherwise a dense all-calendar-day baseline is used;
+- intermittently active tables must still have `min_active_days`; their
+  activity probability is reported separately and count deviations use only
+  active-day values, preventing median-zero/MAD-zero raw-count z scores;
 - sparse/month-end-only histories return `sparse_history` and do not turn a
   missing date into either a clean verdict or an alert;
 - the expected value is the median, dispersion is median absolute deviation
@@ -134,8 +157,9 @@ Each alert includes:
 - a plain-language `explanation` containing the observed and expected values.
 
 Always inspect `status`, `checks_incomplete`, `configuration_errors`, table
-baseline status, and `discovery.skipped_for_scan_safety`. Zero alerts with an
-incomplete catalog/query or sparse history is not a clean operational verdict.
+baseline/availability status, and `discovery.skipped_for_scan_safety`. Zero
+alerts with a pending feed, incomplete catalog/query, intermittent inactive
+date, or sparse history is not a clean operational verdict.
 
 Example call:
 

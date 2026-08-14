@@ -437,7 +437,10 @@ _TOOL_DOMAINS = {
     "drill_to_journals": {"journal", "balance", "variance"},
     "tb_integrity_check": {"balance", "journal"},
     "detect_transaction_anomalies": {
-        "variance", "journal", "billing", "ar", "ap", "am", "pc"},
+        # Operational telemetry can ground an anomaly/variance statement, but
+        # a clean broad scan is not evidence for an AR/AP/asset/project policy
+        # conclusion about a specific balance or transaction.
+        "variance"},
     "rollup_trial_balance": {"balance", "report"},
     "get_exchange_rate": {"fx"},
     "get_top_billing_customers": {"billing", "customer", "fx"},
@@ -945,11 +948,12 @@ _SOURCE_OF_TOOL = {
     "peoplesoft_gl": {
         "get_trial_balance", "get_account_balance", "compare_trial_balance",
         "rollup_trial_balance", "drill_to_journals", "tb_integrity_check",
-        "explain_balance_change", "detect_transaction_anomalies",
+        "explain_balance_change",
         "run_report", "get_budget_variance", "get_exchange_rate",
         "get_tree_node_accounts", "search_accounts", "run_sql",
         "run_playbook",
     },
+    "peoplesoft_operations": {"detect_transaction_anomalies"},
     "peoplesoft_ar": {
         "get_ar_aging", "get_customer_ar", "get_invoice_totals",
         "get_top_billing_customers", "get_billing_workbench",
@@ -989,6 +993,7 @@ _TOOL_SOURCE = {tool: label
 _SYSTEM_OF = {
     "peoplesoft_gl": "peoplesoft", "peoplesoft_ar": "peoplesoft",
     "peoplesoft_ap": "peoplesoft", "peoplesoft_query": "peoplesoft",
+    "peoplesoft_operations": "peoplesoft",
     "coupa": "coupa", "wiki": "wiki",
 }
 
@@ -998,6 +1003,7 @@ SOURCE_LABELS = {
     "peoplesoft_ar": "PeopleSoft receivables and billing",
     "peoplesoft_ap": "PeopleSoft payables",
     "peoplesoft_query": "an existing PeopleSoft query (QAS)",
+    "peoplesoft_operations": "PeopleSoft operational transaction/process telemetry",
     "coupa": "Coupa procurement",
     "wiki": "a policy wiki page",
 }
