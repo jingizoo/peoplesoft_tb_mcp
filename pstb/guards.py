@@ -277,8 +277,28 @@ def unit_access_block(tool_name: str, args, access,
         if value is None:
             continue
         text = str(value).strip()
-        if not text or text.upper() in _BU_ALL_VALUES:
+        if not text:
             continue
+        if text.upper() in _BU_ALL_VALUES:
+            # "ALL" is not a unit anyone was denied, so this loop used to
+            # wave it through as harmless. It is not harmless: it means
+            # every unit that EXISTS, and a restricted caller got another
+            # company's customers and amounts out of the cross-unit ranking.
+            #
+            # The in-process filter (pstb.security.allowed_units) narrows it
+            # for the GUI's own endpoints. It cannot help HERE, because this
+            # gate stands in front of an MCP server running in a SEPARATE
+            # PROCESS that has no way to know who is asking — and passing
+            # the grant as a tool argument would hand the model a value it
+            # could widen. So on this path the answer is to refuse, and to
+            # name the units that would work.
+            mine = ", ".join(sorted(access.units))
+            return (
+                f"{tool_name} was asked for ALL business units, and "
+                f"{access.oprid} is granted only {mine or 'none'}. A "
+                "cross-unit ranking cannot be limited to those units on "
+                "this path, so it is refused rather than quietly narrowed."
+                + (f" Ask for one of: {mine}." if mine else ""))
         if not access.allows(text):
             return access.refusal(text)
     return ""

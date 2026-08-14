@@ -2458,13 +2458,26 @@ class TBEngine:
         }
 
     def list_business_units(self) -> dict:
+        """Every GL business unit THIS CALLER may see.
+
+        The GUI's scope bar was already filtered through _visible_scopes,
+        but this tool was not: asked "what business units exist", a user
+        granted one unit was handed the whole company's list. Unit codes are
+        milder than amounts and it is the same leak, so it closes the same
+        way — through the caller in force, which the model cannot forge.
+        """
         pairs, truncated = self._ledger_scope_pairs()
         enriched = self._business_unit_enrichment()
         first_ledger: dict[str, str] = {}
         for bu, ledger in pairs:
             first_ledger.setdefault(bu, ledger)
+        from .security import allowed_units
+        granted, withheld = allowed_units(list(first_ledger))
+        keep = set(granted)
         rows = []
         for bu, ledger in first_ledger.items():
+            if bu.upper() not in keep:
+                continue
             meta = enriched.get(bu, {})
             rows.append({
                 "business_unit": bu,
@@ -2474,7 +2487,15 @@ class TBEngine:
                     or self._ledger_scope_currency(bu, ledger)
                 ),
             })
-        return {"business_units": rows, "truncated": truncated}
+        out = {"business_units": rows, "truncated": truncated}
+        if withheld:
+            # Say that the list is partial. A filtered list presented as
+            # complete is how someone concludes a unit does not exist.
+            out["restricted_to_granted_units"] = True
+            out["note"] = (
+                f"{len(withheld)} further business units exist and are not "
+                "granted to this user, so they are not listed.")
+        return out
 
     def list_financial_scopes(self, include_activity: bool = True,
                               verify_pairs: bool = True,
