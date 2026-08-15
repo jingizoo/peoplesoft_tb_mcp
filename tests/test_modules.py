@@ -44,6 +44,20 @@ class _SampleCase(unittest.TestCase):
 
 
 class OpenPayablesTests(_SampleCase):
+    def test_historical_as_of_excludes_later_vouchers_and_discloses_basis(
+            self) -> None:
+        out = self.m.open_payables(as_of_date="2026-06-30")
+        self.assertEqual(out["voucher_count"], 2)
+        self.assertEqual(out["open_total"], 49_950.0)
+        self.assertEqual(out["as_of_basis"],
+                         "PS_VOUCHER.INVOICE_DT <= as_of")
+        self.assertFalse(out["point_in_time_complete"],
+                         "current CLOSE_STATUS cannot reconstruct a past "
+                         "open population even after later vouchers are "
+                         "excluded")
+        self.assertIn("current open/close status",
+                      out["point_in_time_reason"])
+
     def test_paid_vouchers_are_not_owed(self) -> None:
         out = self.m.open_payables(as_of_date="2026-08-04")
         # Eleven open: four for the original three suppliers, four added
@@ -79,6 +93,15 @@ class OpenPayablesTests(_SampleCase):
 
 
 class VendorPaymentsTests(_SampleCase):
+    def test_trailing_window_stops_at_as_of_inclusively(self) -> None:
+        out = self.m.vendor_payments(months=12,
+                                     as_of_date="2026-06-30")
+        self.assertEqual(out["total_paid"], 91_300.0)
+        self.assertNotIn("V1009", {v["vendor_id"] for v in out["vendors"]})
+        self.assertTrue(all(v["last_payment_dt"] <= "2026-06-30"
+                            for v in out["vendors"]))
+        self.assertIn("through as_of (inclusive)", out["note"])
+
     def test_the_once_refused_question_answers(self) -> None:
         out = self.m.vendor_payments(vendor="Cobalt", months=12,
                                      as_of_date="2026-08-04")

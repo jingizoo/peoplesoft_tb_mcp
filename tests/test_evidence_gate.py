@@ -341,6 +341,38 @@ class EvidenceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("999.00", answer)
         self.assertIn("could not obtain a successful PeopleSoft", answer)
 
+    async def test_catalog_search_cannot_ground_an_out_of_balance_claim(self):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[
+                call("d1", "search_records", query="trial balance does not tie"),
+            ]),
+            LLMResponse(text="The trial balance does not tie."),
+        ])
+        session = FakeSession({
+            "search_records": {
+                "query": "trial balance does not tie",
+                "records": [{"record": "LEDGER", "table": "PS_LEDGER"}],
+            },
+        })
+
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            answer = await agent_turn(
+                provider,
+                session,
+                "what records show the trial balance does not tie?",
+                scope={
+                    "business_unit": "US200",
+                    "ledger": "ACTUALS",
+                    "fiscal_year": 2026,
+                    "period": 6,
+                },
+            )
+
+        self.assertEqual([name for name, _ in session.calls],
+                         ["search_records"])
+        self.assertNotIn("does not tie", answer)
+        self.assertIn("could not obtain a successful PeopleSoft", answer)
+
     async def test_irrelevant_financial_tool_cannot_ground_a_balance_answer(self):
         provider = ScriptedProvider([
             LLMResponse(tool_calls=[

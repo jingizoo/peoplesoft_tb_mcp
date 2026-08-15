@@ -114,6 +114,39 @@ class BlankCardTests(unittest.TestCase):
                       "exists must fall back to the raw value")
 
 
+class FinancePresentationContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (ROOT / "pstb" / "gui" / "static" / "index.html").read_text()
+
+    def test_primary_evidence_is_not_left_collapsed(self) -> None:
+        self.assertIn("primary.open=true", self.html)
+        self.assertIn("resultBadge(c.result)", self.html)
+
+    def test_custom_discovery_evidence_has_dedicated_renderers(self) -> None:
+        for tool, renderer in (
+                ("describe_record", "renderRecordDescription"),
+                ("profile_record", "renderRecordProfile"),
+                ("compare_records", "renderRecordCompare"),
+                ("detect_transaction_anomalies", "renderAnomalies")):
+            self.assertIn(f"name==='{tool}'", self.html)
+            self.assertIn(renderer, self.html)
+        self.assertIn("unresolved — do not guess", self.html)
+        self.assertIn("r.taught_status", self.html)
+
+    def test_ap_claims_distinguish_candidates_from_confirmed_cash(self) -> None:
+        for renderer in ("renderOpenPayables", "renderVendorPayments",
+                         "renderDuplicatePayments"):
+            self.assertIn(renderer, self.html)
+        self.assertIn("not confirmed paid twice", self.html)
+        self.assertIn("historical limitation", self.html)
+
+    def test_starter_questions_are_grouped_by_controller_workstream(self) -> None:
+        self.assertIn("starter-groups", self.html)
+        for label in ("Billing & AR", "Accounts payable", "GL & close"):
+            self.assertIn(label, self.html)
+
+
 class PerTurnStateTests(unittest.TestCase):
     """Two colleagues asking at once must not share a turn."""
 

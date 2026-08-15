@@ -127,15 +127,41 @@ class ModulePacks:
         cur = ("V.CURRENCY_CD" if "CURRENCY_CD" in cols else "NULL")
         name = ("N.NAME1" if self.db.has_column("PS_VENDOR", "NAME1")
                 else "NULL")
-        rows, _ = self.db.query(
+        # ACCOUNTING_DT is the best available accounting cut-off.  Some
+        # installations expose only INVOICE_DT (including the bundled
+        # sample), while a few custom voucher views expose ENTERED_DT.  An
+        # as-of answer must not pull a voucher that did not exist in the
+        # requested population yet.  Apply every available cut-off field:
+        # an accounting date in range must not hide an invoice or entry date
+        # that is still after the requested date.  Disclose the exact fields.
+        date_columns = [c for c in ("ACCOUNTING_DT", "INVOICE_DT",
+                                    "ENTERED_DT") if c in cols]
+        date_pred = ""
+        params = {"bu": bu}
+        if date_columns:
+            date_pred = "".join(
+                f" AND V.{column} <= {self.db.date_bind('asof')}"
+                for column in date_columns)
+            params["asof"] = asof
+        else:
+            notes.append(
+                "PS_VOUCHER here has no ACCOUNTING_DT, INVOICE_DT or "
+                "ENTERED_DT; future-entered vouchers cannot be excluded "
+                "from this as-of answer.")
+        rows, truncated = self.db.query(
             f"""SELECT V.VENDOR_ID AS vendor_id, {name} AS vendor,
        V.VOUCHER_ID AS voucher_id, V.GROSS_AMT AS amount,
        {cur} AS currency, {due or 'NULL'} AS due_dt,
        {entry} AS entry_status, {post} AS post_status
   FROM {p}PS_VOUCHER V
   LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID
- WHERE V.BUSINESS_UNIT = :bu AND {open_pred}""",
-            {"bu": bu}, max_rows=10_000)
+ WHERE V.BUSINESS_UNIT = :bu AND {open_pred}{date_pred}""",
+            params, max_rows=10_000)
+
+        if truncated:
+            notes.append(
+                "More than 10,000 open vouchers matched; totals and vendor "
+                "rankings cover only the returned rows and are incomplete.")
 
         vendors: dict = {}
         exceptions: list = []
@@ -175,8 +201,44 @@ class ModulePacks:
         for v in ranked:
             v["open_amount"] = r2(v["open_amount"])
             v["overdue_amount"] = r2(v["overdue_amount"])
+        today = dt.date.today().isoformat()
+        point_in_time_complete = (
+            bool(date_columns) and "CLOSE_STATUS" in cols and not truncated
+            and asof == today)
+        if point_in_time_complete:
+            point_in_time_reason = "current open status is available"
+        elif asof < today:
+            point_in_time_reason = (
+                "Voucher dates were capped at as_of, but current open/close "
+                "status cannot reconstruct vouchers that were open then and "
+                "closed later.")
+        elif asof > today:
+            point_in_time_reason = (
+                f"The requested as_of {asof} is in the future; only current "
+                f"voucher state through {today} is available.")
+        elif not date_columns:
+            point_in_time_reason = "no voucher date is available for a cut-off"
+        elif "CLOSE_STATUS" not in cols:
+            point_in_time_reason = (
+                "CLOSE_STATUS is unavailable; payment-cross-reference "
+                "existence is only a current approximation of open status.")
+        else:
+            point_in_time_reason = "the 10,000-row result cap was reached"
         out = {
             "business_unit": bu, "as_of": asof,
+            "as_of_filter_applied": bool(date_columns),
+            "as_of_basis": (
+                " and ".join(f"PS_VOUCHER.{column} <= as_of"
+                             for column in date_columns)
+                if date_columns else "no voucher date available"),
+            # CLOSE_STATUS and payment xrefs are current-state attributes.
+            # Date-capping prevents later vouchers from leaking into an old
+            # answer, but cannot resurrect a voucher closed after that date.
+            "status_basis": ("current PS_VOUCHER.CLOSE_STATUS"
+                             if "CLOSE_STATUS" in cols else
+                             "current payment-cross-reference existence"),
+            "point_in_time_complete": point_in_time_complete,
+            "point_in_time_reason": point_in_time_reason,
             "open_total": r2(totals["open"]),
             "overdue_total": r2(totals["overdue"]),
             "due_within_7_days": r2(totals["due_7_days"]),
@@ -184,9 +246,15 @@ class ModulePacks:
             "by_vendor": ranked,
             "pipeline_exceptions": exceptions,
             "note": ("Open vouchers only. overdue = due date before as_of; "
-                     "pipeline_exceptions are vouchers in recycle or "
-                     "unposted status — money that is owed but invisible to "
-                     "a payment run until someone fixes the entry."),
+                     + ("vouchers dated after as_of are excluded using "
+                        + ", ".join(f"PS_VOUCHER.{column}"
+                                    for column in date_columns)
+                        + "; " if date_columns else "")
+                     + "pipeline_exceptions are vouchers in recycle or "
+                       "unposted status — money that is owed but invisible to "
+                       "a payment run until someone fixes the entry. Current "
+                       "open/close status cannot reconstruct which vouchers "
+                       "were still open on a past date."),
         }
         if len(currencies - {"?"}) > 1:
             out["mixed_currencies"] = sorted(currencies - {"?"})
@@ -432,15 +500,15 @@ class ModulePacks:
     def duplicate_payments(self, business_unit: str = "",
                            months: int = 12, tolerance_days: int = 7,
                            as_of_date: str = "") -> dict:
-        """Possible duplicate vouchers — the AP audit question every close
-        asks and nobody enjoys checking by hand.
+        """Duplicate-voucher candidates plus confirmed payment evidence.
 
         Two mechanical checks, disclosed separately because they carry
         different confidence: the SAME invoice number vouchered twice for
-        one vendor (near-certain duplicate), and the same vendor billed the
-        SAME amount within a few days under different invoice numbers
-        (worth eyes — recurring charges legitimately look like this, so it
-        is a review list, never an accusation).
+        one vendor, and the same vendor billed the SAME amount within a few
+        days under different invoice numbers.  Neither proves cash went out
+        twice.  Confirmation requires two distinct, non-void payment headers
+        linked to two vouchers; candidates and confirmed disbursements are
+        therefore returned as different populations.
         """
         bu = self._bu(business_unit)
         asof = self._asof(as_of_date)
@@ -449,8 +517,9 @@ class ModulePacks:
         self._need("PS_VOUCHER", ["BUSINESS_UNIT", "VOUCHER_ID", "VENDOR_ID",
                                   "INVOICE_ID", "INVOICE_DT", "GROSS_AMT"])
         p = self.db.prefix
-        # Near-certain: one vendor, one invoice number, several vouchers.
-        rows, _ = self.db.query(
+        # Strong voucher candidate: one vendor/invoice, several vouchers.
+        # Payment confirmation is a separate population below.
+        rows, exact_truncated = self.db.query(
             f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
             f"V.INVOICE_ID AS invoice_id, COUNT(*) AS n, "
             f"SUM(V.GROSS_AMT) AS total "
@@ -458,42 +527,178 @@ class ModulePacks:
             f"LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID "
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
+            f"AND V.INVOICE_DT <= {self.db.date_bind('asof')} "
+            f"AND V.INVOICE_ID IS NOT NULL "
+            f"AND TRIM(V.INVOICE_ID) <> '' "
             f"GROUP BY V.VENDOR_ID, V.INVOICE_ID HAVING COUNT(*) > 1",
-            {"bu": bu, "since": since}, max_rows=200)
+            {"bu": bu, "since": since, "asof": asof}, max_rows=200)
         exact = [{"vendor_id": str(r["vendor_id"]),
                   "vendor": str(r["vendor"] or ""),
                   "invoice_id": str(r["invoice_id"]),
                   "vouchers": int(r["n"] or 0),
-                  "total": r2(float(r["total"] or 0))} for r in rows]
+                  "total": r2(float(r["total"] or 0)),
+                  "finding_type": "duplicate_voucher_candidate"}
+                 for r in rows]
 
         # Worth eyes: same vendor, same amount, different invoice numbers,
         # entered within tolerance_days of each other. Day math happens in
         # Python — no dialect-specific date arithmetic in SQL.
-        cand, _ = self.db.query(
+        cand, cand_truncated = self.db.query(
             f"SELECT V.VENDOR_ID AS vendor_id, MAX(N.NAME1) AS vendor, "
             f"V.GROSS_AMT AS amount, COUNT(*) AS n "
             f"FROM {p}PS_VOUCHER V "
             f"LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = V.VENDOR_ID "
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
+            f"AND V.INVOICE_DT <= {self.db.date_bind('asof')} "
             f"GROUP BY V.VENDOR_ID, V.GROSS_AMT HAVING COUNT(*) > 1",
-            {"bu": bu, "since": since}, max_rows=200)
+            {"bu": bu, "since": since, "asof": asof}, max_rows=200)
+
+        xref_cols = self._cols("PS_PYMNT_VCHR_XREF")
+        payment_cols = self._cols("PS_PAYMENT_TBL")
+        payment_shape = (
+            {"BUSINESS_UNIT", "VOUCHER_ID", "PYMNT_ID", "PAID_AMT"}
+            <= xref_cols
+            and {"PYMNT_ID", "PYMNT_DT"} <= payment_cols)
+        void_status_available = "PYMNT_STATUS" in payment_cols
+        payment_evidence_evaluated = bool(payment_shape
+                                          and void_status_available)
+        payment_select = ""
+        payment_joins = ""
+        if payment_shape:
+            status = ("P.PYMNT_STATUS" if void_status_available else "NULL")
+            payment_select = (
+                ", X.PYMNT_ID AS payment_id, X.PAID_AMT AS paid_amount, "
+                f"P.PYMNT_DT AS payment_dt, {status} AS payment_status")
+            payment_joins = (
+                f" LEFT JOIN {p}PS_PYMNT_VCHR_XREF X ON "
+                "X.BUSINESS_UNIT = V.BUSINESS_UNIT "
+                "AND X.VOUCHER_ID = V.VOUCHER_ID"
+                f" LEFT JOIN {p}PS_PAYMENT_TBL P ON "
+                "P.PYMNT_ID = X.PYMNT_ID")
+
         near = []
-        if cand:
+        detail: list = []
+        truncated = False
+        if cand or exact:
             detail, truncated = self.db.query(
-                f"SELECT VENDOR_ID AS vendor_id, VOUCHER_ID AS voucher_id, "
-                f"INVOICE_ID AS invoice_id, INVOICE_DT AS dt, "
-                f"GROSS_AMT AS amount "
-                f"FROM {p}PS_VOUCHER WHERE BUSINESS_UNIT = :bu "
-                f"AND INVOICE_DT >= {self.db.date_bind('since')}",
-                {"bu": bu, "since": since}, max_rows=5000)
+                f"SELECT V.VENDOR_ID AS vendor_id, "
+                f"V.VOUCHER_ID AS voucher_id, V.INVOICE_ID AS invoice_id, "
+                f"V.INVOICE_DT AS dt, V.GROSS_AMT AS amount"
+                f"{payment_select} FROM {p}PS_VOUCHER V{payment_joins} "
+                f"WHERE V.BUSINESS_UNIT = :bu "
+                f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
+                f"AND V.INVOICE_DT <= {self.db.date_bind('asof')}",
+                {"bu": bu, "since": since, "asof": asof}, max_rows=5000)
+
+        # Collapse the payment join back to one voucher.  A voucher may have
+        # several scheduled payments; that must enrich its evidence rather
+        # than turn the voucher itself into several duplicate candidates.
+        vouchers: dict[str, dict] = {}
+        for r in detail:
+            voucher_id = str(r["voucher_id"])
+            v = vouchers.setdefault(voucher_id, {
+                "vendor_id": str(r["vendor_id"]),
+                "voucher_id": voucher_id,
+                "invoice_id": str(r.get("invoice_id") or ""),
+                "dt": str(r.get("dt") or "")[:10],
+                "amount": float(r.get("amount") or 0),
+                "payments": [],
+                "void_payment_rows": 0,
+                "nonpositive_payment_rows": 0,
+            })
+            if not payment_shape or not r.get("payment_id") \
+                    or not r.get("payment_dt"):
+                continue
+            payment_dt = str(r.get("payment_dt") or "")[:10]
+            if payment_dt > asof:
+                continue
+            status = str(r.get("payment_status") or "").strip().upper()
+            if void_status_available and status == "V":
+                v["void_payment_rows"] += 1
+                continue
+            # A status-bearing record with a blank status cannot prove it is
+            # non-void.  Keep confirmation conservative.
+            if void_status_available and not status:
+                continue
+            paid_amount = r2(float(r.get("paid_amount") or 0))
+            if paid_amount <= 0:
+                v["nonpositive_payment_rows"] += 1
+                continue
+            evidence = {
+                "payment_id": str(r["payment_id"]),
+                "payment_dt": payment_dt,
+                "paid_amount": paid_amount,
+                "payment_status": status or None,
+                "voucher_id": voucher_id,
+            }
+            if not any(x["payment_id"] == evidence["payment_id"]
+                       for x in v["payments"]):
+                v["payments"].append(evidence)
+
+        detail_complete = not (truncated or exact_truncated or cand_truncated)
+        exact_by_key: dict[tuple[str, str], list] = {}
+        for v in vouchers.values():
+            exact_by_key.setdefault((v["vendor_id"], v["invoice_id"]),
+                                    []).append(v)
+
+        for candidate in exact:
+            members = exact_by_key.get((candidate["vendor_id"],
+                                        candidate["invoice_id"]), [])
+            evidence_available = (payment_evidence_evaluated
+                                  and detail_complete
+                                  and len(members) == candidate["vouchers"])
+            paid_rows = [pay for v in members for pay in v["payments"]]
+            paid_vouchers = {pay["voucher_id"] for pay in paid_rows}
+            payment_ids = sorted({pay["payment_id"] for pay in paid_rows})
+            confirmed = bool(evidence_available
+                             and len(paid_vouchers) >= 2
+                             and len(payment_ids) >= 2)
+            paid_total = r2(sum(float(pay["paid_amount"])
+                                for pay in paid_rows))
+            # One legitimate voucher is the conservative baseline.  Use the
+            # largest candidate voucher gross, not the largest payment row:
+            # a legitimate voucher may have been paid in instalments.
+            legitimate_gross = max((float(v["amount"]) for v in members),
+                                   default=0.0)
+            exposure = (r2(max(paid_total - legitimate_gross, 0.0))
+                        if confirmed else 0.0)
+            candidate.update({
+                "voucher_ids": sorted(v["voucher_id"] for v in members),
+                "confirmed_duplicate_payment": confirmed,
+                "payment_evidence_status": (
+                    "confirmed_duplicate_disbursement" if confirmed else
+                    "voucher_duplicate_only" if evidence_available else
+                    "unavailable"),
+                "payment_evidence": {
+                    "evaluated": evidence_available,
+                    "confirmed": confirmed,
+                    "payment_count": len(payment_ids),
+                    "payment_ids": payment_ids,
+                    "paid_voucher_count": len(paid_vouchers),
+                    "paid_total": paid_total,
+                    "duplicate_exposure": exposure,
+                    "exposure_basis": (
+                        "confirmed paid total less the largest candidate "
+                        "voucher gross (one legitimate voucher baseline)"),
+                    "voids_excluded": sum(v["void_payment_rows"]
+                                          for v in members),
+                    "nonpositive_rows_excluded": sum(
+                        v["nonpositive_payment_rows"] for v in members),
+                    "basis": ("distinct non-void PS_PAYMENT_TBL headers "
+                              "linked through PS_PYMNT_VCHR_XREF, with "
+                              "payment date through as_of"),
+                },
+            })
+
+        if cand:
             wanted = {(str(c["vendor_id"]), float(c["amount"] or 0))
                       for c in cand}
             names = {str(c["vendor_id"]): str(c["vendor"] or "")
                      for c in cand}
             groups: dict = {}
-            for r in detail:
-                key = (str(r["vendor_id"]), float(r["amount"] or 0))
+            for r in vouchers.values():
+                key = (r["vendor_id"], float(r["amount"] or 0))
                 if key in wanted:
                     groups.setdefault(key, []).append(r)
             for (vid, amount), members in sorted(groups.items()):
@@ -509,27 +714,74 @@ class ModulePacks:
                             "vouchers": [str(a["voucher_id"]),
                                          str(b["voucher_id"])],
                             "invoices": [str(a["invoice_id"]),
-                                         str(b["invoice_id"])]})
+                                         str(b["invoice_id"])],
+                            "finding_type": "same_amount_review_candidate",
+                            "payment_evidence": {
+                                "evaluated": payment_evidence_evaluated
+                                             and detail_complete,
+                                "confirmed": False,
+                                "paid_voucher_count": sum(
+                                    1 for v in (a, b) if v["payments"]),
+                                "payment_ids": sorted({
+                                    pay["payment_id"] for v in (a, b)
+                                    for pay in v["payments"]}),
+                                "note": ("Payments may be confirmed, but "
+                                         "different invoice numbers remain "
+                                         "a review candidate, not proof of "
+                                         "a duplicate disbursement."),
+                            }})
         exact_total = r2(sum(x["total"] for x in exact))
         notes = []
-        if cand and truncated:
+        if exact_truncated or cand_truncated:
+            notes.append("More than 200 duplicate candidate groups matched; "
+                         "the candidate population is incomplete.")
+        if (cand or exact) and truncated:
             notes.append("More than 5,000 vouchers in the window — the "
-                         "same-amount pair scan covered the first 5,000; "
-                         "narrow the window for full coverage.")
+                         "pair scan and payment confirmation covered the "
+                         "first 5,000; narrow the window for full coverage.")
+        if not payment_shape:
+            notes.append(
+                "PS_PYMNT_VCHR_XREF and PS_PAYMENT_TBL do not expose the "
+                "required payment-link fields here; duplicate vouchers can "
+                "be listed, but duplicate disbursement cannot be confirmed.")
+        elif not void_status_available:
+            notes.append(
+                "PS_PAYMENT_TBL has no PYMNT_STATUS; voids cannot be "
+                "excluded, so duplicate disbursement is not confirmed.")
+        confirmed = [
+            {**x, "finding_type": "confirmed_duplicate_payment"}
+            for x in exact if x.get("confirmed_duplicate_payment")]
+        confirmed_paid_total = r2(sum(
+            float(x["payment_evidence"]["paid_total"]) for x in confirmed))
+        confirmed_exposure = r2(sum(
+            float(x["payment_evidence"]["duplicate_exposure"])
+            for x in confirmed))
         return {
             **({"record_notes": notes} if notes else {}),
             "business_unit": bu, "since": since, "as_of": asof,
             "window_months": int(months or 12),
             "tolerance_days": int(tolerance_days or 7),
             "exact_invoice_duplicates": exact,
+            "duplicate_voucher_candidates": exact,
             "same_amount_pairs": near,
             "exact_total": exact_total,
+            "candidate_gross_total": exact_total,
+            "payment_evidence_evaluated": (payment_evidence_evaluated
+                                           and detail_complete),
+            "confirmed_duplicate_payments": confirmed,
+            "confirmed_duplicate_payment_count": len(confirmed),
+            "confirmed_duplicate_payment_total": confirmed_paid_total,
+            "confirmed_duplicate_exposure": confirmed_exposure,
             "note": ("Exact list = one vendor invoice number vouchered more "
-                     "than once (near-certain duplicate). Same-amount list "
+                     "than once: a duplicate-VOUCHER candidate, not proof "
+                     "that cash was paid twice. confirmed_duplicate_payments "
+                     "requires two distinct non-void payment headers linked "
+                     "to two vouchers as of the requested date. Same-amount "
+                     "list "
                      "= same vendor and amount within the tolerance window "
                      "under different invoice numbers — a REVIEW list, not "
                      "an accusation; recurring charges look like this too. "
-                     "No duplicates found is a real answer, not a failure."
+                     "No candidates found is a real answer, not a failure."
                      ),
         }
 
@@ -552,7 +804,7 @@ class ModulePacks:
         has_status = self.db.has_column("PS_PAYMENT_TBL", "PYMNT_STATUS")
         name = ("N.NAME1" if self.db.has_column("PS_VENDOR", "NAME1")
                 else "NULL")
-        params: dict = {"since": since}
+        params: dict = {"since": since, "asof": asof}
         vend_pred = ""
         term = (vendor or "").strip()
         if term:
@@ -588,9 +840,10 @@ class ModulePacks:
                 f"""SELECT P.VENDOR_ID AS vendor_id, {name} AS vendor,
        COUNT(*) AS payments, SUM(P.PYMNT_AMT) AS paid,
        MAX(P.PYMNT_DT) AS last_payment_dt
-  FROM {p}PS_PAYMENT_TBL P
+ FROM {p}PS_PAYMENT_TBL P
   LEFT JOIN {self._vendor_names()} N ON N.VENDOR_ID = P.VENDOR_ID
- WHERE P.PYMNT_DT >= {self.db.date_bind('since')}"""
+ WHERE P.PYMNT_DT >= {self.db.date_bind('since')}
+   AND P.PYMNT_DT <= {self.db.date_bind('asof')}"""
                 f"{scope_pred}{void_pred}{vend_pred}\n"
                 f" GROUP BY P.VENDOR_ID"
                 f"{', ' + name if name != 'NULL' else ''}\n"
@@ -632,9 +885,11 @@ class ModulePacks:
             ],
             "vendor_count": len(rows),
             "total_paid": r2(sum(float(r["paid"] or 0) for r in rows)),
-            "note": ("Payments by payment date; voided payments excluded"
+            "note": ("Payments by payment date through as_of (inclusive); "
+                     "voided payments excluded"
                      if has_status else
-                     "Payments by payment date; PS_PAYMENT_TBL here has no "
+                     "Payments by payment date through as_of (inclusive); "
+                     "PS_PAYMENT_TBL here has no "
                      "PYMNT_STATUS, so voids cannot be excluded")
             + (f"; scoped to {bu} through the voucher cross-reference"
                if scoped else "; NOT scoped to a business unit — see "

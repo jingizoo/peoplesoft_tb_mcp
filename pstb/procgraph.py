@@ -67,6 +67,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import queries as q
+
 SCHEMA_VERSION = 1
 DEFAULT_FILENAME = "process_graph.db"
 
@@ -449,6 +451,20 @@ def harvest_peopletools(db, limits: GraphBuildLimits | None = None) -> Harvest:
             after = next_after
         return out
 
+    catalog_names: set[str] = set()
+    suffixes: dict[str, list[str]] = {}
+
+    def physical_for(record: str, override: str = "") -> str:
+        """Catalog-backed physical name; ambiguity deliberately stays blank."""
+        explicit = _norm(override)
+        logical = _norm(record)
+        if explicit:
+            return explicit
+        if logical in catalog_names:
+            return logical
+        candidates = list(dict.fromkeys(suffixes.get(logical, [])))
+        return candidates[0] if len(candidates) == 1 else ""
+
     # Records. RECTYPE tells a table from a view from a derived work record,
     # which is what separates "where the data lives" from "what the page uses
     # to show it" — a distinction a reader of the answer needs.
@@ -460,16 +476,51 @@ def harvest_peopletools(db, limits: GraphBuildLimits | None = None) -> Harvest:
         for opt in ("RECDESCR", "RECTYPE", "SQLTABLENAME"):
             if opt in rec_cols:
                 sel.append(opt)
-        for r in rows("PSRECDEFN", ", ".join(sel), "RECNAME",
-                      limits.max_records):
+        record_rows = rows("PSRECDEFN", ", ".join(sel), "RECNAME",
+                           limits.max_records)
+
+        # SQLTABLENAME is decisive when populated.  When it is blank, resolve
+        # against the live catalog in one bounded pass: exact physical name,
+        # then a unique company-prefix suffix.  This preserves delivered
+        # PS_BI_HDR behaviour without assuming that every installation uses
+        # PS_ (ACME_Z_AR_STAGE is just as legitimate).
+        params = {"pat": "%"}
+        try:
+            catalog_rows, catalog_truncated = db.query(
+                q.table_list(db, params), params,
+                max_rows=limits.max_records)
+            catalog_names = {
+                _norm(r.get("table_name")) for r in catalog_rows
+                if _norm(r.get("table_name"))
+            }
+            for physical in catalog_names:
+                parts = physical.split("_")
+                for i in range(len(parts)):
+                    candidate = "_".join(parts[i:])
+                    suffixes.setdefault(candidate, []).append(physical)
+            if catalog_truncated:
+                h.partial = True
+                h.note(
+                    f"the live object catalog exceeded {limits.max_records:,} "
+                    "rows; physical-table resolution is PARTIAL. Explicit "
+                    "SQLTABLENAME values remain authoritative.", ok=False)
+        except Exception as e:                          # noqa: BLE001
+            h.note(
+                "the live object catalog could not be read "
+                f"({type(e).__name__}); records without SQLTABLENAME keep "
+                "their logical name rather than receiving a guessed prefix.")
+
+        for r in record_rows:
             name = _norm(r.get("recname"))
             if not name:
                 continue
             rt = r.get("rectype")
+            override = _norm(r.get("sqltablename"))
+            physical = physical_for(name, override)
             h.node("record", name, label=str(r.get("recdescr") or ""),
                    rectype=rectypes.get(int(rt), str(rt)) if rt is not None
                    else "",
-                   table=_norm(r.get("sqltablename")) or f"PS_{name}")
+                   record=name, table=physical)
     else:
         h.note("PSRECDEFN is not readable; record descriptions and types are "
                "missing. The graph still has whatever the catalog and the "
@@ -500,7 +551,9 @@ def harvest_peopletools(db, limits: GraphBuildLimits | None = None) -> Harvest:
             page, rec = _norm(r.get("pnlname")), _norm(r.get("recname"))
             if not page or not rec:
                 continue
-            h.edge(h.node("page", page), h.node("record", rec),
+            h.edge(h.node("page", page),
+                   h.node("record", rec, record=rec,
+                          table=physical_for(rec)),
                    "page_reads_record", evidence="PSPNLFIELD.RECNAME")
     elif pnl_cols:
         h.note("PSPNLFIELD has no readable PNLNAME/RECNAME pair, so pages "
@@ -564,7 +617,8 @@ def harvest_peopletools(db, limits: GraphBuildLimits | None = None) -> Harvest:
             qn, rec = _norm(r.get("qryname")), _norm(r.get("recname"))
             if qn and rec:
                 h.edge(h.node("query", qn, label=descrs.get(qn, "")),
-                       h.node("record", rec), "query_reads_record",
+                       h.node("record", rec, record=rec,
+                              table=physical_for(rec)), "query_reads_record",
                        evidence="PSQRYRECORD")
     return h
 
@@ -1065,43 +1119,52 @@ _RECORD_KINDS = ("setup", "record")
 
 
 def _canonicalise(nodes: dict, edges: dict) -> tuple:
-    """Merge BI_HDR into PS_BI_HDR — one record, not two islands.
+    """Merge a logical record into its evidenced physical SQL object.
 
-    PeopleTools names a record BI_HDR; SQL, the curated map and every tool in
-    this app call the same thing PS_BI_HDR. Left alone, the page layer
-    attaches to one node and the data layer to the other, and the graph
-    quietly reports that invoicing pages touch no records anybody queries —
-    a hole shaped exactly like a working answer.
+    PeopleTools names a record BI_HDR while SQL uses PS_BI_HDR; at a custom
+    site the same pair may be Z_AR_STAGE and CORP_AR_TXN.  ``attrs.table`` is
+    catalog evidence for that mapping.  Prefixing every logical name with
+    PS_ connected delivered sample records but corrupted custom identities.
 
     Done here, once, rather than in each harvester: they arrive at record
     names from four different directions and any one of them forgetting
     re-opens the split. `setup` wins over `record` when both exist, because
     the curated map is the only source that knows a table is REFERENCE data.
     """
+    identity_of: dict[str, str] = {}
     kind_of: dict = {}
-    for node in nodes.values():
+    for nid, node in nodes.items():
         if node["kind"] in _RECORD_KINDS:
-            bare = node["name"][3:] if node["name"].startswith("PS_") \
-                else node["name"]
-            cur = kind_of.get(bare)
+            attrs = node.get("attrs") or {}
+            physical = _norm(attrs.get("table"))
+            identity = physical or _norm(node["name"])
+            identity_of[nid] = identity
+            cur = kind_of.get(identity)
             if cur is None or (cur == "record" and node["kind"] == "setup"):
-                kind_of[bare] = node["kind"]
+                kind_of[identity] = node["kind"]
 
     def canon(nid: str) -> str:
         kind, _, name = nid.partition(":")
         if kind not in _RECORD_KINDS:
             return nid
-        bare = name[3:] if name.startswith("PS_") else name
-        return f"{kind_of.get(bare, kind)}:PS_{bare}"
+        identity = identity_of.get(nid, _norm(name))
+        return f"{kind_of.get(identity, kind)}:{identity}"
 
     merged: dict = {}
     for nid, node in nodes.items():
         cid = canon(nid)
+        attrs = dict(node.get("attrs") or {})
+        if node["kind"] in _RECORD_KINDS:
+            identity = identity_of.get(nid, _norm(node["name"]))
+            if attrs.get("table"):
+                attrs["table"] = identity
+                attrs.setdefault("record", _norm(node["name"]))
         cur = merged.get(cid)
         if cur is None:
             merged[cid] = {**node, "id": cid,
                            "name": cid.split(":", 1)[1],
-                           "kind": cid.split(":", 1)[0]}
+                           "kind": cid.split(":", 1)[0],
+                           "attrs": attrs}
             continue
         # Keep the richer description; a PeopleTools RECDESCR and a curated
         # label say different useful things, so prefer the longer one and
@@ -1110,7 +1173,9 @@ def _canonicalise(nodes: dict, edges: dict) -> tuple:
             cur["label"] = node["label"]
         if node.get("module") and not cur.get("module"):
             cur["module"] = node["module"]
-        cur["attrs"] = {**(node.get("attrs") or {}), **(cur.get("attrs") or {})}
+        for key, value in attrs.items():
+            if value and not (cur.get("attrs") or {}).get(key):
+                cur.setdefault("attrs", {})[key] = value
         if cur["source"] != node["source"]:
             cur["source"] = "+".join(sorted({cur["source"], node["source"]}))
 
@@ -1459,7 +1524,7 @@ class ProcessGraph:
                 attrs = json.loads(node.get("attrs") or "{}")
             except ValueError:
                 pass
-            buckets.setdefault(node["kind"], []).append({
+            item = {
                 "name": node["name"], "label": node["label"] or "",
                 "module": node["module"] or "",
                 "role": attrs.get("role") or attrs.get("rectype") or "",
@@ -1467,7 +1532,11 @@ class ProcessGraph:
                 "reached_by": ekind or "seed",
                 "relevance": round(score, 3),
                 "source": node["source"],
-            })
+            }
+            if node["kind"] in _RECORD_KINDS:
+                item["record"] = attrs.get("record") or node["name"]
+                item["table"] = attrs.get("table") or ""
+            buckets.setdefault(node["kind"], []).append(item)
         def finish(kind, items):
             items.sort(key=lambda x: (-x["relevance"], x["name"]))
             cut = items[0]["relevance"] * LAYER_DROPOFF

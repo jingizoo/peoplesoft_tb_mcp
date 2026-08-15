@@ -29,6 +29,45 @@ from pstb.guards import (FINANCIAL_EVIDENCE_TOOLS,  # noqa: E402
                          wants_all_business_units)
 
 
+class ControllerQuestionIntentTests(unittest.TestCase):
+    """Everyday controller wording must open with evidence, not prose."""
+
+    def test_common_ap_questions_force_a_data_turn(self) -> None:
+        from pstb.guards import evidence_intent
+        for question in (
+                "Any duplicate vendor payments?",
+                "What should we accrue?",
+                "What is voucher VCH1001 status?",
+                "Are we ready to close AP?",
+                "Show GRNI at June close"):
+            self.assertEqual(evidence_intent(question), "data", question)
+
+    def test_gl_close_question_forces_a_data_turn(self) -> None:
+        from pstb.guards import evidence_intent
+        self.assertEqual(evidence_intent("Are we ready to close GL?"),
+                         "data")
+
+    def test_custom_catalog_question_routes_to_discovery(self) -> None:
+        from pstb.guards import evidence_intent
+        for question in (
+                "Which record has the approval status field?",
+                "Find the physical table used for our Phoenix interface",
+                "Which invoice record is live rather than staging history?"):
+            self.assertEqual(evidence_intent(question), "technical", question)
+
+    def test_catalog_words_cannot_turn_off_financial_evidence(self) -> None:
+        from pstb.guards import evidence_intent
+        for question in (
+                "what records show the trial balance does not tie?",
+                "which tables are out of balance?",
+                "what records explain the variance in travel?",
+                "which records reconcile?"):
+            self.assertEqual(evidence_intent(question), "data", question)
+        self.assertEqual(
+            evidence_intent("which records show we are compliant?"),
+            "mixed")
+
+
 class OweDirectionTests(unittest.TestCase):
     def test_money_we_owe_is_payables(self) -> None:
         for q in ("how much do we owe our vendors right now?",

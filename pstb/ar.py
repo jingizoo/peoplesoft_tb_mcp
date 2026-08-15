@@ -21,8 +21,10 @@ Semantics (deliberate, reviewed):
     never as a pass.
   - Customer summaries aggregate in SQL (one GROUP BY, scales to a real
     PS_ITEM); item detail is fetched row-wise only when asked, with a cap.
-  - Billing lifecycle: NEW/PND -> HLD -> RDY -> INV (finalized) or CAN.
-    Finalized invoices missing from PS_ITEM have not reached AR.
+  - Billing lifecycle: finalized statuses come from the governed
+    billing_invoiced concept; every other observed non-terminal status is
+    pipeline, while CAN is always terminal. Finalized invoices missing from
+    PS_ITEM have not reached AR.
 """
 from __future__ import annotations
 
@@ -43,6 +45,9 @@ BILL_STATUS_DESCR = {
     "TMP": "Temporary bill",
 }
 LOAD_STATUS_DESCR = {"NEW": "Awaiting processing", "DON": "Processed", "ERR": "Error"}
+# Backward-compatible delivered-code reference. Runtime classification must
+# use _billing_invoiced_semantics instead: a site may govern RDY (or another
+# custom status) as finalized.
 NOT_FINAL = ("NEW", "PND", "HLD", "RDY", "TMP")
 DETAIL_ROW_CAP = 5_000
 
@@ -252,6 +257,67 @@ class ARBilling:
             {"bu": bu}, max_rows=1,
         )
         return bool(rows)
+
+    def _business_unit_no_data(self, bu: str, **sections) -> dict:
+        """A nonexistent BU is an unknown scope, never a clean zero."""
+        known, _ = self.db.query(
+            f"SELECT BUSINESS_UNIT AS bu FROM "
+            f"{self.db.prefix}PS_BUS_UNIT_TBL_GL ORDER BY BUSINESS_UNIT",
+            {}, max_rows=25,
+        )
+        return {
+            "scope_status": "business_unit_not_found",
+            "business_unit": bu,
+            "detail": f"Business unit {bu!r} does not exist.",
+            "known_business_units": [r["bu"] for r in known],
+            "note": "NO DATA — this is not a zero balance or a clean check.",
+            **sections,
+        }
+
+    @staticmethod
+    def _value_binds(prefix: str, values) -> tuple[str, dict]:
+        binds = {f"{prefix}{i}": value for i, value in enumerate(values)}
+        return ("(" + ", ".join(f":{key}" for key in binds) + ")",
+                binds)
+
+    def _billing_invoiced_semantics(self) -> dict:
+        """Resolve the governed finalized population with one hard stop.
+
+        A site may teach custom finalized statuses, but CAN is a terminal
+        cancellation in PeopleSoft. Even a mistaken override must never
+        turn it into revenue or place it back in the processing pipeline.
+        """
+        from .semantics import resolve as resolve_concept
+        sem = resolve_concept("billing_invoiced", cfg=self.cfg,
+                              memory=getattr(self.e, "_memory", None))
+        finalized = tuple(v for v in sem.values
+                          if v not in self._BILL_TERMINAL)
+        notes = list(sem.notes)
+        removed = [v for v in sem.values if v in self._BILL_TERMINAL]
+        if removed:
+            notes.append(
+                "Cancelled/terminal status code(s) " + ", ".join(removed)
+                + " were ignored by billing_invoiced; terminal bills can "
+                  "never be finalized revenue or processing pipeline."
+            )
+        if not finalized:
+            raise ARError(
+                "billing_invoiced resolves only to cancelled/terminal "
+                "statuses. Configure at least one non-terminal finalized "
+                "BILL_STATUS value."
+            )
+        predicate = (f"BILL_STATUS = '{finalized[0]}'"
+                     if len(finalized) == 1 else
+                     "BILL_STATUS IN ("
+                     + ", ".join(f"'{v}'" for v in finalized) + ")")
+        return {
+            "values": finalized,
+            "predicate": predicate,
+            "source": sem.source,
+            "meaning": ("site-governed finalized billing; cancelled/terminal "
+                        "statuses are always excluded"),
+            "notes": notes,
+        }
 
     def _latest_posted_period(self, bu: str) -> tuple[int, int, Optional[str]]:
         """(fy, period, period_end_date) of the newest regular period with
@@ -1006,11 +1072,9 @@ class ARBilling:
             return set()
         return {str(r["parent"]) for r in rows if int(r["n"] or 0) > 0}
 
-    # Bill statuses by lifecycle class. INV is the only status that IS
-    # revenue; the pipeline statuses can still become revenue; CAN never
-    # will. Splitting the exclusions is the point: lumping a cancelled
-    # bill with a ready-to-invoice one tells a controller upside that
-    # does not exist.
+    # Familiar delivered statuses provide descriptions, but classification
+    # is governed: billing_invoiced names finalized revenue, CAN is always
+    # terminal, and every other observed status remains pipeline.
     _BILL_PIPELINE = {"NEW": "new bill", "RDY": "ready to invoice",
                       "HLD": "on hold", "TMP": "temporary", "PND": "pending"}
     _BILL_TERMINAL = {"CAN": "cancelled"}
@@ -1020,19 +1084,17 @@ class ARBilling:
         """Total FINALIZED invoice amount, with a population block that
         says exactly what was counted and what was left out.
 
-        "Give me total invoice amount" means finalized bills only
-        (BILL_STATUS = 'INV') — but the default must be VISIBLE, split
+        "Give me total invoice amount" means governed finalized bills only —
+        but the resolved population must be VISIBLE, split
         into pipeline (could still become revenue) vs cancelled (never
         will), and it must refuse rather than answer 0.00 when the
         default itself emptied the result. One query: the same grouped
         aggregate produces the answer AND its counterfactual.
         """
-        from .semantics import resolve as resolve_concept
         bu = self._bu(business_unit)
         p = self.db.prefix
-        sem = resolve_concept("billing_invoiced", cfg=self.cfg,
-                              memory=getattr(self.e, "_memory", None))
-        finalized = set(sem.values)
+        sem = self._billing_invoiced_semantics()
+        finalized = set(sem["values"])
         cols = self._cols("PS_BI_HDR")
         date_col = "ACCOUNTING_DT"
         notes: list = []
@@ -1063,6 +1125,8 @@ class ARBilling:
             f"GROUP BY BILL_STATUS, BI_CURRENCY_CD",
             params, max_rows=200,
         )
+        if not rows and not self._bu_exists(bu):
+            return self._business_unit_no_data(bu, by_status=[])
         by_status = []
         inv_total: dict[str, float] = {}
         inv_count = 0
@@ -1091,11 +1155,11 @@ class ARBilling:
             by_status.append({"status": status, "class": cls,
                               "currency": cur, "n": n, "amount": amt})
         window_applied = {
-            "predicate": sem.predicate,
-            "source": sem.source,
-            "meaning": sem.concept.meaning,
+            "predicate": sem["predicate"],
+            "source": sem["source"],
+            "meaning": sem["meaning"],
         }
-        notes.extend(sem.notes)
+        notes.extend(sem["notes"])
         applied = [window_applied,
                    {"predicate": f"BUSINESS_UNIT = '{bu}'",
                     "source": "request scope", "meaning": "your selected "
@@ -1132,7 +1196,7 @@ class ARBilling:
                 "scope_status": "empty_after_default",
                 "business_unit": bu,
                 "detail": (
-                    f"No FINALIZED bills ({sem.predicate}) match this "
+                    f"No FINALIZED bills ({sem['predicate']}) match this "
                     "scope — the zero comes from the finalized-only "
                     "default, not from an empty table. Statuses that DO "
                     "exist here: "
@@ -1184,6 +1248,10 @@ class ARBilling:
         p = self.db.prefix
         stages: list = []
         notes: list = []
+        sem = self._billing_invoiced_semantics()
+        finalized = set(sem["values"])
+        final_expr, final_binds = self._value_binds("fin", sem["values"])
+        notes.extend(sem["notes"])
 
         # Stage 1: the billing interface — rows waiting or in error.
         if self._cols("PS_INTFC_BI"):
@@ -1202,22 +1270,43 @@ class ARBilling:
             notes.append("PS_INTFC_BI not present — interface visibility "
                          "not available at this site.")
 
-        # Stage 2: bills in the pipeline, aged by accounting date.
+        # Stage 2: classify every observed bill status using the governed
+        # finalized population. Unknown non-terminal statuses stay visible as
+        # pipeline; CAN is terminal and can never become revenue.
+        bi_cols = self._cols("PS_BI_HDR")
+        age_col = ("ACCOUNTING_DT" if not bi_cols or
+                   "ACCOUNTING_DT" in bi_cols else
+                   ("INVOICE_DT" if "INVOICE_DT" in bi_cols else ""))
+        oldest_sel = f"MIN({age_col})" if age_col else "NULL"
         rows, _ = self.db.query(
             f"SELECT BILL_STATUS AS st, COUNT(*) AS n, "
-            f"SUM(INVOICE_AMOUNT) AS amt, MIN(ACCOUNTING_DT) AS oldest "
+            f"SUM(INVOICE_AMOUNT) AS amt, {oldest_sel} AS oldest "
             f"FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu "
-            f"AND BILL_STATUS IN ('NEW','PND','HLD','RDY','TMP') "
-            f"GROUP BY BILL_STATUS", {"bu": bu}, max_rows=20)
+            f"GROUP BY BILL_STATUS", {"bu": bu}, max_rows=200)
+        if not rows and not self._bu_exists(bu):
+            return self._business_unit_no_data(
+                bu, stages=[], billing_statuses=[])
+        billing_statuses = []
         for r in rows:
+            status = str(r["st"] or "")
+            cls = ("finalized" if status in finalized else
+                   ("terminal" if status in self._BILL_TERMINAL else
+                    "pipeline"))
             oldest = _iso_opt(r.get("oldest"))
+            billing_statuses.append({
+                "status": status, "class": cls,
+                "n": int(r["n"] or 0),
+                "amount": r2(float(r["amt"] or 0)),
+                "oldest_date": oldest.isoformat() if oldest else None,
+            })
+            if cls != "pipeline":
+                continue
             stages.append({
-                "stage": f"bill_{str(r['st']).lower()}",
+                "stage": f"bill_{status.lower()}",
                 "n": int(r["n"] or 0),
                 "amount": r2(float(r["amt"] or 0)),
                 "oldest_days": (asof - oldest).days if oldest else None,
-                "meaning": BILL_STATUS_DESCR.get(str(r["st"]),
-                                                 str(r["st"]))})
+                "meaning": BILL_STATUS_DESCR.get(status, status)})
 
         # Stage 3: finalized but never reached AR — billed, invisible.
         # Date-floored, same as the workbench and for the same reason: an
@@ -1229,12 +1318,12 @@ class ARBilling:
         rows, _ = self.db.query(
             f"SELECT COUNT(*) AS n, SUM(H.INVOICE_AMOUNT) AS amt "
             f"FROM {p}PS_BI_HDR H WHERE H.BUSINESS_UNIT = :bu "
-            f"AND H.BILL_STATUS = 'INV' "
+            f"AND H.BILL_STATUS IN {final_expr} "
             f"AND H.INVOICE_DT >= {self.db.date_bind('since')} "
             f"AND NOT EXISTS "
             f"(SELECT 1 FROM {p}PS_ITEM I WHERE "
             f"I.BUSINESS_UNIT = H.BUSINESS_UNIT AND I.ITEM = H.INVOICE)",
-            {"bu": bu, "since": since}, max_rows=1)
+            {"bu": bu, "since": since, **final_binds}, max_rows=1)
         orphan = rows[0] if rows else {}
         stages.append({"stage": "finalized_not_in_ar",
                        "n": int(orphan.get("n") or 0),
@@ -1266,9 +1355,9 @@ class ARBilling:
             rows, _ = self.db.query(
                 f"SELECT {add_col} AS created, INVOICE_DT AS finalized "
                 f"FROM {p}PS_BI_HDR WHERE BUSINESS_UNIT = :bu "
-                f"AND BILL_STATUS = 'INV' "
+                f"AND BILL_STATUS IN {final_expr} "
                 f"AND INVOICE_DT >= {self.db.date_bind('since')}",
-                {"bu": bu, "since": since}, max_rows=5000)
+                {"bu": bu, "since": since, **final_binds}, max_rows=5000)
             gaps = sorted((_iso(str(r["finalized"])) -
                            _iso(str(r["created"]))).days
                           for r in rows
@@ -1293,6 +1382,13 @@ class ARBilling:
         return {
             "business_unit": bu, "as_of": asof.isoformat(),
             "stages": stages,
+            "billing_statuses": billing_statuses,
+            "population": {
+                "concept": "finalized billing",
+                "predicate": sem["predicate"],
+                "source": sem["source"],
+                "meaning": sem["meaning"],
+            },
             **({"cycle_time": cycle} if cycle else {}),
             "bottleneck": (
                 {"stage": bottleneck["stage"],
@@ -1302,7 +1398,9 @@ class ARBilling:
                 if bottleneck else None),
             **({"record_notes": notes} if notes else {}),
             "lookback_days": int(lookback_days or 365),
-            "note": ("Pipeline from the billing interface to AR. "
+            "note": ("Pipeline from the billing interface to AR. Bill "
+                     f"statuses are classified using {sem['predicate']}; "
+                     "cancelled bills are terminal, never pipeline. "
                      "Visibility starts at the interface; upstream order "
                      "records vary by site and are not assumed. Orphan and "
                      "cycle checks cover the lookback window, not all "
@@ -1495,7 +1593,8 @@ class ARBilling:
         top = self.top_billing_customers(
             business_unit=bu, n=n, months=months, display_currency=disp,
             as_of_date=as_of_date)
-        if top.get("mixed_currencies") and not top.get("customers"):
+        if top.get("scope_status") or (
+                top.get("mixed_currencies") and not top.get("customers")):
             return top  # ranking impossible; pass the refusal through
         ranked = top.get("customers") or []
         ids = [c["cust_id"] for c in ranked]
@@ -1530,13 +1629,12 @@ class ARBilling:
         # WHAT they buy: finalized bill lines over the same window, with
         # the finalized statuses resolved through the concept register so
         # a taught status override applies here too.
-        from .semantics import resolve as resolve_concept
-        sem = resolve_concept("billing_invoiced", cfg=self.cfg,
-                              memory=getattr(self.e, "_memory", None))
+        sem = self._billing_invoiced_semantics()
         products: dict = {}
         if ids and self._cols("PS_BI_LINE"):
             expr, binds = in_binds("l")
-            status_binds = {f"st{i}": v for i, v in enumerate(sem.values)}
+            status_binds = {f"st{i}": v
+                            for i, v in enumerate(sem["values"])}
             st_expr = "(" + ", ".join(f":{k}" for k in status_binds) + ")"
             since = (_iso(asof) - dt.timedelta(
                 days=max(int(months or 12), 1) * 30)).isoformat()
@@ -1566,29 +1664,58 @@ class ARBilling:
                          "mix is not available.")
 
         # HOW they pay: open-item behavior computed in Python (no dialect-
-        # specific date arithmetic in SQL).
+        # specific date arithmetic in SQL). It uses the same record-shape
+        # adaptation and FX path as aging, so these figures reconcile to it.
         behavior: dict = {}
+        ar_fx: dict = {}
+        item_shape = self._item_shape()
+        notes.extend(n for n in item_shape["notes"] if n not in notes)
+        ar_scope = (f"open PS_ITEM balances with {item_shape['date']} through "
+                    f"{asof}, converted to {disp}"
+                    if item_shape["date"] else
+                    f"current open PS_ITEM balances converted to {disp}; "
+                    "no item-date column exists for an as-of cutoff")
         if ids:
             expr, binds = in_binds("b")
+            item_date = (f"I.{item_shape['date']} AS item_dt"
+                         if item_shape["date"] else "NULL AS item_dt")
+            due_date = (f"I.{item_shape['due']} AS due"
+                        if item_shape["due"] else "NULL AS due")
+            item_cur = (f"I.{item_shape['currency']} AS currency"
+                        if item_shape["currency"] else "'' AS currency")
+            dispute = (f"I.{item_shape['dispute']} AS dispute"
+                       if item_shape["dispute"] else "NULL AS dispute")
+            asof_cut = (f" AND I.{item_shape['date']} <= "
+                         f"{self.db.date_bind('asof')}"
+                         if item_shape["date"] else "")
             rows, _ = self.db.query(
-                f"SELECT CUST_ID AS cid, BAL_AMT AS bal, DUE_DT AS due, "
-                f"DISPUTE_STATUS AS dispute "
-                f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu "
-                f"AND ITEM_STATUS = 'O' AND CUST_ID IN {expr}",
-                {"bu": bu, **binds}, max_rows=DETAIL_ROW_CAP)
+                f"SELECT I.CUST_ID AS cid, I.BAL_AMT AS bal, {item_date}, "
+                f"{due_date}, {item_cur}, {dispute} "
+                f"FROM {p}PS_ITEM I WHERE I.BUSINESS_UNIT = :bu "
+                f"AND I.ITEM_STATUS = 'O' AND I.CUST_ID IN {expr}"
+                f"{asof_cut}",
+                {"bu": bu, "asof": asof, **binds},
+                max_rows=DETAIL_ROW_CAP)
             today = _iso(asof)
             for r in rows:
                 b = behavior.setdefault(str(r["cid"]), {
                     "open_ar": 0.0, "overdue_amt": 0.0,
-                    "late_weight": 0.0, "disputed_amt": 0.0})
-                bal = float(r["bal"] or 0)
+                    "late_weight": 0.0, "late_balance": 0.0,
+                    "disputed_amt": 0.0, "source_currencies": set()})
+                source_cur = (str(r.get("currency") or "").upper() or base)
+                rate = self._rate_to(source_cur, disp, asof, ar_fx,
+                                     base=base)
+                bal = float(r["bal"] or 0) * rate
+                b["source_currencies"].add(source_cur)
                 b["open_ar"] = r2(b["open_ar"] + bal)
-                due = _iso_opt(r.get("due"))
-                if due and due < today and bal > 0:
+                due = _iso_opt(r.get("due")) or _iso_opt(r.get("item_dt"))
+                if due and due < today:
                     days = (today - due).days
                     b["overdue_amt"] = r2(b["overdue_amt"] + bal)
-                    b["late_weight"] += bal * days
-                if str(r.get("dispute") or "").strip() and bal > 0:
+                    if bal > 0:
+                        b["late_weight"] += bal * days
+                        b["late_balance"] += bal
+                if str(r.get("dispute") or "").strip():
                     b["disputed_amt"] = r2(b["disputed_amt"] + bal)
 
         customers = []
@@ -1601,13 +1728,19 @@ class ARBilling:
                 "location": locations.get(cid),
                 "top_products": (products.get(cid) or [])[:3],
                 "open_ar": r2(b.get("open_ar", 0.0)),
+                "open_ar_currency": disp,
                 "overdue_amt": r2(overdue),
+                "overdue_currency": disp,
                 "overdue_share_pct": (
                     r2(overdue / b["open_ar"] * 100.0)
                     if b.get("open_ar") else 0.0),
-                "avg_days_late": (int(round(b["late_weight"] / overdue))
-                                  if overdue else 0),
+                "avg_days_late": (
+                    int(round(b["late_weight"] / b["late_balance"]))
+                    if b.get("late_balance") else 0),
                 "disputed_amt": r2(b.get("disputed_amt", 0.0)),
+                "disputed_currency": disp,
+                "open_ar_source_currencies": sorted(
+                    b.get("source_currencies") or []),
             }
             customers.append(entry)
 
@@ -1631,8 +1764,9 @@ class ARBilling:
                         "overdue_amt": c["overdue_amt"],
                         "avg_days_late": c["avg_days_late"],
                         "text": (f"{c.get('name') or c['cust_id']} has "
-                                 f"{c['overdue_amt']:,.2f} overdue, on "
-                                 f"average {c['avg_days_late']} days late — "
+                                 f"{c['overdue_amt']:,.2f} {disp} overdue, "
+                                 f"averaging {c['avg_days_late']} days "
+                                 "late — "
                                  "working capital sitting with the "
                                  "customer; a collections touch or terms "
                                  "conversation is the lever.")})
@@ -1642,7 +1776,8 @@ class ARBilling:
                         "cust_id": c["cust_id"],
                         "disputed_amt": c["disputed_amt"],
                         "text": (f"{c.get('name') or c['cust_id']} is "
-                                 f"disputing {c['disputed_amt']:,.2f} — "
+                                 f"disputing {c['disputed_amt']:,.2f} "
+                                 f"{disp} — "
                                  "resolve the dispute before it ages into "
                                  "a write-off conversation.")})
             lapsed = [c for c in customers
@@ -1668,25 +1803,44 @@ class ARBilling:
             "population": {
                 "concept": "customer intelligence over finalized billing",
                 "applied": [
-                    {"predicate": sem.predicate, "source": sem.source,
-                     "meaning": sem.concept.meaning},
+                    {"predicate": sem["predicate"],
+                     "source": sem["source"],
+                     "meaning": sem["meaning"]},
                     {"predicate": f"trailing {int(months or 12)} months",
                      "source": "tool default",
                      "meaning": "billing ranked over this window"},
+                    {"predicate": ar_scope,
+                     "source": ("PS_ITEM.BAL_AMT and BAL_CURRENCY; "
+                                "effective-dated PS_RT_RATE_TBL when "
+                                "source and display currencies differ"),
+                     "meaning": (
+                         "open_ar, overdue_amt and disputed_amt are all "
+                         "expressed in display_currency; overdue_amt is "
+                         "net open-item exposure, so overdue credits reduce "
+                         "it, while avg_days_late is balance-weighted over "
+                         "positive overdue balances only")},
                 ],
             },
+            "ar_fx_applied": sorted(n for _, n in ar_fx.values()),
+            **({"fx_applied": sorted(set((top.get("fx_applied") or [])
+                                         + [n for _, n in ar_fx.values()]))}
+               if top.get("fx_applied") or ar_fx else {}),
             **({"record_notes": notes} if notes else {}),
             "note": ("Observations are computed from the records above — "
                      "concentration, overdue, disputes and lapsed activity "
                      "— never generated advice. Billing ranked in "
-                     f"{disp}; open-AR figures are in item currency."),
+                     f"{disp}; open AR, overdue and disputes are converted "
+                     f"to the same display currency ({disp}). Overdue is net "
+                     "open-item exposure (credits reduce it); average days "
+                     "late weights positive overdue balances only. Product-line "
+                     "amounts remain in each invoice currency."),
         }
 
     def top_billing_customers(self, business_unit: str = "", n: int = 10,
                               months: int = 12, as_of_date: str = "",
                               display_currency: str = "",
                               active_within_months: int = 0) -> dict:
-        """Top customers by FINALIZED billing (BILL_STATUS='INV') over a
+        """Top customers by governed FINALIZED billing over a
         trailing window. Groups by customer AND currency — mixed currencies are
         never silently summed; pass display_currency to convert server-side.
 
@@ -1728,9 +1882,11 @@ class ARBilling:
             active_since = _months_before(
                 _iso(asof), int(active_within_months)).isoformat()
         p = self.db.prefix
+        sem = self._billing_invoiced_semantics()
+        final_expr, final_binds = self._value_binds("fin", sem["values"])
         setid = None if bu_all else self.e.resolve_setid(bu, "CUSTOMER")
         bi = self._cols("PS_BI_HDR")
-        record_notes: list[str] = []
+        record_notes: list[str] = list(sem["notes"])
         if bi:
             need = [c for c in ("INVOICE_DT", "INVOICE_AMOUNT",
                                 "BILL_TO_CUST_ID") if c not in bi]
@@ -1755,7 +1911,8 @@ class ARBilling:
         having = (f" HAVING MAX(H.INVOICE_DT) >= {self.db.date_bind('active_since')}"
                   if active_since else "")
         params: dict = {"bu": bu, "setid": setid, "since": since,
-                        "asof": asof, "active_since": active_since}
+                        "asof": asof, "active_since": active_since,
+                        **final_binds}
         unit_pred = ""
         if ranked_units:
             marks = {f"ru{i}": u for i, u in enumerate(ranked_units)}
@@ -1782,7 +1939,7 @@ class ARBilling:
                FROM {p}PS_CUSTOMER GROUP BY CUST_ID{
                    ', ' + _cs['name'] if _cs['name'] else ''}) N
     ON N.CUST_ID = H.BILL_TO_CUST_ID
- WHERE H.BILL_STATUS = 'INV'
+ WHERE H.BILL_STATUS IN {final_expr}
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
    AND H.INVOICE_DT <= {self.db.date_bind('asof')}
 {unit_pred} GROUP BY H.BILL_TO_CUST_ID, H.BUSINESS_UNIT{group_cur}{having}""",
@@ -1797,12 +1954,20 @@ class ARBilling:
        MAX(H.INVOICE_DT) AS last_invoice
   FROM {p}PS_BI_HDR H
   LEFT JOIN {p}PS_CUSTOMER C ON C.SETID = :setid AND C.CUST_ID = H.BILL_TO_CUST_ID
- WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
+ WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS IN {final_expr}
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
    AND H.INVOICE_DT <= {self.db.date_bind('asof')}
  GROUP BY H.BILL_TO_CUST_ID{tb_group}, H.BUSINESS_UNIT{group_cur}{having}""",
                 params, max_rows=10_000,
             )
+        if not bu_all and not rows and not self._bu_exists(bu):
+            return self._business_unit_no_data(
+                bu, customers=[],
+                window_months=int(months or 12), since=since, as_of=asof,
+                population={"concept": "finalized billing",
+                            "predicate": sem["predicate"],
+                            "source": sem["source"],
+                            "meaning": sem["meaning"]})
         base_by_bu: dict = {}
         for r in rows:
             row_bu = str(r.get("bu") or "")
@@ -1848,6 +2013,10 @@ class ARBilling:
                 "since": since, "as_of": asof,
                 "ranking_complete": not truncated,
                 "mixed_currencies": currencies,
+                "population": {"concept": "finalized billing",
+                               "predicate": sem["predicate"],
+                               "source": sem["source"],
+                               "meaning": sem["meaning"]},
                 # business_unit rides along on the ALL ranking, exactly as
                 # it does on the converted path below. Without it a
                 # cross-unit ranking names customers and amounts but never
@@ -1900,7 +2069,12 @@ class ARBilling:
             # customer, which is a WRONG answer wearing a right one — worse
             # than a short list. Say whether the ranking can be trusted.
             "ranking_complete": not truncated,
-            "note": ("Finalized (INV) invoices only, by invoice date window "
+            "population": {"concept": "finalized billing",
+                           "predicate": sem["predicate"],
+                           "source": sem["source"],
+                           "meaning": sem["meaning"]},
+            "note": (f"Finalized bills ({sem['predicate']}) only, by "
+                     "invoice date window "
                      f"{since} to {asof} inclusive. "
                      "This is BILLING volume, not open AR — see get_ar_aging "
                      "for what is owed."
@@ -1955,11 +2129,14 @@ class ARBilling:
         asof = self._asof(as_of_date)
         asof_d = _iso(asof)
         p = self.db.prefix
+        sem = self._billing_invoiced_semantics()
+        finalized = set(sem["values"])
+        final_expr, final_binds = self._value_binds("fin", sem["values"])
 
         # Adapt to this site's PS_BI_HDR shape; unknown shape (introspection
         # failed) assumes the reference layout.
         bi = self._cols("PS_BI_HDR")
-        record_notes: list[str] = []
+        record_notes: list[str] = list(sem["notes"])
         if bi:
             req = [c for c in ("INVOICE", "BILL_STATUS") if c not in bi]
             if req:
@@ -2008,6 +2185,10 @@ class ARBilling:
  GROUP BY BILL_STATUS{cur_grp}""",
             {"bu": bu}, max_rows=100,
         )
+        if not rows and not self._bu_exists(bu):
+            return self._business_unit_no_data(
+                bu, statuses=[], stuck_invoices=[], interface=[],
+                interface_errors=[], finalized_not_in_ar=[])
         bill_fx: dict = {}
         merged: dict = {}
         for r in rows:
@@ -2019,6 +2200,9 @@ class ARBilling:
             entry = merged.setdefault(st, {
                 "status": st, "n": 0, "amount": 0.0, "currency": disp,
                 "amounts_by_currency": {},
+                "class": ("finalized" if st in finalized else
+                          ("terminal" if st in self._BILL_TERMINAL else
+                           "pipeline")),
                 "descr": BILL_STATUS_DESCR.get(st, st)})
             entry["n"] += int(r["n"] or 0)
             entry["amount"] += float(r["amount"] or 0) * rate
@@ -2032,16 +2216,24 @@ class ARBilling:
                 entry.pop("amounts_by_currency")
             statuses.append(entry)
 
-        pend, pend_trunc = self.db.query(
-            f"""SELECT INVOICE AS invoice, BILL_STATUS AS status,
+        pipeline_statuses = sorted(
+            st for st in merged
+            if st not in finalized and st not in self._BILL_TERMINAL)
+        if pipeline_statuses:
+            pipe_expr, pipe_binds = self._value_binds(
+                "pipe", pipeline_statuses)
+            pend, pend_trunc = self.db.query(
+                f"""SELECT INVOICE AS invoice, BILL_STATUS AS status,
        {_h('BILL_TO_CUST_ID', 'cust_id')}, {_h('INVOICE_DT', 'invoice_dt')},
        {_h('INVOICE_AMOUNT', 'amount')}, {_h('BILL_SOURCE_ID', 'source')}
   FROM {p}PS_BI_HDR
  WHERE BUSINESS_UNIT = :bu
-   AND BILL_STATUS IN ({", ".join("'" + s + "'" for s in NOT_FINAL)})
+   AND BILL_STATUS IN {pipe_expr}
  ORDER BY {'INVOICE_DT' if has_dt else 'INVOICE'}""",
-            {"bu": bu}, max_rows=1_000,
-        )
+                {"bu": bu, **pipe_binds}, max_rows=1_000,
+            )
+        else:
+            pend, pend_trunc = [], False
         stuck = []
         for r in pend:
             inv_d = _iso_opt(r["invoice_dt"])
@@ -2094,13 +2286,13 @@ class ARBilling:
                 f"""SELECT H.INVOICE AS invoice, {_h('BILL_TO_CUST_ID', 'cust_id')},
        H.INVOICE_DT AS invoice_dt, {_h('INVOICE_AMOUNT', 'amount')}
   FROM {p}PS_BI_HDR H
- WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS = 'INV'
+ WHERE H.BUSINESS_UNIT = :bu AND H.BILL_STATUS IN {final_expr}
    AND H.INVOICE_DT >= {self.db.date_bind('since')}
    AND NOT EXISTS (SELECT 1 FROM {p}PS_ITEM I
                     WHERE I.BUSINESS_UNIT = H.BUSINESS_UNIT
                       AND I.ITEM = H.INVOICE)
  ORDER BY H.INVOICE_DT""",
-                {"bu": bu, "since": since}, max_rows=50,
+                {"bu": bu, "since": since, **final_binds}, max_rows=50,
             )
             for o in orphans:
                 o["amount"] = r2(o["amount"] or 0)
@@ -2120,6 +2312,12 @@ class ARBilling:
             "business_unit": bu,
             "as_of": asof,
             "statuses": statuses,
+            "population": {
+                "concept": "finalized billing",
+                "predicate": sem["predicate"],
+                "source": sem["source"],
+                "meaning": sem["meaning"],
+            },
             # Say which currency the status amounts are in, and which rate
             # got them there. A converted figure with no rate beside it is
             # a figure nobody can check.
@@ -2140,7 +2338,9 @@ class ARBilling:
                       else "passed")
             ),
             "note": (
-                "Lifecycle: NEW/PND -> HLD -> RDY -> INV (finalized) or CAN. "
+                f"Finalized billing is governed by {sem['predicate']}. "
+                "Every other observed non-terminal status is pipeline; CAN "
+                "is terminal and is never treated as pipeline or revenue. "
                 "'Finalized not in AR' means the invoice exists in Billing but "
                 "has no open-item row — the AR update has not run or failed."
             ),

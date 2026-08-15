@@ -348,13 +348,17 @@ _POLICY_QUERY = re.compile(
 )
 _DATA_QUERY = re.compile(
     r"(?i)\b(?:amounts?|figures?|balances?|trial balances?|tb|ledgers?|accounts?|"
-    r"activity|postings?|journals?|billing|invoices?|receivables?|aging|customers?|revenues?|"
+    r"activity|postings?|journals?|general ledger|gl|billing|invoices?|"
+    r"receivables?|ar|aging|customers?|revenues?|"
+    r"payables?|accounts payable|ap|vouchers?|vendors?|suppliers?|"
+    r"payments?|disbursements?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
     r"expenses?|variances?|budgets?|actuals?|financial statements?|reports?|"
     r"income statements?|balance sheets?|cash flow statements?|p\s*&\s*l|"
     r"profit and loss|profits?|earn(?:ed|ings?)?|sales|margins?|costs?|"
     r"owe[ds]?|owing|due|overdue|past[ -]due|collections?|"
     r"business units?|bu(?:s)?|periods?|fiscal years?|currenc(?:y|ies)|"
-    r"exchange rates?|suspense|open items?|debits?|credits?)\b"
+    r"exchange rates?|suspense|open items?|debits?|credits?|"
+    r"close readiness|ready to close|month[ -]end close|year[ -]end close)\b"
 )
 # A domain NOUN alone does not make a question a data question: "what is our
 # travel EXPENSE policy" is pure policy. Requiring an anchor — a request to
@@ -390,7 +394,8 @@ _DATA_ANCHOR_STRONG = re.compile(
 _QUESTION_DOMAINS = {
     "balance": re.compile(
         r"(?i)\b(?:balances?|trial balances?|tb|activity|postings?|suspense|"
-        r"debits?|credits?)\b"
+        r"debits?|credits?|general ledger|gl|close readiness|"
+        r"ready to close|month[ -]end close|year[ -]end close)\b"
     ),
     "journal": re.compile(r"(?i)\bjournals?\b"),
     "billing": re.compile(r"(?i)\b(?:billing|invoices?)\b"),
@@ -405,8 +410,10 @@ _QUESTION_DOMAINS = {
         r"due|overdue|past[ -]due|collections?)\b"
     ),
     "ap": re.compile(
-        r"(?i)\b(?:payables?|vouchers?|vendors?|suppliers?|"
-        r"pay(?:ment)?\s+runs?)\b"
+        r"(?i)\b(?:payables?|accounts payable|ap|vouchers?|vendors?|suppliers?|"
+        r"payments?|disbursements?|pay(?:ment)?\s+runs?|"
+        r"accru(?:e[ds]?|al|als|ed|ing)|"
+        r"grni|rni)\b"
         r"|\b(?:we|do\s+we|should\s+we|how\s+much\s+do\s+we)\s+owe\b"
     ),
     "am": re.compile(
@@ -547,6 +554,17 @@ _EXPLICIT_POLICY_WORD = re.compile(
     r"(?i)\b(?:polic(?:y|ies)|procedure|rule|guideline|threshold|"
     r"checklist|complian\w+)\b")
 
+# Metadata discovery is an evidence-gathering task even when its subject is
+# an approval/status concept.  Treating "which record has the approval status
+# field?" as a policy question kept Gemini away from the catalog tools — a
+# particularly costly failure for custom, company-prefixed records.
+_CATALOG_QUERY = re.compile(
+    r"(?i)(?:\b(?:find|search|locate|which|what|show|describe|compare|profile)\b"
+    r".{0,80}\b(?:records?|tables?|fields?|columns?)\b|"
+    r"\b(?:records?|tables?)\b.{0,80}\b(?:used|holds?|contains?|live|"
+    r"staging|history|historical|physical)\b)"
+)
+
 
 def evidence_intent(question: str) -> str:
     """Classify a question for deterministic evidence routing.
@@ -579,6 +597,17 @@ def evidence_intent(question: str) -> str:
     if _VERDICT.search(text):
         # A compliance verdict genuinely needs both halves: rule and figure.
         policy = data = True
+    # Metadata wording is technical only after the stronger reconciliation,
+    # verdict and data rules have had their say.  Putting this first allowed
+    # "which tables are out of balance?" to turn off the financial-evidence
+    # gate; it also stole domain-free hard overrides such as "which records
+    # reconcile?" and "which records show we are compliant?".  Explicit
+    # custom-object asks still arrive here with data demoted by the technical
+    # rule above, and approval/status field discovery remains technical.
+    if (_CATALOG_QUERY.search(text)
+            and not _FIGURE_ASK.search(text)
+            and not data):
+        return "technical"
     if policy and data:
         return "mixed"
     if policy:

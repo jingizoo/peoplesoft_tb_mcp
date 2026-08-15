@@ -3655,10 +3655,75 @@ class TBEngine:
     _RECTYPE = {0: "table", 1: "view", 7: "temp table"}
 
     def _physical_name(self, recname: str, sqltablename: str) -> str:
-        """Physical object for a PeopleSoft record. A site can override the
-        name in PSRECDEFN.SQLTABLENAME; otherwise it is PS_ + RECNAME."""
+        """Physical object for a PeopleSoft record, resolved from evidence.
+
+        ``PS_ + RECNAME`` is a convention, not metadata.  Delivered records
+        often use it, but company-prefixed records and sites that override a
+        physical table do not.  Returning an invented name is worse than an
+        unresolved name because the next query fails against the wrong
+        object with great confidence.  Resolution therefore follows the
+        live facts: SQLTABLENAME, an exact catalog object, then one unique
+        catalog suffix match.
+        """
         override = (sqltablename or "").strip()
-        return override or f"PS_{(recname or '').strip()}"
+        if override:
+            return override.upper()
+        rec = (recname or "").strip().upper()
+        if not rec:
+            return ""
+        try:
+            if self._table_exists(rec):
+                return rec
+        except Exception:
+            pass
+        bare = rec[3:] if rec.startswith("PS_") else rec
+        try:
+            candidates = self.list_tables(bare).get("tables") or []
+        except Exception:
+            candidates = []
+        suffixes = []
+        for row in candidates:
+            name = str(row.get("table_name") or "").strip().upper()
+            if name == bare or name.endswith("_" + bare):
+                suffixes.append(name)
+        suffixes = list(dict.fromkeys(suffixes))
+        return suffixes[0] if len(suffixes) == 1 else ""
+
+    _RECORD_SEARCH_STOP = frozenset({
+        "A", "AN", "THE", "THIS", "THAT", "OUR", "MY", "YOUR", "OF",
+        "FOR", "FROM", "WITH", "IN", "ON", "AT", "TO", "AND", "OR",
+        "WHAT", "WHICH", "WHERE", "SHOW", "FIND", "GET", "TABLE",
+        "RECORD", "RECORDS", "CONFIGURED", "CONFIGURATION", "SETUP",
+    })
+
+    @classmethod
+    def _record_search_terms(cls, text: str) -> list[str]:
+        """Meaningful bounded terms for a natural-language catalog search.
+
+        The old single ``%FULL PHRASE%`` required the user's word order to
+        match a PeopleTools description byte-for-byte.  Keep the phrase as a
+        ranking boost, but retrieve on individual business terms so
+        "interface file" still finds "File Interface Setup".
+        """
+        terms = []
+        for raw in re.findall(r"[A-Za-z0-9]+", (text or "").upper()):
+            if len(raw) < 2 or raw in cls._RECORD_SEARCH_STOP:
+                continue
+            variants = [raw]
+            if raw.endswith("IES") and len(raw) > 5:
+                variants.append(raw[:-3] + "Y")
+            elif raw.endswith("S") and len(raw) > 4:
+                variants.append(raw[:-1])
+            if raw.endswith("ED") and len(raw) > 6:
+                variants.append(raw[:-2])
+            if raw.endswith("ING") and len(raw) > 7:
+                variants.append(raw[:-3])
+            for value in variants:
+                if value not in terms:
+                    terms.append(value)
+                if len(terms) >= 8:
+                    return terms
+        return terms
 
     def search_records(self, query: str = "", limit: int = 25) -> dict:
         """Find the right PeopleSoft record for a question, using PeopleTools
@@ -3674,42 +3739,105 @@ class TBEngine:
         if not term:
             raise EngineError("search_records needs something to search for")
         cap = min(max(int(limit or 25), 1), 100)
-        like = f"%{term.upper()}%"
-        out: list = []
-        seen: set = set()
+        phrase = term.upper()
+        terms = self._record_search_terms(term) or [phrase]
+        candidates: dict[str, dict] = {}
         source = "psrecdefn"
         notes: list = []
 
-        def add(r: dict, matched_on: str) -> None:
+        def add(r: dict, matched_on: str, matched_term: str = "") -> None:
             rec = str(r.get("recname") or "").strip()
-            if not rec or rec in seen:
+            if not rec:
                 return
-            seen.add(rec)
             phys = self._physical_name(rec, r.get("sqltablename"))
-            entry = {
+            entry = candidates.setdefault(rec, {
                 "record": rec,
-                "table": phys,
+                "table": phys or None,
                 "descr": (str(r.get("recdescr") or "").strip() or None),
                 "kind": self._RECTYPE.get(int(r.get("rectype") or 0), "table"),
-                "matched_on": matched_on,
-            }
+                "matched_on": [], "matched_terms": [], "relevance": 0,
+            })
+            if phys and not entry.get("table"):
+                entry["table"] = phys
+            if matched_on not in entry["matched_on"]:
+                entry["matched_on"].append(matched_on)
+            if matched_term and matched_term not in entry["matched_terms"]:
+                entry["matched_terms"].append(matched_term)
             if r.get("fieldname"):
-                entry["matched_field"] = r["fieldname"]
-            rows = self._approx_rows(phys)
-            if rows is not None:
-                entry["approx_rows"] = rows
-            out.append(entry)
+                entry.setdefault("matched_fields", [])
+                field = str(r["fieldname"])
+                if field not in entry["matched_fields"]:
+                    entry["matched_fields"].append(field)
+
+            haystacks = {
+                "record name": rec.upper().replace("_", " "),
+                "physical table": (phys or "").upper().replace("_", " "),
+                "description": str(r.get("recdescr") or "").upper(),
+                "field name": str(r.get("fieldname") or "").upper()
+                              .replace("_", " "),
+                "field label": str(r.get("fieldlabel") or "").upper(),
+            }
+            normalized_phrase = re.sub(r"[_\s]+", " ", phrase).strip()
+            if normalized_phrase and any(normalized_phrase in value
+                                         for value in haystacks.values()):
+                entry["relevance"] += 80
+            coverage = sum(1 for token in terms
+                           if any(token in value for value in haystacks.values()))
+            entry["relevance"] += coverage * 20
+            if coverage == len(terms):
+                entry["relevance"] += 40
+            if phrase in {rec.upper(), (phys or "").upper()}:
+                entry["relevance"] += 120
+            entry["relevance"] += {
+                "physical table": 18, "record name": 14,
+                "description": 10, "field name": 7, "field label": 9,
+            }.get(matched_on, 0)
 
         try:
-            recs, _ = self.db.query(q.psrecdefn_search(self.db), {"q": like},
-                                    max_rows=cap * 4)
-            for r in recs:
-                add(r, "record name or description")
-            if len(out) < cap:
-                flds, _ = self.db.query(q.psrecfield_search(self.db),
-                                        {"q": like}, max_rows=cap * 4)
+            # Exact phrase first gives it a ranking boost when it exists;
+            # token probes provide coverage without assuming word order.
+            probes = [phrase] + [t for t in terms if t != phrase]
+            for probe in probes[:9]:
+                like = f"%{probe}%"
+                recs, _ = self.db.query(
+                    q.psrecdefn_search(self.db), {"q": like},
+                    max_rows=cap * 4)
+                for r in recs:
+                    recname = str(r.get("recname") or "").upper()
+                    table = str(r.get("sqltablename") or "").upper()
+                    descr = str(r.get("recdescr") or "").upper()
+                    on = ("physical table" if probe in table else
+                          "record name" if probe in recname else
+                          "description")
+                    add(r, on, probe)
+                flds, _ = self.db.query(
+                    q.psrecfield_search(self.db), {"q": like},
+                    max_rows=cap * 4)
                 for r in flds:
-                    add(r, "field name")
+                    add(r, "field name", probe)
+
+            # Field labels are optional PeopleTools metadata.  They are the
+            # only way a user saying "approval status" can find a custom
+            # X_APPR_STAT field without already knowing its abbreviation.
+            label_cols = self.db.columns("PSDBFLDLABL")
+            label_text = next((c for c in ("LONGNAME", "SHORTNAME", "LABEL_ID")
+                               if c in label_cols), "")
+            if label_text and {"FIELDNAME"} <= label_cols:
+                for probe in probes[:9]:
+                    rows, _ = self.db.query(
+                        f"SELECT R.RECNAME AS recname, R.RECDESCR AS recdescr, "
+                        f"R.RECTYPE AS rectype, R.SQLTABLENAME AS sqltablename, "
+                        f"F.FIELDNAME AS fieldname, L.{label_text} AS fieldlabel "
+                        f"FROM {self.db.prefix}PSDBFLDLABL L "
+                        f"JOIN {self.db.prefix}PSRECFIELD F "
+                        "ON F.FIELDNAME = L.FIELDNAME "
+                        f"JOIN {self.db.prefix}PSRECDEFN R "
+                        "ON R.RECNAME = F.RECNAME "
+                        f"WHERE R.RECTYPE IN (0,1,7) AND UPPER(L.{label_text}) "
+                        "LIKE :q ORDER BY R.RECNAME, F.FIELDNAME",
+                        {"q": f"%{probe}%"}, max_rows=cap * 4)
+                    for row in rows:
+                        add(row, "field label", probe)
         except DbError as e:
             # PeopleTools metadata not granted — degrade to the catalog.
             source = "database catalog"
@@ -3725,15 +3853,9 @@ class TBEngine:
                 tabs = []
             for t in tabs:
                 name = str(t.get("table_name") or "")
-                if name and name not in seen:
-                    seen.add(name)
-                    entry = {"record": name, "table": name, "descr": None,
-                             "kind": str(t.get("object_type") or "table"),
-                             "matched_on": "table name"}
-                    rows = self._approx_rows(name)
-                    if rows is not None:
-                        entry["approx_rows"] = rows
-                    out.append(entry)
+                if name:
+                    add({"recname": name, "sqltablename": name,
+                         "rectype": 0}, "physical table", phrase)
 
         # Records someone here has TAUGHT us about. A client-specific table
         # has no description in PSRECDEFN and a name that gives nothing away,
@@ -3752,30 +3874,44 @@ class TBEngine:
             rec = str(fact.get("record") or "").upper()
             if not rec:
                 continue
-            phys = rec if rec.startswith("PS_") else f"PS_{rec}"
-            existing = next((e for e in out
-                             if e["table"].upper() == phys
-                             or e["record"].upper() == rec), None)
-            entry = existing or {"record": rec, "table": phys, "descr": None,
-                                 "kind": "table"}
-            entry["matched_on"] = "taught here"
+            phys = self._physical_name(rec, "") or rec
+            existing = candidates.get(rec)
+            entry = existing or {"record": rec, "table": phys,
+                                 "descr": None, "kind": "table",
+                                 "matched_on": [], "matched_terms": [],
+                                 "relevance": 0}
+            if existing is None:
+                candidates[rec] = entry
+            entry["matched_on"] = ["taught here"]
+            entry["matched_terms"] = sorted(set(
+                entry.get("matched_terms") or []) | set(terms))
+            entry["relevance"] = max(int(entry.get("relevance") or 0), 1000)
             entry["taught"] = fact.get("detail") or fact.get("text")
             entry["taught_status"] = fact.get("status")
-            if existing is None:
-                # Row counts cost a query each. Taught records lead the list
-                # anyway, so only the ones a reader will actually see are
-                # worth probing.
-                if len(out) < 5:
-                    rows = self._approx_rows(phys)
-                    if rows is not None:
-                        entry["approx_rows"] = rows
-                out.append(entry)
-            seen.add(rec)
 
-        # Populated objects first: a record with rows is the likelier answer
-        # than an identically-named staging or history shell. Taught records
-        # outrank everything — that is the whole point of having been told.
+        out = list(candidates.values())
+        # Probe only the candidates a caller might see.  Optimizer statistics
+        # are cheap, but one catalog round trip per result still adds up on a
+        # 100-result discovery call.
+        out.sort(key=lambda x: (-int(x.get("relevance") or 0), x["record"]))
+        for entry in out[: min(len(out), cap * 2)]:
+            if entry.get("table"):
+                rows = self._approx_rows(entry["table"])
+                if rows is not None:
+                    entry["approx_rows"] = rows
+        for entry in out:
+            entry["matched_on"] = ", ".join(entry.get("matched_on") or [])
+            fields = entry.pop("matched_fields", [])
+            if fields:
+                entry["matched_field"] = fields[0]
+                if len(fields) > 1:
+                    entry["matched_fields"] = fields
+            if not entry.get("table"):
+                entry["physical_resolution"] = (
+                    "unresolved — no SQLTABLENAME, exact catalog object, or "
+                    "unique suffix match; no prefix was invented")
         out.sort(key=lambda x: (0 if x.get("taught") else 1,
+                                -int(x.get("relevance") or 0),
                                 -(x.get("approx_rows") or 0), x["record"]))
         return {
             "query": term,
@@ -3787,7 +3923,10 @@ class TBEngine:
                 "Query these with run_sql using the 'table' value (the "
                 "physical object). 'record' is the PeopleTools record name. "
                 "approx_rows comes from optimizer statistics and may be "
-                "stale or absent."
+                "stale or absent. Relevance is explainable token coverage; "
+                "the exact phrase is only a boost, never a requirement. A "
+                "missing table means physical identity could not be proven "
+                "and no PS_ or company prefix was guessed."
             ),
         }
 
@@ -3818,27 +3957,53 @@ class TBEngine:
             raise EngineError("Raw SQL tools are disabled")
         from .profiles import RecordProfiler
 
+        resolved = []
+        for table in (tables or []):
+            name = str(table or "").strip()
+            if not name:
+                continue
+            if self._table_exists(name):
+                resolved.append(name)
+                continue
+            try:
+                resolved.append(self.describe_record(name).get("table") or name)
+            except EngineError:
+                resolved.append(name)
         try:
             return RecordProfiler(self.db, self.cfg).compare(
-                tables or [], sample_rows=None if sample_rows < 0 else sample_rows)
+                resolved, sample_rows=None if sample_rows < 0 else sample_rows)
         except ValueError as e:
             raise EngineError(str(e))
 
     def describe_record(self, record: str) -> dict:
         """Fields of a PeopleSoft record from PeopleTools, with the physical
         column list as a cross-check."""
-        rec = (record or "").strip().upper()
+        asked = (record or "").strip().upper()
+        rec = asked
         if not rec:
             raise EngineError("describe_record needs a record name")
-        if rec.startswith("PS_"):
-            rec = rec[3:]
+        # A physical object may be company-prefixed or explicitly overridden.
+        # Search metadata before stripping the delivered PS_ convention.
         out: dict = {"record": rec}
         try:
             defn, _ = self.db.query(q.psrecdefn_search(self.db),
-                                    {"q": rec}, max_rows=50)
+                                    {"q": f"%{rec}%"}, max_rows=50)
             match = next((d for d in defn
-                          if str(d.get("recname") or "").upper() == rec), None)
+                          if str(d.get("recname") or "").upper() == rec
+                          or str(d.get("sqltablename") or "").upper() == rec),
+                         None)
+            if match is None and rec.startswith("PS_"):
+                logical = rec[3:]
+                if not defn:
+                    defn, _ = self.db.query(
+                        q.psrecdefn_search(self.db),
+                        {"q": f"%{logical}%"}, max_rows=50)
+                match = next((d for d in defn
+                              if str(d.get("recname") or "").upper()
+                              == logical), None)
             if match:
+                rec = str(match.get("recname") or rec).upper()
+                out["record"] = rec
                 out["descr"] = str(match.get("recdescr") or "").strip() or None
                 out["kind"] = self._RECTYPE.get(int(match.get("rectype") or 0),
                                                 "table")
@@ -3849,8 +4014,13 @@ class TBEngine:
                 out["fields"] = [f["fieldname"] for f in flds]
         except DbError:
             pass
-        table = out.get("table") or f"PS_{rec}"
-        out["table"] = table
+        table = out.get("table") or self._physical_name(rec, "")
+        if not table and self._table_exists(asked):
+            table = asked
+            out["record_resolution"] = (
+                "physical catalog object; no PeopleTools record definition "
+                "matched this name")
+        out["table"] = table or None
         taught = self._taught(rec)
         if taught:
             out["taught_here"] = [
@@ -3863,6 +4033,10 @@ class TBEngine:
                 "pointer, not as authority: the columns above come from the "
                 "live catalog and win any disagreement.")
         try:
+            if not table:
+                raise EngineError(
+                    "Physical table unresolved; no prefix was guessed. Use "
+                    "search_records and choose a result with a table value.")
             out["columns"] = [c["column_name"]
                               for c in self.describe_table(table)["columns"]]
         except EngineError as e:

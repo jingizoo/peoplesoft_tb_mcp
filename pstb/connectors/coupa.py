@@ -333,9 +333,10 @@ class CoupaConnector(RestConnector):
         today = today or dt.date.today()
         since = (today - dt.timedelta(days=max(int(days or 90), 1))
                  ).isoformat()
+        asof = today.isoformat()
         coupa = [r for r in self._invoices()
                  if r["status"].lower() in {"approved", "paid"}
-                 and r["invoice_date"] >= since]
+                 and since <= r["invoice_date"] <= asof]
         p = db.prefix
         try:
             vouchers, _ = db.query(
@@ -344,8 +345,9 @@ class CoupaConnector(RestConnector):
                 f"N.NAME1 AS vendor "
                 f"FROM {p}PS_VOUCHER V LEFT JOIN {p}PS_VENDOR N "
                 f"ON N.VENDOR_ID = V.VENDOR_ID "
-                f"WHERE V.INVOICE_DT >= {db.date_bind('since')}",
-                {"since": since}, max_rows=5000)
+                f"WHERE V.INVOICE_DT >= {db.date_bind('since')} "
+                f"AND V.INVOICE_DT <= {db.date_bind('asof')}",
+                {"since": since, "asof": asof}, max_rows=5000)
         except Exception as e:
             return {"source": "coupa+peoplesoft", "evaluated": False,
                     "reason": f"Could not read PS_VOUCHER: {e}"}
@@ -376,7 +378,7 @@ class CoupaConnector(RestConnector):
         ties = not missing_in_ap and not amount_breaks
         return {
             "source": "coupa+peoplesoft", "evaluated": True, "ties": ties,
-            "since": since, "match_basis": (
+            "since": since, "as_of": asof, "match_basis": (
                 "invoice number equality against PS_VOUCHER.INVOICE_ID, "
                 "supplier verified against the vendor master by normalized "
                 "name"),

@@ -506,10 +506,17 @@ class VendorNetwork:
             "same_amount_pairs": [
                 d for d in out.get("same_amount_pairs") or []
                 if str(d.get("vendor_id")) in keep],
+            "confirmed_duplicate_payments": [
+                d for d in out.get("confirmed_duplicate_payments") or []
+                if str(d.get("vendor_id")) in keep],
+            "payment_evidence_evaluated": out.get(
+                "payment_evidence_evaluated"),
             "window_months": out.get("window_months"),
-            "note": ("Duplicate VOUCHERS, not duplicate cash out — whether "
-                     "one was actually paid twice is get_vendor_payments. "
-                     "Figures come from get_duplicate_payments unchanged."),
+            "note": ("Duplicate-voucher candidates and confirmed payment "
+                     "evidence are separate. Only "
+                     "confirmed_duplicate_payments proves two non-void "
+                     "payment headers; figures come from "
+                     "get_duplicate_payments unchanged."),
         }
 
     def _locations(self, setid: str, ids: list) -> dict:
