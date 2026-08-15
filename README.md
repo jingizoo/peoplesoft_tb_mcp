@@ -191,6 +191,29 @@ Full walkthrough in [docs/SETUP.md](docs/SETUP.md#4b-restrict-data-by-business-u
 The agent works without the views (its inline SQL encodes the same effective
 dating / setid / tree logic), so you can pilot first and deploy views later.
 
+## Offline metadata intelligence
+
+Build the structural catalog after connecting the intended databases:
+
+```bash
+.venv/bin/python scripts/build_metadata_catalog.py
+```
+
+It indexes names, columns, ordered indexes, PeopleTools logical records,
+labels, translate values, page use and public saved-query use across `default`
+and every configured `sources:` database. It keeps source/schema identities
+separate and resolves custom physical names from evidence — it never assumes
+`PS_` or another company prefix.
+
+For Gemini 2.5 Pro, unfamiliar-record discovery follows
+`search_metadata` → `get_metadata_context` → a live scoped tool such as
+`profile_record`, `compare_records`, a curated financial tool or guarded
+`run_sql`. The catalog is structure only: it contains no source rows or
+balances and cannot satisfy the financial-evidence gate. See
+[docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) for source/schema scope,
+read-only grants, confidence tiers, exact limits, refresh cadence and partial
+or stale behavior.
+
 ## Wiki context (Confluence)
 
 Set in `.env`:
@@ -253,6 +276,10 @@ billing pipeline — see [docs/BILLING_AR.md](docs/BILLING_AR.md)) ·
 `get_top_billing_customers` · `get_exchange_rate` (effective-dated
 PS_RT_RATE_TBL, server-side conversion, base-currency triangulation) ·
 `get_record_map` (semantic record dictionary with live row counts) ·
+`describe_metadata_catalog` / `search_metadata` / `get_metadata_context`
+(offline, versioned structural discovery across configured databases and
+PeopleTools metadata, with explainable confidence — see
+[docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md)) ·
 `search_records` / `describe_record` (find ANY record — including custom and
 site-specific ones — by searching PeopleTools record descriptions and field
 names, then list its fields) ·
@@ -283,9 +310,11 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 - **Tool packs per module:** AP open vouchers/aging, Asset Management
   roll-forward tie-outs, commitment control, allocations, intercompany
   eliminations (see the end of docs/QUESTIONS.md).
-- **Semantic layer:** `list_tables`/`describe_table` already let the model
-  explore; next step is a curated record dictionary (PSRECDEFN-driven) so
-  free-form questions ground in the right records.
+- **Metadata intelligence (first slice shipped):** the versioned offline
+  catalog grounds delivered and custom terminology in physical objects across
+  configured databases, with PeopleTools labels/codes and explainable mapping
+  confidence. PK/FK/dependency lineage and optional semantic reranking remain
+  future layers — see [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md).
 - **Wiki-augmented answers (shipped):** `wiki_lookup` returns ranked passages
   with page/section provenance so policy answers quote real text and combine
   with ledger figures. Whether to add embeddings — and the evidence that would
@@ -295,10 +324,12 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 
 ```
 pstb/            server.py (MCP) · engine.py (TB math) · queries.py · db.py ·
-                 wiki.py · client/ (chat REPL + providers) · gui/ (web UI)
-scripts/         seed_sample_data.py · smoke_test.py · mcp_probe.py
+                 metadata.py · wiki.py · client/ (chat REPL + providers) ·
+                 gui/ (web UI)
+scripts/         seed_sample_data.py · build_metadata_catalog.py ·
+                 smoke_test.py · mcp_probe.py
 sql/oracle/      XX_TB_* view DDL for the real database
 docs/            SETUP.md (install) · QUESTIONS.md (catalog) · VIEWS.md ·
-                 REVIEW_RESPONSE.md (open items) · DEVELOPMENT.md
+                 METADATA_CATALOG.md · RECORD_SELECTION.md · DEVELOPMENT.md
 sample_wiki/     sample policy pages served by the local wiki provider
 ```

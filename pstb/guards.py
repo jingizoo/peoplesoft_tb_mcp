@@ -214,7 +214,9 @@ _UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"}
 # Structure, never amounts: a process trace must not satisfy the
 # grounding guard's demand for evidence behind a figure.
 STRUCTURAL_TOOLS = {"trace_process", "describe_process_graph",
-                    "get_record_map", "join_path"}
+                    "get_record_map", "join_path",
+                    "describe_metadata_catalog", "search_metadata",
+                    "get_metadata_context"}
 
 
 def filter_scope_payload(tool_name: str, payload: str, access) -> str:

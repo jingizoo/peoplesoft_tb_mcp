@@ -792,7 +792,102 @@ Question-time traversal remains deliberately small (`3` hops, `12` seeds,
 `400` visited nodes, and `40` results per layer). Those response limits keep
 chat output relevant and are independent of how large the offline index is.
 
-## 7b. When a query hangs
+## 7b. Build the metadata catalog (recommended)
+
+The metadata catalog lets Gemini find delivered and custom records across the
+PeopleSoft database and other configured databases without guessing a `PS_` or
+company prefix. Build it after the source connections work:
+
+```bash
+.venv/bin/python scripts/build_metadata_catalog.py
+```
+
+The default includes the primary `db:` connection as `default` and every
+database under `sources:`. Only `default` receives the PeopleTools overlay by
+default. Narrow or redirect that explicitly when required:
+
+```bash
+.venv/bin/python scripts/build_metadata_catalog.py --source default,warehouse
+.venv/bin/python scripts/build_metadata_catalog.py \
+  --source default,psft --peopletools-source psft
+.venv/bin/python scripts/build_metadata_catalog.py --peopletools-source none
+```
+
+Oracle collection is owner-scoped: a configured `db.schema` uses filtered
+`ALL_*` views and a blank schema uses `USER_*`. SQL Server retains the
+`sys.schemas` owner and filters to a configured schema when present; SQLite
+uses `MAIN`. Same-named objects in different sources or schemas never merge.
+
+The build account needs read-only metadata visibility for objects, columns and
+indexes in each selected source (`VIEW DEFINITION` on the intended SQL Server
+database/schema; the corresponding `USER_*` or owner-filtered `ALL_*`
+visibility on Oracle; file read access on SQLite). For the PeopleTools layer,
+grant `SELECT` on `PSRECDEFN` and `PSRECFIELD`, plus the optional
+`PSDBFIELD`, `PSDBFLDLABL`, `PSXLATITEM`, `PSPNLFIELD`, `PSQRYDEFN` and
+`PSQRYRECORD` layers you want indexed. Saved-query use is collected only when
+the local catalog shape can prove that the query is public.
+
+The shipped limits are exact and per build:
+
+```yaml
+metadata_catalog:
+  max_objects: 100000          # per source
+  max_fields: 500000           # columns per source
+  max_indexes: 250000          # index definitions per source
+  max_peopletools_rows: 500000 # per PeopleTools layer
+  query_page_size: 5000
+  stale_after_hours: 168
+```
+
+Use `--max-objects`, `--max-fields`, `--max-indexes`,
+`--max-peopletools-rows` or `--page-size` for a one-build override. The
+builder writes a mode-`0600` `.building` file and atomically publishes
+`metadata_catalog.db`; a failed or empty build preserves the prior artifact.
+A layer that reaches a configured limit remains usable but is marked partial.
+`describe_metadata_catalog` reports every limit hit, source/layer error,
+snapshot age and search mode. Stale snapshots remain readable with a warning;
+absence in a partial or stale layer is never evidence that an object does not
+exist.
+
+Rebuild after customizations, DDL/index changes, field-label/translate changes
+or saved-query changes. Weekly matches the default seven-day freshness target
+for a stable PeopleSoft environment; schedule nightly if custom integration or
+warehouse metadata changes frequently.
+
+### 7b.1 Keep the offline refreshes in one schedule
+
+The local snapshots have different truth clocks. Keep their jobs together so a
+new deployment does not refresh the transaction-derived entity graph while
+leaving structural discovery stale. For a stable installation, this is a
+reasonable starting crontab (adjust `/opt/peoplesoft_tb_mcp` and the times):
+
+```cron
+# Structural snapshots: weekly and after every customization/deployment.
+0 2 * * 0 cd /opt/peoplesoft_tb_mcp && .venv/bin/python scripts/build_process_graph.py --quiet
+30 2 * * 0 cd /opt/peoplesoft_tb_mcp && .venv/bin/python scripts/build_metadata_catalog.py --quiet
+
+# Transaction-derived actor relationships: nightly.
+0 3 * * * cd /opt/peoplesoft_tb_mcp && .venv/bin/python scripts/build_entity_graph.py --quiet
+
+# Operational findings/history: each weekday morning; output only on change.
+30 6 * * 1-5 cd /opt/peoplesoft_tb_mcp && .venv/bin/python scripts/monitor.py --quiet
+```
+
+Run both structural builders immediately after a PeopleTools migration rather
+than waiting for Sunday. Sites with daily custom-schema changes should move the
+metadata build to the nightly clock. Each builder publishes atomically, so a
+failed refresh leaves its prior readable artifact in place; alert on a nonzero
+exit code rather than deleting that artifact.
+
+The resulting artifact contains structural metadata only — no source rows,
+balances, credentials, private PSQuery names or full view SQL. It is not
+business-unit row security and cannot substantiate a financial answer. Gemini
+2.5 Pro uses `search_metadata` → `get_metadata_context` to select an object,
+then a live tool must enforce caller scope and the required date/status basis.
+The full contract, confidence tiers, source examples and first-slice
+limitations are in [METADATA_CATALOG.md](METADATA_CATALOG.md).
+
+## 7c. When a query hangs
 
 If the UI or chat sits on a tool call and never returns, time each database
 step:
@@ -824,7 +919,9 @@ one period range, an account filter) before widening again.
 | `model requires more system memory` | use a smaller model: `ollama pull llama3.2:3b` and `--model llama3.2:3b` |
 | `Set GOOGLE_CLOUD_PROJECT in .env` | fill it in, then `gcloud auth application-default login` |
 | `ORA-12541` / `ORA-12154` | DSN wrong or blocked; confirm `host:port/service_name` and firewall access |
-| Tool call hangs, no result | run `scripts/diagnose_db.py` (section 7b); check the PS_LEDGER index and `db.query_timeout_seconds` |
+| Tool call hangs, no result | run `scripts/diagnose_db.py` (section 7c); check the PS_LEDGER index and `db.query_timeout_seconds` |
+| Metadata search says unavailable | run `scripts/build_metadata_catalog.py`; then inspect `describe_metadata_catalog` for missing source/schema grants |
+| Metadata result is stale or partial | rebuild it; inspect `describe_metadata_catalog.limit_hits` and source/layer notes before raising only the affected configured limit or grant |
 | pip TLS/certificate errors | corporate TLS inspection — point pip at the internal mirror (step 3) |
 | PowerShell blocks activation | you do not need to activate; call `.venv\Scripts\python` directly |
 

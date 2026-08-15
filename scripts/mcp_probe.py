@@ -62,6 +62,7 @@ async def main() -> None:
                             "coupa_health",
                             "describe_process_graph",
                             "describe_entity_graph",
+                            "describe_metadata_catalog",
                             "list_integration_endpoints"}
             missing = [s.name for s in specs if not s.schema.get("properties")
                        and s.name not in NO_ARG_TOOLS]
@@ -84,6 +85,8 @@ async def main() -> None:
                 "get_coupa_supplier_spend", "coupa_to_ap_tie",
                 "get_trial_balance", "get_account_balance", "drill_to_journals",
                 "tb_integrity_check", "search_accounts", "resolve_period",
+                "describe_metadata_catalog", "search_metadata",
+                "get_metadata_context",
                 "run_sql", "search_records", "describe_record", "list_tables",
                 "describe_table", "profile_record", "compare_records",
                 "run_playbook", "get_ar_aging", "resolve_policy_value",

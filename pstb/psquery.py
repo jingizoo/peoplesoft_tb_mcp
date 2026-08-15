@@ -96,7 +96,10 @@ class QueryCatalog:
         params: dict = {}
         if not include_private:
             # OPRID is blank on public queries and set on private ones.
-            where.append("(Q.OPRID IS NULL OR TRIM(Q.OPRID) = '')")
+            # Oracle stores an empty string as NULL, so equality to '' is
+            # never true there. TRIM(... ) IS NULL is portable to Oracle,
+            # SQL Server and SQLite and excludes private owners.
+            where.append("(TRIM(Q.OPRID) IS NULL OR TRIM(Q.OPRID) = '')")
         needle = (text or "").strip()
         if needle:
             where.append("(UPPER(Q.QRYNAME) LIKE :q "
@@ -112,11 +115,16 @@ class QueryCatalog:
             bare = rec[3:] if rec.startswith("PS_") else rec
             where.append(
                 f"EXISTS (SELECT 1 FROM {p}PSQRYRECORD R "
-                "WHERE R.QRYNAME = Q.QRYNAME AND R.OPRID = Q.OPRID "
+                "WHERE R.QRYNAME = Q.QRYNAME AND "
+                "(R.OPRID = Q.OPRID OR (((TRIM(R.OPRID) IS NULL OR "
+                "TRIM(R.OPRID)='') AND (TRIM(Q.OPRID) IS NULL OR "
+                "TRIM(Q.OPRID)='')))) "
                 "AND UPPER(R.RECNAME) IN (:r1, :r2))")
             params.update({"r1": bare, "r2": rec})
         join = (f"LEFT JOIN {p}PSQRYSTATS S ON S.QRYNAME = Q.QRYNAME "
-                "AND TRIM(COALESCE(S.OPRID,'')) = TRIM(COALESCE(Q.OPRID,'')) "
+                "AND (S.OPRID = Q.OPRID OR (((TRIM(S.OPRID) IS NULL OR "
+                "TRIM(S.OPRID)='') AND (TRIM(Q.OPRID) IS NULL OR "
+                "TRIM(Q.OPRID)='')))) "
                 if stats else "")
         rows, truncated = self.db.query(
             f"SELECT Q.QRYNAME AS name, Q.OPRID AS owner, Q.DESCR AS descr, "
@@ -163,11 +171,14 @@ class QueryCatalog:
             return {"available": False, "query": name,
                     "detail": "PSQRYDEFN is not readable by this account."}
         p = self.db.prefix
-        params = {"n": name, "o": (owner or "").strip()}
+        owner_filter = (owner or "").strip() or None
+        params = {"n": name, "o": owner_filter}
         rows, _ = self.db.query(
             f"SELECT QRYNAME AS name, OPRID AS owner, DESCR AS descr "
             f"FROM {p}PSQRYDEFN WHERE UPPER(QRYNAME) = :n "
-            f"AND (TRIM(COALESCE(OPRID,'')) = :o OR :o = '')",
+            f"AND ((:o IS NULL AND (TRIM(OPRID) IS NULL OR "
+            f"TRIM(OPRID)='')) "
+            f"OR TRIM(OPRID) = :o)",
             params, max_rows=5)
         if not rows:
             return {"available": True, "found": False, "query": name,
@@ -190,8 +201,10 @@ class QueryCatalog:
                 f"SELECT BNDNUM AS n, BNDNAME AS bind, {label}, "
                 f"FIELDTYPE AS ftype FROM {p}PSQRYBIND "
                 f"WHERE UPPER(QRYNAME) = :n "
-                f"AND TRIM(COALESCE(OPRID,'')) = :own ORDER BY BNDNUM",
-                {"n": name, "own": head_owner}, max_rows=50)
+                f"AND ((:own IS NULL AND (TRIM(OPRID) IS NULL OR "
+                f"TRIM(OPRID)='')) "
+                f"OR TRIM(OPRID) = :own) ORDER BY BNDNUM",
+                {"n": name, "own": head_owner or None}, max_rows=50)
             for b in binds:
                 code = b.get("ftype")
                 prompts.append({
@@ -207,8 +220,10 @@ class QueryCatalog:
             recs, _ = self.db.query(
                 f"SELECT RECNAME AS rec, CORRNAME AS alias "
                 f"FROM {p}PSQRYRECORD WHERE UPPER(QRYNAME) = :n "
-                f"AND TRIM(COALESCE(OPRID,'')) = :own "
-                f"ORDER BY SELNUM", {"n": name, "own": head_owner},
+                f"AND ((:own IS NULL AND (TRIM(OPRID) IS NULL OR "
+                f"TRIM(OPRID)='')) "
+                f"OR TRIM(OPRID) = :own) "
+                f"ORDER BY SELNUM", {"n": name, "own": head_owner or None},
                 max_rows=50)
             records = [{"record": str(r.get("rec") or ""),
                         "alias": str(r.get("alias") or "") or None}

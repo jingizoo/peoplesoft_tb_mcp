@@ -3,8 +3,9 @@
 The primary connection (config `db:`) is the DEFAULT source — every curated
 PeopleSoft tool uses it and nothing about it changes. Entries under
 `sources:` are additional databases (a reporting mart, an extract schema,
-another application's DB) reachable from the guarded ad-hoc tools only:
-run_sql, list_tables, describe_table, search_records.
+another application's DB) reachable from the guarded ad-hoc tools.  Their
+structure can also be indexed by the offline metadata catalog; curated
+financial tools continue to use the PeopleSoft primary only.
 
 Each source gets its own Database instance — its own credentials, session
 pool, dialect branching, schema catalog, and error translation — built
@@ -84,7 +85,8 @@ class SourceRegistry:
                 "source": name,
                 "backend": src.backend,
                 "schema": src.schema or None,
-                "role": "ad-hoc SQL only (run_sql / list_tables / "
-                        "describe_table / search_records with source=...)",
+                "role": "guarded discovery/SQL; structure can be included "
+                        "in the offline metadata catalog (curated financial "
+                        "tools remain on the PeopleSoft primary)",
             })
         return out

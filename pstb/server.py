@@ -23,6 +23,8 @@ from .db import Database, DbError
 from .engine import EngineError, TBEngine
 from .ar import ARBilling, ARError
 from .anomalies import AnomalyDetector, AnomalyError
+from .metadata import (MetadataCatalog, MetadataError,
+                       catalog_path as _metadata_path)
 from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
@@ -56,6 +58,9 @@ from .procgraph import ProcessGraph, graph_path
 # this process started is picked up without a restart — the build script is
 # run by an administrator, not by the server.
 process_graph = ProcessGraph(graph_path(cfg))
+metadata_catalog = MetadataCatalog(
+    _metadata_path(cfg),
+    stale_after_hours=getattr(cfg.metadata_catalog, "stale_after_hours", 168))
 from .psquery import QueryCatalog
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
@@ -116,7 +121,7 @@ def _safe(fn, /, **kw) -> dict:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
             PlaybookError, MemoryError_, ModuleError, ConnectorError,
-            AnomalyError) as e:
+            AnomalyError, MetadataError) as e:
         # These carry a remedy written for the reader. Passing the message
         # through UNPREFIXED is the point: "ConnectorError: check
         # PSFT_QAS_NODE" reads as a crash, "check PSFT_QAS_NODE" reads as
@@ -384,6 +389,47 @@ def get_record_map() -> dict:
     names the curated tool to prefer over raw SQL. CALL THIS BEFORE run_sql
     whenever unsure which record answers a question."""
     return _safe(engine.get_record_map)
+
+
+@mcp.tool()
+def describe_metadata_catalog() -> dict:
+    """Coverage and freshness of the offline metadata intelligence catalog.
+    It reports which database sources and PeopleTools layers were harvested,
+    any build limits/errors, and whether the snapshot is stale or partial.
+    This is STRUCTURE only: it contains no transaction rows or balances and
+    cannot support a financial conclusion. If unavailable, return the exact
+    offline build command to the user."""
+    return _safe(metadata_catalog.describe)
+
+
+@mcp.tool()
+def search_metadata(query: str, source: str = "", kinds: str = "",
+                    limit: int = 20) -> dict:
+    """Find the database object behind natural business/custom terminology.
+    Searches logical PeopleTools records, physical tables/views, fields,
+    labels, translate values, pages and public saved-query use across the
+    offline catalog. It preserves company prefixes and SQLTABLENAME mappings;
+    NEVER add PS_ or another prefix yourself. Results aggregate to a physical
+    object when proven and explain relevance, confidence and provenance.
+    source narrows to one configured database; kinds is an optional comma list
+    such as table,view,record,field. Call get_metadata_context before querying
+    an unfamiliar result. Metadata is not financial evidence."""
+    return _safe(metadata_catalog.search, query=query, source=source,
+                 kinds=kinds, limit=limit)
+
+
+@mcp.tool()
+def get_metadata_context(identifier: str, source: str = "",
+                         limit: int = 40) -> dict:
+    """Explain one logical record, physical object, field or qualified column
+    from the offline metadata catalog. Returns the proven logical-to-physical
+    mapping, real columns, ordered indexes, field labels and effective-dated
+    translate codes, with confidence/provenance. Ambiguous names return
+    bounded candidates instead of guessing. Use the returned physical_object
+    exactly; then use live/profile/financial tools with caller scope. This
+    structural snapshot contains no transaction values."""
+    return _safe(metadata_catalog.context, identifier=identifier,
+                 source=source, limit=limit)
 
 
 @mcp.tool()

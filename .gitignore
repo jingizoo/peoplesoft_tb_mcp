@@ -38,3 +38,7 @@ process_graph.db.building
 # Built by scripts/build_entity_graph.py — derived business data.
 entity_graph.db
 entity_graph.db.building
+
+# Built by scripts/build_metadata_catalog.py -- source structure, no rows.
+metadata_catalog.db
+metadata_catalog.db.building
