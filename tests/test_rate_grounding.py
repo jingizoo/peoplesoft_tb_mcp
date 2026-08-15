@@ -28,6 +28,8 @@ from pstb.guards import (PAYLOAD_DECLARED, USER_STATED,  # noqa: E402
                          payload_numbers, payload_rates, rate_caveat,
                          rate_findings, ungrounded_figures)
 
+SAMPLE_AS_OF = "2026-08-06"
+
 
 class NothingMovedTests(unittest.TestCase):
     """The prove-nothing-moved pins. If these fail, the money guard changed
@@ -287,7 +289,7 @@ class ToolsDeclareTheirPercentagesTests(unittest.TestCase):
 
     def test_aging_declares_its_bucket_shares(self) -> None:
         import pstb.server as srv
-        out = srv.get_ar_aging()
+        out = srv.get_ar_aging(as_of_date=SAMPLE_AS_OF)
         self.assertIsNotNone(out.get("overdue_pct"))
         self.assertTrue(out.get("bucket_share_pct"))
         self.assertAlmostEqual(
@@ -296,7 +298,7 @@ class ToolsDeclareTheirPercentagesTests(unittest.TestCase):
 
     def test_a_real_aging_percentage_answer_is_not_caveated(self) -> None:
         import pstb.server as srv
-        out = srv.get_ar_aging()
+        out = srv.get_ar_aging(as_of_date=SAMPLE_AS_OF)
         payloads = [json.dumps(out, default=str)]
         answer = f"{out['overdue_pct']}% of open AR is overdue."
         self.assertEqual(rate_caveat(rate_findings(answer, payloads)), "",
@@ -316,7 +318,7 @@ class NoFalsePositivesOnRealPayloadsTests(unittest.TestCase):
 
     def test_percentages_the_tools_declare_are_never_flagged(self) -> None:
         import pstb.server as srv
-        aging = srv.get_ar_aging()
+        aging = srv.get_ar_aging(as_of_date=SAMPLE_AS_OF)
         top = srv.get_top_billing_customers(display_currency="USD")
         proj = srv.get_project_costs()
         cases = [
@@ -338,7 +340,7 @@ class NoFalsePositivesOnRealPayloadsTests(unittest.TestCase):
 
     def test_the_fabrication_is_still_caught_beside_them(self) -> None:
         import pstb.server as srv
-        for payload in (srv.get_ar_aging(),
+        for payload in (srv.get_ar_aging(as_of_date=SAMPLE_AS_OF),
                         srv.get_exchange_rate(from_currency="USD",
                                               to_currency="EUR")):
             self.assertIn("did not come from", rate_caveat(rate_findings(

@@ -579,8 +579,6 @@ def evidence_intent(question: str) -> str:
     figure such an answer states.
     """
     text = question or ""
-    if _CATALOG_QUERY.search(text) and not _FIGURE_ASK.search(text):
-        return "technical"
     if _RECON_QUERY.search(text) and not _EXPLICIT_POLICY_WORD.search(text):
         return "data"
     policy = bool(_POLICY_QUERY.search(text))
@@ -599,6 +597,17 @@ def evidence_intent(question: str) -> str:
     if _VERDICT.search(text):
         # A compliance verdict genuinely needs both halves: rule and figure.
         policy = data = True
+    # Metadata wording is technical only after the stronger reconciliation,
+    # verdict and data rules have had their say.  Putting this first allowed
+    # "which tables are out of balance?" to turn off the financial-evidence
+    # gate; it also stole domain-free hard overrides such as "which records
+    # reconcile?" and "which records show we are compliant?".  Explicit
+    # custom-object asks still arrive here with data demoted by the technical
+    # rule above, and approval/status field discovery remains technical.
+    if (_CATALOG_QUERY.search(text)
+            and not _FIGURE_ASK.search(text)
+            and not data):
+        return "technical"
     if policy and data:
         return "mixed"
     if policy:

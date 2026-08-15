@@ -55,6 +55,18 @@ class ControllerQuestionIntentTests(unittest.TestCase):
                 "Which invoice record is live rather than staging history?"):
             self.assertEqual(evidence_intent(question), "technical", question)
 
+    def test_catalog_words_cannot_turn_off_financial_evidence(self) -> None:
+        from pstb.guards import evidence_intent
+        for question in (
+                "what records show the trial balance does not tie?",
+                "which tables are out of balance?",
+                "what records explain the variance in travel?",
+                "which records reconcile?"):
+            self.assertEqual(evidence_intent(question), "data", question)
+        self.assertEqual(
+            evidence_intent("which records show we are compliant?"),
+            "mixed")
+
 
 class OweDirectionTests(unittest.TestCase):
     def test_money_we_owe_is_payables(self) -> None:

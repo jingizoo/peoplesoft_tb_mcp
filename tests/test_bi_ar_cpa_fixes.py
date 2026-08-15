@@ -154,6 +154,23 @@ class CustomerIntelligenceCurrencyTests(unittest.TestCase):
             str(v) for v in self.intel["population"]["applied"][2].values())
         self.assertIn("PS_ITEM.BAL_AMT", provenance)
         self.assertIn("PS_RT_RATE_TBL", provenance)
+        self.assertIn("net open-item exposure", provenance)
+        self.assertIn("overdue credits reduce", provenance)
+        self.assertIn("positive overdue balances only", provenance)
+
+    def test_overdue_is_net_but_average_age_is_positive_only(self) -> None:
+        row = next(c for c in self.intel["customers"]
+                   if c["cust_id"] == "C1002")
+        aging = self.ar.aging(
+            BU, customer_id="C1002", as_of_date=AS_OF,
+            display_currency="USD")
+
+        # Two overdue debit items (27,300 + 44,800) less an 8,400 overdue
+        # credit memo: exposure is signed/net, while the age statistic must
+        # describe only the positive receivables that collections can pursue.
+        self.assertEqual(row["overdue_amt"], 63700.0)
+        self.assertEqual(row["overdue_amt"], aging["overdue_total"])
+        self.assertEqual(row["avg_days_late"], 40)
 
 
 class InvalidBusinessUnitTests(unittest.TestCase):

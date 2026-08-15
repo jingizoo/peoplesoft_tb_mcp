@@ -1813,8 +1813,12 @@ class ARBilling:
                      "source": ("PS_ITEM.BAL_AMT and BAL_CURRENCY; "
                                 "effective-dated PS_RT_RATE_TBL when "
                                 "source and display currencies differ"),
-                     "meaning": ("open_ar, overdue_amt and disputed_amt "
-                                 "are all expressed in display_currency")},
+                     "meaning": (
+                         "open_ar, overdue_amt and disputed_amt are all "
+                         "expressed in display_currency; overdue_amt is "
+                         "net open-item exposure, so overdue credits reduce "
+                         "it, while avg_days_late is balance-weighted over "
+                         "positive overdue balances only")},
                 ],
             },
             "ar_fx_applied": sorted(n for _, n in ar_fx.values()),
@@ -1826,7 +1830,9 @@ class ARBilling:
                      "concentration, overdue, disputes and lapsed activity "
                      "— never generated advice. Billing ranked in "
                      f"{disp}; open AR, overdue and disputes are converted "
-                     f"to the same display currency ({disp}). Product-line "
+                     f"to the same display currency ({disp}). Overdue is net "
+                     "open-item exposure (credits reduce it); average days "
+                     "late weights positive overdue balances only. Product-line "
                      "amounts remain in each invoice currency."),
         }
 
