@@ -53,6 +53,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "compare_trial_balance",
     "explain_balance_change",
     "drill_to_journals",
+    "get_journal_status",
     "tb_integrity_check",
     "detect_transaction_anomalies",
     "rollup_trial_balance",
@@ -78,6 +79,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "get_vendor_payables_network",
     "search_vendors",
     "get_match_exceptions",
+    "get_po_grni_candidates",
     "get_procurement_chain",
     "get_entity_network",
     "get_concentration",
@@ -130,6 +132,11 @@ _TOOL_SCOPE_ARGS = {
     "drill_to_journals": {
         "business_unit": "business_unit", "ledger": "ledger",
         "fiscal_year": "fiscal_year", "period": "period",
+    },
+    "get_journal_status": {
+        "business_unit": "business_unit", "ledger": "ledger",
+        "fiscal_year": "fiscal_year", "period": "period",
+        "as_of_date": "as_of_date",
     },
     "list_periods": {"fiscal_year": "fiscal_year"},
     "tb_integrity_check": {
@@ -190,6 +197,9 @@ _TOOL_SCOPE_ARGS = {
                                   "as_of_date": "as_of_date"},
     "get_match_exceptions": {"business_unit": "business_unit",
                              "as_of_date": "as_of_date"},
+    "get_po_grni_candidates": {
+        "business_unit": "business_unit", "as_of_date": "as_of_date",
+    },
     "get_entity_network": {"business_unit": "business_unit"},
     "get_concentration": {"business_unit": "business_unit"},
     "get_entity_connection": {"business_unit": "business_unit"},
@@ -380,6 +390,7 @@ _DATA_QUERY = re.compile(
     r"receivables?|ar|aging|customers?|revenues?|"
     r"payables?|accounts payable|ap|APY14(?:00|05|10|20)|vouchers?|vendors?|suppliers?|"
     r"payments?|paid|disbursements?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
+    r"received[ -]not[ -]invoiced|uninvoiced receipts?|receipt[ -]accruals?|"
     r"expenses?|variances?|budgets?|actuals?|financial statements?|reports?|"
     r"income statements?|balance sheets?|cash flow statements?|p\s*&\s*l|"
     r"profit and loss|profits?|earn(?:ed|ings?)?|sales|margins?|costs?|"
@@ -419,6 +430,32 @@ _DATA_ANCHOR_STRONG = re.compile(
     # because they occur naturally in policy wording.
     r"\b(?:balances?|amounts?|totals?|aging|open items?)\b)"
 )
+_JOURNAL_NETTING_QUERY = re.compile(
+    r"(?i)(?:\bjournals?\b.{0,80}\b(?:net(?:s|ted|ting)?|balance[sd]?)\b|"
+    r"\b(?:net(?:s|ted|ting)?|balance[sd]?)\b.{0,80}\bjournals?\b)"
+)
+_JOURNAL_POSTED_BY_QUERY = re.compile(
+    r"(?i)(?:\b(?:was|were|is)\b.{0,80}\bposted\b.{0,40}\b(?:by|as of|at)\b|"
+    r"\bposted[- ]by[- ]cutoff\b)"
+)
+_JOURNAL_HISTORICAL_STATUS_QUERY = re.compile(
+    r"(?i)(?:\bwhat\s+was\b.{0,80}\bstatus\b|"
+    r"\bstatus\b.{0,40}\b(?:as of|at)\b|"
+    r"\b(?:as of|at)\b.{0,40}\bstatus\b|"
+    r"\b(?:was|were)\b.{0,80}\bjournals?\b.{0,80}"
+    r"\b(?:valid|ready|errors?|incomplete|unposted|deleted|model|"
+    r"needs? edit|upgrade)\b.{0,40}\b(?:as of|at|on)\b)"
+)
+_PO_GRNI_CANDIDATE_QUERY = re.compile(
+    r"(?i)(?:\bpo[- ]linked\b|\breceipt schedules?\b|"
+    r"\bschedule[- ]level\b|"
+    r"\b(?:grni|rni|received[ -]not[ -]invoiced)\b.{0,60}"
+    r"\b(?:candidates?|review)\b)"
+)
+_BOOKED_GRNI_QUERY = re.compile(
+    r"(?i)\b(?:booked|generated|posted|liabilit(?:y|ies)|po_recvaccr|"
+    r"recv_ln_acctg|journal generator|general ledger|gl)\b"
+)
 _QUESTION_DOMAINS = {
     "balance": re.compile(
         r"(?i)\b(?:balances?|trial balances?|tb|activity|postings?|suspense|"
@@ -440,9 +477,12 @@ _QUESTION_DOMAINS = {
     "ap": re.compile(
         r"(?i)\b(?:payables?|accounts payable|ap|APY14(?:00|05|10|20)|vouchers?|vendors?|suppliers?|"
         r"payments?|paid|disbursements?|pay(?:ment)?\s+runs?|"
-        r"accru(?:e[ds]?|al|als|ed|ing)|"
-        r"grni|rni)\b"
+        r"(?<!receipt[ -])accru(?:e[ds]?|al|als|ed|ing))\b"
         r"|\b(?:we|do\s+we|should\s+we|how\s+much\s+do\s+we)\s+owe\b"
+    ),
+    "grni": re.compile(
+        r"(?i)\b(?:grni|rni|received[ -]not[ -]invoiced|"
+        r"uninvoiced receipts?|receipt[ -]accruals?)\b"
     ),
     "am": re.compile(
         r"(?i)\b(?:assets?|capitali[sz]\w+|depreciat\w+|"
@@ -470,6 +510,10 @@ _TOOL_DOMAINS = {
                                "ar", "ap", "am", "pc",
                                "customer", "fx", "journal"},
     "drill_to_journals": {"journal", "balance", "variance"},
+    "get_journal_status": {
+        "journal", "journal_netting", "journal_posted_by",
+        "journal_historical_status",
+    },
     "tb_integrity_check": {"balance", "journal"},
     "detect_transaction_anomalies": {
         # Operational telemetry can ground an anomaly/variance statement, but
@@ -507,6 +551,10 @@ _TOOL_DOMAINS = {
                                    "balance", "fx"},
     "get_vendor_payables_network": {"ap", "report", "balance"},
     "get_match_exceptions": {"ap", "report", "balance"},
+    # Receipt/voucher schedule arithmetic supports the AP accrual-candidate
+    # population only. It does not prove a booked GL receipt-accrual balance,
+    # so deliberately do not grant it the balance domain.
+    "get_po_grni_candidates": {"po_grni_candidates"},
     "get_entity_network": {"billing", "customer", "ar", "ap", "report"},
     "get_concentration": {"billing", "customer", "ar", "ap", "report",
                           "balance"},
@@ -610,8 +658,18 @@ def evidence_intent(question: str) -> str:
     text = question or ""
     if _RECON_QUERY.search(text) and not _EXPLICIT_POLICY_WORD.search(text):
         return "data"
+    if (not _EXPLICIT_POLICY_WORD.search(text)
+            and (_JOURNAL_NETTING_QUERY.search(text)
+                 or _JOURNAL_POSTED_BY_QUERY.search(text)
+                 or _JOURNAL_HISTORICAL_STATUS_QUERY.search(text))):
+        return "data"
     policy = bool(_POLICY_QUERY.search(text))
-    data = bool(_DATA_QUERY.search(text))
+    data = bool(
+        _DATA_QUERY.search(text)
+        or _JOURNAL_NETTING_QUERY.search(text)
+        or _JOURNAL_POSTED_BY_QUERY.search(text)
+        or _JOURNAL_HISTORICAL_STATUS_QUERY.search(text)
+    )
     technical = bool(_TECHNICAL_QUERY.search(text))
     if technical and data and not _FIGURE_ASK.search(text):
         # The billing/customer/invoice nouns are the SUBJECT of a technical
@@ -661,16 +719,124 @@ def requires_financial_evidence(question: str) -> bool:
 
 def question_financial_domains(question: str) -> set[str]:
     """Financial fact domains explicitly present in a user question."""
-    return {
+    domains = {
         domain
         for domain, pattern in _QUESTION_DOMAINS.items()
         if pattern.search(question or "")
     }
+    if _JOURNAL_NETTING_QUERY.search(question or ""):
+        # Exact journal netting is narrower than trial-balance integrity.
+        # It remains its own capability so a complete header-status result
+        # cannot satisfy the question when JRNL_LN evidence was unavailable.
+        domains.discard("balance")
+        domains.add("journal_netting")
+    if _JOURNAL_POSTED_BY_QUERY.search(question or ""):
+        domains.add("journal")
+        domains.add("journal_posted_by")
+    elif _JOURNAL_HISTORICAL_STATUS_QUERY.search(question or ""):
+        domains.add("journal")
+        domains.add("journal_historical_status")
+    if (_PO_GRNI_CANDIDATE_QUERY.search(question or "")
+            and not _BOOKED_GRNI_QUERY.search(question or "")):
+        domains.discard("grni")
+        domains.discard("ap")
+        domains.add("po_grni_candidates")
+    return domains
 
 
 def financial_tool_domains(tool_name: str) -> set[str]:
     """Fact domains a curated tool can directly ground."""
     return set(_TOOL_DOMAINS.get(tool_name, set()))
+
+
+def financial_result_domains(tool_name: str, content: str) -> set[str]:
+    """Fact domains grounded by one particular structured tool result.
+
+    Journal header status and signed-line netting can have different evidence
+    completeness.  A status-only result remains useful for the narrow status
+    question, but cannot ground whether that journal nets to zero.
+    """
+    domains = financial_tool_domains(tool_name)
+    if tool_name != "get_journal_status":
+        return domains
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    completeness = payload.get("evidence_completeness") or {}
+    journals = payload.get("journals") or []
+
+    def finite_number(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def netting_row_valid(row):
+        if not isinstance(row, Mapping):
+            return False
+        groups = row.get("currency_totals")
+        if (row.get("ledger_scope_confirmed") is not True
+                or row.get("currency_basis_complete") is not True
+                or not isinstance(groups, list) or len(groups) != 1
+                or not isinstance(row.get("line_count"), int)
+                or isinstance(row.get("line_count"), bool)
+                or row.get("line_count") <= 0
+                or not bool(str(row.get("currency") or "").strip())
+                or type(row.get("netting")) is not bool
+                or not all(finite_number(row.get(key)) for key in (
+                    "debit_total", "credit_total", "signed_net"))):
+            return False
+        group = groups[0]
+        return (
+            isinstance(group, Mapping)
+            and group.get("currency") == row.get("currency")
+            and group.get("line_count") == row.get("line_count")
+            and group.get("null_amount_count") == 0
+            and type(group.get("netting")) is bool
+            and group.get("netting") is row.get("netting")
+            and all(finite_number(group.get(key)) for key in (
+                "debit_total", "credit_total", "signed_net"))
+        )
+
+    netting_rows_complete = (
+        isinstance(journals, list)
+        and bool(journals)
+        and all(netting_row_valid(row) for row in journals)
+    )
+    observed_netting_passed = (
+        all(row.get("netting") is True for row in journals)
+        if netting_rows_complete else None
+    )
+    netting_complete = (
+        payload.get("netting_evaluated") is True
+        and payload.get("netting_complete") is True
+        and type(payload.get("netting_passed")) is bool
+        and payload.get("netting_passed") is observed_netting_passed
+        and isinstance(completeness, dict)
+        and completeness.get("netting_complete") is True
+        and netting_rows_complete
+    )
+    if not netting_complete:
+        domains.discard("journal_netting")
+    cutoff = payload.get("cutoff") or {}
+    if not (isinstance(cutoff, dict)
+            and cutoff.get("historical_status_reconstructed") is True):
+        domains.discard("journal_historical_status")
+    posting_dates_complete = (
+        isinstance(completeness, dict)
+        and completeness.get("posting_date_claim_available") is True
+        and isinstance(journals, list)
+        and bool(journals)
+        and all(isinstance(row, dict) and bool(row.get("posted_date"))
+                for row in journals)
+    )
+    if not posting_dates_complete:
+        domains.discard("journal_posted_by")
+    return domains
 
 
 def financial_tool_is_relevant(tool_name: str, question: str) -> bool:
@@ -916,6 +1082,10 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
 def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
     """Return whether a tool result is usable evidence and, if not, why."""
     raw = content or ""
+    structured_only = {
+        "reconcile_ap_to_gl", "get_journal_status",
+        "get_po_grni_candidates",
+    }
     if raw.startswith("TOOL ERROR"):
         return False, raw[:240]
     try:
@@ -923,8 +1093,17 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
     except (json.JSONDecodeError, TypeError):
         # MCP may return a non-JSON text result. Absence of an explicit tool
         # error still means the call completed; the model can read the text.
+        if tool_name in structured_only:
+            return False, (
+                f"{tool_name} requires a structured result before it can "
+                "serve as financial evidence"
+            )[:240]
         return True, ""
     if not isinstance(payload, dict):
+        if tool_name in structured_only:
+            return False, (
+                f"{tool_name} returned an unexpected result shape"
+            )[:240]
         return True, ""
     if payload.get("error"):
         return False, str(payload["error"])[:240]
@@ -959,6 +1138,155 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
                 payload.get("reason")
                 or payload.get("detail")
                 or "AP/GL reconciliation was not fully evaluated"
+            )[:240]
+    if tool_name == "get_journal_status":
+        completeness = payload.get("evidence_completeness") or {}
+        population = payload.get("population") or {}
+        journals = payload.get("journals") or []
+        count = population.get("returned_journals")
+        delivered_codes = {"D", "I", "M", "E", "N", "P", "T", "U", "V", "Z"}
+        actionable_codes = {"I", "E", "N", "T", "U", "V"}
+
+        def status_row_valid(row):
+            if not isinstance(row, dict):
+                return False
+            code = str(row.get("header_status_code") or "").upper()
+            key = row.get("journal_key") or {}
+            key_valid = (
+                isinstance(key, Mapping)
+                and bool(str(key.get("business_unit") or "").strip())
+                and bool(str(key.get("journal_id") or "").strip())
+                and bool(str(key.get("journal_date") or "").strip())
+                and isinstance(key.get("unpost_seq"), int)
+                and not isinstance(key.get("unpost_seq"), bool)
+            )
+            return (
+                code in delivered_codes
+                and key_valid
+                and bool(str(row.get("header_status_label") or "").strip())
+                and type(row.get("requires_close_action")) is bool
+                and row["requires_close_action"] == (code in actionable_codes)
+            )
+
+        classified = (
+            isinstance(journals, list)
+            and all(status_row_valid(row) for row in journals)
+        )
+        expected_status_passed = (
+            bool(journals)
+            and not any(
+                str(row.get("header_status_code") or "").upper()
+                in actionable_codes
+                for row in journals if isinstance(row, dict)
+            )
+        )
+        complete = (
+            str(payload.get("status") or "").lower() == "evaluated"
+            and payload.get("evaluated") is True
+            and payload.get("status_evaluated") is True
+            and type(payload.get("status_control_passed")) is bool
+            and payload.get("status_control_passed")
+            is expected_status_passed
+            and ("control_passed" not in payload
+                 or payload.get("control_passed") is expected_status_passed)
+            and payload.get("truncated") is False
+            and isinstance(completeness, dict)
+            and completeness.get("complete") is True
+            and completeness.get("status_complete") is True
+            and completeness.get("population_complete") is True
+            and completeness.get("statuses_classified") is True
+            and isinstance(population, dict)
+            and population.get("population_complete") is True
+            and isinstance(count, int) and not isinstance(count, bool)
+            and count > 0
+            and len(journals) == count
+            and classified
+        )
+        if not complete:
+            return False, str(
+                payload.get("reason")
+                or "journal status population was not completely classified"
+            )[:240]
+    if tool_name == "get_po_grni_candidates":
+        population = payload.get("population") or {}
+        coverage = payload.get("coverage") or {}
+        totals = payload.get("totals_by_currency")
+
+        amount_fields = {
+            "received_amount", "attributed_voucher_amount",
+            "rni_candidate_amount", "candidate_amount", "amount", "total",
+            "over_invoiced_amount",
+        }
+        candidate_fields = {
+            "rni_candidate_amount", "candidate_amount", "amount", "total",
+        }
+
+        def finite_number(value):
+            return (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            )
+
+        def amount_row_valid(row, *, candidate_required=True):
+            if not isinstance(row, Mapping):
+                return False
+            present = amount_fields.intersection(row)
+            if not present or not all(finite_number(row[key])
+                                      for key in present):
+                return False
+            return (not candidate_required
+                    or bool(candidate_fields.intersection(present)))
+
+        def totals_valid(value):
+            if isinstance(value, Mapping):
+                if not value:
+                    return False
+                if all(finite_number(v) for v in value.values()):
+                    return all(bool(str(k).strip()) for k in value)
+                return all(bool(str(k).strip()) and amount_row_valid(v)
+                           for k, v in value.items())
+            if isinstance(value, list):
+                return bool(value) and all(
+                    amount_row_valid(row)
+                    and bool(str(row.get("currency") or "").strip())
+                    for row in value
+                )
+            return False
+
+        candidate_count = population.get("candidate_count")
+        complete = (
+            str(payload.get("status") or "").lower() == "evaluated"
+            and payload.get("evaluated") is True
+            and isinstance(coverage, dict)
+            and coverage.get("classification") == (
+                "po_linked_document_review_only")
+            and coverage.get("all_grni_complete") is False
+            and coverage.get("point_in_time_complete") is True
+            and isinstance(payload.get("candidate_basis"), Mapping)
+            and payload["candidate_basis"].get("classification")
+            == "review_candidate_only"
+            and payload.get("booked_status") == "not_evaluated"
+            and payload.get("conclusion") in {
+                "po_linked_candidates_present", "no_po_linked_candidates"}
+            and isinstance(population, dict)
+            and population.get("complete") is True
+            and population.get("truncated") is False
+            and not payload.get("partial_result")
+            and isinstance(candidate_count, int)
+            and not isinstance(candidate_count, bool)
+            and candidate_count >= 0
+            and totals_valid(totals)
+            and isinstance(payload.get("lines"), list)
+            and all(amount_row_valid(row)
+                    for row in (payload.get("lines") or []))
+            and len(payload.get("lines") or []) == candidate_count
+            and (candidate_count == 0 or bool(totals))
+        )
+        if not complete:
+            return False, str(
+                payload.get("reason")
+                or "GRNI candidate population was not completely evaluated"
             )[:240]
     # Evidence is judged on STRUCTURED fields only. Scanning prose for "no
     # data" failed every successful run_report, whose note legitimately
@@ -1053,6 +1381,7 @@ _SOURCE_OF_TOOL = {
     "peoplesoft_gl": {
         "get_trial_balance", "get_account_balance", "compare_trial_balance",
         "rollup_trial_balance", "drill_to_journals", "tb_integrity_check",
+        "get_journal_status",
         "explain_balance_change",
         "run_report", "get_budget_variance", "get_exchange_rate",
         "get_tree_node_accounts", "search_accounts", "run_sql",
@@ -1072,6 +1401,7 @@ _SOURCE_OF_TOOL = {
         "get_vendor_intelligence", "get_asset_register", "get_project_costs",
         "get_vendor_payables_network", "search_vendors",
         "get_match_exceptions", "get_procurement_chain",
+        "get_po_grni_candidates",
         "get_entity_network", "get_concentration",
         "get_entity_connection",
     },

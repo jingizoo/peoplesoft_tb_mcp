@@ -21,6 +21,8 @@ from typing import Optional
 from .config import load_config
 from .db import Database, DbError
 from .engine import EngineError, TBEngine
+from .journal_controls import JournalControlError, JournalStatusControl
+from .grni import GRNIControl
 from .ar import ARBilling, ARError
 from .anomalies import AnomalyDetector, AnomalyError
 from .metadata import (MetadataCatalog, MetadataError,
@@ -38,6 +40,7 @@ from .wiki import WikiError, make_wiki
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+journal_status = JournalStatusControl(engine)
 anomaly_detector = AnomalyDetector(db, cfg)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
@@ -47,6 +50,7 @@ from .connectors import coupa as _coupa_mod
 coupa = _coupa_mod.from_env()
 playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
+grni = GRNIControl(modules)
 vendor_network = VendorNetwork(modules)
 from .procurement import Procurement
 procurement = Procurement(modules)
@@ -123,7 +127,7 @@ def _safe(fn, /, **kw) -> dict:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
             PlaybookError, MemoryError_, ModuleError, ConnectorError,
-            AnomalyError, MetadataError) as e:
+            AnomalyError, MetadataError, JournalControlError) as e:
         # These carry a remedy written for the reader. Passing the message
         # through UNPREFIXED is the point: "ConnectorError: check
         # PSFT_QAS_NODE" reads as a crash, "check PSFT_QAS_NODE" reads as
@@ -314,6 +318,40 @@ def drill_to_journals(
         engine.drill_to_journals,
         account=account, period=period, business_unit=business_unit,
         fiscal_year=fiscal_year, ledger=ledger, dept=dept, limit=limit,
+    )
+
+
+@mcp.tool()
+def get_journal_status(
+    journal_id: str = "",
+    business_unit: str = "",
+    ledger: str = "",
+    fiscal_year: int = 0,
+    period: int = 0,
+    as_of_date: str = "",
+    limit: int = 500,
+) -> dict:
+    """Exact CURRENT PeopleSoft journal status for one journal or a scoped
+    period population. Keeps every BUSINESS_UNIT/JOURNAL_ID/JOURNAL_DATE/
+    UNPOST_SEQ version and reports the delivered status code and meaning;
+    it never treats every non-P status as the same kind of "unposted" item.
+
+    Use journal_id for "what is journal J0001's status?" and leave it blank
+    for "which journals still need action before close?". business_unit,
+    ledger, fiscal_year and period are caller scope. as_of_date limits the
+    JOURNAL_DATE population; PS_JRNL_HEADER is current state, so this does
+    NOT prove what the status was historically at that date. A posted-by-
+    cutoff claim additionally requires POSTED_DATE. Read status/evaluated,
+    evidence_completeness and truncated before drawing a conclusion."""
+    return _safe(
+        journal_status.evaluate,
+        journal_id=journal_id,
+        business_unit=business_unit,
+        ledger=ledger,
+        fiscal_year=fiscal_year,
+        period=period,
+        through_date=as_of_date,
+        limit=limit,
     )
 
 
@@ -713,6 +751,39 @@ def get_match_exceptions(business_unit: str = "", months: int = 12,
     and never summed across."""
     return _safe(procurement.match_exceptions, business_unit=business_unit,
                  months=months, as_of_date=as_of_date)
+
+
+@mcp.tool()
+def get_po_grni_candidates(
+    business_unit: str = "",
+    as_of_date: str = "",
+    materiality: float = 0.0,
+    aging_days: int = 30,
+    max_rows: int = 50000,
+) -> dict:
+    """PO-LINKED PeopleSoft receipt-schedule GRNI REVIEW CANDIDATES at one cut-off.
+    Computes accepted receipt value less cutoff-eligible voucher-line value
+    on the same PO line/schedule, with currencies kept separate. Use for
+    "which received-not-invoiced items should we review/accrue at close?".
+
+    Coverage is limited to same-business-unit, PO-linked documents; non-PO
+    receipt accruals need the delivered accounting source. This is document-
+    level candidate evidence only. It does NOT prove that
+    PO_RECVACCR generated an RAC receipt-accrual accounting line, that Journal
+    Generator distributed it, or that GL posted it; read booked_status and
+    candidate_basis and call the result candidates, not a booked liability.
+    Missing dates/keys/status/currency, ambiguous custom records, historical
+    availability uncertainty, and row caps fail closed. materiality is
+    applied separately within each transaction currency; no cross-currency
+    total is produced."""
+    return _safe(
+        grni.period_end_accrual,
+        business_unit=business_unit,
+        as_of_date=as_of_date,
+        materiality=materiality,
+        aging_days=aging_days,
+        max_rows=max_rows,
+    )
 
 
 @mcp.tool()

@@ -1301,7 +1301,7 @@ function renderIntegrity(d){
   };
   [['Trial balance nets to zero',d.balanced,d.balanced?'':'difference '+money(d.total_ending),null],
    ['Suspense accounts',!d.suspense_balances.length,d.suspense_balances.length?d.suspense_balances.length+' carrying a balance':'clear',d.suspense_balances],
-   ['Unposted journals',!d.unposted_journals.length,d.unposted_journals.length?d.unposted_journals.length+' not posted':'all posted',d.unposted_journals],
+   ['Journals requiring close review',!d.unposted_journals.length,d.unposted_journals.length?d.unposted_journals.length+' need action':'none',d.unposted_journals],
    ['Posted journals balance',!d.out_of_balance_journals.length,'',d.out_of_balance_journals],
    ['Inactive accounts with balances',!d.inactive_accounts_with_balances.length,'',d.inactive_accounts_with_balances],
    ['Accounts missing definition',!d.accounts_missing_definition.length,'',d.accounts_missing_definition],
@@ -1469,6 +1469,102 @@ function renderJournals(d){
       esc(l.source||'')+'</td><td>'+esc(l.oprid||'')+'</td><td>'+esc(l.line_descr||'')+'</td><td class="num '+
       (l.amount>=0?'dr':'cr')+'">'+money(l.amount)+'</td></tr>').join('')+'</tbody>';
   sc.append(t);c.append(sc);return c;
+}
+function renderJournalStatus(d){
+  const frag=document.createDocumentFragment();
+  const rows=Array.isArray(d.journals)?d.journals:[];
+  const scope=d.scope||{}, cutoff=d.cutoff||{};
+  const bu=scope.business_unit||d.business_unit||'';
+  const led=scope.ledger||d.ledger||'';
+  const fy=scope.fiscal_year||d.fiscal_year||'';
+  const per=scope.period||d.period||'';
+  const evaluated=d.status==='evaluated'&&d.status_evaluated===true;
+  const noData=d.status==='no_data';
+  const statusPassed=typeof d.status_control_passed==='boolean'
+    ?d.status_control_passed:d.control_passed;
+  const cls=noData?'bad':(evaluated?(statusPassed?'ok':'warn'):'warn');
+  const label=noData?'No data':(evaluated?(statusPassed?'No action statuses':'Action required'):
+    'Incomplete — no conclusion');
+  const head=el('div','card');
+  head.append(el('h2',null,'Journal status <span class="badge '+cls+'">'+label+'</span>'+
+    '<span class="sub">'+esc(bu)+(led?' · '+esc(led):'')+
+    (fy?' · FY'+esc(fy):'')+(per?' P'+esc(per):'')+'</span>'));
+  head.append(el('div','pad','<p>'+esc(d.reason||'')+'</p><p class="sub">'+
+    esc(cutoff.status_time_basis||cutoff.note||
+      'PS_JRNL_HEADER is current state; a date filter does not reconstruct historical status.')+
+    '</p>'));
+  frag.append(head);
+  if(noData) return frag;
+
+  const known=new Set(['D','I','M','E','N','P','T','U','V','Z']);
+  const codeOf=r=>String(r.header_status_code||r.status_code||
+    r.jrnl_hdr_status||r.status||'').toUpperCase();
+  const action=new Set(['I','E','N','T','U','V']);
+  const counts={};
+  rows.forEach(r=>{const k=codeOf(r)||'?';counts[k]=(counts[k]||0)+1;});
+  const actionable=rows.filter(r=>action.has(codeOf(r))).length;
+  const unknown=rows.filter(r=>!known.has(codeOf(r))).length;
+  if(evaluated){
+    frag.append(tiles([
+      ['Journal versions',String(rows.length),'Full date + unpost sequence identity',''],
+      ['Require action',String(actionable),'V/E/I/N/T/U kept distinct',actionable?'cr':'dr'],
+      ['Posted',String(counts.P||0),'current header status P','dr'],
+      ['Unknown codes',String(unknown),unknown?'not treated as clean':'none',unknown?'cr':''],
+      ['Line netting',d.netting_evaluated===true
+        ?(d.netting_passed?'Within tolerance':'Exception'):'Not evaluated',
+       d.netting_evaluated===true?'selected-ledger signed lines':
+         'status remains usable; no balance conclusion',
+       d.netting_evaluated===true&&d.netting_passed===true?'dr':'cr']
+    ]));
+  }
+  if(Object.keys(counts).length){
+    const matrix=el('div','card');
+    matrix.append(el('h2',null,'Exact journal status matrix <span class="sub">no blanket non-P bucket</span>'));
+    const mt=el('table');
+    mt.innerHTML='<thead><tr><th>Code</th><th>Meaning</th><th class="num">Versions</th></tr></thead><tbody>'+
+      Object.keys(counts).sort().map(code=>{
+        const first=rows.find(r=>codeOf(r)===code)||{};
+        const meaning=first.header_status_label||first.status_meaning||
+          first.status_description||first.status_descr||
+          (known.has(code)?'Delivered status — see record detail':'Unknown code — interpretation withheld');
+        return '<tr><td><span class="badge '+(action.has(code)?'warn':'dim')+'">'+esc(code)+'</span></td>'+
+          '<td>'+esc(meaning)+'</td><td class="num">'+counts[code]+'</td></tr>';}).join('')+
+      '</tbody>';
+    matrix.append(mt);frag.append(matrix);
+  }
+  if(rows.length){
+    const card=el('div','card');
+    card.append(el('h2',null,'Journal versions <span class="sub">current status, full key retained</span>'));
+    const sc=el('div');sc.style.maxHeight='390px';sc.style.overflow='auto';
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Journal</th><th>Date</th><th class="num">Unpost seq</th>'+
+      '<th>Status</th><th>Action class</th><th>Posted date</th><th>Source / operator</th></tr></thead><tbody>'+
+      rows.map(r=>{const code=codeOf(r),key=r.journal_key||{};return '<tr><td class="mono">'+
+        esc(key.journal_id||r.journal_id||'')+'</td><td>'+esc(key.journal_date||r.journal_date||'')+
+        '</td><td class="num">'+esc(key.unpost_seq??r.unpost_sequence??r.unpost_seq??'')+'</td>'+
+        '<td><span class="badge '+(action.has(code)?'warn':'dim')+'">'+esc(code||'?')+'</span> '+
+        esc(r.header_status_label||r.status_meaning||r.status_description||r.status_descr||'')+'</td>'+
+        '<td>'+esc(r.header_status_disposition||r.action_class||r.action||'')+'</td><td>'+esc(r.posted_date||'')+'</td>'+
+        '<td>'+esc([r.source,Object.values(r.operator_fields||{}).join('/')].filter(Boolean).join(' · '))+
+        '</td></tr>';}).join('')+'</tbody>';
+    sc.append(t);card.append(sc);frag.append(card);
+  }
+  if(evaluated&&d.netting_evaluated!==true){
+    const warn=el('div','card');
+    warn.append(el('div','pad','<span class="badge warn">Netting unavailable</span> '+
+      'Current journal status is completely classified, but selected-ledger '+
+      'line netting was not. This result cannot support a trial-balance or '+
+      'journal-balance conclusion.'));
+    frag.append(warn);
+  }
+  if(!evaluated){
+    const warn=el('div','card');
+    warn.append(el('div','pad','<span class="badge warn">Incomplete</span> '+
+      esc(d.reason||'The journal population could not be evaluated completely.')+
+      (d.truncated?' The safety cap was reached; absence is not proven.':'')));
+    frag.append(warn);
+  }
+  return frag;
 }
 function renderScopes(d){
   return renderScopeChooser(
@@ -2031,6 +2127,24 @@ function resultBadge(d){
     return {text:'incomplete',cls:'warn'};
   if(d.evaluated===true&&typeof d.ties==='boolean')
     return {text:d.ties?'reconciled':'difference',cls:d.ties?'ok':'bad'};
+  if(d.status_evaluated===true&&typeof d.status_control_passed==='boolean'){
+    if(!d.status_control_passed) return {text:'status review',cls:'bad'};
+    if(d.netting_evaluated===true&&d.netting_passed===false)
+      return {text:'netting exception',cls:'bad'};
+    return {text:'status clear',cls:'ok'};
+  }
+  if(d.evaluated===true&&typeof d.control_passed==='boolean')
+    return {text:d.control_passed?'clear':'review',
+      cls:d.control_passed?'ok':'bad'};
+  if(d.evaluated===true&&d.coverage&&
+     d.coverage.classification==='po_linked_document_review_only'){
+    const n=Number((d.population||{}).candidate_count??(d.lines||[]).length);
+    return {text:n+' PO-linked',cls:n?'warn':'dim'};
+  }
+  if(d.evaluated===true&&d.candidate_basis){
+    const n=Number((d.population||{}).candidate_count??(d.lines||[]).length);
+    return {text:n+' candidate'+(n===1?'':'s'),cls:n?'warn':'ok'};
+  }
   if(d.status==='checks_incomplete'||d.verdict==='incomplete'||
       (d.checks_incomplete||[]).length) return {text:'incomplete',cls:'warn'};
   if(Array.isArray(d.alerts)) return {text:d.alerts.length+' alert'+(d.alerts.length===1?'':'s'),
@@ -2094,6 +2208,7 @@ function renderToolBody(name,data,args){
     if(name==='explain_balance_change') return renderBridge(data);
     if(name==='get_account_balance') return renderAccount(data);
     if(name==='drill_to_journals') return renderJournals(data);
+    if(name==='get_journal_status') return renderJournalStatus(data);
     if(name==='list_financial_scopes') return renderScopes(data);
     if(name==='run_report') return renderReport(data);
     if(name==='get_customer_intelligence') return renderCustomerIntel(data);
@@ -2104,6 +2219,7 @@ function renderToolBody(name,data,args){
     if(name==='get_concentration') return renderConcentration(data);
     if(name==='get_entity_connection') return renderConnection(data);
     if(name==='get_match_exceptions') return renderMatchExceptions(data);
+    if(name==='get_po_grni_candidates') return renderGRNICandidates(data);
     if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_open_payables') return renderOpenPayables(data);
@@ -2282,6 +2398,105 @@ function renderMatchExceptions(d){
     c.append(el('div','pad','<p style="color:var(--muted)">'+
       esc(d.system_match_flags.note)+'</p>'));
   frag.append(c); return frag;
+}
+function renderGRNICandidates(d){
+  const frag=document.createDocumentFragment();
+  const rows=d.lines||[], pop=d.population||{};
+  const evaluated=d.status==='evaluated'&&d.evaluated===true;
+  const noData=d.status==='no_data';
+  const count=Number(pop.candidate_count??rows.length);
+  const conclusionText={
+    po_linked_candidates_present:'PO-linked review candidates were identified in the covered current-state population.',
+    no_po_linked_candidates:'No candidates were identified in the covered current-state PO-linked population; this is not an all-GRNI conclusion.'
+  }[d.conclusion]||'';
+  const badge=noData?'<span class="badge bad">No data</span>':
+    (evaluated?'<span class="badge '+(count?'warn':'dim')+'">'+
+      count+' PO-linked candidate'+(count===1?'':'s')+'</span>':
+      '<span class="badge warn">Incomplete — no conclusion</span>');
+  const head=el('div','card');
+  head.append(el('h2',null,'PO-linked GRNI review candidates '+badge+
+    '<span class="sub">'+esc(d.business_unit||'')+' · '+esc(d.as_of_date||'')+'</span>'));
+  head.append(el('div','pad','<p>'+esc(d.reason||conclusionText||d.note||'')+'</p>'+
+    (d.note?'<p class="sub">'+esc(d.note)+'</p>':'')+
+    '<p><b>Not booked-accrual evidence:</b> '+esc(d.booked_basis||
+      'Receipt/voucher schedule arithmetic does not prove PO_RECVACCR, Journal Generator, or GL posting.')+'</p>'));
+  frag.append(head);
+  if(noData) return frag;
+
+  const amounts=[];
+  const raw=d.totals_by_currency||d.rni_totals_by_currency||{};
+  if(Array.isArray(raw)) raw.forEach(x=>amounts.push([
+    x.currency||'',x.rni_candidate_amount??x.amount??x.total??0]));
+  else Object.entries(raw).forEach(([currency,value])=>
+    amounts.push([currency,typeof value==='object'?(value.amount??value.total??0):value]));
+  if(evaluated){
+    const items=[['Candidates',String(count),'receipt schedules at the selected cut-off',count?'cr':'dr']];
+    amounts.slice(0,3).forEach(([currency,value])=>items.push([
+      'Candidate amount',money(value)+' '+esc(currency),'currencies remain separate',count?'cr':'']));
+    frag.append(tiles(items));
+  }
+
+  const coverage=d.coverage||{}, candidate=d.candidate_basis||{};
+  const cutoff=d.cutoff_basis||{}, matching=d.matching_basis||{};
+  const sources=Array.isArray(d.source_records)?d.source_records.join(', '):
+    Object.entries(d.source_records||{}).map(([logical,info])=>
+      logical+': '+(typeof info==='object'?(info.physical||'unresolved'):info)).join(', ');
+  const basis=el('div','card');
+  basis.append(el('h2',null,'Population and cut-off basis <span class="sub">review population, not a GL balance</span>'));
+  const bt=el('table');
+  bt.innerHTML='<thead><tr><th>Basis</th><th>Evidence</th></tr></thead><tbody>'+[
+    ['Candidate',candidate.formula||String(d.candidate_basis||'')],
+    ['Amount',candidate.amount_basis||''],
+    ['Cut-off',[cutoff.receipts,cutoff.vouchers,cutoff.availability_guard].filter(Boolean).join(' · ')],
+    ['Matching',(matching.primary_key||[]).join(' + ')+(matching.reduced_precision?' (reduced precision)':'')],
+    ['Coverage',coverage.included||'same-BU PO-linked document review only'],
+    ['Outside scope',(coverage.excluded||[]).join(' · ')],
+    ['Booked status',d.booked_status],['Source records',sources]
+  ].map(x=>'<tr><td><b>'+esc(x[0])+'</b></td><td>'+esc(x[1]||'')+'</td></tr>').join('')+
+    '</tbody>';
+  basis.append(bt);frag.append(basis);
+
+  if(rows.length){
+    const card=el('div','card');
+    card.append(el('h2',null,'Schedule-level review candidates'));
+    const sc=el('div');sc.style.maxHeight='390px';sc.style.overflow='auto';
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>PO / schedule</th><th>Receipt</th><th>Supplier</th>'+
+      '<th class="num">Received value</th><th class="num">Cut-off voucher value</th>'+
+      '<th class="num">Candidate amount</th><th>Age</th></tr></thead><tbody>'+
+      rows.map(r=>'<tr><td class="mono">'+esc(r.po_id||'')+' / '+esc(r.line_nbr??r.po_line??'')+
+        ' / '+esc(r.sched_nbr??r.schedule_nbr??'')+'</td><td class="mono">'+
+        esc((r.receiver_ids||[]).join(', ')||r.receiver_id||r.receipt_id||'')+
+        '<br><span class="sub">'+esc(r.first_receipt_date||r.receipt_date||'')+'</span></td>'+
+        '<td>'+esc(r.vendor_name||r.vendor_id||'')+'</td><td class="num">'+
+        money(r.received_amount)+'</td><td class="num">'+money(r.attributed_voucher_amount)+'</td>'+
+        '<td class="num">'+money(r.rni_candidate_amount??r.candidate_amount??r.rni_amount)+
+        ' '+esc(r.currency||r.currency_cd||'')+'</td><td>'+esc(r.age_days??'')+'</td></tr>').join('')+'</tbody>';
+    sc.append(t);card.append(sc);frag.append(card);
+  }
+  const exc=d.exceptions||{};
+  const groups=[['Material / aged',exc.material_or_aged],
+                ['Over-invoiced',exc.over_invoiced],
+                ['Unmatched voucher references',exc.unmatched_voucher_references],
+                ['Voucher statuses excluded',exc.excluded_voucher_statuses],
+                ['Receipt statuses excluded',exc.excluded_receipt_statuses]];
+  if(groups.some(([,v])=>Array.isArray(v)&&v.length)){
+    const card=el('div','card');
+    card.append(el('h2',null,'Exceptions <span class="sub">review, do not net away</span>'));
+    groups.forEach(([label,list])=>{
+      if(!Array.isArray(list)||!list.length) return;
+      card.append(el('div','pad','<b>'+esc(label)+'</b> · '+list.length));
+    });
+    frag.append(card);
+  }
+  if(!evaluated){
+    const warn=el('div','card');
+    warn.append(el('div','pad','<span class="badge warn">Incomplete</span> '+
+      esc(d.reason||'The receipt/voucher population was not complete.')+
+      ' No zero or clean conclusion is shown.'));
+    frag.append(warn);
+  }
+  return frag;
 }
 function renderProcurementChain(d){
   const frag=document.createDocumentFragment();
@@ -3735,7 +3950,7 @@ function viewChat(){
    'What should we accrue for AP at month-end?',
    'Is AP complete for month-end?',
    'Does the trial balance balance?',
-   'Are there unposted journals?',
+   'Which journals still need action before close?',
    'Are we ready to close GL?',
    'What needs my attention today?'].forEach((q,i)=>{
     const c=el('button','chip',esc(q)); c.type='button';

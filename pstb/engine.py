@@ -45,10 +45,12 @@ JRNL_STATUS = {
     "V": "Valid, not posted",
     "E": "Edit errors",
     "N": "No status / not edited",
-    "I": "Posting in process",
-    "T": "Journal generated, not edited",
+    "I": "Posting incomplete — repost as soon as possible",
+    "T": "Journal entry incomplete",
     "U": "Unposted",
-    "D": "Deleted",
+    "D": "Deleted — anchor journal unposted",
+    "M": "Valid standard-journal model — do not post",
+    "Z": "Upgrade journal — cannot unpost",
 }
 
 
@@ -2082,7 +2084,9 @@ class TBEngine:
         for u in unposted:
             u["status_descr"] = JRNL_STATUS.get(u.get("status"), u.get("status"))
         if unposted:
-            issues.append(f"{len(unposted)} journal(s) in periods 1-{per} are not posted")
+            issues.append(
+                f"{len(unposted)} journal(s) in periods 1-{per} require "
+                "close review")
 
         params = {"bu": bu, "ledger": led, "fy": fy, "minper": 0,
                   "maxper": per}

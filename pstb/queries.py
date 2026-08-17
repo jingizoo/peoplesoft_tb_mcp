@@ -313,10 +313,14 @@ def journal_lines(db: Database, dept: str, params: dict) -> str:
 
 
 def unposted_journals(db: Database) -> str:
-    """Journals not yet posted. The finding is the journal itself; who entered
-    it, which subsystem it came from and its free-text description are labels
-    on that finding, so they degrade to NULL rather than taking the check
-    down. DESCR254_MIXED in particular is renamed or absent across releases.
+    """Journals whose exact current status requires close review.
+
+    This legacy function name is kept for payload compatibility, but the
+    population is not a blanket ``status != P``: deleted siblings, standard-
+    journal models and upgrade journals are documented non-actionable states.
+    Who entered a finding, its subsystem and free-text description are labels,
+    so they degrade to NULL rather than taking the check down.
+    DESCR254_MIXED in particular is renamed or absent across releases.
     """
     p = db.prefix
     j = "PS_JRNL_HEADER"
@@ -336,7 +340,11 @@ def unposted_journals(db: Database) -> str:
  WHERE BUSINESS_UNIT = :bu
    AND FISCAL_YEAR = :fy
    AND ACCOUNTING_PERIOD BETWEEN :minper AND :maxper
-   AND JRNL_HDR_STATUS NOT IN ('P', 'D')
+   -- P is posted; D is a deleted sibling; M is a non-posting model; Z is
+   -- the special upgrade/cannot-unpost state. None belongs in the actionable
+   -- close population. A NULL status is unknown and must remain visible.
+   AND (JRNL_HDR_STATUS IS NULL
+        OR JRNL_HDR_STATUS NOT IN ('P', 'D', 'M', 'Z'))
    {led_clause}
  ORDER BY ACCOUNTING_PERIOD, JOURNAL_DATE, JOURNAL_ID"""
 

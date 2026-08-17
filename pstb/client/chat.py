@@ -33,7 +33,7 @@ from ..guards import (
     evidence_intent,
     misattributed_figures,
     wants_all_business_units,
-    financial_tool_domains,
+    financial_result_domains,
     is_policy_tool,
     normalize_request_scope,
     promises_tool_call,
@@ -697,7 +697,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                         if call.name == "run_sql":
                             sql_remedy_pending = False
                         if call.name in FINANCIAL_EVIDENCE_TOOLS:
-                            covered = financial_tool_domains(call.name)
+                            covered = financial_result_domains(call.name, out)
                             if call.name == "run_sql":
                                 # Ad-hoc SQL has no fixed domain: a successful
                                 # SELECT the user's question routed to IS the
