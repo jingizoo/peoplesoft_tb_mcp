@@ -118,6 +118,40 @@ wiki:
   confluence_space: ""    # optional space key filter, e.g. FIN
   confluence_labels: ""   # optional label filter, e.g. "gl-policy,gl-close,gl-coa"
 
+# Coupa purchasing semantics. Credentials and the instance URL stay in .env.
+# Turn this on only when Coupa, rather than PeopleSoft Purchasing, owns the
+# PO/receipt population. The RNI control then reads dated Coupa receiving
+# transactions and invoice lines; it still does NOT prove an accrual was
+# booked or posted in PeopleSoft.
+coupa:
+  po_receipt_authority: false
+  # Required when authority=true. Use the Coupa company/calendar IANA zone;
+  # current-date cutoffs are computed in this zone, not the server host zone.
+  business_timezone: ""   # e.g. America/New_York
+  # Required for a BU-scoped Coupa RNI result. This is a dotted JSON path on
+  # each receiving transaction, such as account.segment-1 or a tenant custom
+  # field. There is no universal Coupa segment meaning, so blank fails closed.
+  business_unit_path: ""
+  # Required exact server-side Coupa query keys for live evaluation. Coupa's
+  # query spelling varies by resource/release, so test both keys in the tenant;
+  # they are never guessed from the JSON path. Values come from the BU map.
+  receipt_business_unit_filter: ""  # e.g. account[segment_1]
+  invoice_business_unit_filter: ""  # e.g. invoice_lines[account][segment_1]
+  # Enable only after a tenant API test proves the invoice filter returns
+  # every header containing an in-scope PO/order-line even if the invoice
+  # distribution account was reassigned. False makes live RNI incomplete.
+  invoice_scope_order_line_invariant: false
+  # Optional translation when Coupa and PeopleSoft use different unit codes.
+  # business_unit_map: {US001: US_CORP, CA001: CANADA}
+  business_unit_map: {}
+  # `paid` is a separate Coupa boolean, not a delivered invoice status.
+  # Add a tenant-specific legacy status only after testing its outbound rules.
+  invoice_eligible_statuses: [approved]
+  # Receipt status is tenant-extensible text. Add only tested values; an
+  # observed unconfigured status makes the candidate control incomplete.
+  receipt_eligible_statuses: [created]
+  rni_max_rows: 50000      # runtime hard ceiling remains 100000 per endpoint
+
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
   max_rows: 200           # cap on rows returned to the LLM

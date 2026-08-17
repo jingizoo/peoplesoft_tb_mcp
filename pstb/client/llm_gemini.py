@@ -54,15 +54,16 @@ _AP_TOOLS = {
     "get_entity_network", "get_concentration", "get_entity_connection",
     "get_coupa_invoices", "get_coupa_stuck_approvals", "get_coupa_rni",
     "get_coupa_supplier_spend", "get_coupa_budget_lines",
-    "coupa_budget_variance", "coupa_to_ap_tie", "run_playbook",
+    "coupa_budget_variance", "run_playbook",
 }
-_GRNI_TOOLS = {
-    "get_po_grni_candidates", "get_coupa_rni", "get_match_exceptions",
-    "run_playbook",
-}
+_PS_GRNI_TOOLS = {"get_po_grni_candidates", "get_match_exceptions",
+                  "run_playbook"}
+_COUPA_RNI_TOOLS = {"get_coupa_rni", "run_playbook"}
+_BOOKED_GRNI_TOOLS = {"run_playbook"}
 
 
-def routing_tool_names(question: str, available_names) -> list[str]:
+def routing_tool_names(question: str, available_names,
+                       procurement_authority: str = "") -> list[str]:
     """Broad, deterministic first-call shortlist for Gemini 2.5 Pro.
 
     The full declaration set remains available after the first tool result,
@@ -83,10 +84,30 @@ def routing_tool_names(question: str, available_names) -> list[str]:
         chosen |= _DISCOVERY_TOOLS
     if domains & {"billing", "ar", "customer", "fx"}:
         chosen |= _BI_AR_TOOLS | _DISCOVERY_TOOLS
-    if "ap" in domains:
+    if "ap_completeness" in domains:
+        chosen |= {"run_playbook"} | _DISCOVERY_TOOLS
+    elif "ap" in domains:
         chosen |= _AP_TOOLS | _DISCOVERY_TOOLS
-    if domains & {"grni", "po_grni_candidates"}:
-        chosen |= _GRNI_TOOLS | _DISCOVERY_TOOLS
+    if domains & {"coupa_to_ps_posting", "coupa_export_delivery",
+                  "coupa_receiving_export_population",
+                  "coupa_receipt_export_detail",
+                  "rni_allocation", "rni_receipt_matching"}:
+        # These legs have no governed financial tool yet. Discovery may find
+        # a site-specific bridge, but candidate tools must not be offered as
+        # though they prove posting or account allocation.
+        chosen |= _DISCOVERY_TOOLS
+    elif domains & {"coupa_rni_candidates", "coupa_receipt_export_state"}:
+        chosen |= _COUPA_RNI_TOOLS | _DISCOVERY_TOOLS
+    elif "po_grni_candidates" in domains:
+        chosen |= _PS_GRNI_TOOLS | _DISCOVERY_TOOLS
+    elif "rni_candidates" in domains:
+        chosen |= ((_COUPA_RNI_TOOLS if procurement_authority == "coupa"
+                    else _PS_GRNI_TOOLS if procurement_authority == "peoplesoft"
+                    else _COUPA_RNI_TOOLS | _PS_GRNI_TOOLS)
+                   | _DISCOVERY_TOOLS)
+    elif "grni" in domains:
+        # A candidate population never proves a booked liability or posting.
+        chosen |= _BOOKED_GRNI_TOOLS | _GL_TOOLS | _DISCOVERY_TOOLS
     if domains & {"balance", "journal", "journal_netting",
                   "journal_posted_by", "journal_historical_status",
                   "report", "variance"}:
@@ -224,6 +245,11 @@ class GeminiVertexProvider(LLMProvider):
         self._base_kwargs = kwargs
         self._force_tool_round = bool(
             getattr(cfg.llm, "gemini_force_tool_round", True))
+        self.procurement_authority = (
+            "coupa" if getattr(getattr(cfg, "coupa", None),
+                               "po_receipt_authority", False) is True
+            else "peoplesoft"
+        )
         self._routing_temperature = float(
             getattr(cfg.llm, "gemini_routing_temperature", 0.0))
         # The agent loop sets this per turn from its intent classification;
@@ -257,7 +283,8 @@ class GeminiVertexProvider(LLMProvider):
     def set_routing_question(self, question: str) -> None:
         """Set the first-call shortlist; subsequent AUTO rounds see all tools."""
         self._routing_tool_names = routing_tool_names(
-            question, self._available_tool_names)
+            question, self._available_tool_names,
+            procurement_authority=self.procurement_authority)
 
     def reset(self) -> None:
         self.contents: list = []

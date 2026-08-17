@@ -378,6 +378,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 <script>
 const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!==undefined)n.innerHTML=h;return n;};
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const coupaAmount=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:9});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[], CARDSEQ=0;
 let SCOPE_YEARS_STALE=false;
@@ -991,12 +992,14 @@ function copyTableButton(table,label){
   return b;
 }
 
-function csvButton(tool,args,result){
-  const b=el('button','csvbtn','CSV');
+function csvButton(tool,args,result,label,exportView){
+  const b=el('button','csvbtn',label||'CSV');
   b.type='button'; b.title=CSV_HINT;
   b.setAttribute('aria-label','Download full '+tool+' result as CSV');
   b.onclick=ev=>{ ev.preventDefault(); ev.stopPropagation();
-    downloadExport(tool,args,result,b); };
+    const exportArgs=Object.assign({},args||{});
+    if(exportView) exportArgs._export_view=exportView;
+    downloadExport(tool,exportArgs,result,b); };
   return b;
 }
 
@@ -2141,6 +2144,17 @@ function resultBadge(d){
     const n=Number((d.population||{}).candidate_count??(d.lines||[]).length);
     return {text:n+' PO-linked',cls:n?'warn':'dim'};
   }
+  if(d.evaluated===true&&d.coverage&&
+     d.coverage.classification==='coupa_po_linked_event_review_only'){
+    const n=Number((d.population||{}).candidate_count??(d.lines||[]).length);
+    const counts=((d.exceptions||{}).counts)||{};
+    const x=['invoice_present_not_eligible','over_invoiced',
+      'net_credit_invoice_activity','excluded_receiving_types']
+      .reduce((total,key)=>total+Number(counts[key]??
+        (Array.isArray((d.exceptions||{})[key])?(d.exceptions||{})[key].length:0)),0);
+    return {text:n?n+' Coupa candidate'+(n===1?'':'s'):
+      x+' exception'+(x===1?'':'s'),cls:(n||x)?'warn':'dim'};
+  }
   if(d.evaluated===true&&d.candidate_basis){
     const n=Number((d.population||{}).candidate_count??(d.lines||[]).length);
     return {text:n+' candidate'+(n===1?'':'s'),cls:n?'warn':'ok'};
@@ -2220,6 +2234,7 @@ function renderToolBody(name,data,args){
     if(name==='get_entity_connection') return renderConnection(data);
     if(name==='get_match_exceptions') return renderMatchExceptions(data);
     if(name==='get_po_grni_candidates') return renderGRNICandidates(data);
+    if(name==='get_coupa_rni') return renderCoupaRNI(data);
     if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_open_payables') return renderOpenPayables(data);
@@ -2431,7 +2446,7 @@ function renderGRNICandidates(d){
     amounts.push([currency,typeof value==='object'?(value.amount??value.total??0):value]));
   if(evaluated){
     const items=[['Candidates',String(count),'receipt schedules at the selected cut-off',count?'cr':'dr']];
-    amounts.slice(0,3).forEach(([currency,value])=>items.push([
+    amounts.forEach(([currency,value])=>items.push([
       'Candidate amount',money(value)+' '+esc(currency),'currencies remain separate',count?'cr':'']));
     frag.append(tiles(items));
   }
@@ -2494,6 +2509,208 @@ function renderGRNICandidates(d){
     warn.append(el('div','pad','<span class="badge warn">Incomplete</span> '+
       esc(d.reason||'The receipt/voucher population was not complete.')+
       ' No zero or clean conclusion is shown.'));
+    frag.append(warn);
+  }
+  return frag;
+}
+function renderCoupaRNI(d){
+  const frag=document.createDocumentFragment();
+  const rows=Array.isArray(d.lines)?d.lines:[], pop=d.population||{};
+  const coverage=d.coverage||{}, basis=d.candidate_basis||{};
+  const exc=d.exceptions||{};
+  const exceptionCounts=exc.counts||{};
+  const exceptionCount=['invoice_present_not_eligible','over_invoiced',
+    'net_credit_invoice_activity','excluded_receiving_types'].reduce((n,k)=>n+
+      Number(exceptionCounts[k]??(Array.isArray(exc[k])?exc[k].length:0)),0);
+  const evaluated=d.status==='evaluated'&&d.evaluated===true;
+  const noData=d.status==='no_data';
+  const count=Number(pop.candidate_count??rows.length);
+  const positiveCount=Number(pop.positive_candidate_count??count);
+  const threshold=Number(d.min_amount||0);
+  const headline=evaluated?
+    (count?'Coupa PO-line review candidates were identified.':
+      d.conclusion==='no_candidates_above_threshold'?
+        positiveCount+' positive candidate'+(positiveCount===1?' exists':'s exist')+
+        ', but none is above the '+coupaAmount(threshold)+' native-currency threshold.':
+      exceptionCount?'No positive candidates are displayed, but matching exceptions still require review.':
+      'No candidates were observed in this completed sequential Coupa collection; this is not an atomic snapshot or an all-GRNI conclusion.'):
+    (d.reason||'The Coupa receipt and invoice-line population is incomplete.');
+  const badge=noData?'<span class="badge bad">No data — no zero conclusion</span>':
+    evaluated?'<span class="badge '+((count||exceptionCount)?'warn':'dim')+'">'+
+      (count?count+' candidate'+(count===1?'':'s'):
+        exceptionCount+' exception'+(exceptionCount===1?'':'s'))+'</span>':
+      '<span class="badge warn">Incomplete — no conclusion</span>';
+  const head=el('div','card');
+  head.append(el('h2',null,'Coupa PO-line review candidates '+badge+
+    '<span class="sub">'+esc(d.business_unit||'')+' · '+esc(d.as_of_date||'')+
+    ' · '+esc(d.mode||'unknown mode')+'</span>'));
+  head.append(el('div','pad','<p>'+esc(headline)+'</p>'+
+    (d.note?'<p class="sub">'+esc(d.note)+'</p>':'')+
+    '<p><b>Booking and posting:</b> Not evaluated. '+esc(d.booked_basis||
+      'Coupa operational or export state does not prove an ERP accounting entry or posted GL journal.')+'</p>'));
+  frag.append(head);
+
+  const raw=d.totals_by_currency||d.rni_totals_by_currency||{};
+  const amounts=Object.entries(raw).map(([currency,value])=>[
+    currency,typeof value==='object'?(value.amount??value.total??0):value]);
+  if(evaluated){
+    const items=[['Review candidates',String(count),
+      'aggregate Coupa PO-line precision',count?'cr':'']];
+    amounts.forEach(([currency,value])=>items.push([
+      'Candidate amount',coupaAmount(value)+' '+esc(currency),
+      'currencies remain separate',count?'cr':'']));
+    frag.append(tiles(items));
+    if(positiveCount>count){
+      const allPositive=d.all_positive_candidate_totals_by_currency||{};
+      const detail=Object.entries(allPositive).map(([c,v])=>coupaAmount(v)+' '+esc(c)).join(' · ');
+      frag.append(el('div','card pad','<span class="badge warn">Below threshold</span> '+
+        positiveCount+' positive candidate'+(positiveCount===1?'':'s')+
+        ' before the '+coupaAmount(threshold)+' same-nominal native-currency threshold'+
+        (detail?' · '+detail:'')+'.'));
+    }
+    if(pop.display_truncated===true){
+      frag.append(el('div','card pad','<span class="badge warn">Display limited</span> Showing '+
+        Number(pop.displayed_candidate_count??rows.length)+' of '+count+
+        ' candidates. Full-population counts and currency totals above remain complete.'));
+    }
+  }
+
+  const pages=d.pagination||{}, snapshot=d.snapshot||{}, exportInfo=d.export_evidence||{};
+  const pageText=['receipts','invoices'].map(k=>{
+    const p=pages[k]||{};
+    return k+': '+(p.complete===true?'complete':'incomplete')+
+      (p.rows_returned!==undefined?' ('+p.rows_returned+' rows)':'');
+  }).join(' · ');
+  const population=el('div','card');
+  population.append(el('h2',null,'What this evidence covers <span class="sub">Coupa operations, not the ledger</span>'));
+  const pt=el('table');
+  const businessDateBasis=coverage.current_date_basis===
+    'configured_coupa_company_timezone'?'configured Coupa company timezone':
+    (coverage.current_date_basis||'not established');
+  const invalidExportTimes=Number(
+    exportInfo.invalid_last_exported_at_transactions||0);
+  pt.innerHTML='<thead><tr><th>Control</th><th>Basis</th></tr></thead><tbody>'+[
+    ['Source','Coupa receiving transactions plus nested invoice lines'],
+    ['Business date',(coverage.current_date||d.as_of_date||'')+
+      (coverage.business_timezone?' · '+coverage.business_timezone:'')+
+      ' · '+businessDateBasis],
+    ['Business-unit scope',(coverage.business_unit_basis||'configured Coupa mapping')+
+      (coverage.coupa_business_unit?' · Coupa value '+coverage.coupa_business_unit:'')],
+    ['Matching',coverage.matching_precision==='order_line_aggregate'?
+      'Aggregate by exact Coupa order-line ID; a specific receipt is not claimed uninvoiced':
+      (coverage.matching_precision||'not established')],
+    ['Eligible invoice coverage',(basis.eligible_invoice_statuses||[]).join(', ')||'not established'],
+    ['Pagination',pageText],
+    ['Snapshot',(snapshot.collection_complete===true?'completed sequential collections':'incomplete collections')+
+      ' · '+(snapshot.atomic===true?'atomic':'not cross-endpoint atomic; not an exact-instant state')+
+      (snapshot.as_of?' · data as of '+snapshot.as_of:'')],
+    ['Coupa export',exportInfo.evaluated===true?
+      ((exportInfo.exported_receipt_transactions||0)+' exported · '+
+       (exportInfo.not_exported_receipt_transactions||0)+' not exported · transport state only'):
+      ('not completely available'+(invalidExportTimes?
+        ' · '+invalidExportTimes+' invalid export timestamp'+
+        (invalidExportTimes===1?'':'s'):'')+
+       '; Coupa export does not prove ERP booking')],
+    ['Candidate formula',basis.formula||''],
+    ['Outside scope',(coverage.excluded||[]).join(' · ')],
+    ['Booked status',d.booked_status||'not evaluated']
+  ].map(x=>'<tr><td><b>'+esc(x[0])+'</b></td><td>'+esc(x[1]||'')+'</td></tr>').join('')+
+    '</tbody>';
+  population.append(pt);frag.append(population);
+
+  const exportRows=Array.isArray(exportInfo.receipt_transactions)?
+    exportInfo.receipt_transactions:[];
+  if(exportRows.length){
+    const card=el('div','card');
+    const exportCount=Number(exportInfo.receipt_transaction_count??exportRows.length);
+    card.append(el('h2',null,'Receipt export flags <span class="sub">Coupa transport state only</span>'));
+    if(exportInfo.display_truncated===true){
+      card.append(el('div','pad','<span class="badge warn">Display limited</span> Showing '+
+        Number(exportInfo.displayed_receipt_transaction_count??exportRows.length)+' of '+
+        exportCount+' in-scope receipt events.'));
+    }
+    const sc=el('div');sc.style.maxHeight='320px';sc.style.overflow='auto';
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Receipt event</th><th>Order line</th><th>Type / date</th><th>Coupa export flag</th><th>Last exported</th></tr></thead><tbody>'+exportRows.map(r=>
+      '<tr><td class="mono">'+esc(r.receipt_transaction_id||'')+'</td><td class="mono">'+
+      esc(r.order_line_id||'')+'</td><td>'+esc(r.type||'')+'<br><span class="sub">'+
+      esc(r.transaction_date||'')+'</span></td><td>'+esc(r.exported===true?'exported':
+      r.exported===false?'not exported':'unknown')+'</td><td>'+esc(r.last_exported_at||'')+'</td></tr>'
+    ).join('')+'</tbody>';
+    sc.append(t);card.append(sc);frag.append(card);
+  }
+
+  if(rows.length){
+    const card=el('div','card');
+    card.append(el('h2',null,'Coupa PO-line candidates <span class="sub">receipt-level matching needs Coupa matching allocations</span>'));
+    const sc=el('div');sc.style.maxHeight='390px';sc.style.overflow='auto';
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>PO / line</th><th>Supplier</th><th>Receipt evidence</th>'+
+      '<th class="num">Net receipt value at receipt valuation</th><th class="num">Eligible invoice coverage at receipt valuation</th>'+
+      '<th class="num">Review amount</th></tr></thead><tbody>'+rows.map(r=>{
+      const valuation=Number(r.net_receipt_value_at_receipt_valuation??r.net_receipt_amount??0);
+      const face=Number(r.net_receipt_face_amount??valuation);
+      const difference=Number(r.receipt_face_to_valuation_difference??(face-valuation));
+      const faceNote=Math.abs(difference)>1e-12?
+        '<br><span class="sub">Coupa source face total '+coupaAmount(face)+' '+esc(r.currency||'')+
+        ' · face-to-valuation difference '+coupaAmount(difference)+' '+esc(r.currency||'')+'</span>':'';
+      const receiptCount=Number(r.receipt_transaction_count??0);
+      const receiptIds=Array.isArray(r.receipt_transaction_ids)?r.receipt_transaction_ids:[];
+      const receiptIdsShown=Number(r.receipt_id_evidence_displayed_count??receiptIds.length);
+      const receiptBounded=r.receipt_id_evidence_truncated===true||receiptIdsShown<receiptCount;
+      return '<tr><td class="mono">'+esc(r.po||r.po_id||'')+' / '+esc(r.line||'')+
+        '<br><span class="sub">'+esc(r.order_line_id||'')+'</span></td><td>'+esc(r.supplier||'')+
+        '</td><td>'+esc(receiptCount)+' event(s)'+
+        (receiptBounded?' · '+esc(receiptIdsShown)+' of '+esc(receiptCount)+' IDs shown':'')+
+        '<br><span class="sub">'+esc(receiptIds.join(', '))+' · '+esc(r.first_receipt_date||'')+
+        ' to '+esc(r.last_receipt_date||'')+'</span>'+faceNote+'</td><td class="num">'+
+        coupaAmount(valuation)+' '+esc(r.currency||'')+'</td><td class="num">'+
+        coupaAmount(r.eligible_invoice_coverage_at_receipt_valuation??r.eligible_invoice_amount)+' '+esc(r.currency||'')+'</td><td class="num">'+
+        coupaAmount(r.rni_candidate_amount??r.rni_amt)+' '+esc(r.currency||'')+'</td></tr>';
+    }).join('')+'</tbody>';
+    sc.append(t);card.append(sc);frag.append(card);
+  }
+
+  const groups=[
+    ['Invoices present but not eligible','invoice_present_not_eligible',exc.invoice_present_not_eligible],
+    ['Invoice value exceeds receipt value','over_invoiced',exc.over_invoiced],
+    ['Net credit invoice activity','net_credit_invoice_activity',exc.net_credit_invoice_activity],
+    ['Receiving types outside this control','excluded_receiving_types',exc.excluded_receiving_types]
+  ];
+  if(groups.some(([,key,list])=>Number(exceptionCounts[key]??(Array.isArray(list)?list.length:0))>0)){
+    const card=el('div','card');
+    card.append(el('h2',null,'Exceptions and exclusions'));
+    const exceptionRows=[];
+    groups.forEach(([label,key,list])=>{
+      const shown=Array.isArray(list)?list.length:0;
+      const full=Number(exceptionCounts[key]??shown);
+      if(full>0)
+        card.append(el('div','pad','<b>'+esc(label)+'</b> · '+full+
+          (full>shown?' <span class="sub">('+shown+' shown)</span>':'')));
+      (Array.isArray(list)?list:[]).forEach(row=>exceptionRows.push({label,row}));
+    });
+    if(exceptionRows.length){
+      const sc=el('div');sc.style.maxHeight='320px';sc.style.overflow='auto';
+      const t=el('table');
+      t.innerHTML='<thead><tr><th>Category</th><th>Reference</th><th>Status / reason</th><th class="num">Observed amount</th></tr></thead><tbody>'+exceptionRows.map(item=>{
+        const r=item.row||{};
+        const ref=r.invoice_number||r.invoice_id||r.po||r.receipt_transaction_id||r.type||r.order_line_id||'';
+        const secondary=r.order_line_id&&String(r.order_line_id)!==String(ref)?' · order line '+r.order_line_id:'';
+        const status=r.reason||r.header_status||r.line_status||r.type||'';
+        const amount=r.eligible_invoice_coverage_at_receipt_valuation??r.candidate_valuation_amount??r.face_amount??r.net_receipt_value_at_receipt_valuation;
+        return '<tr><td>'+esc(item.label)+'</td><td class="mono">'+esc(ref)+esc(secondary)+'</td><td>'+esc(status)+'</td><td class="num">'+
+          (amount===undefined||amount===null?'—':coupaAmount(amount)+' '+esc(r.currency||''))+'</td></tr>';
+      }).join('')+'</tbody>';
+      sc.append(t);card.append(sc);
+    }
+    frag.append(card);
+  }
+  if(!evaluated){
+    const warn=el('div','card');
+    warn.append(el('div','pad','<span class="badge warn">'+
+      (noData?'No data':'Incomplete')+'</span> '+
+      esc(d.reason||'The Coupa population was not complete.')+
+      ' No zero, clean, booked, or posted conclusion is shown.'));
     frag.append(warn);
   }
   return frag;
@@ -3920,7 +4137,7 @@ function viewChat(){
   msgs.setAttribute('aria-relevant','additions');
   const hero=el('div','hero');
   hero.innerHTML='<h1>Ask your finance data anything</h1>'+
-    '<p>Ask in plain language. The agent queries the ledger first and dynamically builds the relevant '+
+    '<p>Ask in plain language. The agent queries each configured system of record and dynamically builds the relevant '+
     'tables, controls, statements, customer views, and approved wiki evidence inside this conversation.</p>';
   msgs.append(hero);
   if(!CHAT_SCOPE){
@@ -3937,9 +4154,13 @@ function viewChat(){
     box.append(el('div','starter-label',esc(label)));
     const row=el('div','chips');box.append(row);chips.append(box);return row;
   });
+  const coupaAuthority='coupa';
   // Every chip below is PINNED to an eval case with the same question
   // text (smoke enforces it), so a suggestion on this page is a promise
   // the suite keeps — never an untested guess.
+  const accrualQuestion=(META.procurement&&META.procurement.authority===coupaAuthority)?
+    'Which current Coupa PO lines have net receipt activity above eligible invoice coverage?':
+    'Which current PO-linked received-not-invoiced items in the configured ERP should we review today?';
   ['Give me total finalized invoice amount',
    'Show AR aging and reconcile it to the GL control account',
    'Which customers are overdue or in dispute?',
@@ -3947,7 +4168,7 @@ function viewChat(){
    'Find the custom billing-interface record for rejected rows; do not assume it starts with PS_.',
    'How much did we owe vendors at the selected period end?',
    'Any confirmed duplicate vendor payments?',
-   'What should we accrue for AP at month-end?',
+   accrualQuestion,
    'Is AP complete for month-end?',
    'Does the trial balance balance?',
    'Which journals still need action before close?',
@@ -4083,7 +4304,13 @@ async function send(messageOverride,appendUser){
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       const rb=resultBadge(c.result);
       if(rb) summary.append(el('span','badge '+rb.cls,esc(rb.text)));
-      if(c.ok!==false&&hasTable(c.result))
+      if(c.ok!==false&&c.tool==='get_coupa_rni'){
+        if(Array.isArray((c.result||{}).lines)&&(c.result||{}).lines.length)
+          summary.append(csvButton(c.tool,c.args||{},c.result,'Candidate CSV'));
+        const exportRows=(((c.result||{}).export_evidence||{}).receipt_transactions)||[];
+        if(Array.isArray(exportRows)&&exportRows.length)
+          summary.append(csvButton(c.tool,c.args||{},c.result,'Export flags CSV','receipt_export_state'));
+      }else if(c.ok!==false&&hasTable(c.result))
         summary.append(csvButton(c.tool,c.args||{},c.result));
       // CSV downloads a file; Copy puts it on the clipboard. Different
       // jobs — one goes into a folder, the other into the email someone

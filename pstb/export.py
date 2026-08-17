@@ -256,7 +256,7 @@ def build_registry(engine=None, ar=None, modules=None, report_runner=None,
         reg["get_coupa_budget_lines"] = lambda a, cap: _call_filtered(
             coupa.budget_lines, a, {})
         reg["get_coupa_rni"] = lambda a, cap: _call_filtered(
-            coupa.received_not_invoiced, a, {})
+            coupa.received_not_invoiced, a, {"display_rows": cap})
         reg["get_coupa_supplier_spend"] = lambda a, cap: _call_filtered(
             coupa.supplier_spend, a, {"top_n": cap})
     return reg
@@ -282,24 +282,48 @@ def export(tool: str, args: dict, registry: dict, *,
             f"{tool} has nothing to export: no rows were captured for this "
             "card and the tool is not re-runnable. Re-ask the question, "
             "then export the fresh result.")
-    table = tabular(payload)
+    export_view = str((args or {}).get("_export_view") or "").strip()
+    if tool == "get_coupa_rni" and export_view == "receipt_export_state":
+        evidence = (payload.get("export_evidence") or {}
+                    if isinstance(payload, dict) else {})
+        records = evidence.get("receipt_transactions") or []
+        table = (_table_from(records, "receipt_transactions")
+                 if isinstance(records, list) and records else None)
+        source_total = evidence.get("receipt_transaction_count")
+        source_truncated = evidence.get("display_truncated") is True
+    else:
+        table = tabular(payload)
+        if tool == "get_coupa_rni" and isinstance(payload, dict):
+            population = payload.get("population") or {}
+            source_total = population.get("candidate_count")
+            source_truncated = population.get("display_truncated") is True
+        else:
+            source_total = None
+            source_truncated = False
     if not table or not table["rows"]:
         raise ExportError(
             f"{tool} returned no table to export — this result is a single "
             "figure or a status, not a row set.")
-    total = len(table["rows"])
-    truncated = total > cap
-    if truncated:
+    visible_total = len(table["rows"])
+    total = (source_total if isinstance(source_total, int)
+             and not isinstance(source_total, bool)
+             and source_total >= visible_total else visible_total)
+    truncated = source_truncated or total > cap or visible_total > cap
+    if visible_total > cap:
         table = {**table, "rows": table["rows"][:cap]}
     rows = len(table["rows"])
     return {
         "csv": to_csv(table),
-        "filename": filename(tool, rows, truncated, today),
+        "filename": filename(
+            f"{tool}_{export_view}" if export_view else tool,
+            rows, truncated, today),
         "rows": rows, "columns": len(table["columns"]),
         "truncated": truncated, "row_cap": cap, "rerun": rerun,
-        "note": (f"Export hit the {cap:,}-row ceiling; {total:,} rows "
-                 "matched. Narrow the scope and export again for the "
-                 "rest — the filename records the cut."
+        "note": (f"{total:,} rows matched; export contains {rows:,} of "
+                 f"{total:,} rows. The source "
+                 "or export display ceiling was reached. Narrow the scope "
+                 "and export again for the rest — the filename records "
+                 "the cut."
                  if truncated else
                  ("Full result re-run server-side, beyond the rows shown "
                   "on screen." if rerun else

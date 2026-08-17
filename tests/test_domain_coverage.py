@@ -25,6 +25,7 @@ import unittest
 
 from pstb import guards
 from pstb.guards import (
+    RUNTIME_RESOLVED_DOMAINS,
     UNSUPPORTED_DOMAIN_REASONS,
     financial_tool_is_relevant,
     question_financial_domains,
@@ -73,14 +74,27 @@ class DomainCoverageTests(unittest.TestCase):
     def test_every_required_domain_is_reachable_or_declared_unreachable(self):
         orphans = sorted(
             emittable_domains() - owned_domains()
-            - set(UNSUPPORTED_DOMAIN_REASONS))
+            - set(UNSUPPORTED_DOMAIN_REASONS)
+            - set(RUNTIME_RESOLVED_DOMAINS))
         self.assertEqual(
             orphans, [],
             "these domains can be required by a question but no tool "
-            f"declares them: {orphans}. Either give one to a tool in "
-            "_TOOL_DOMAINS, or — if the question genuinely cannot be "
-            "answered here — add it to UNSUPPORTED_DOMAIN_REASONS with a "
-            "sentence saying what is missing and what to ask instead.")
+            f"declares them: {orphans}. Give one to a tool in _TOOL_DOMAINS; "
+            "or, if the question genuinely cannot be answered here, add it "
+            "to UNSUPPORTED_DOMAIN_REASONS with a sentence saying what is "
+            "missing and what to ask instead; or, if the agent loop rewrites "
+            "it to a system-specific domain, record that in "
+            "RUNTIME_RESOLVED_DOMAINS.")
+
+    def test_a_runtime_resolved_domain_resolves_to_owned_domains(self):
+        """The escape hatch must not become a second way to orphan one."""
+        owned = owned_domains()
+        for generic, targets in RUNTIME_RESOLVED_DOMAINS.items():
+            self.assertTrue(targets, f"{generic} resolves to nothing")
+            for target in targets:
+                self.assertIn(target, owned,
+                              f"{generic} resolves to {target}, which no "
+                              "tool declares")
 
     def test_declared_holes_are_not_secretly_answerable(self):
         """A domain in both maps means the refusal text is a lie."""

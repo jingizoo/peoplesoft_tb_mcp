@@ -119,7 +119,7 @@ class RegistrationAndRoutingTests(unittest.TestCase):
             self.assertTrue(financial_tool_is_relevant(
                 "get_po_grni_candidates", question), question)
         candidate = (
-            "Which PO-linked received-not-invoiced items should we accrue "
+            "Which PO-linked received-not-invoiced items should we review "
             "today?")
         self.assertEqual(question_financial_domains(candidate),
                          {"po_grni_candidates"})
@@ -131,7 +131,7 @@ class RegistrationAndRoutingTests(unittest.TestCase):
             "What is journal J0001's exact status?": {"journal"},
             "Which journals still need action before close?": {"journal"},
             "Which receipts are GRNI candidates at June close?": {
-                "po_grni_candidates"},
+                "rni_candidates"},
             "Does journal J123 net to zero?": {
                 "journal", "journal_netting"},
             "Was journal J123 posted by June 30?": {

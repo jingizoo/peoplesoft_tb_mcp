@@ -18,16 +18,36 @@ called:
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import math
 import re
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _PROMISE = re.compile(
     r"(?i)\b(?:i (?:will|'ll|am going to)|let me|next,? i(?:'ll| will)|"
     r"to (?:verify|confirm|check) this,? i(?:'ll| will)?)\b[^.]{0,80}\b"
     r"(?:call|use|check|query|run|look ?up|retrieve|fetch)\b"
 )
+
+
+def _current_date_iso(timezone: str = "") -> str:
+    """Current date in a governed IANA business timezone.
+
+    Current-only external controls must not inherit the application host's
+    timezone: near midnight that can select a different Coupa business day.
+    An invalid or missing zone therefore fails closed instead of falling back
+    to the server-local calendar.
+    """
+    try:
+        zone = ZoneInfo(str(timezone or "").strip())
+    except (ZoneInfoNotFoundError, ValueError):
+        return ""
+    return dt.datetime.now(zone).date().isoformat()
+
+
 _VERDICT = re.compile(
     r"(?i)(?:\b(?:with)?in (?:our |the )?polic\w*|\b(?:non-?)?compliant\b|"
     r"\bin compliance\b|\bviolat\w+|\bbreach\w*|"
@@ -94,7 +114,6 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "get_coupa_stuck_approvals",
     "get_coupa_rni",
     "get_coupa_supplier_spend",
-    "coupa_to_ap_tie",
 }
 
 # Request-scope field -> tool argument. The right-hand value differs only where
@@ -200,6 +219,9 @@ _TOOL_SCOPE_ARGS = {
     "get_po_grni_candidates": {
         "business_unit": "business_unit", "as_of_date": "as_of_date",
     },
+    "get_coupa_rni": {
+        "business_unit": "business_unit", "as_of_date": "as_of_date",
+    },
     "get_entity_network": {"business_unit": "business_unit"},
     "get_concentration": {"business_unit": "business_unit"},
     "get_entity_connection": {"business_unit": "business_unit"},
@@ -240,6 +262,11 @@ BU_ALL_TOOLS = {"get_top_billing_customers"}
 # refused outright — most are catalogs or shape lookups with no figures in
 # them — but the ad-hoc ones are, below.
 _UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"}
+_UNSCOPED_EXTERNAL_DATA_TOOLS = {
+    "coupa_to_ap_tie", "get_coupa_invoices",
+    "get_coupa_stuck_approvals", "get_coupa_budget_lines",
+    "get_coupa_supplier_spend",
+}
 # Structure, never amounts: a process trace must not satisfy the
 # grounding guard's demand for evidence behind a figure.
 STRUCTURAL_TOOLS = {"trace_process", "describe_process_graph",
@@ -312,6 +339,14 @@ def unit_access_block(tool_name: str, args, access,
             "arbitrary SQL, which cannot be limited to the business units "
             f"PeopleSoft grants this user ({', '.join(sorted(access.units)) or 'none'}). "
             "Use the curated tools — they carry the unit and are filtered.")
+    if tool_name in _UNSCOPED_EXTERNAL_DATA_TOOLS:
+        return (
+            f"{tool_name} is not available to {access.oprid}: this external "
+            "connector call has no governed business-unit argument, so its "
+            "rows cannot be limited to the PeopleSoft units granted to this "
+            f"user ({', '.join(sorted(access.units)) or 'none'}). Use a "
+            "business-unit-scoped connector control instead."
+        )
     for key in ("business_unit", "bu"):
         value = (args or {}).get(key)
         if value is None:
@@ -389,8 +424,10 @@ _DATA_QUERY = re.compile(
     r"activity|postings?|journals?|general ledger|gl|billing|invoices?|"
     r"receivables?|ar|aging|customers?|revenues?|"
     r"payables?|accounts payable|ap|APY14(?:00|05|10|20)|vouchers?|vendors?|suppliers?|"
-    r"payments?|paid|disbursements?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
-    r"received[ -]not[ -]invoiced|uninvoiced receipts?|receipt[ -]accruals?|"
+    r"payments?|paid|disbursements?|receipts?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
+    r"received(?:[ -]|\s+but\s+)not[ -]invoiced|"
+    r"receipts?[ -]not[ -]invoiced|"
+    r"uninvoiced receipts?|receipt[ -]accruals?|"
     r"expenses?|variances?|budgets?|actuals?|financial statements?|reports?|"
     r"income statements?|balance sheets?|cash flow statements?|p\s*&\s*l|"
     r"profit and loss|profits?|earn(?:ed|ings?)?|sales|margins?|costs?|"
@@ -475,7 +512,44 @@ _PO_GRNI_CANDIDATE_QUERY = re.compile(
     r"(?i)(?:\bpo[- ]linked\b|\breceipt schedules?\b|"
     r"\bschedule[- ]level\b|"
     r"\b(?:grni|rni|received[ -]not[ -]invoiced)\b.{0,60}"
-    r"\b(?:candidates?|review)\b)"
+    r"\b(?:candidates?|review)\b|"
+    r"\breceipt[ -]accrual\b.{0,40}\b(?:candidates?|review)\b|"
+    r"\breceipts?\b.{0,50}\b(?:no|without|not covered by)\b.{0,30}"
+    r"\b(?:eligible )?invoices?\b)"
+)
+_COUPA_RNI_CANDIDATE_QUERY = re.compile(
+    r"(?i)(?:\bcoupa\b.{0,100}\b(?:receipt[ -]events?|"
+    r"received(?:[ -]|\s+but\s+)not[ -]invoiced|accrual review|"
+    r"receipts?\b.{0,30}\b(?:candidates?|review)|"
+    r"receipts?\b.{0,40}\b(?:fully|partially)\s+invoiced|"
+    r"(?:po|purchase order)[ -]lines?\b.{0,80}\b(?:candidates?|review|"
+    r"(?:not\s+)?fully invoiced|partially invoiced|unmatched receipts?|"
+    r"receipts?\b.{0,35}\b(?:not covered by|without|no)\b.{0,20}"
+    r"\binvoices?|(?:received value|net receipt activity)\b.{0,30}"
+    r"\binvoice coverage)|"
+    r"receipts?\b.{0,60}\b(?:approved|eligible)\s+invoices?|"
+    r"(?:grni|rni)\b.{0,30}\b(?:candidates?|review)|"
+    r"receipts?\b.{0,30}\b(?:uninvoiced|under[ -]invoiced))\b|"
+    r"\b(?:receipt[ -]events?|received[ -]not[ -]invoiced|accrual review|"
+    r"(?:grni|rni)\b.{0,30}\b(?:candidates?|review))\b.{0,100}\bcoupa\b|"
+    r"\b(?:received value|net receipt activity)\b.{0,50}"
+    r"\b(?:lacks?|above|without|no)\b.{0,40}"
+    r"\b(?:approved |eligible )?invoice coverage|"
+    r"\b(?:received value|net receipt activity)\b.{0,80}"
+    r"\b(?:approved|eligible)\s+invoices?\b.{0,80}\bcoupa\b)"
+)
+_COUPA_PO_LINE_RNI_QUERY = re.compile(
+    r"(?is)^(?=.*\bcoupa\b)"
+    r"(?=.*\b(?:po|purchase order)[ -]lines?\b.{0,100}"
+    r"\b(?:candidates?|review|(?:not\s+)?fully invoiced|partially invoiced|"
+    r"unmatched receipts?|receipts?\b.{0,35}\b(?:not covered by|without|no)"
+    r"\b.{0,20}\binvoices?|(?:received value|net receipt activity)"
+    r"\b.{0,30}\binvoice coverage)\b).*$"
+)
+_PEOPLESOFT_GRNI_CANDIDATE_QUERY = re.compile(
+    r"(?i)(?:\b(?:peoplesoft|people soft|ps)\b.{0,100}\b(?:receipts?|grni|"
+    r"rni|received[ -]not[ -]invoiced)\b|\bpo[- ]linked\b|\breceipt schedules?\b|"
+    r"\bschedule[- ]level\b)"
 )
 # Asking for the WHOLE received-not-invoiced position. The PO-linked control
 # excludes non-PO receipts, inventory/miscellaneous accruals and cross-unit
@@ -493,6 +567,126 @@ _BOOKED_GRNI_QUERY = re.compile(
     r"(?i)\b(?:booked|generated|posted|liabilit(?:y|ies)|po_recvaccr|"
     r"recv_ln_acctg|journal generator|general ledger|gl)\b"
 )
+_RNI_BOOKING_DECISION_QUERY = re.compile(
+    r"(?i)(?:\b(?:how much|what|which|should|must)\b.{0,90}"
+    r"\b(?:accrue|book(?:ed|ing)?)\b|"
+    r"\b(?:prepare|record|create|book)\b.{0,60}\b(?:accrual|journal)\b|"
+    r"\b(?:receipts?|grni|rni)\b.{0,40}\b(?:need|needs|require|requires)"
+    r"\b.{0,20}\baccrual\b(?!\s+review)|"
+    r"\b(?:accrue|book(?:ed|ing)?)\b.{0,90}"
+    r"\b(?:grni|rni|receipts?|received[ -]not[ -]invoiced)\b)"
+)
+_RNI_RECEIPT_MATCH_QUERY = re.compile(
+    r"(?is)^(?=.*\b(?:coupa|receipts?)\b)(?=.*\breceipts?\b)"
+    r"(?=.*(?:\binvoices?\b|\binvoiced\b|\buninvoiced\b))"
+    r"(?=.*(?:\b(?:all|every|each)\b.{0,80}"
+    r"\b(?:have|has|match|matched|matching|covered|invoiced)\b|"
+    r"\b(?:have|has|had|do|does|did|are|were|is|was)\b.{0,80}"
+    r"\breceipts?\b.{0,80}\b(?:have|has|invoiced|uninvoiced|"
+    r"matched|unmatched|covered)\b|"
+    r"\bwhich\b.{0,50}\breceipts?\b.{0,80}"
+    r"\b(?:covered|matched|matching|unmatched|invoiced|uninvoiced|"
+    r"missing\b.{0,12}\binvoices?|not\b.{0,12}\binvoiced|"
+    r"not\b.{0,12}\ban?\s+invoice|without\b.{0,12}\binvoices?)\b|"
+    r"\b(?:show|list|what)\b.{0,50}\breceipts?\b.{0,80}"
+    r"\b(?:uninvoiced|not\b.{0,12}\binvoiced|missing\b.{0,12}\binvoices?|"
+    r"without\b.{0,12}\binvoices?|no\b.{0,12}\binvoice|unmatched)\b|"
+    r"\breceipt[- ]to[- ]invoice\b|"
+    r"\bwhich\b.{0,50}\breceipt[ -]events?\b.{0,100}"
+    r"\binvoice(?:[ -]events?)?\b.{0,40}\bcover(?:s|ed|age)?\b|"
+    r"\b(?:individual|specific)\b.{0,35}\breceipts?\b.{0,80}"
+    r"\b(?:uninvoiced|no invoice|match(?:ed|ing)?|cover(?:ed|age)?)\b|"
+    r"\breceipt[ -]events?\b.{0,80}"
+    r"\b(?:unmatched|not matched|no invoice|not covered|invoice match)\b|"
+    r"\b(?:are|were|is|was)\b.{0,40}\breceipts?\b.{0,60}"
+    r"\b(?:matched|covered)\b.{0,40}\binvoices?\b|"
+    r"\b(?:are|were|is|was)\b.{0,40}\binvoices?\b.{0,60}"
+    r"\b(?:matched|cover(?:s|ed)?)\b.{0,40}\breceipts?\b|"
+    r"\breceipts?\s+(?:id\s*)?[a-z]*\d[\w-]*\b.{0,100}"
+    r"\b(?:which invoice|invoices?\b.{0,20}\bcover|covered by|match(?:ed|ing)?|"
+    r"how much\b.{0,30}\bcovered|invoiced|has\b.{0,12}\binvoices?)\b|"
+    r"\bwhich\s+invoices?\b.{0,80}\b(?:corresponds?\s+to|covers?|matches?|"
+    r"belongs?\s+to|associated\s+with)\b.{0,80}"
+    r"\breceipts?\s+(?:id\s*)?[a-z]*\d[\w-]*\b)).*$"
+)
+_RNI_RECEIPT_ID_INVOICE_QUERY = re.compile(
+    r"(?is)^(?=.*\breceipts?\s+(?:id\s*)?[a-z]*\d[\w-]*\b)"
+    r"(?=.*\binvoices?\b).*$"
+)
+_FX_CONVERSION_QUERY = re.compile(
+    r"(?i)\b(?:exchange(?:[ -]rates?)?|fx[ -]rates?|convert\w*|conversion)\b"
+)
+_RNI_ALLOCATION_SCOPE_QUERY = re.compile(
+    r"(?i)\b(?:accounts?|accounting string|departments?|dept(?:id)?|"
+    r"cost cent(?:er|re)s?|projects?|chartfields?|allocations?)\b"
+)
+_AP_COMPLETENESS_QUERY = re.compile(
+    r"(?i)(?:^(?=.*\b(?:AP|accounts payable)\b)"
+    r"(?=.*\b(?:complete|completeness|readiness|ready|captured)\b)"
+    r"(?=.*\b(?:month[ -]end|close|obligations?|everything|accrual|AP)\b).*$|"
+    r"\beverything\b.{0,50}\bshould hit AP\b.{0,30}\bactually hit AP\b)"
+)
+_COUPA_ERP_POSTING_QUERY = re.compile(
+    r"(?is)^(?=.*\bcoupa\b)"
+    r"(?=.*\b(?:peoplesoft|people soft|ps|ap|gl|ledger|vouchers?|erp|oracle|"
+    r"finance[ -]system|accounting[ -]system)\b)"
+    r"(?=.*\b(?:receipts?|receipt[ -]events?|receiving[ -]transactions?|"
+    r"receiving[ -]exports?|returns?|voids?|return[ -]events?|void[ -]events?|invoices?|"
+    r"exports?|everything approved)\b)"
+    r"(?=.*\b(?:book(?:ed|ing)?|post(?:ed|ing)?|land(?:ed)?|reach(?:ed)?|"
+    r"make it|made it|"
+    r"become|became|turn(?:ed)?\s+into|show(?:ed)?\s+up|get\s+into|got\s+into|"
+    r"create(?:d)?\s+as|interface(?:d)?|send|sent|received|missing|"
+    r"arriv(?:e|ed))\b).*$"
+)
+_COUPA_RECEIPT_EXPORT_STATE_QUERY = re.compile(
+    r"(?is)^(?=.*\bcoupa\b)"
+    r"(?=.*\b(?:receipts?|receipt[ -]events?|receiving[ -]transactions?|"
+    r"returns?|voids?|(?:receipt[ -])?return[ -]events?|"
+    r"(?:receipt[ -])?void[ -]events?)\b)"
+    r"(?=.*\b(?:export|exported|exports|unexported|not[ -]exported|"
+    r"export[ -]flags?|flags?|flagged)\b).*$"
+)
+_COUPA_EXPORT_DELIVERY_QUERY = re.compile(
+    r"(?is)^(?=.*\bcoupa\b)"
+    r"(?=.*\b(?:receipts?|receipt[ -]events?|receiving[ -]transactions?|"
+    r"receiving[ -]exports?|returns?|voids?|"
+    r"(?:receipt[ -])?return[ -]events?|(?:receipt[ -])?void[ -]events?)\b)"
+    r"(?=.*\b(?:export|exported|exports)\b)"
+    r"(?=.*\b(?:succeed(?:ed)?|success(?:ful|fully)?|fail(?:ed|ure)?|errors?|delivered|"
+    r"processed|arrived?)\b).*$"
+)
+_COUPA_RECEIPT_EXPORT_DETAIL_QUERY = re.compile(
+    r"(?is)(?:^(?=.*\bcoupa\b)(?=.*\breceipts?\s+"
+    r"(?:id\s*)?[a-z]*\d[\w-]*\b)(?=.*\bexport\w*\b).*$|"
+    r"\bwhen\b.{0,40}\br\d[\w-]*\b.{0,40}\blast[ -]export\w*\b)"
+)
+_COUPA_RECEIVING_EXPORT_POPULATION_QUERY = re.compile(
+    r"(?is)^(?=.*\bcoupa\b)(?=.*\breceiving[ -]transactions?\b)"
+    r"(?=.*\b(?:export|exported|exports|unexported|not[ -]exported|"
+    r"export[ -]flags?|flags?|flagged)\b).*$"
+)
+
+
+def _is_coupa_rni_candidate_query(question: str) -> bool:
+    """Whether the ask targets the supported Coupa PO-line aggregate."""
+    text = question or ""
+    return bool(
+        _COUPA_RNI_CANDIDATE_QUERY.search(text)
+        or _COUPA_PO_LINE_RNI_QUERY.search(text)
+    )
+
+
+def _is_rni_receipt_match_query(question: str) -> bool:
+    """Whether the ask needs unsupported receipt-to-invoice attribution."""
+    text = question or ""
+    return bool(
+        (_RNI_RECEIPT_MATCH_QUERY.search(text)
+         or _RNI_RECEIPT_ID_INVOICE_QUERY.search(text))
+        and not _COUPA_PO_LINE_RNI_QUERY.search(text)
+    )
+
+
 _QUESTION_DOMAINS = {
     "balance": re.compile(
         r"(?i)\b(?:balances?|trial balances?|tb|activity|postings?|suspense|"
@@ -518,8 +712,9 @@ _QUESTION_DOMAINS = {
         r"|\b(?:we|do\s+we|should\s+we|how\s+much\s+do\s+we)\s+owe\b"
     ),
     "grni": re.compile(
-        r"(?i)\b(?:grni|rni|received[ -]not[ -]invoiced|"
-        r"uninvoiced receipts?|receipt[ -]accruals?)\b"
+        r"(?i)\b(?:grni|rni|received(?:[ -]|\s+but\s+)not[ -]invoiced|"
+        r"receipts?[ -]not[ -]invoiced|uninvoiced receipts?|"
+        r"receipt[ -]accruals?)\b"
     ),
     "am": re.compile(
         r"(?i)\b(?:assets?|capitali[sz]\w+|depreciat\w+|"
@@ -565,7 +760,10 @@ _TOOL_DOMAINS = {
     "search_customers": {"balance", "customer"},
     "get_billing_workbench": {"billing"},
     "run_report": {"report", "balance", "variance"},
-    "run_playbook": {"balance", "journal", "ar", "billing", "report"},
+    "run_playbook": {
+        "balance", "journal", "ar", "billing", "report",
+        "ap_completeness",
+    },
     # Module packs and connectors. Domains are what a tool can GROUND, and
     # they are deliberately generous where the tool really computes the
     # fact: open payables reports overdue/due amounts, so it grounds those
@@ -612,9 +810,15 @@ _TOOL_DOMAINS = {
     "get_project_costs": {"pc", "report", "variance"},
     "get_coupa_invoices": {"ap", "billing"},
     "get_coupa_stuck_approvals": {"ap", "billing"},
-    "get_coupa_rni": {"ap", "billing", "balance"},
+    # Coupa RNI is a narrow PO-line aggregate review population, supported by
+    # receipt events. It cannot ground generic AP, billing, receipt identity,
+    # a booked receipt-accrual liability, or GL posting.
+    "get_coupa_rni": {
+        "coupa_rni_candidates", "coupa_receipt_export_state"},
     "get_coupa_supplier_spend": {"ap", "report"},
-    "coupa_to_ap_tie": {"ap", "billing", "balance"},
+    # Current diagnostic only: it is not BU/as-of complete or fully paged,
+    # so it must not satisfy a financial-evidence domain until remediated.
+    "coupa_to_ap_tie": set(),
 }
 
 
@@ -698,6 +902,19 @@ def evidence_intent(question: str) -> str:
     text = question or ""
     if _RECON_QUERY.search(text) and not _EXPLICIT_POLICY_WORD.search(text):
         return "data"
+    if (_AP_COMPLETENESS_QUERY.search(text)
+            and not _EXPLICIT_POLICY_WORD.search(text)):
+        return "data"
+    if ((_COUPA_ERP_POSTING_QUERY.search(text)
+         or _COUPA_EXPORT_DELIVERY_QUERY.search(text)
+         or _COUPA_RECEIPT_EXPORT_STATE_QUERY.search(text)
+         or _COUPA_RECEIPT_EXPORT_DETAIL_QUERY.search(text))
+            and not _EXPLICIT_POLICY_WORD.search(text)):
+        return "data"
+    if ((_is_coupa_rni_candidate_query(text)
+         or _is_rni_receipt_match_query(text))
+            and not _EXPLICIT_POLICY_WORD.search(text)):
+        return "data"
     if (not _EXPLICIT_POLICY_WORD.search(text)
             and (_JOURNAL_NETTING_QUERY.search(text)
                  or _JOURNAL_POSTED_BY_QUERY.search(text)
@@ -760,12 +977,67 @@ def requires_financial_evidence(question: str) -> bool:
 def question_financial_domains(question: str) -> set[str]:
     """Financial fact domains explicitly present in a user question."""
     text = question or ""
+    coupa_candidate = _is_coupa_rni_candidate_query(text)
+    receipt_match = _is_rni_receipt_match_query(text)
+    coupa_transport = bool(
+        _COUPA_ERP_POSTING_QUERY.search(text)
+        or _COUPA_EXPORT_DELIVERY_QUERY.search(text)
+        or _COUPA_RECEIPT_EXPORT_STATE_QUERY.search(text)
+        or _COUPA_RECEIPT_EXPORT_DETAIL_QUERY.search(text)
+    )
+    journal_subject = bool(_JOURNAL_NOUN.search(text))
     domains = {
         domain
         for domain, pattern in _QUESTION_DOMAINS.items()
         if pattern.search(text)
     }
-    journal_subject = bool(_JOURNAL_NOUN.search(text))
+    if _COUPA_ERP_POSTING_QUERY.search(text):
+        # Export is only Coupa transport state. This domain deliberately has
+        # no candidate-tool provider until a governed Coupa -> PeopleSoft
+        # interface/JGEN/posted-journal bridge is configured.
+        domains.discard("billing")
+        domains.discard("ap")
+        domains.add("coupa_to_ps_posting")
+    elif _COUPA_EXPORT_DELIVERY_QUERY.search(text):
+        domains.discard("ap")
+        domains.discard("billing")
+        domains.discard("grni")
+        domains.add("coupa_export_delivery")
+    elif _COUPA_RECEIVING_EXPORT_POPULATION_QUERY.search(text):
+        # The current control covers its governed receipt/return/void event
+        # family, not every Coupa receiving-transaction type. A broad "all"
+        # population claim therefore remains unsupported.
+        domains.discard("ap")
+        domains.discard("billing")
+        domains.discard("grni")
+        domains.add("coupa_receiving_export_population")
+    elif _COUPA_RECEIPT_EXPORT_DETAIL_QUERY.search(text):
+        # The bounded export-state display cannot prove that one requested ID
+        # is absent, present, or last exported at a particular timestamp.
+        domains.discard("ap")
+        domains.discard("billing")
+        domains.discard("grni")
+        domains.add("coupa_receipt_export_detail")
+    elif _COUPA_RECEIPT_EXPORT_STATE_QUERY.search(text):
+        domains.discard("ap")
+        domains.discard("billing")
+        domains.discard("grni")
+        domains.add("coupa_receipt_export_state")
+    elif ((_BOOKED_GRNI_QUERY.search(text)
+           or _RNI_BOOKING_DECISION_QUERY.search(text))
+          and ("grni" in domains
+               or re.search(r"(?i)\breceipts?\b", text)
+               or (re.search(r"(?i)\bcoupa\b", text)
+                   and re.search(r"(?i)\breceipts?\b", text))
+               or _PO_GRNI_CANDIDATE_QUERY.search(text)
+               or coupa_candidate)):
+        # A candidate list cannot decide what to book or what the booked
+        # receipt-accrual liability is. Remove broad AP/Billing coverage so a
+        # payables or invoice tool cannot accidentally authorize that claim.
+        domains.discard("ap")
+        domains.discard("billing")
+        domains.discard("grni")
+        domains.add("grni_booked")
     if _JOURNAL_NETTING_QUERY.search(text):
         # Exact journal netting is narrower than trial-balance integrity.
         # It remains its own capability so a complete header-status result
@@ -778,19 +1050,56 @@ def question_financial_domains(question: str) -> set[str]:
     elif journal_subject and _JOURNAL_HISTORICAL_STATUS_QUERY.search(text):
         domains.add("journal")
         domains.add("journal_historical_status")
-    if _QUESTION_DOMAINS["grni"].search(text):
-        if _BOOKED_GRNI_QUERY.search(text):
-            # "What GRNI liability is booked in the GL?" is a different fact
-            # from "what should we review", and nothing here can prove it.
-            # Name it so the refusal can say what is missing instead of
-            # claiming the database produced no result.
-            domains.discard("grni")
-            domains.add("grni_booked")
-        elif _COMPLETE_GRNI_QUERY.search(text):
-            # Breadth, not bookedness. A PO-linked candidate population is
-            # the honest answer to "show me received not invoiced" and the
-            # wrong answer to "what is our TOTAL GRNI", because the parts it
-            # excludes are exactly the parts that word is asking about.
+    if ((_PO_GRNI_CANDIDATE_QUERY.search(text) or coupa_candidate)
+            and not coupa_transport
+            and not _BOOKED_GRNI_QUERY.search(text)
+            and not _RNI_BOOKING_DECISION_QUERY.search(text)):
+        domains.discard("grni")
+        domains.discard("ap")
+        domains.discard("balance")
+        domains.discard("report")
+        domains.discard("variance")
+        # "No eligible invoice covers this receipt" describes the matching
+        # side of the RNI candidate calculation, not a separate Billing fact.
+        domains.discard("billing")
+        if coupa_candidate:
+            domains.add("coupa_rni_candidates")
+            if _FX_CONVERSION_QUERY.search(text):
+                domains.add("fx")
+            else:
+                # "By currency" asks the source control to preserve native
+                # currency buckets; it is not a foreign-exchange fact.
+                domains.discard("fx")
+        elif _PEOPLESOFT_GRNI_CANDIDATE_QUERY.search(text):
+            domains.add("po_grni_candidates")
+        else:
+            domains.add("rni_candidates")
+        if _RNI_ALLOCATION_SCOPE_QUERY.search(question or ""):
+            # Neither candidate tool proves or filters a financial allocation
+            # dimension. Keep that leg visibly unsupported instead of letting
+            # a whole-BU candidate list satisfy an account/department ask.
+            domains.add("rni_allocation")
+    if receipt_match and not coupa_transport:
+        # Order-line aggregation can show that a PO line has residual
+        # received value. It cannot identify which individual receipt was
+        # covered by which invoice without Coupa matching_allocations.
+        domains.difference_update({
+            "ap", "billing", "grni", "rni_candidates",
+            "coupa_rni_candidates", "po_grni_candidates",
+        })
+        domains.add("rni_receipt_matching")
+    if _AP_COMPLETENESS_QUERY.search(question or ""):
+        domains.difference_update({"ap", "billing", "balance", "report"})
+        domains.add("ap_completeness")
+    if "grni" in domains:
+        # Last, so this only sees questions no narrower branch above claimed.
+        # A plain "show me received not invoiced" survives to here and is
+        # answerable; the two claims a candidate population must never make
+        # are breadth and bookedness, and bookedness was already split off.
+        if _COMPLETE_GRNI_QUERY.search(text):
+            # The PO-linked control excludes non-PO receipts, inventory and
+            # miscellaneous accruals and cross-unit relationships — exactly
+            # the parts the word "total" is asking about.
             domains.discard("grni")
             domains.add("grni_complete")
         else:
@@ -799,11 +1108,6 @@ def question_financial_domains(question: str) -> set[str]:
             # required a second, unrelated ledger call before the receipt
             # answer was allowed to stand.
             domains.discard("balance")
-    if (_PO_GRNI_CANDIDATE_QUERY.search(text)
-            and not _BOOKED_GRNI_QUERY.search(text)):
-        domains.discard("grni")
-        domains.discard("ap")
-        domains.add("po_grni_candidates")
     return domains
 
 
@@ -822,6 +1126,44 @@ def financial_tool_domains(tool_name: str) -> set[str]:
 # what CAN be asked instead. tests/test_domain_coverage.py enforces that
 # nothing is missing from both this map and _TOOL_DOMAINS.
 UNSUPPORTED_DOMAIN_REASONS = {
+    "coupa_to_ps_posting": (
+        "The Coupa-to-PeopleSoft accounting or interface leg is not "
+        "established. A Coupa source record or export flag is not evidence "
+        "that PeopleSoft received, booked, or posted it; that claim needs "
+        "governed integration history with a complete population and a "
+        "destination-record bridge. Ask what Coupa itself shows — receipts, "
+        "invoices, or review candidates — and I can answer from the source."
+    ),
+    "coupa_export_delivery": (
+        "Coupa export delivery or processing success is not established. "
+        "The source exported flag is transport state, not evidence of "
+        "delivery. Ask which receipts carry the flag and I will show that, "
+        "labelled as source state."
+    ),
+    "coupa_receiving_export_population": (
+        "The complete Coupa receiving-transaction export population is not "
+        "established. This control covers its governed receipt, return and "
+        "void event family, not every receiving-transaction type. Ask about "
+        "those event types and the answer is complete for them."
+    ),
+    "coupa_receipt_export_detail": (
+        "One receipt ID's presence, absence, or last-export timestamp "
+        "cannot be proven from the bounded export-state result. Ask for the "
+        "export state of the receipts in a business unit and cut-off and I "
+        "can show that population."
+    ),
+    "rni_receipt_matching": (
+        "Receipt-to-invoice matching is not established. The control "
+        "compares PO-line aggregates; saying which individual receipt an "
+        "invoice covered needs complete Coupa matching-allocation evidence. "
+        "Ask for residual received value by PO line and I can answer that."
+    ),
+    "rni_allocation": (
+        "An account, department, project or split allocation for the "
+        "receipt-accrual candidates cannot be established — the control is "
+        "business-unit scoped. Ask for the candidates by business unit, "
+        "supplier or PO line instead."
+    ),
     "grni_complete": (
         "I cannot give you a COMPLETE received-not-invoiced position. The "
         "control here reads PO-linked receipt schedules in one business "
@@ -842,6 +1184,18 @@ UNSUPPORTED_DOMAIN_REASONS = {
 }
 
 
+# Domains that name a fact without naming the system that holds it. The
+# agent loop rewrites these to the deployment's configured purchasing
+# authority before the gate sees them (chat.py), so they are reachable even
+# where _TOOL_DOMAINS does not list them — the coverage test has to know
+# that, or it would demand an owner for a domain that never survives to the
+# gate.
+RUNTIME_RESOLVED_DOMAINS = {
+    "rni_candidates": ("coupa_rni_candidates", "po_grni_candidates"),
+    "grni": ("coupa_rni_candidates", "po_grni_candidates"),
+}
+
+
 def unsupported_domain_reason(missing) -> tuple[str, bool]:
     """(text for the deliberate holes in ``missing``, any ordinary misses).
 
@@ -856,6 +1210,50 @@ def unsupported_domain_reason(missing) -> tuple[str, bool]:
     return text, bool(wanted - set(holes))
 
 
+def _ap_completeness_result_valid(payload: Mapping) -> bool:
+    """Validate today's deliberately incomplete composed AP control.
+
+    The current Coupa-to-AP diagnostic lacks governed pagination/scope/cutoff,
+    and Coupa candidates do not prove booking. Until both legs are replaced,
+    an AP-completeness payload can truthfully establish only ``incomplete``.
+    """
+    if payload.get("playbook") != "ap_completeness":
+        return False
+    steps = payload.get("steps")
+    expected = {"procurement_tie", "accruals", "voucher_pipeline"}
+    if (not isinstance(steps, list) or len(steps) != len(expected)
+            or not all(
+                isinstance(row, Mapping)
+                and row.get("status") in {"ok", "attention", "skipped"}
+                and bool(str(row.get("headline") or "").strip())
+                for row in steps)):
+        return False
+    by_id = {str(row.get("step") or ""): row for row in steps}
+    if set(by_id) != expected:
+        return False
+    skipped = sum(row["status"] == "skipped" for row in steps)
+    attention = sum(row["status"] == "attention" for row in steps)
+    try:
+        dt.date.fromisoformat(str(payload.get("as_of") or ""))
+    except ValueError:
+        return False
+    return (
+        payload.get("verdict") == "incomplete"
+        and by_id["procurement_tie"]["status"] == "skipped"
+        and by_id["accruals"]["status"] == "skipped"
+        and payload.get("skipped_count") == skipped
+        and payload.get("attention_count") == attention
+        and skipped >= 2
+        and bool(str(payload.get("business_unit") or "").strip())
+        and isinstance(payload.get("fiscal_year"), int)
+        and not isinstance(payload.get("fiscal_year"), bool)
+        and payload.get("fiscal_year") > 0
+        and isinstance(payload.get("period"), int)
+        and not isinstance(payload.get("period"), bool)
+        and 1 <= payload.get("period") <= 998
+    )
+
+
 def financial_result_domains(tool_name: str, content: str) -> set[str]:
     """Fact domains grounded by one particular structured tool result.
 
@@ -864,7 +1262,9 @@ def financial_result_domains(tool_name: str, content: str) -> set[str]:
     question, but cannot ground whether that journal nets to zero.
     """
     domains = financial_tool_domains(tool_name)
-    if tool_name != "get_journal_status":
+    if tool_name not in {
+        "get_journal_status", "get_coupa_rni", "run_playbook",
+    }:
         return domains
     try:
         payload = json.loads(content)
@@ -872,6 +1272,134 @@ def financial_result_domains(tool_name: str, content: str) -> set[str]:
         return set()
     if not isinstance(payload, dict):
         return set()
+    if tool_name == "run_playbook":
+        if payload.get("playbook") != "ap_completeness":
+            return domains
+        return ({"ap_completeness"}
+                if _ap_completeness_result_valid(payload) else set())
+    if tool_name == "get_coupa_rni":
+        export = payload.get("export_evidence") or {}
+        population = payload.get("population") or {}
+        receipt_rows = export.get("receipt_transactions")
+        receipt_count = export.get("receipt_transaction_count")
+        displayed_receipt_count = export.get(
+            "displayed_receipt_transaction_count")
+        receipt_display_truncated = export.get("display_truncated")
+        export_display_cap = population.get("display_row_cap")
+        counts = [
+            export.get("exported_receipt_transactions"),
+            export.get("not_exported_receipt_transactions"),
+            export.get("unknown_export_receipt_transactions"),
+        ]
+        invalid_export_timestamps = export.get(
+            "invalid_last_exported_at_transactions")
+        business_timezone = str(
+            (payload.get("coverage") or {}).get("business_timezone")
+            or "").strip()
+        try:
+            business_zone = ZoneInfo(business_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            business_zone = None
+        try:
+            export_cutoff = dt.date.fromisoformat(
+                str(payload.get("as_of_date") or ""))
+        except ValueError:
+            export_cutoff = None
+        export_types = {
+            "InventoryReceipt", "ReceivingQuantityReturnToSupplier",
+            "ReceivingAmountReturnToSupplier", "VoidInventoryReceipt",
+            "VoidReceivingQuantityReturnToSupplier",
+            "VoidReceivingAmountReturnToSupplier",
+        }
+
+        def export_row_valid(row):
+            try:
+                event_date = dt.date.fromisoformat(
+                    str(row.get("transaction_date") or ""))
+            except (AttributeError, TypeError, ValueError):
+                return False
+            last_exported = row.get("last_exported_at")
+            if last_exported is not None:
+                if (not isinstance(last_exported, str)
+                        or not last_exported.strip()):
+                    return False
+                try:
+                    exported_at = dt.datetime.fromisoformat(
+                        str(last_exported).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    return False
+                if (exported_at.utcoffset() is None
+                        or export_cutoff is None or business_zone is None
+                        or exported_at.astimezone(
+                            business_zone).date() > export_cutoff):
+                    return False
+            return (
+                isinstance(row, Mapping)
+                and bool(str(row.get("receipt_transaction_id") or "").strip())
+                and bool(str(row.get("order_line_id") or "").strip())
+                and row.get("type") in export_types
+                and export_cutoff is not None
+                and event_date <= export_cutoff
+                and type(row.get("exported")) is bool
+                and row.get("last_exported_at_valid") is True
+            )
+
+        displayed_exported = (
+            sum(row.get("exported") is True for row in receipt_rows)
+            if isinstance(receipt_rows, list) else -1)
+        displayed_not_exported = (
+            sum(row.get("exported") is False for row in receipt_rows)
+            if isinstance(receipt_rows, list) else -1)
+        displayed_flags_coherent = (
+            displayed_exported <= counts[0]
+            and displayed_not_exported <= counts[1]
+            if all(isinstance(value, int) and not isinstance(value, bool)
+                   for value in counts[:2]) else False)
+        if receipt_display_truncated is False and displayed_flags_coherent:
+            displayed_flags_coherent = (
+                displayed_exported == counts[0]
+                and displayed_not_exported == counts[1])
+
+        export_complete = (
+            isinstance(export, Mapping)
+            and export.get("evaluated") is True
+            and export.get("complete") is True
+            and all(isinstance(value, int) and not isinstance(value, bool)
+                    and value >= 0 for value in counts)
+            and counts[2] == 0
+            and isinstance(invalid_export_timestamps, int)
+            and not isinstance(invalid_export_timestamps, bool)
+            and invalid_export_timestamps == 0
+            and isinstance(receipt_count, int)
+            and not isinstance(receipt_count, bool)
+            and receipt_count > 0
+            and isinstance(displayed_receipt_count, int)
+            and not isinstance(displayed_receipt_count, bool)
+            and isinstance(receipt_rows, list)
+            and displayed_receipt_count == len(receipt_rows)
+            and isinstance(export_display_cap, int)
+            and not isinstance(export_display_cap, bool)
+            and 1 <= export_display_cap <= 200
+            and displayed_receipt_count
+            == min(receipt_count, export_display_cap)
+            and 0 < displayed_receipt_count <= receipt_count
+            and type(receipt_display_truncated) is bool
+            and receipt_display_truncated
+            == (receipt_count > displayed_receipt_count)
+            and all(export_row_valid(row) for row in receipt_rows)
+            and len({str(row["receipt_transaction_id"])
+                     for row in receipt_rows}) == len(receipt_rows)
+            and displayed_flags_coherent
+            and isinstance(population, Mapping)
+            and isinstance(population.get("receipt_events_in_scope"), int)
+            and not isinstance(population.get("receipt_events_in_scope"), bool)
+            and counts[0] + counts[1]
+            == receipt_count
+            == population.get("receipt_events_in_scope")
+        )
+        if not export_complete:
+            domains.discard("coupa_receipt_export_state")
+        return domains
     completeness = payload.get("evidence_completeness") or {}
     journals = payload.get("journals") or []
 
@@ -1191,7 +1719,7 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
     raw = content or ""
     structured_only = {
         "reconcile_ap_to_gl", "get_journal_status",
-        "get_po_grni_candidates",
+        "get_po_grni_candidates", "get_coupa_rni",
     }
     if raw.startswith("TOOL ERROR"):
         return False, raw[:240]
@@ -1219,6 +1747,13 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
         return False, str(payload.get("detail") or status)[:240]
     if payload.get("control_status") == "not_run":
         return False, str(payload.get("summary") or "control did not run")[:240]
+    if (tool_name == "run_playbook"
+            and payload.get("playbook") == "ap_completeness"
+            and not _ap_completeness_result_valid(payload)):
+        return False, (
+            "AP-completeness playbook did not preserve the required "
+            "incomplete control contract"
+        )
     # A reconciliation is financial evidence only after both sides were
     # evaluated on a compatible basis.  The AP/GL control deliberately
     # returns the GL side when AP accounting-line/JGR evidence is unavailable
@@ -1394,6 +1929,476 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
             return False, str(
                 payload.get("reason")
                 or "GRNI candidate population was not completely evaluated"
+            )[:240]
+    if tool_name == "get_coupa_rni":
+        coverage = payload.get("coverage") or {}
+        population = payload.get("population") or {}
+        pagination = payload.get("pagination") or {}
+        snapshot = payload.get("snapshot") or {}
+        totals = payload.get("totals_by_currency")
+        lines = payload.get("lines")
+
+        def finite_decimal(value):
+            if (not isinstance(value, (int, float, Decimal))
+                    or isinstance(value, bool)):
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return None
+            return number if number.is_finite() else None
+
+        def currency_totals(value, *, allow_empty=False):
+            return (
+                isinstance(value, Mapping)
+                and (allow_empty or bool(value))
+                and all(bool(str(key).strip())
+                        and finite_decimal(amount) is not None
+                        for key, amount in value.items())
+            )
+
+        candidate_count = population.get("candidate_count")
+        positive_candidate_count = population.get("positive_candidate_count")
+        displayed_candidate_count = population.get(
+            "displayed_candidate_count")
+        display_truncated = population.get("display_truncated")
+        display_row_cap = population.get("display_row_cap")
+        receipt_events_in_scope = population.get("receipt_events_in_scope")
+        payload_bu = str(payload.get("business_unit") or "").strip()
+        threshold = finite_decimal(payload.get("min_amount"))
+        scope = payload.get("scope") or {}
+        source_bu = (str(scope.get("coupa_business_unit") or "").strip()
+                     if isinstance(scope, Mapping) else "")
+        business_timezone = (
+            str(coverage.get("business_timezone") or "").strip()
+            if isinstance(coverage, Mapping) else "")
+        epsilon = Decimal("0.000000001")
+        try:
+            candidate_cutoff = dt.date.fromisoformat(
+                str(payload.get("as_of_date") or ""))
+        except ValueError:
+            candidate_cutoff = None
+        candidate_basis = payload.get("candidate_basis") or {}
+        raw_eligible_statuses = (
+            candidate_basis.get("eligible_invoice_statuses")
+            if isinstance(candidate_basis, Mapping) else [])
+        if not isinstance(raw_eligible_statuses, (list, tuple, set)):
+            raw_eligible_statuses = []
+        eligible_invoice_statuses = {
+            str(value or "").strip().lower()
+            for value in raw_eligible_statuses
+            if isinstance(value, str) and value.strip()
+        }
+
+        def candidate_provenance_valid(row):
+            try:
+                first_receipt = dt.date.fromisoformat(
+                    str(row.get("first_receipt_date") or ""))
+                last_receipt = dt.date.fromisoformat(
+                    str(row.get("last_receipt_date") or ""))
+            except (AttributeError, TypeError, ValueError):
+                return False
+            receipt_count = row.get("receipt_transaction_count")
+            receipt_ids = row.get("receipt_transaction_ids")
+            receipt_displayed = row.get(
+                "receipt_id_evidence_displayed_count")
+            receipt_truncated = row.get("receipt_id_evidence_truncated")
+            invoice_count = row.get("eligible_invoice_line_count")
+            invoice_rows = row.get("eligible_invoice_lines")
+            invoice_displayed = row.get(
+                "eligible_invoice_evidence_displayed_count")
+            invoice_truncated = row.get(
+                "eligible_invoice_evidence_truncated")
+            if not (
+                candidate_cutoff is not None
+                and first_receipt <= last_receipt <= candidate_cutoff
+                and isinstance(receipt_count, int)
+                and not isinstance(receipt_count, bool)
+                and receipt_count > 0
+                and isinstance(receipt_ids, list)
+                and isinstance(receipt_displayed, int)
+                and not isinstance(receipt_displayed, bool)
+                and receipt_displayed == len(receipt_ids)
+                == min(receipt_count, 20)
+                and all(bool(str(value or "").strip())
+                        for value in receipt_ids)
+                and len({str(value) for value in receipt_ids})
+                == len(receipt_ids)
+                and type(receipt_truncated) is bool
+                and receipt_truncated == (receipt_count > receipt_displayed)
+                and isinstance(invoice_count, int)
+                and not isinstance(invoice_count, bool)
+                and invoice_count >= 0
+                and isinstance(invoice_rows, list)
+                and isinstance(invoice_displayed, int)
+                and not isinstance(invoice_displayed, bool)
+                and invoice_displayed == len(invoice_rows)
+                == min(invoice_count, 20)
+                and type(invoice_truncated) is bool
+                and invoice_truncated == (invoice_count > invoice_displayed)
+                and (invoice_count == 0
+                     or bool(eligible_invoice_statuses))
+            ):
+                return False
+            for invoice in invoice_rows:
+                if not isinstance(invoice, Mapping):
+                    return False
+                try:
+                    created = dt.date.fromisoformat(
+                        str(invoice.get("created_at") or ""))
+                except (TypeError, ValueError):
+                    return False
+                if not (
+                    bool(str(invoice.get("invoice_id") or "").strip())
+                    and bool(str(invoice.get("invoice_line_id") or "").strip())
+                    and str(invoice.get("order_line_id") or "").strip()
+                    == str(row.get("order_line_id") or "").strip()
+                    and str(invoice.get("currency") or "").strip()
+                    == str(row.get("currency") or "").strip()
+                    and str(invoice.get("header_status") or "").lower()
+                    in eligible_invoice_statuses
+                    and invoice.get("canceled") is False
+                    and finite_decimal(
+                        invoice.get("candidate_valuation_amount")) is not None
+                    and candidate_cutoff is not None
+                    and created <= candidate_cutoff
+                ):
+                    return False
+            return True
+
+        def candidate_row_valid(row):
+            if not isinstance(row, Mapping):
+                return False
+            receipt = finite_decimal(row.get("net_receipt_amount"))
+            receipt_valuation = finite_decimal(
+                row.get("net_receipt_value_at_receipt_valuation"))
+            receipt_face = finite_decimal(row.get("net_receipt_face_amount"))
+            receipt_difference = finite_decimal(
+                row.get("receipt_face_to_valuation_difference"))
+            invoiced = finite_decimal(row.get("eligible_invoice_amount"))
+            candidate = finite_decimal(row.get("rni_candidate_amount"))
+            coverage_alias = finite_decimal(
+                row.get("eligible_invoice_coverage_at_receipt_valuation"))
+            candidate_alias = finite_decimal(row.get("rni_amt"))
+            if (not payload_bu or str(row.get("business_unit") or "").strip()
+                    != payload_bu
+                    or str(row.get("coupa_business_unit") or "").strip()
+                    != source_bu
+                    or not str(row.get("order_line_id") or "").strip()
+                    or not str(row.get("currency") or "").strip()
+                    or row.get("matching_precision")
+                    != "order_line_aggregate"
+                    or not candidate_provenance_valid(row)
+                    or receipt is None or receipt_valuation is None
+                    or receipt_face is None or receipt_difference is None
+                    or invoiced is None or candidate is None
+                    or receipt < 0 or receipt_face < 0 or invoiced < 0
+                    or abs(receipt_valuation - receipt) > epsilon
+                    or abs(receipt_difference
+                           - (receipt_face - receipt_valuation)) > epsilon
+                    or (row.get("eligible_invoice_coverage_at_receipt_valuation")
+                        is not None and (coverage_alias is None
+                        or abs(coverage_alias - invoiced) > epsilon))
+                    or (row.get("rni_amt") is not None
+                        and (candidate_alias is None
+                             or abs(candidate_alias - candidate) > epsilon))
+                    or threshold is None or candidate <= threshold):
+                return False
+            line_type = str(row.get("line_type") or "").lower()
+            if "quantity" in line_type:
+                remaining = finite_decimal(row.get("remaining_quantity"))
+                unit_price = finite_decimal(row.get("valuation_unit_price"))
+                receipt_qty = finite_decimal(row.get("net_receipt_quantity"))
+                invoice_qty = finite_decimal(
+                    row.get("eligible_invoice_quantity"))
+                return (remaining is not None and remaining >= 0
+                        and unit_price is not None and unit_price >= 0
+                        and receipt_qty is not None and invoice_qty is not None
+                        and receipt_qty >= 0 and invoice_qty >= 0
+                        and abs(remaining - (receipt_qty - invoice_qty))
+                        <= epsilon
+                        and abs(receipt - receipt_qty * unit_price)
+                        <= epsilon
+                        and abs(invoiced - invoice_qty * unit_price)
+                        <= epsilon
+                        and abs(candidate - remaining * unit_price)
+                        <= epsilon
+                        and row.get("net_receipt_valuation_basis")
+                        == "net quantity times single proven receipt price")
+            if "amount" in line_type or "service" in line_type:
+                return (abs(candidate - (receipt - invoiced)) <= epsilon
+                        and abs(receipt_face - receipt) <= epsilon
+                        and abs(receipt_difference) <= epsilon
+                        and row.get("net_receipt_valuation_basis")
+                        == "Coupa receiving-transaction face total")
+            return False
+
+        rows_valid = (
+            isinstance(lines, list)
+            and all(candidate_row_valid(row) for row in (lines or []))
+        )
+        derived_totals: dict[str, Decimal] = {}
+        displayed_rows_by_currency: dict[str, int] = {}
+        if rows_valid:
+            for row in lines:
+                currency = str(row["currency"])
+                derived_totals[currency] = (
+                    derived_totals.get(currency, Decimal("0"))
+                    + finite_decimal(row["rni_candidate_amount"]))
+                displayed_rows_by_currency[currency] = (
+                    displayed_rows_by_currency.get(currency, 0) + 1)
+        tolerance = epsilon
+
+        def aggregate_rounding_tolerance(currency):
+            # Amounts retain their source precision, but JSON numeric values
+            # are binary floats. Allow only a tiny accumulation bound per
+            # displayed row when comparing them with the independently
+            # computed full-population aggregate.
+            return (epsilon * Decimal(
+                displayed_rows_by_currency.get(str(currency), 0) + 1)
+                    / Decimal("2"))
+
+        totals_shape_ok = currency_totals(
+            totals, allow_empty=candidate_count == 0)
+        if totals_shape_ok and display_truncated is False:
+            totals_match = (
+                set(totals) == set(derived_totals)
+                and all(abs(finite_decimal(totals[key])
+                            - derived_totals[key])
+                        <= aggregate_rounding_tolerance(key)
+                        for key in totals)
+            )
+        elif totals_shape_ok and display_truncated is True:
+            # Full-population totals remain authoritative while the bounded
+            # rows are presentation evidence. Every displayed positive amount
+            # must fit inside its full currency total, but omitted rows need
+            # not be allocated back into the model payload.
+            totals_match = (
+                set(derived_totals).issubset(set(totals))
+                and all(derived_totals[key]
+                        <= (finite_decimal(totals[key])
+                            + aggregate_rounding_tolerance(key))
+                        for key in derived_totals)
+            )
+        else:
+            totals_match = False
+        positive_totals = payload.get(
+            "all_positive_candidate_totals_by_currency")
+        positive_totals_shape_ok = currency_totals(
+            positive_totals, allow_empty=positive_candidate_count == 0)
+        selected_within_positive = (
+            positive_totals_shape_ok and totals_shape_ok
+            and set(totals).issubset(set(positive_totals))
+            and all(finite_decimal(totals[key])
+                    <= finite_decimal(positive_totals[key]) + tolerance
+                    for key in totals)
+        )
+        if threshold == 0 and selected_within_positive:
+            selected_within_positive = (
+                candidate_count == positive_candidate_count
+                and set(totals) == set(positive_totals)
+                and all(abs(finite_decimal(totals[key])
+                            - finite_decimal(positive_totals[key])) <= tolerance
+                        for key in totals)
+            )
+        aliases_match = True
+        for alias in (
+            payload.get("rni_totals_by_currency"),
+            ((payload.get("observed") or {}).get(
+                "candidate_totals_by_currency")
+             if isinstance(payload.get("observed"), Mapping) else None),
+        ):
+            if alias is None:
+                continue
+            if not currency_totals(alias, allow_empty=candidate_count == 0):
+                aliases_match = False
+                break
+            if (set(alias) != set(totals)
+                    or any(abs(finite_decimal(alias[key])
+                               - finite_decimal(totals[key])) > tolerance
+                           for key in totals)):
+                aliases_match = False
+                break
+        observed = payload.get("observed")
+        observed_values_match = False
+        if isinstance(observed, Mapping):
+            receipt_values = observed.get(
+                "net_receipt_values_at_receipt_valuation_by_currency")
+            receipt_values_alias = observed.get("net_receipts_by_currency")
+            receipt_faces = observed.get(
+                "net_receipt_face_totals_by_currency")
+            receipt_differences = observed.get(
+                "receipt_face_to_valuation_differences_by_currency")
+            observed_values_match = (
+                currency_totals(receipt_values)
+                and currency_totals(receipt_values_alias)
+                and currency_totals(receipt_faces)
+                and currency_totals(receipt_differences)
+                and set(receipt_values) == set(receipt_values_alias)
+                == set(receipt_faces) == set(receipt_differences)
+                and all(
+                    abs(finite_decimal(receipt_values[key])
+                        - finite_decimal(receipt_values_alias[key])) <= epsilon
+                    and abs(finite_decimal(receipt_differences[key])
+                            - (finite_decimal(receipt_faces[key])
+                               - finite_decimal(receipt_values[key]))) <= epsilon
+                    for key in receipt_values
+                )
+            )
+        exception_counts = (
+            (payload.get("exceptions") or {}).get("counts")
+            if isinstance(payload.get("exceptions"), Mapping) else None)
+        exception_count = None
+        if (isinstance(exception_counts, Mapping)
+            and all(isinstance(exception_counts.get(key), int)
+                        and not isinstance(exception_counts.get(key), bool)
+                        and exception_counts.get(key) >= 0 for key in (
+                            "invoice_present_not_eligible", "over_invoiced",
+                            "net_credit_invoice_activity",
+                            "excluded_receiving_types"))):
+            exception_count = sum(exception_counts[key] for key in (
+                "invoice_present_not_eligible", "over_invoiced",
+                "net_credit_invoice_activity",
+                "excluded_receiving_types"))
+        exception_display = (
+            (payload.get("exceptions") or {}).get("display_truncated")
+            if isinstance(payload.get("exceptions"), Mapping) else None)
+        exception_lists_coherent = (
+            isinstance(payload.get("exceptions"), Mapping)
+            and isinstance(exception_display, Mapping)
+            and exception_count is not None
+            and all(
+                isinstance(payload["exceptions"].get(key), list)
+                and len(payload["exceptions"][key])
+                <= exception_counts[key]
+                and type(exception_display.get(key)) is bool
+                and exception_display[key]
+                == (exception_counts[key]
+                    > len(payload["exceptions"][key]))
+                for key in ("invoice_present_not_eligible",
+                            "over_invoiced", "net_credit_invoice_activity",
+                            "excluded_receiving_types")
+            )
+        )
+        conclusion = payload.get("conclusion")
+        conclusion_coherent = (
+            (candidate_count is not None and candidate_count > 0
+             and conclusion == "po_linked_candidates_present")
+            or (candidate_count == 0 and positive_candidate_count is not None
+                and positive_candidate_count > 0
+                and conclusion == "no_candidates_above_threshold")
+            or (candidate_count == 0 and positive_candidate_count == 0
+                and exception_count is not None and exception_count > 0
+                and conclusion == "exceptions_present_no_positive_candidates")
+            or (candidate_count == 0 and positive_candidate_count == 0
+                and exception_count == 0
+                and conclusion == "no_po_linked_candidates")
+        )
+        pages_complete = (
+            isinstance(pagination, Mapping)
+            and all(
+                isinstance(pagination.get(name), Mapping)
+                and pagination[name].get("complete") is True
+                and pagination[name].get("truncated") is False
+                and isinstance(pagination[name].get("rows_returned"), int)
+                and not isinstance(pagination[name].get("rows_returned"), bool)
+                and pagination[name].get("rows_returned") >= 0
+                for name in ("receipts", "invoices")
+            )
+        )
+        complete = (
+            str(payload.get("source") or "").lower() == "coupa"
+            and str(payload.get("mode") or "").lower() == "live"
+            and str(payload.get("status") or "").lower() == "evaluated"
+            and payload.get("evaluated") is True
+            and bool(payload_bu)
+            and bool(str(payload.get("as_of_date") or "").strip())
+            and threshold is not None
+            and threshold >= 0
+            and isinstance(scope, Mapping)
+            and scope.get("business_unit") == payload_bu
+            and bool(source_bu)
+            and bool(business_timezone)
+            and scope.get("business_timezone") == business_timezone
+            and scope.get("mapping_basis") in {
+                "explicit_identity", "configured_business_unit_map"}
+            and bool(str(scope.get("business_unit_path") or "").strip())
+            and isinstance(coverage, Mapping)
+            and coverage.get("classification")
+            == "coupa_po_linked_event_review_only"
+            and coverage.get("cutoff_classification") == "current_date_only"
+            and coverage.get("current_date") == payload.get("as_of_date")
+            and coverage.get("current_date_basis")
+            == "configured_coupa_company_timezone"
+            and payload.get("as_of_date")
+            == _current_date_iso(business_timezone)
+            and coverage.get("all_grni_complete") is False
+            and coverage.get("collection_complete") is True
+            and coverage.get("point_in_time_complete") is False
+            and coverage.get("business_unit_complete") is True
+            and coverage.get("matching_precision") == "order_line_aggregate"
+            and coverage.get("invoice_scope_order_line_invariant") is True
+            and coverage.get("coupa_business_unit") == source_bu
+            and coverage.get("business_unit_mapping_basis")
+            == scope.get("mapping_basis")
+            and isinstance(coverage.get("server_side_filters"), Mapping)
+            and bool(str(coverage["server_side_filters"].get("receipts")
+                         or "").strip())
+            and bool(str(coverage["server_side_filters"].get("invoices")
+                         or "").strip())
+            and isinstance(payload.get("candidate_basis"), Mapping)
+            and payload["candidate_basis"].get("classification")
+            == "review_candidate_only"
+            and payload.get("booked_status") == "not_evaluated"
+            and isinstance(snapshot, Mapping)
+            and snapshot.get("classification") == "current_api_collection"
+            and snapshot.get("collection_complete") is True
+            and snapshot.get("complete") is False
+            and snapshot.get("atomic") is False
+            and snapshot.get("business_timezone") == business_timezone
+            and snapshot.get("as_of") == payload.get("as_of_date")
+            and isinstance(population, Mapping)
+            and population.get("complete") is True
+            and population.get("truncated") is False
+            and population.get("totals_complete") is True
+            and isinstance(receipt_events_in_scope, int)
+            and not isinstance(receipt_events_in_scope, bool)
+            and receipt_events_in_scope > 0
+            and isinstance(candidate_count, int)
+            and not isinstance(candidate_count, bool)
+            and candidate_count >= 0
+            and isinstance(positive_candidate_count, int)
+            and not isinstance(positive_candidate_count, bool)
+            and positive_candidate_count >= candidate_count
+            and isinstance(displayed_candidate_count, int)
+            and not isinstance(displayed_candidate_count, bool)
+            and displayed_candidate_count == len(lines or [])
+            and type(display_truncated) is bool
+            and display_truncated == (candidate_count > displayed_candidate_count)
+            and isinstance(display_row_cap, int)
+            and not isinstance(display_row_cap, bool)
+            and 1 <= display_row_cap <= 200
+            and displayed_candidate_count <= display_row_cap
+            and displayed_candidate_count
+            == min(candidate_count, display_row_cap)
+            and isinstance(lines, list)
+            and (display_truncated or len(lines) == candidate_count)
+            and (payload.get("count") in (None, candidate_count))
+            and rows_valid
+            and totals_match
+            and selected_within_positive
+            and aliases_match
+            and observed_values_match
+            and exception_lists_coherent
+            and pages_complete
+            and conclusion_coherent
+            and not payload.get("partial_result")
+        )
+        if not complete:
+            return False, str(
+                payload.get("reason")
+                or "Coupa receipt-event candidate population was not "
+                   "completely evaluated"
             )[:240]
     # Evidence is judged on STRUCTURED fields only. Scanning prose for "no
     # data" failed every successful run_report, whose note legitimately

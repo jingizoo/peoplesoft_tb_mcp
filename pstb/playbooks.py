@@ -231,11 +231,26 @@ def _step_procurement_tie(ctx: dict) -> tuple:
     tie = ctx.get("ap_tie")
     if not isinstance(tie, dict):
         return "skipped", f"procurement tie could not run: {tie}", {}
-    if not tie.get("evaluated"):
-        return ("skipped",
-                tie.get("reason") or "tie not evaluated", tie)
     mode = (" — SAMPLE procurement fixtures, not live data"
             if ctx.get("coupa_mode") == "fixtures" else "")
+    if not tie.get("evaluated"):
+        return ("skipped",
+                (tie.get("reason") or "tie not evaluated") + mode, tie)
+    coverage = tie.get("coverage") or {}
+    if not (
+        isinstance(coverage, dict)
+        and coverage.get("pagination_complete") is True
+        and coverage.get("business_unit_complete") is True
+        and coverage.get("cutoff_complete") is True
+        and coverage.get("population_complete") is True
+    ):
+        return (
+            "skipped",
+            "Coupa-to-PeopleSoft invoice matching is only a current "
+            "diagnostic: complete pagination, selected-business-unit scope, "
+            "and selected-cutoff coverage are not established" + mode,
+            tie,
+        )
     breaks = tie.get("amount_breaks") or []
     missing = tie.get("missing_in_ap") or []
     if not breaks and not missing:
@@ -253,21 +268,48 @@ def _step_accrual_candidates(ctx: dict) -> tuple:
     rni = ctx.get("rni")
     if not isinstance(rni, dict):
         return "skipped", f"received-not-invoiced could not run: {rni}", {}
-    if rni.get("evaluated") is False:
+    if rni.get("evaluated") is not True:
         return ("skipped",
                 rni.get("reason") or
                 "received-not-invoiced was not evaluated as of the period",
                 rni)
     mode = (" — SAMPLE procurement fixtures, not live data"
             if ctx.get("coupa_mode") == "fixtures" else "")
-    lines = rni.get("lines") or []
-    if not lines:
-        return "ok", f"nothing received awaits an invoice{mode}", rni
+    population = rni.get("population") or {}
+    count = population.get("candidate_count")
+    positive_count = population.get("positive_candidate_count", count)
+    if (not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return ("skipped", "candidate population count is incomplete" + mode,
+                rni)
+    exception_counts = ((rni.get("exceptions") or {}).get("counts") or {})
+    exception_count = sum(
+        int(value) for value in exception_counts.values()
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0)
     totals = rni.get("rni_totals_by_currency") or {}
-    return ("attention",
-            f"{len(lines)} PO line(s) received but not invoiced — accrue "
-            + " · ".join(f"{_fmt(v)} {c}" for c, v in sorted(totals.items()))
-            + mode, rni)
+    total_text = " · ".join(
+        f"{_fmt(v)} {c}" for c, v in sorted(totals.items()))
+    if count:
+        headline = (
+            f"{count} Coupa PO-line review candidate(s)"
+            + (f" — {total_text}" if total_text else "")
+            + "; booking and GL posting are not evaluated")
+    elif exception_count:
+        headline = (
+            f"no positive candidates, but {exception_count} matching/status "
+            "exception(s) require review; booking is not evaluated")
+    elif isinstance(positive_count, int) and positive_count > 0:
+        headline = (
+            f"{positive_count} positive candidate(s) exist below the display "
+            "threshold; booking is not evaluated")
+    else:
+        headline = (
+            "no candidates were observed in the completed sequential Coupa "
+            "collection; this is not an atomic clean-GRNI or booking result")
+    # A review-candidate population is useful evidence for the controller,
+    # but it cannot complete an AP close control until a governed booking/
+    # posting bridge proves what reached the ERP and GL.
+    return "skipped", headline + mode, rni
 
 
 def _step_voucher_pipeline(ctx: dict) -> tuple:
@@ -456,8 +498,8 @@ PLAYBOOKS: dict = {
         "title": "AP completeness (month-end)",
         "description": (
             "Did everything that should hit payables actually hit it: "
-            "approved procurement invoices reconciled to vouchers, received-"
-            "not-invoiced value listed for accrual, and vouchers stuck in "
+            "approved procurement invoices checked against vouchers, received-"
+            "not-invoiced review candidates surfaced, and vouchers stuck in "
             "recycle or unposted surfaced before the period closes."
         ),
         "context": ("ap_tie", "rni", "payables"),
@@ -466,8 +508,8 @@ PLAYBOOKS: dict = {
                  "an approved invoice that never became a voucher is a "
                  "liability the ledger cannot see", _step_procurement_tie),
             Step("accruals", "Received-not-invoiced accruals",
-                 "value received without an invoice must be accrued at "
-                 "month-end", _step_accrual_candidates),
+                 "Coupa PO-line candidates require controller review and do "
+                 "not prove that an accrual was booked", _step_accrual_candidates),
             Step("voucher_pipeline", "Vouchers stuck in the pipeline",
                  "recycle and unposted vouchers are owed but invisible to "
                  "payment runs", _step_voucher_pipeline),
@@ -540,7 +582,7 @@ class PlaybookRunner:
         self.modules = modules
         if coupa is None:
             from .connectors import coupa as _coupa_mod
-            coupa = _coupa_mod.from_env()
+            coupa = _coupa_mod.from_env(cfg=getattr(engine, "cfg", None))
         self.coupa = coupa
 
     def list_playbooks(self) -> dict:
@@ -606,60 +648,53 @@ class PlaybookRunner:
                 return None, None
 
         def period_ap_tie() -> dict:
-            """Run Coupa→AP through the available cut-off, never future data."""
+            """Disclose the unavailable governed bridge without reading it.
+
+            The legacy diagnostic is tenant-wide, unpaginated and has no
+            selected-cutoff contract. Calling it under a BU-scoped playbook
+            would leak foreign-unit invoice/voucher detail even when the step
+            is later marked skipped, so the playbook must not call it at all.
+            """
             if not period_end:
                 return {"evaluated": False,
                         "reason": ("No fiscal-calendar end date is available "
                                    "for the requested AP period.")}
-            asof_date = dt.date.fromisoformat(effective_as_of)
-            result = self.coupa.ap_tie(self.e.db, today=asof_date)
-            if period_end > today:
-                return {
-                    "source": result.get("source", "coupa+peoplesoft")
-                    if isinstance(result, dict) else "coupa+peoplesoft",
-                    "evaluated": False,
-                    "reason": (f"FY{fy} period {period} ends {period_end}; "
-                               f"only current data through {today} exists, "
-                               "so period-end AP completeness cannot yet be "
-                               "concluded."),
-                    "requested_as_of": period_end,
-                    "current_state_as_of": today,
-                    "current_state": result,
-                }
-            if isinstance(result, dict):
-                result["requested_as_of"] = period_end
-            return result
+            return {
+                "source": "coupa+peoplesoft", "evaluated": False,
+                "business_unit": bu, "requested_as_of": period_end,
+                "reason": (
+                    "The current diagnostic for Coupa-to-PeopleSoft invoices is "
+                    "not called because it lacks complete pagination, "
+                    "selected-business-unit scope, and selected-cutoff "
+                    "predicates on both systems."),
+                "coverage": {
+                    "pagination_complete": False,
+                    "business_unit_complete": False,
+                    "cutoff_complete": False,
+                    "population_complete": False,
+                },
+            }
 
         def period_rni() -> dict:
-            """Coupa PO-line RNI is a snapshot unless event dates are exposed."""
-            current = self.coupa.received_not_invoiced()
+            """Coupa PO-line candidates, bounded to the selected scope.
+
+            The connector itself owns point-in-time eligibility: dated
+            receipts alone cannot reconstruct a historical mutable invoice
+            status. Never promote its current result here.
+            """
             if not period_end:
                 return {"evaluated": False,
                         "reason": ("No fiscal-calendar end date is available "
-                                   "for the requested AP period."),
-                        "current_state_as_of": today,
-                        "current_state": current}
-            if period_end != today:
-                direction = ("has not ended" if period_end > today else
-                             "is historical")
-                return {
-                    "source": current.get("source", "coupa")
-                    if isinstance(current, dict) else "coupa",
-                    "evaluated": False,
-                    "reason": (f"FY{fy} period {period} {direction} "
-                               f"(end {period_end}). This Coupa RNI view "
-                               "exposes current PO-line balances without "
-                               "receipt/invoice event dates, so its "
-                               f"{today} snapshot cannot be labelled a "
-                               "period-end accrual population."),
-                    "requested_as_of": period_end,
-                    "current_state_as_of": today,
-                    "current_state": current,
-                }
-            if isinstance(current, dict):
-                current["evaluated"] = True
-                current["requested_as_of"] = period_end
-            return current
+                                   "for the requested AP period.")}
+            result = self.coupa.received_not_invoiced(
+                business_unit=bu,
+                as_of_date=period_end,
+                today=dt.date.fromisoformat(today),
+            )
+            if isinstance(result, dict):
+                result["requested_as_of"] = period_end
+                result["current_state_as_of"] = today
+            return result
 
         def period_payables() -> dict:
             result = self.modules.open_payables(

@@ -156,6 +156,81 @@ class RerunTests(unittest.TestCase):
         self.assertIn("US001", out["csv"])
         self.assertIn("7", out["csv"])
 
+    def test_coupa_rni_export_lifts_only_the_display_cap(self) -> None:
+        class CoupaRNI:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def received_not_invoiced(
+                    self, business_unit: str = "", max_rows=None,
+                    display_rows: int = 200) -> dict:
+                self.calls.append({"business_unit": business_unit,
+                                   "max_rows": max_rows,
+                                   "display_rows": display_rows})
+                rows = [{"order_line_id": i, "candidate_amount": 1.0}
+                        for i in range(205)]
+                return {"lines": rows[:display_rows]}
+
+        coupa = CoupaRNI()
+        registry = export.build_registry(coupa=coupa)
+        out = export.export(
+            "get_coupa_rni", {"business_unit": "US001"}, registry,
+            payload={"lines": [{"order_line_id": 1}]}, row_cap=500,
+            today=DAY)
+
+        self.assertTrue(out["rerun"])
+        self.assertEqual(out["rows"], 205)
+        self.assertFalse(out["truncated"])
+        self.assertEqual(coupa.calls, [{
+            "business_unit": "US001", "max_rows": None,
+            "display_rows": 500,
+        }])
+        self.assertIn("Full result re-run server-side", out["note"])
+
+    def test_coupa_source_truncation_is_in_filename_at_exact_export_cap(self):
+        class CoupaRNI:
+            def received_not_invoiced(self, display_rows: int = 200) -> dict:
+                return {
+                    "population": {"candidate_count": 3,
+                                   "display_truncated": True},
+                    "lines": [{"order_line_id": i} for i in range(2)],
+                }
+
+        out = export.export(
+            "get_coupa_rni", {}, export.build_registry(coupa=CoupaRNI()),
+            row_cap=2, today=DAY)
+        self.assertEqual(out["rows"], 2)
+        self.assertTrue(out["truncated"])
+        self.assertIn("TRUNCATED_at_2_rows", out["filename"])
+        self.assertIn("2 of 3", out["note"])
+
+    def test_coupa_export_flag_view_exports_receipts_not_candidates(self):
+        class CoupaRNI:
+            def received_not_invoiced(self, display_rows: int = 200) -> dict:
+                return {
+                    "population": {"candidate_count": 1,
+                                   "display_truncated": False},
+                    "lines": [{"order_line_id": "CANDIDATE-ONLY"}],
+                    "export_evidence": {
+                        "receipt_transaction_count": 2,
+                        "display_truncated": False,
+                        "receipt_transactions": [
+                            {"receipt_transaction_id": "REC-1",
+                             "exported": True},
+                            {"receipt_transaction_id": "REC-2",
+                             "exported": False},
+                        ],
+                    },
+                }
+
+        out = export.export(
+            "get_coupa_rni", {"_export_view": "receipt_export_state"},
+            export.build_registry(coupa=CoupaRNI()), row_cap=10, today=DAY)
+        self.assertEqual(out["rows"], 2)
+        self.assertIn("REC-1", out["csv"])
+        self.assertNotIn("CANDIDATE-ONLY", out["csv"])
+        self.assertIn("receipt_export_state", out["filename"])
+
 
 class ModelCannotRaiseItsOwnLimitTests(unittest.TestCase):
     """run_sql caps a model at 500 rows so payloads stay readable. Export

@@ -11,6 +11,20 @@ the model and the MCP tools together. Unit tests remain the authority for the
 underlying calculations; this pack checks whether Gemini selects the right
 controlled calculation and presents its evidence honestly.
 
+## Deployment profile under test
+
+This acceptance pack assumes **Coupa is the system of authority for every
+purchase order and receipt** (`coupa.po_receipt_authority: true`). PeopleSoft
+may receive invoices and accounting, but its Purchasing tables are not a
+substitute for the Coupa event population. A user must name PeopleSoft
+explicitly before the PeopleSoft PO/receipt candidate path is appropriate.
+
+Production acceptance requires every Coupa result used as financial evidence
+to report `source=coupa` and **`mode=live`**. `mode=fixtures` is useful for a
+developer demonstration only and fails this production pack, even when its
+sample numbers look plausible. A missing or stale live population produces
+`incomplete`; it never becomes a clean zero.
+
 ## What a passing answer looks like
 
 Every financial answer should make the following visible without requiring the
@@ -68,38 +82,43 @@ population. Ask Gemini exactly this:
 | A1 | **How much did we owe vendors at the selected period end?** | Resolve the selected period end, then `get_open_payables(as_of_date="2026-06-30")` for the sample FY2026 P6 scope | Voucher date cut-off, current open-status basis, point-in-time completeness disclosure, amount/count by vendor, and either one currency basis or a prominent mixed-currency limitation | A voucher dated after the resolved cut-off is included, today's open AP is presented as a reconstructed historical subledger, or mixed face amounts are presented as one consolidated-currency total |
 | A2 | **Which vendors had we paid through June 30, 2026?** | `get_vendor_payments(as_of_date="2026-06-30")` | Inclusive payment-date cut-off; void treatment; whether the payment population was actually scoped to the BU | A later payment is included, an unscoped installation-wide total is labelled as the BU, or void support is assumed |
 | A3 | **Any confirmed duplicate vendor payments?** | `get_duplicate_payments` | Confirmed population reported separately from duplicate-voucher and same-amount review candidates; distinct non-void payment IDs and paid amount for each confirmation | A repeated invoice number with no payment header is called a duplicate payment |
-| A4 | **Is AP complete for month-end?** | `run_playbook(playbook="ap_completeness")` | Exact period/cut-off; AP posting/pipeline exceptions; approved procurement items missing from AP; RNI/accrual population; composed verdict | Current trailing activity is labelled FY/period-end evidence, one unavailable step still yields `passed`, or booked AP and accrual candidates are added together without explaining the populations |
-| A5 | **Which current PO-linked PeopleSoft received-not-invoiced items should we review today?** | `get_po_grni_candidates()` in the active BU | Current-state, same receiving/PO/AP BU only; accepted receipt value less eligible posted voucher value on the same PO line/schedule; transaction currencies kept separate; schedule-level candidates, excluded statuses and explicit out-of-scope coverage | A historical date is treated as reconstructed; non-PO or cross-BU coverage is implied; recycled/unposted voucher states silently remove a candidate; a capped or ambiguous population becomes zero; or the result is called a booked accrual/GL liability |
-| A6 | **Does AP accounting activity reconcile to the Finance-approved GL control accounts for this period?** | `reconcile_ap_to_gl(control_accounts="<approved comma-separated list>", fiscal_year=2026, period=6, as_of_date="2026-06-30")` | One AP/GL BU, ledger, approved account set, fiscal period and cut-off; an account-attributed `VCHR_ACCTG_LINE` population across all posting processes; AP-posted + Journal Generator-distributed status; signed base-currency amounts; complete JGEN journal identity matched to posted `JRNL_HEADER`/`JRNL_LN`; numeric and exact-key verdict plus observed exception categories | Voucher gross/payment arithmetic or a `PS_LEDGER` ending balance substitutes for period journal activity; another liability account enters the AP side; a missing/null amount, blank JGEN key, mixed currency, non-distributed AP row, unposted GL journal, duplicate key, empty population or capped result becomes a pass; or an observed residual is assigned a cause the tool did not prove |
+| A4 | **Is AP complete for month-end?** | `run_playbook(playbook="ap_completeness")`, with the Coupa-to-AP leg presently expected `incomplete` | Exact period/cut-off; AP posting/pipeline exceptions; RNI review population kept separate from booked AP; explicit disclosure that the current Coupa tie lacks complete pagination, same-BU proof and selected-cut-off scope | A candidate-only tool satisfies the broad conclusion; the current Coupa diagnostic yields `passed`; current trailing activity is labelled FY/period-end evidence; one unavailable step is hidden; or booked AP and review candidates are added together |
+| A5 | **Show Coupa PO lines with net receipt activity above eligible invoice coverage at the selected period end, by currency.** | `get_coupa_rni(business_unit="US001", as_of_date="2026-06-30")` for the sample FY2026 P6 scope | `source=coupa`, `mode=live`; requested and mapped Coupa BU/path; cut-off and data-as-of; contributing receipt and invoice event IDs/dates/statuses on the same PO line; eligible-status rule; amount/count by currency; population pages, caps, freshness, missing-key/date/currency exceptions and order-line aggregate precision; classification as `Coupa PO-line review candidates`; `booked status not evaluated` | Fixture mode is accepted; BU/date scope is absent or guessed; current mutable invoice status is presented as a reconstructed historical cut-off; missing, stale or truncated coverage becomes zero; currencies are combined; or the result is called AP, JGEN, booked accrual, or posted GL evidence |
+| A6 | **Which current Coupa PO lines have net receipt activity above eligible invoice coverage?** | `get_coupa_rni()` with the active BU and selected current date | Same live Coupa evidence as A5, plus the configured receipt/invoice statuses, tenant-tested invoice/order-line scope invariant, full-population counts/totals and bounded displayed candidates. State that receipt IDs are contributing evidence, not individually matched/unmatched receipts; the complete endpoint collections were sequential/non-atomic; and booked status was not evaluated. | A specific receipt is called uninvoiced without `matching_allocations`; a pending/draft/held invoice silently reduces the candidate; a 200-row display cap truncates the stated total; or a completed sequential collection is called an exact-instant snapshot. |
+| A7 | **Did every approved Coupa invoice through the selected period end become a PeopleSoft voucher?** | A separately governed complete Coupa-invoice → PeopleSoft-voucher bridge; otherwise answer **`not established`**. The broader `ap_completeness` playbook may report its control as `incomplete`, but that does not answer this business fact | State the missing complete pagination, same-BU and selected-as-of properties. A future pass also needs a stable cross-system key, matched/missing/ambiguous counts and amounts, and complete live populations on both sides | The incomplete playbook or either candidate tool answers the fact; current unscoped/unpaginated rows are called complete; a zero exception count survives the missing controls; or exported means booked |
+| A8 | **What booked receipt-accrual liability from those Coupa candidates posted to PeopleSoft GL at the selected period end?** | A separately governed Coupa-interface → PeopleSoft receipt-accounting/JGEN → posted-GL evidence path; otherwise answer **`not established`** | Accounting event identity, BU/ledger/account/currency/cut-off, Journal Generator key, posted journal key/status and an exact bridge back to the Coupa candidate | Either candidate tool is sole evidence; the candidate total is called a journal or liability; “exported from Coupa” is treated as posted; or the answer omits `not established` when no governed bridge exists |
+| A9 | **Which current PO-linked received-not-invoiced items in the configured ERP should we review today?** | `get_po_grni_candidates()` only for the explicitly selected separate PeopleSoft population | Current-state, same receiving/PO/AP BU only; accepted receipt value less eligible posted voucher value on the same PO line/schedule; transaction currencies kept separate; schedule-level candidates, excluded statuses and explicit out-of-scope coverage | This fallback silently replaces Coupa authority; a historical date is reconstructed; non-PO or cross-BU coverage is implied; a capped population becomes zero; or the result is called a booked accrual/GL liability |
+| A10 | **Does AP accounting activity reconcile to the Finance-approved GL control accounts for this period?** | `reconcile_ap_to_gl(control_accounts="<approved comma-separated list>", fiscal_year=2026, period=6, as_of_date="2026-06-30")` | One AP/GL BU, ledger, approved account set, fiscal period and cut-off; an account-attributed `VCHR_ACCTG_LINE` population across all posting processes; AP-posted + Journal Generator-distributed status; signed base-currency amounts; complete JGEN journal identity matched to posted `JRNL_HEADER`/`JRNL_LN`; numeric and exact-key verdict plus observed exception categories | Voucher gross/payment arithmetic or a `PS_LEDGER` ending balance substitutes for period journal activity; another liability account enters the AP side; a missing/null amount, blank JGEN key, mixed currency, non-distributed AP row, unposted GL journal, duplicate key, empty population or capped result becomes a pass; or an observed residual is assigned a cause the tool did not prove |
 | G1 | **Does the trial balance balance?** | `tb_integrity_check` | BU, ledger, FY/period; total debits, total credits, difference, and balance verdict | A zero/no-data scope is balanced, or totals are omitted while a verdict is asserted |
 | G2 | **Which journals still need action before close?** | `get_journal_status` | BU, ledger, FY/period/cut-off; full journal key including date and unpost sequence; exact D/I/M/E/N/P/T/U/V/Z status meaning; action-required V/E/I/N/T/U separated from informational M/D/Z; count/detail or explicit incomplete reason | Every non-P status is called unposted/actionable, duplicate versions collapse, another ledger or period leaks in, an unknown code is guessed, or unreadable/capped data becomes “none found” |
 | G3 | **Are we ready to close GL?** | `run_playbook(playbook="close_readiness")` | Balance, suspense, unposted and unbalanced journals, retained-earnings roll, AR tie, billing handoff, period position, and composed verdict | A balanced TB alone is called ready, or any skipped step is hidden |
 | G4 | **Our asset accounts 1000-1999 are up versus last year end. What drove it, and does the breakdown add up?** | `explain_balance_change` | Start/end basis, bridge drivers, residual/reconciliation, and exception-first explanation | Gemini calculates a bridge in prose, quotes a number absent from tool evidence, or omits the reconciliation |
 | G5 | **What is journal J0001's exact status?** | `get_journal_status(journal_id="J0001")` | Every matching JOURNAL_DATE/UNPOST_SEQ version; current delivered code/meaning; raw optional approval/process fields only when present; POSTED_DATE for any posted-by-cutoff claim | The first matching ID is chosen, today's header status is described as historical as-of evidence, missing POSTED_DATE is replaced by an inference, or an optional SOURCE/approval field becomes a required-field failure |
 
-For A6, Finance may govern the account list once in
+For A10, Finance may govern the account list once in
 `defaults.ap_control_accounts`; leaving it empty makes the tool refuse rather
 than guess. `tools.ap_reconciliation_line_cap` defaults to 50,000 rows per
 side and has a runtime hard ceiling of 100,000. Reaching either cap returns an
-incomplete result with no totals or verdict. A6 is the APY1410/APY1420-style
+incomplete result with no totals or verdict. A10 is the APY1410/APY1420-style
 period-activity control; APY1400/APY1405 remains the separate ending
 open-liability reconciliation.
 
-A5 is intentionally a document-level review population. It does not prove
-that PO_RECVACCR wrote RAC rows to RECV_LN_ACCTG, that Journal Generator
-distributed those rows, or that a posted GL journal exists. A request for the
-booked receipt-accrual liability needs that separate governed accounting-line
-and GL evidence; never upgrade A5's candidate amount into it. G2/G5 report the
-current PS_JRNL_HEADER status observed at query time. A historical cut-off
-narrows JOURNAL_DATE, but cannot reconstruct the prior status without a
-governed audit/history source; POSTED_DATE can prove only the posting date when
-the site exposes it.
+A5/A6 are intentionally Coupa event review populations. They do not prove that
+an invoice became a PeopleSoft voucher, that receipt accounting wrote an
+accounting line, that Journal Generator distributed it, or that a posted GL
+journal exists. Preserve `booked status not evaluated` in the answer and never
+upgrade the candidate amount into A8. Coupa export state is transport evidence,
+not accounting evidence.
 
-The first A5 control is also current-state only: receipt/voucher statuses,
-amounts, matching and references are not effective dated. A past month-end
-request must return `incomplete`; `ENTERED_DT` alone cannot reconstruct those
-mutable fields. Keep that historical refusal as an acceptance case rather
-than freezing the successful Gemini replay to an old period.
+A historical A5 can pass only when the live source supplies immutable dated
+receipt events and an invoice-eligibility history valid at the selected
+cut-off. If it exposes only today's mutable invoice status, the correct outcome
+is `incomplete`; do not relabel today's population. A9 carries the same
+historical limitation for mutable PeopleSoft receipt/voucher status. G2/G5
+report the current PS_JRNL_HEADER status observed at query time. A historical
+cut-off narrows JOURNAL_DATE but cannot reconstruct prior status without a
+governed audit/history source; POSTED_DATE proves only posting date when the
+site exposes it.
 
 ## Custom-record discipline
 

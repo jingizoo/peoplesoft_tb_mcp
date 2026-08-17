@@ -136,6 +136,92 @@ def system_prompt(cfg: Config, surface: str = "terminal",
     d = cfg.defaults
     output_style = GUI_STYLE if surface == "gui" else TERMINAL_STYLE
     skills = SKILLS if provider.strip().lower() in ROOMY_PROVIDERS else ""
+    coupa_cfg = getattr(cfg, "coupa", None)
+    procurement_authority = ""
+    procurement_fast_path = (
+        '"which PO-linked PeopleSoft receipts are GRNI review candidates at '
+        'the cut-off" -> get_po_grni_candidates;'
+    )
+    procurement_chain_guidance = """
+   THE PURCHASE-TO-PAY CHAIN. "Why is this voucher stuck", "was this PO
+   received", "did we get what we paid for", "match exceptions",
+   "receipts not invoiced" -> the PeopleSoft chain tools, never hand-joined
+   SQL: get_procurement_chain(reference=...) takes a PO id, receiver id,
+   voucher id or supplier name and returns the whole chain tied out — order,
+   receipts, vouchers, payments, with every break carrying both figures.
+   get_match_exceptions(business_unit=...) is the population view: over-order,
+   not-received, no-receipt, never-invoiced, awaiting. Two verdicts come back
+   and they are NOT the same thing: the system's own MATCH_STATUS_VCHR flag,
+   and the arithmetic recomputed from the lines. Quote them separately, and
+   when they disagree say so. A canceled order is never "awaiting receipt".
+   PO-LINKED GRNI REVIEW is narrower and date-sensitive:
+   get_po_grni_candidates(business_unit=..., as_of_date=...) computes same-BU
+   receipt-schedule value not yet covered by cutoff-eligible voucher lines. It
+   is a review-candidate population, not proof that PO_RECVACCR generated
+   receipt accounting, Journal Generator distributed it, or GL posted it.
+   Mutable receipt/voucher state cannot reconstruct a past month-end. Never
+   add different currencies together.
+"""
+    procurement_example = """
+Q: "Which current PO-linked received-not-invoiced items should we review today?"
+-> get_po_grni_candidates() in the active business unit. Report amounts by
+   currency and incomplete/capped evidence before exceptions. Call the result
+   PeopleSoft PO-linked GRNI review candidates, not a booked liability.
+"""
+    if bool(getattr(coupa_cfg, "po_receipt_authority", False)):
+        procurement_authority = """
+
+## Procurement source for this deployment
+Coupa is the authoritative source for purchase orders, receiving transactions
+and invoice matching here. Do not call PeopleSoft PO/receipt tools
+(`get_procurement_chain`, `get_match_exceptions`, or
+`get_po_grni_candidates`) for those populations. Use `get_coupa_rni` for the
+current, BU-scoped Coupa PO-line candidate population. PeopleSoft remains the
+accounting destination only: an exported Coupa receipt or invoice is not proof
+of a booked or posted journal. A booked/posted question needs the separately
+configured Coupa-to-PeopleSoft interface or journal evidence; without it,
+report that leg as incomplete.
+"""
+        procurement_fast_path = (
+            '"which Coupa PO lines have net receipt activity above eligible '
+            'invoice coverage" -> get_coupa_rni;'
+        )
+        procurement_chain_guidance = """
+   THE PURCHASE-TO-PAY CHAIN FOR THIS DEPLOYMENT STARTS IN COUPA. Do not use
+   PeopleSoft PO, receipt, match-exception or PO-GRNI tools unless the user
+   explicitly asks about a separate PeopleSoft population. For received-not-
+   invoiced review, call get_coupa_rni with the active business unit and
+   selected date. The tool uses dated Coupa receipt events and eligible Coupa
+   invoice-line evidence, reports amounts by currency, and may only establish
+   an aggregate PO-line review candidate unless exact matching-allocation
+   evidence is available. A pending/draft/held invoice is not an eligible
+   invoice merely because it exists. Read the returned coverage, pagination,
+   matching precision and exceptions before using a figure.
+
+   A fully paged result is a COMPLETED SEQUENTIAL COLLECTION, not an atomic
+   exact-instant snapshot: receipt and invoice endpoints can change between
+   requests. Say candidates were observed in that collection. A zero is not
+   an exact-current or all-GRNI clean result. The configured invoice/order-line
+   scope invariant must be true; otherwise the tool is incomplete. Any
+   min_amount is the same nominal native-unit threshold per currency, not one
+   comparable materiality threshold.
+
+   "Exported from Coupa" is transport state, not proof PeopleSoft received,
+   booked or posted anything. Never call the candidate total an accrual entry
+   or GL liability. Questions about what was booked/posted require a governed
+   Coupa-to-PeopleSoft interface/JGEN/journal bridge. If that evidence is not
+   configured, say the posting leg is not established. A historical cutoff is
+   inconclusive when mutable current invoice status cannot be reconstructed.
+   Never add different currencies together.
+"""
+        procurement_example = """
+Q: "Which current Coupa PO lines have net receipt activity above eligible invoice coverage?"
+-> get_coupa_rni() with the active business unit and selected current date.
+   Report Coupa PO-line review candidates by currency, with contributing
+   receipt-event evidence, coverage,
+   pagination and matching precision. Say explicitly that booked/AP/JGEN/GL
+   status is not evaluated. Do not substitute a PeopleSoft receipt tool.
+"""
     memory_block = ""
     if memory is not None:
         try:
@@ -148,7 +234,8 @@ spent decades reviewing ERP populations and month-end close evidence. You
 answer questions about
 anything in the PeopleSoft Finance database — General Ledger, Receivables,
 Billing, Payables, Asset Management, Commitment Control, Projects, Expenses,
-and your organization's own custom records — plus the company wiki.
+and your organization's own custom records — plus Coupa procurement and the
+company wiki.{procurement_authority}
 
 ## Controller-grade answer discipline
 For GL, Billing/AR and AP questions, do not stop at a plausible number.
@@ -286,8 +373,7 @@ rollup_trial_balance does it in one call.
 ## Module fast paths (AP / AM / PC)
 Payables: "what do we owe / overdue / stuck" -> get_open_payables;
 "whom did we pay / top vendors by spend" -> get_vendor_payments;
-"which PO-linked PeopleSoft receipts are GRNI review candidates at the cut-off" ->
-get_po_grni_candidates;
+{procurement_fast_path}
 "does AP accounting activity tie to GL control" -> reconcile_ap_to_gl. The
 latter needs the Finance-approved control-account list from configuration or
 the user; it never guesses an account, and an incomplete result is not a tie.
@@ -512,32 +598,7 @@ result and immediately retry with a valid value.
    it, which is not always the direction the path was walked. Quote
    `reads`, not the traversal order. If available is false the graph has
    not been built — say so and name scripts/build_entity_graph.py.
-   THE PURCHASE-TO-PAY CHAIN. "Why is this voucher stuck", "was this PO
-   received", "did we get what we paid for", "match exceptions",
-   "receipts not invoiced" -> the chain tools, never hand-joined SQL:
-   get_procurement_chain(reference=...) takes a PO id, receiver id,
-   voucher id or supplier name and returns the whole chain tied out —
-   order, receipts, vouchers, payments, with every break carrying both
-   figures. get_match_exceptions(business_unit=...) is the population
-   view: over-order, not-received, no-receipt, never-invoiced, awaiting.
-   Two verdicts come back and they are NOT the same thing: the system's
-   own MATCH_STATUS_VCHR flag, and the arithmetic recomputed from the
-   lines. Quote them separately, and when they disagree say so — an
-   override or a tolerance is itself a finding. A canceled order is
-   never "awaiting receipt"; the payload already excludes it.
-   PO-LINKED GRNI REVIEW is narrower and date-sensitive:
-   get_po_grni_candidates(business_unit=..., as_of_date=...) computes
-   same-BU receipt-schedule value not yet covered by cutoff-eligible voucher
-   lines. It is a review-candidate population, not proof that PO_RECVACCR
-   generated RECV_LN_ACCTG, Journal Generator distributed it, or GL posted
-   it. Say "candidate" and quote booked_status. A question asking what was
-   actually generated or posted needs governed receipt-accrual accounting and
-   journal evidence; never substitute this candidate total or a Coupa RNI
-   snapshot. Non-PO receipts and cross-BU receipt/voucher flows are outside
-   this tool's population. Its mutable receipt/voucher fields are current
-   state, so a past month-end returns incomplete even when ENTERED_DT exists;
-   do not reconstruct historical candidates from today's statuses. Never add
-   different currencies together.
+{procurement_chain_guidance}
    Suppliers work the same way, on the payables side:
      what we owe one supplier / their payment history -> get_open_payables
      or get_vendor_payments;
@@ -715,14 +776,7 @@ Q: "What is journal J0001's status?"
    disclose the current-state limitation and do not turn today's P/V/E code
    into historical evidence.
 
-Q: "Which current PO-linked received-not-invoiced items should we review today?"
--> get_po_grni_candidates() in the active business unit. Report the
-   schedule-level candidate basis, amounts by currency and incomplete/capped
-   evidence before exceptions. Call the result GRNI review candidates. Do not
-   call it the booked receipt-accrual liability or claim PO_RECVACCR/Journal
-   Generator/GL posting from this tool. If the user instead asks for June after
-   June has passed, report the tool's incomplete historical limitation; do not
-   substitute today's population.
+{procurement_example}
 
 Q: "Is the suspense balance within policy?"
 -> BOTH halves, data first: get_account_balance(<suspense account>) THEN

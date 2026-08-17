@@ -47,7 +47,7 @@ ar = ARBilling(engine)
 relationships = Relationships(ar)
 from .connectors import ConnectorError
 from .connectors import coupa as _coupa_mod
-coupa = _coupa_mod.from_env()
+coupa = _coupa_mod.from_env(cfg=cfg)
 playbooks = PlaybookRunner(engine, ar, modules=None, coupa=coupa)
 modules = ModulePacks(engine)
 grni = GRNIControl(modules)
@@ -741,7 +741,8 @@ def get_match_exceptions(business_unit: str = "", months: int = 12,
     """Every break in the purchase-to-pay tie, computed from the documents
     and ranked by money: vouchered OVER the order price, invoiced more than
     was RECEIVED, vouchered with NO receipt at all, received and NEVER
-    invoiced (the accrual nobody booked), and orders still awaiting receipt
+    invoiced (a document-review candidate whose booking status is unknown),
+    and orders still awaiting receipt
     — with canceled orders excluded, never counted as late. Use for "any
     match exceptions", "did we get what we paid for", "receipts not
     invoiced", "three-way match problems". The system's own
@@ -1376,7 +1377,9 @@ def coupa_health() -> dict:
 def get_coupa_invoices(status: str = "", supplier: str = "",
                        days: int = 30, max_rows: int = 50) -> dict:
     """Coupa invoices over a trailing window with per-currency totals.
-    status filters exactly (approved, paid, pending_approval, draft);
+    status filters the Coupa invoice-header status exactly (for example,
+    approved, pending_approval, or draft). Coupa `paid` is a separate boolean,
+    not a delivered header status;
     supplier matches by normalized name. Use for "what invoices are in
     Coupa / what did supplier X invoice us / Coupa invoice status". This
     is the PROCUREMENT side; the ledger's AP view is get_open_payables."""
@@ -1394,12 +1397,24 @@ def get_coupa_stuck_approvals(days_pending: int = 3) -> dict:
 
 
 @mcp.tool()
-def get_coupa_rni(min_amount: float = 0.0) -> dict:
-    """Coupa received-not-invoiced by PO line — the month-end ACCRUAL
-    CANDIDATES: value received from suppliers with no invoice yet. Totals
-    are per currency, never summed across. Use for "what should we accrue /
-    received not invoiced / open receipts"."""
-    return _safe(coupa.received_not_invoiced, min_amount=min_amount)
+def get_coupa_rni(business_unit: str = "", as_of_date: str = "",
+                  min_amount: float = 0.0, max_rows: int = 0) -> dict:
+    """Coupa PO-line received-not-invoiced REVIEW CANDIDATES for one
+    caller-authorized business unit. Reads fully paged receiving events and
+    eligible invoice lines, keeps currencies separate, and discloses matching,
+    scope, threshold, pagination and display limits. Current API status cannot
+    reconstruct a historical cut-off, so that case returns incomplete. It also
+    reports the bounded current Coupa ``exported`` flag and a governed export
+    timestamp when valid. Those source flags do NOT prove export delivery or
+    success, PeopleSoft receipt or booking, Journal Generator, posted GL
+    activity, an ending GRNI liability, or what should be booked."""
+    return _safe(
+        coupa.received_not_invoiced,
+        min_amount=min_amount,
+        business_unit=business_unit,
+        as_of_date=as_of_date,
+        max_rows=(max_rows or None),
+    )
 
 
 @mcp.tool()
@@ -1438,13 +1453,15 @@ def coupa_budget_variance(business_unit: str = "", fiscal_year: int = 0,
 
 @mcp.tool()
 def coupa_to_ap_tie(days: int = 90) -> dict:
-    """RECONCILIATION: approved/paid Coupa invoices vs PS vouchers, matched
+    """CURRENT DIAGNOSTIC: approved/paid Coupa invoices vs PS vouchers, matched
     server-side on invoice number with the supplier verified against the
     vendor master. Reports matched pairs, amount breaks (same invoice,
     different amount — the dangerous kind), and invoices that never reached
-    AP. Use for "did everything approved in Coupa land in AP / AP
-    completeness". Every figure comes from this payload — never recompute
-    differences in prose."""
+    AP. This path is not fully paged, same-BU proven, or selected-as-of
+    complete, so it cannot certify period-end AP completeness or that every
+    Coupa invoice reached PeopleSoft. Every displayed figure comes from this
+    payload, but its conclusion remains incomplete until those controls are
+    implemented."""
     return _safe(coupa.ap_tie, db=db, days=days)
 
 
