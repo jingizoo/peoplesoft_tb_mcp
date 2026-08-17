@@ -22,8 +22,14 @@ The default build reads the primary `db:` connection as source `default`, plus
 every database configured under `sources:`. It applies the PeopleTools overlay
 to `default` unless told otherwise. Useful scoped builds are:
 
+`--source` REPLACES the whole artifact — it is not an incremental refresh.
+A build naming one source produces a catalog containing only that source, and
+because the write is atomic the result looks complete. Name every source you
+want indexed, or omit the flag entirely (the normal case, and what cron uses).
+
 ```bash
-# Only the PeopleSoft primary and a named warehouse
+# Only the PeopleSoft primary and a named warehouse — anything else
+# configured is DROPPED from the rebuilt catalog
 .venv/bin/python scripts/build_metadata_catalog.py --source default,warehouse
 
 # PeopleTools is on a different selected source

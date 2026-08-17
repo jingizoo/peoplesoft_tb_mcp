@@ -1350,3 +1350,60 @@ class SourceProvenanceTests(unittest.TestCase):
         self.assertIn("function renderToolBody(", html,
                       "the wrapper must delegate, not replace, the 40 "
                       "existing renderers")
+
+class SourceScopeWarningTests(unittest.TestCase):
+    """`--source` rebuilds the artifact; it does not patch it.
+
+    A narrower --source is a legitimate diagnostic, but the result is a
+    SMALLER catalog rather than an updated one, and it is written atomically
+    so it looks complete. Discovered the hard way: `--source p2go
+    --peopletools-source none` succeeded and left a catalog with no
+    PeopleSoft in it, after which search_metadata reported delivered records
+    as not existing.
+    """
+
+    def _run(self, *args):
+        import contextlib
+        import io
+        from scripts import build_metadata_catalog as builder
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = builder.main(list(args))
+        return code, out.getvalue()
+
+    def _config(self) -> str:
+        import sqlite3
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        # A real table, not an empty file: a source with nothing in it
+        # harvests nothing and the builder correctly refuses to write,
+        # which would mask the warning this test is about.
+        con = sqlite3.connect(d / "extra.db")
+        con.execute("CREATE TABLE EXTRA_FACT (ID INTEGER, AMT REAL)")
+        con.commit()
+        con.close()
+        (d / "config.yaml").write_text(
+            "db:\n  backend: sqlite\n"
+            f"  sqlite_path: {ROOT / 'sample_data' / 'ps_sample.db'}\n"
+            "sources:\n  extra:\n    backend: sqlite\n"
+            f"    sqlite_path: {d / 'extra.db'}\n")
+        return str(d / "config.yaml")
+
+    def test_excluding_the_peopletools_source_names_the_safe_fix(self):
+        code, text = self._run("--config", self._config(), "--source", "extra")
+        self.assertEqual(code, 2)
+        self.assertIn("REPLACES the whole artifact", text)
+        self.assertIn("--source default,extra", text,
+                      "the message must name the command that keeps the "
+                      "catalog whole, not only the one that shrinks it")
+
+    def test_a_narrower_source_warns_which_sources_it_drops(self):
+        code, text = self._run("--config", self._config(), "--source", "extra",
+                               "--peopletools-source", "none", "--quiet")
+        self.assertEqual(code, 0)
+        self.assertIn("will NOT contain default", text)
+
+    def test_the_normal_full_build_says_nothing_extra(self):
+        code, text = self._run("--config", self._config(), "--quiet")
+        self.assertEqual(code, 0)
+        self.assertNotIn("NOTE:", text)

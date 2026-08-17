@@ -67,9 +67,30 @@ def main(argv=None) -> int:
         primary.close()
         return 2
     if args.peopletools_source not in requested and args.peopletools_source != "none":
-        print("--peopletools-source must be included in --source (or use none)")
+        # Point at the fix that KEEPS the artifact whole. Offering "none" as
+        # a co-equal escape sent people down the one path that silently
+        # halves their catalog: --source rebuilds the whole file, so
+        # dropping the PeopleTools source drops PeopleSoft from it.
+        print(
+            f"--peopletools-source {args.peopletools_source!r} is not in "
+            f"--source ({', '.join(requested)}).\n"
+            "--source REPLACES the whole artifact — it is not an incremental "
+            "refresh — so name every source you want in it, e.g.\n"
+            f"    --source {','.join(registry.names())}\n"
+            "Use --peopletools-source none only to build native database "
+            "structure WITHOUT any PeopleTools layer; the resulting catalog "
+            "contains only the sources named above.")
         primary.close()
         return 2
+    # A narrower --source is legitimate (diagnosing one connection), but the
+    # result is a smaller catalog, not a patched one. Say so before the write
+    # rather than leaving it to be discovered through a search that finds
+    # nothing — the artifact is replaced atomically and looks complete.
+    dropped = [name for name in registry.names() if name not in requested]
+    if dropped:
+        print(f"NOTE: --source names {', '.join(requested)}; the rebuilt "
+              f"catalog will NOT contain {', '.join(dropped)}. Run without "
+              "--source to index every configured source.")
 
     overrides = {}
     for arg_name, limit_name in (
