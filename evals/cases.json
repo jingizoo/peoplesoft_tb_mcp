@@ -780,13 +780,78 @@
       },
       "expect": {
         "any_tool": [
-          "run_playbook",
-          "get_coupa_rni",
-          "coupa_to_ap_tie",
-          "get_open_payables"
+          "run_playbook"
+        ],
+        "tool_args_contain": {
+          "playbook": "ap_completeness"
+        },
+        "not_refused": true,
+        "_why": "A broad AP accrual question is a composed completeness review. A PO-only GRNI candidate list, Coupa snapshot, or current open-payables population alone cannot support the full conclusion; the playbook must distinguish booked AP, missing intake, and each incomplete source."
+      }
+    },
+    {
+      "id": "ps-grni-review-candidates",
+      "question": "Which current PO-linked PeopleSoft received-not-invoiced items should we review today?",
+      "scope": {
+        "business_unit": "US001"
+      },
+      "expect": {
+        "any_tool": [
+          "get_po_grni_candidates"
+        ],
+        "not_tool": [
+          "get_match_exceptions",
+          "get_coupa_rni"
+        ],
+        "answer_contains": [
+          "candidate"
         ],
         "not_refused": true,
-        "_why": "An accrual question is a completeness review, not a general-chat request. It must reach the AP evidence chain and distinguish booked payables from receipts/invoices not yet in AP."
+        "_why": "The first PO-linked control evaluates only a current-state same-BU receipt/voucher candidate population. Historical month-end status is intentionally incomplete; even today's result must not be described as a booked PO_RECVACCR, Journal Generator, or GL accrual."
+      }
+    },
+    {
+      "id": "journal-exact-current-status",
+      "question": "What is journal TRV2606225's exact status? Show every date and unpost version.",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_journal_status"
+        ],
+        "not_tool": [
+          "drill_to_journals",
+          "tb_integrity_check"
+        ],
+        "tool_args_contain": {
+          "journal_id": "TRV2606225"
+        },
+        "not_refused": true,
+        "_why": "An exact status question is not a journal-line drill or a broad integrity check. Full JOURNAL_DATE/UNPOST_SEQ identity and the current delivered status meaning must be retained."
+      }
+    },
+    {
+      "id": "journal-close-action-population",
+      "question": "Which journals still need action before close?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_journal_status"
+        ],
+        "not_tool": [
+          "drill_to_journals"
+        ],
+        "not_refused": true,
+        "_why": "V/E/I/N/T/U need distinct actions while M/D/Z are informational. A blanket status-not-P query would misstate the close population."
       }
     },
     {

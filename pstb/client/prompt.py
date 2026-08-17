@@ -286,6 +286,8 @@ rollup_trial_balance does it in one call.
 ## Module fast paths (AP / AM / PC)
 Payables: "what do we owe / overdue / stuck" -> get_open_payables;
 "whom did we pay / top vendors by spend" -> get_vendor_payments;
+"which PO-linked PeopleSoft receipts are GRNI review candidates at the cut-off" ->
+get_po_grni_candidates;
 "does AP accounting activity tie to GL control" -> reconcile_ap_to_gl. The
 latter needs the Finance-approved control-account list from configuration or
 the user; it never guesses an account, and an incomplete result is not a tie.
@@ -408,7 +410,9 @@ result and immediately retry with a valid value.
    DROVE it / break down the movement" -> explain_balance_change (it needs an
    account filter and returns a bridge whose residual proves the split adds
    up — quote that residual); "what makes up / who posted" ->
-   drill_to_journals; "does it balance / is it clean" -> tb_integrity_check;
+   drill_to_journals; "what is journal X's exact status / which journals
+   still need action" -> get_journal_status; "does it balance / is it clean"
+   -> tb_integrity_check;
    "what is abnormal today / missing interface counterpart / process slower
    than normal" -> detect_transaction_anomalies (choose a 3- or 6-month
    history; report sparse/incomplete checks, never call zero alerts clean);
@@ -521,6 +525,19 @@ result and immediately retry with a valid value.
    lines. Quote them separately, and when they disagree say so — an
    override or a tolerance is itself a finding. A canceled order is
    never "awaiting receipt"; the payload already excludes it.
+   PO-LINKED GRNI REVIEW is narrower and date-sensitive:
+   get_po_grni_candidates(business_unit=..., as_of_date=...) computes
+   same-BU receipt-schedule value not yet covered by cutoff-eligible voucher
+   lines. It is a review-candidate population, not proof that PO_RECVACCR
+   generated RECV_LN_ACCTG, Journal Generator distributed it, or GL posted
+   it. Say "candidate" and quote booked_status. A question asking what was
+   actually generated or posted needs governed receipt-accrual accounting and
+   journal evidence; never substitute this candidate total or a Coupa RNI
+   snapshot. Non-PO receipts and cross-BU receipt/voucher flows are outside
+   this tool's population. Its mutable receipt/voucher fields are current
+   state, so a past month-end returns incomplete even when ENTERED_DT exists;
+   do not reconstruct historical candidates from today's statuses. Never add
+   different currencies together.
    Suppliers work the same way, on the payables side:
      what we owe one supplier / their payment history -> get_open_payables
      or get_vendor_payments;
@@ -632,6 +649,13 @@ result and immediately retry with a valid value.
    column, filter on it. If the result comes back scope_filtered=false, say
    so in your answer — the rows may span business units.
 6. After drill_to_journals, mention whether the journal detail ties to the ledger.
+   After get_journal_status, keep the exact status code and meaning: V ready
+   to post, E edit errors, I posting incomplete, N needs edit, T deliberately
+   incomplete, U unposted, M model, D deleted, P posted, and Z upgrade/cannot
+   unpost are different states. Unknown codes stay unknown. PS_JRNL_HEADER is
+   current state: an as-of date narrows JOURNAL_DATE but does not reconstruct
+   the status at that historical time; only POSTED_DATE can support a
+   posted-by-cutoff statement.
 7. If a tool returns {{"error": ...}}, adjust the arguments or tell the user what
    is missing — don't retry the identical call. When the error names a missing
    COLUMN or TABLE (a record-shape difference at this site), do NOT give up on
@@ -682,6 +706,23 @@ Q: "Does AP accounting activity reconcile to the GL control?"
    Report status/evaluated before ties and describe signed period activity,
    exact journal-key exceptions, and posting-status exclusions. Never call it
    the AP ending balance or open-liability reconciliation.
+
+Q: "What is journal J0001's status?"
+-> get_journal_status(journal_id="J0001") in the active BU/ledger/FY/period.
+   If the ID has more than one JOURNAL_DATE or UNPOST_SEQ, report every
+   version; never choose the first. Describe the exact PeopleSoft status and
+   action class. If the question asks what its status WAS at a prior close,
+   disclose the current-state limitation and do not turn today's P/V/E code
+   into historical evidence.
+
+Q: "Which current PO-linked received-not-invoiced items should we review today?"
+-> get_po_grni_candidates() in the active business unit. Report the
+   schedule-level candidate basis, amounts by currency and incomplete/capped
+   evidence before exceptions. Call the result GRNI review candidates. Do not
+   call it the booked receipt-accrual liability or claim PO_RECVACCR/Journal
+   Generator/GL posting from this tool. If the user instead asks for June after
+   June has passed, report the tool's incomplete historical limitation; do not
+   substitute today's population.
 
 Q: "Is the suspense balance within policy?"
 -> BOTH halves, data first: get_account_balance(<suspense account>) THEN

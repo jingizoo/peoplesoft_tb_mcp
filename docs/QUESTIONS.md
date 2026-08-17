@@ -35,7 +35,8 @@ routes through. Use these as acceptance tests when trying a new model.
 
 ## Health / integrity → `tb_integrity_check`
 25. Does the trial balance balance?
-26. Are there unposted journals this period?
+26. Which journals still need action this period? *(use `get_journal_status`
+    for exact V/E/I/N/T/U action states; M/D/Z are informational)*
 27. Is there anything in suspense? How old is it? *(+ wiki for the 30-day rule)*
 28. Any accounts with balances but no chartfield definition?
 29. Any posted journals that don't net to zero?
@@ -212,6 +213,7 @@ search_records + run_sql (+ pivot); this map is the fast path.
 | What do we owe, and to whom? | `get_open_payables` |
 | How much is overdue / due this week? | `get_open_payables` (overdue_total, due_within_7_days) |
 | Anything stuck in AP nobody can see? | `get_open_payables` → pipeline_exceptions (recycle/unposted) |
+| Which current PO-linked PeopleSoft received-not-invoiced items should we review today? | `get_po_grni_candidates()` — current-state, same-BU schedule-level document candidates by currency; a past date is incomplete; excludes non-PO/cross-BU coverage and does not prove a booked PO_RECVACCR/JGEN/GL accrual |
 | Does AP accounting activity reconcile to the GL control for this period? | `reconcile_ap_to_gl(control_accounts=<Finance-approved list>, fiscal_year=..., period=..., as_of_date=...)` — exact AP accounting/JGEN-to-posted-GL journal keys; missing evidence and mixed currency fail closed |
 | Whom did we pay, how much, when? | `get_vendor_payments` |
 | Top vendors by spend | `get_vendor_payments` (empty vendor ranks all) |
@@ -230,6 +232,7 @@ search_records + run_sql (+ pivot); this map is the fast path.
 | Does the TB balance / what's the balance of X | `get_trial_balance`, `get_account_balance` |
 | What changed vs last period/year | `compare_trial_balance` |
 | What makes up this number / who posted it | `drill_to_journals` |
+| What is journal X's exact current status / which journals need action | `get_journal_status` — retains JOURNAL_DATE and UNPOST_SEQ versions; current header state is not reconstructed historical status |
 | Is the ledger ready to close | `run_playbook close_readiness` |
 | Statements | `run_report` (income_statement, balance_sheet, quarterly_expenses) |
 | Any trend/cross-tab | `run_sql` + `pivot` |

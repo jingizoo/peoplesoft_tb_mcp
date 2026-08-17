@@ -85,6 +85,10 @@ class SourceTaggingTests(unittest.TestCase):
         self.assertEqual(source_of_tool("get_ar_aging"), "peoplesoft_ar")
         self.assertEqual(source_of_tool("get_open_payables"), "peoplesoft_ap")
         self.assertEqual(source_of_tool("reconcile_ap_to_gl"), "peoplesoft_ap")
+        self.assertEqual(source_of_tool("get_po_grni_candidates"),
+                         "peoplesoft_ap")
+        self.assertEqual(source_of_tool("get_journal_status"),
+                         "peoplesoft_gl")
         self.assertEqual(source_of_tool("coupa_to_ap_tie"), "coupa")
         self.assertEqual(source_of_tool("run_ps_query"), "peoplesoft_query")
         self.assertEqual(source_of_tool("wiki_get_page"), "wiki")

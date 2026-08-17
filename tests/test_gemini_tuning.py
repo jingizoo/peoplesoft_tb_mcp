@@ -53,7 +53,8 @@ class GeminiShortlistTests(unittest.TestCase):
     AVAILABLE = {
         "get_trial_balance", "tb_integrity_check", "run_playbook",
         "get_open_payables", "get_vendor_payments", "get_duplicate_payments",
-        "reconcile_ap_to_gl",
+        "reconcile_ap_to_gl", "get_po_grni_candidates",
+        "get_journal_status",
         "get_coupa_rni", "search_records", "describe_record",
         "profile_record", "compare_records", "run_sql", "explain_query",
         "describe_metadata_catalog", "search_metadata",
