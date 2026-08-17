@@ -1772,8 +1772,12 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
             str(payload.get("status") or "").lower() == "evaluated"
             and payload.get("evaluated") is True
             and type(payload.get("ties")) is bool
+            # gl_total, not gl_balance: this control compares signed period
+            # ACTIVITY on both sides. It once published gl_balance as an
+            # alias purely to satisfy this check, which meant the gate was
+            # asserting the presence of a balance the control never computes.
             and all(numeric(payload.get(field)) for field in (
-                "subledger_total", "gl_balance", "difference"))
+                "subledger_total", "gl_total", "difference"))
         )
         if not complete_verdict:
             return False, str(

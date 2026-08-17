@@ -332,7 +332,6 @@ class ModulePacks:
             "control_accounts_source": account_source,
             "subledger_total": None,
             "gl_total": None,
-            "gl_balance": None,
             "difference": None,
             "currency": base_currency or None,
             "tolerance": 0.01,
@@ -1081,10 +1080,11 @@ class ModulePacks:
             "accounting_source": source,
             "subledger_total": ap_total,
             "gl_total": gl_total,
-            # Compatibility alias for the evidence gate/controller card. The
-            # amount_basis below is authoritative: this is signed period
-            # activity, not an ending balance despite the legacy key name.
-            "gl_balance": gl_total,
+            # Deliberately NO gl_balance key. This figure is signed period
+            # activity, and AR's own gl_tie publishes gl_balance meaning an
+            # ending balance from account_balance(). One key naming two
+            # different quantities is how a period movement gets read as a
+            # closing liability — so the AP control names its own thing.
             "difference": difference,
             "currency_basis": (
                 f"{base_currency} base-currency MONETARY_AMOUNT on both AP "
@@ -1092,9 +1092,9 @@ class ModulePacks:
                 "currency populations fail closed"
             ),
             "gl_sign_basis": (
-                "Signed selected-period activity: debits positive, credits "
-                "negative; gl_balance is a compatibility alias for gl_total, "
-                "not an ending balance"
+                "Signed selected-period activity in gl_total: debits "
+                "positive, credits negative. This control reports no ending "
+                "balance"
             ),
             "population": population,
             "reconciling_categories": categories,

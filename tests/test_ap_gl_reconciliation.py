@@ -139,7 +139,11 @@ class APGLReconciliationTests(unittest.TestCase):
         self.assertTrue(out["aggregate_ties"])
         self.assertEqual(out["subledger_total"], self.ACTIVITY)
         self.assertEqual(out["gl_total"], self.ACTIVITY)
-        self.assertEqual(out["gl_balance"], self.ACTIVITY)
+        # gl_balance must NOT exist here: this control reports signed period
+        # activity, and AR's gl_tie already uses that key for a real ending
+        # balance. Two meanings behind one name is how a movement gets read
+        # as a closing liability.
+        self.assertNotIn("gl_balance", out)
         self.assertEqual(out["difference"], 0.0)
         self.assertEqual(out["currency"], "USD")
         self.assertEqual(out["accounting_source"], "PS_VCHR_ACCTG_LINE")

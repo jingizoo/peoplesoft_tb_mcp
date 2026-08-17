@@ -75,7 +75,7 @@ class RequestScopeTests(unittest.TestCase):
                 "status": "incomplete",
                 "evaluated": False,
                 "ties": None,
-                "gl_balance": 125000.0,
+                "gl_total": 125000.0,
                 "reason": "AP accounting-line evidence is unavailable",
             }),
         )
@@ -90,7 +90,7 @@ class RequestScopeTests(unittest.TestCase):
                 "evaluated": True,
                 "ties": False,
                 "subledger_total": 100.0,
-                "gl_balance": 75.0,
+                "gl_total": 75.0,
                 "difference": 25.0,
             }),
         )
@@ -100,24 +100,46 @@ class RequestScopeTests(unittest.TestCase):
     def test_ap_reconciliation_evidence_contract_is_whitelisted(self):
         for payload in (
             {"evaluated": True, "ties": True,
-             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+             "subledger_total": 0, "gl_total": 0, "difference": 0},
             {"status": "error", "evaluated": True, "ties": True,
-             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+             "subledger_total": 0, "gl_total": 0, "difference": 0},
             {"status": "evaluated", "evaluated": True, "ties": "yes",
-             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+             "subledger_total": 0, "gl_total": 0, "difference": 0},
             {"status": "evaluated", "evaluated": True, "ties": True,
-             "subledger_total": None, "gl_balance": 0, "difference": 0},
+             "subledger_total": None, "gl_total": 0, "difference": 0},
             {"status": "evaluated", "evaluated": True, "ties": True,
-             "subledger_total": float("nan"), "gl_balance": 0,
+             "subledger_total": float("nan"), "gl_total": 0,
              "difference": 0},
             {"status": "evaluated", "evaluated": True, "ties": True,
-             "subledger_total": 0, "gl_balance": float("inf"),
+             "subledger_total": 0, "gl_total": float("inf"),
              "difference": 0},
         ):
             with self.subTest(payload=payload):
                 ok, _ = tool_result_status(
                     "reconcile_ap_to_gl", json.dumps(payload))
                 self.assertFalse(ok)
+
+    def test_the_old_gl_balance_alias_cannot_satisfy_the_gate(self):
+        """The gate asks for the figure the control actually computes.
+
+        reconcile_ap_to_gl compares signed period ACTIVITY. It briefly
+        published gl_balance as an alias for gl_total purely to satisfy this
+        check, which meant the gate was asserting a balance nothing had
+        computed — and AR's gl_tie uses that same key for a real ending
+        balance from account_balance(). Accepting the alias here would let
+        the two quantities keep sharing a name.
+        """
+        ok, _ = tool_result_status(
+            "reconcile_ap_to_gl",
+            json.dumps({
+                "status": "evaluated", "evaluated": True, "ties": False,
+                "subledger_total": 100.0,
+                "gl_balance": 75.0,          # the alias, and nothing else
+                "difference": 25.0,
+            }),
+        )
+        self.assertFalse(ok, "a payload with only the legacy alias must not "
+                             "ground an AP/GL answer")
 
     def test_scope_aliases_are_normalized_and_injected(self):
         scope = normalize_request_scope({
