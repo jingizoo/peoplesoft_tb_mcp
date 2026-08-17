@@ -89,6 +89,30 @@ def _primary_database(path: Path) -> None:
             CREATE TABLE PRIVATE_AR_DATA (
               CUSTOMER_NAME TEXT, OPEN_AMOUNT REAL
             );
+
+            CREATE TABLE CORP_CUSTOMER_KEY (
+              BUSINESS_UNIT TEXT NOT NULL,
+              CUSTOMER_ID TEXT NOT NULL,
+              PRIMARY KEY (BUSINESS_UNIT, CUSTOMER_ID)
+            );
+            CREATE TABLE CORP_AR_DETAIL (
+              BUSINESS_UNIT TEXT NOT NULL,
+              CUSTOMER_ID TEXT NOT NULL,
+              LINE_NBR INTEGER NOT NULL,
+              DETAIL_STATUS TEXT,
+              PRIMARY KEY (BUSINESS_UNIT, CUSTOMER_ID, LINE_NBR),
+              UNIQUE (BUSINESS_UNIT, CUSTOMER_ID),
+              FOREIGN KEY (BUSINESS_UNIT, CUSTOMER_ID)
+                REFERENCES CORP_CUSTOMER_KEY (BUSINESS_UNIT, CUSTOMER_ID)
+            );
+            CREATE TABLE CORP_UNRESOLVED_REF (
+              EXTERNAL_ID TEXT,
+              FOREIGN KEY (EXTERNAL_ID)
+                REFERENCES NOT_DEPLOYED_OBJECT (EXTERNAL_ID)
+            );
+            CREATE VIEW CORP_AR_DETAIL_V AS
+              SELECT BUSINESS_UNIT, CUSTOMER_ID, LINE_NBR
+              FROM CORP_AR_DETAIL;
             """
         )
         con.executemany(
@@ -539,6 +563,220 @@ class PeopleToolsMetadataTests(_FixtureCase):
         self.assertEqual(current["effective_date"], "2025-01-01")
 
 
+class NativeLineageTests(_FixtureCase):
+    def test_lineage_limits_are_configurable_and_validated(self):
+        cfg = self._config()
+        cfg.metadata_catalog.max_constraints = 321
+        cfg.metadata_catalog.max_constraint_columns = 987
+        cfg.metadata_catalog.max_dependencies = 654
+        limits = MetadataBuildLimits.from_config(cfg.metadata_catalog)
+        self.assertEqual(limits.max_constraints, 321)
+        self.assertEqual(limits.max_constraint_columns, 987)
+        self.assertEqual(limits.max_dependencies, 654)
+        with self.assertRaises(Exception):
+            MetadataBuildLimits(max_constraints=0).validate()
+        with self.assertRaises(Exception):
+            MetadataBuildLimits(max_dependencies=2_000_001).validate()
+        with self.assertRaises(Exception):
+            MetadataBuildLimits(max_constraint_columns=5_000_001).validate()
+
+    def test_sqlite_primary_unique_and_foreign_keys_are_namespaced(self):
+        catalog, _ = self._build()
+        detail = catalog.context("CORP_AR_DETAIL", source="default", limit=50)
+        self.assertTrue(detail["found"], detail)
+        self.assertEqual(detail["schema"], "MAIN")
+        by_type = {item["type"]: item
+                   for item in detail.get("constraints") or []}
+        self.assertEqual(
+            by_type["primary_key"]["columns"],
+            ["BUSINESS_UNIT", "CUSTOMER_ID", "LINE_NBR"],
+        )
+        self.assertEqual(
+            by_type["unique"]["columns"],
+            ["BUSINESS_UNIT", "CUSTOMER_ID"],
+        )
+        foreign = by_type["foreign_key"]
+        self.assertEqual(
+            [(pair["column"], pair["referenced_column"])
+             for pair in foreign["column_pairs"]],
+            [("BUSINESS_UNIT", "BUSINESS_UNIT"),
+             ("CUSTOMER_ID", "CUSTOMER_ID")],
+        )
+        self.assertEqual(foreign["reference"]["source"], "default")
+        self.assertEqual(foreign["reference"]["schema"], "MAIN")
+        self.assertEqual(
+            foreign["reference"]["object"], "CORP_CUSTOMER_KEY")
+        self.assertEqual(
+            foreign["reference"]["resolution_status"], "resolved")
+
+    def test_unresolved_foreign_key_target_remains_explicit(self):
+        catalog, _ = self._build()
+        detail = catalog.context(
+            "CORP_UNRESOLVED_REF", source="default", limit=50)
+        foreign = next(item for item in detail["constraints"]
+                       if item["type"] == "foreign_key")
+        self.assertEqual(
+            foreign["reference"]["object"], "NOT_DEPLOYED_OBJECT")
+        self.assertEqual(
+            foreign["reference"]["resolution_status"], "unresolved")
+        self.assertEqual(foreign["reference"]["kind"], "external_object")
+        found = catalog.search(
+            "NOT_DEPLOYED_OBJECT", source="default", limit=20)
+        self.assertTrue(any(
+            hit.get("physical_object") == "CORP_UNRESOLVED_REF"
+            for hit in found.get("matches") or []
+        ), found)
+
+    def test_sqlite_view_dependency_gap_is_machine_readable_and_not_partial(self):
+        catalog, _ = self._build()
+        described = catalog.describe()
+        note = next(
+            item for item in described["notes"]
+            if item["source"] == "default"
+            and item["layer"] == "view_dependencies"
+        )
+        self.assertEqual(note["status"], "unavailable")
+        self.assertFalse(note["ok"])
+        self.assertFalse(note["partial"])
+        self.assertIn("full view sql", note["note"].lower())
+        # Unsupported dependency introspection must not erase the valid
+        # object/column/constraint coverage or label it partial.
+        self.assertFalse(described["snapshot"]["partial"], described)
+        self.assertNotIn("SELECT BUSINESS_UNIT", _artifact_text(
+            self.catalog_path).upper())
+
+    def test_constraint_limit_is_disclosed_as_partial(self):
+        cfg = self._config()
+        limits = MetadataBuildLimits.from_config(
+            cfg.metadata_catalog, max_constraints=1)
+        catalog, _ = self._build(limits=limits)
+        described = catalog.describe()
+        hit = next(item for item in described["limit_hits"]
+                   if item["layer"] == "constraints"
+                   and item["source"] == "default")
+        self.assertEqual(hit["limit"], 1)
+        self.assertEqual(hit["rows_kept"], 1)
+        self.assertTrue(described["snapshot"]["partial"])
+
+    def test_constraint_column_limit_is_applied_before_edge_allocation(self):
+        cfg = self._config()
+        limits = MetadataBuildLimits.from_config(
+            cfg.metadata_catalog, max_constraint_columns=2)
+        catalog, _ = self._build(limits=limits)
+        described = catalog.describe()
+        hit = next(item for item in described["limit_hits"]
+                   if item["layer"] == "constraint_columns"
+                   and item["source"] == "default")
+        self.assertEqual(hit["rows_kept"], 2)
+        detail = catalog.context(
+            "CORP_AR_DETAIL", source="default", limit=50)
+        primary = next(item for item in detail["constraints"]
+                       if item["type"] == "primary_key")
+        self.assertEqual(len(primary["columns"]), 2)
+        self.assertFalse(primary["rowset_complete"])
+        self.assertTrue(detail["snapshot"]["partial"])
+
+
+class NativeDependencyCollectorTests(unittest.TestCase):
+    def _state(self, max_dependencies: int = 10):
+        from pstb.metadata import _DDL, _Writer
+
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        con.executescript(_DDL)
+        state = _Writer(
+            con, MetadataBuildLimits(max_dependencies=max_dependencies))
+        return con, state
+
+    def test_resolved_view_dependency_targets_observed_object(self):
+        import json
+        from pstb.metadata import _collect_view_dependencies
+
+        con, state = self._state()
+        try:
+            view_id = state.node(
+                source="erp", schema="FIN", kind="view", name="AR_OPEN_V",
+                collector="db_catalog", evidence="ALL_OBJECTS",
+                authority="observed", confidence="confirmed")
+            table_id = state.node(
+                source="erp", schema="FIN", kind="table", name="AR_OPEN",
+                collector="db_catalog", evidence="ALL_OBJECTS",
+                authority="observed", confidence="confirmed")
+            objects = {
+                ("FIN", "AR_OPEN_V"): {
+                    "id": view_id, "schema": "FIN", "name": "AR_OPEN_V",
+                    "kind": "view"},
+                ("FIN", "AR_OPEN"): {
+                    "id": table_id, "schema": "FIN", "name": "AR_OPEN",
+                    "kind": "table"},
+            }
+            row = {
+                "schema_name": "FIN", "view_name": "AR_OPEN_V",
+                "referenced_schema": "FIN", "referenced_object": "AR_OPEN",
+                "referenced_type": "TABLE", "referenced_link": "",
+            }
+            db = SimpleNamespace(
+                dialect="oracle",
+                cfg=SimpleNamespace(db=SimpleNamespace(schema="FIN")))
+            with mock.patch(
+                    "pstb.metadata._view_dependency_pages",
+                    return_value=iter([([row], False)])):
+                count = _collect_view_dependencies(
+                    state, "erp", db, objects, object_overflow=False)
+            self.assertEqual(count, 1)
+            edge = con.execute(
+                "SELECT * FROM edges WHERE kind='view_depends_on'"
+            ).fetchone()
+            self.assertEqual((edge["src"], edge["dst"]),
+                             (view_id, table_id))
+            self.assertEqual(edge["confidence"], "confirmed")
+            self.assertEqual(
+                json.loads(edge["attrs"])["resolution_status"],
+                "resolved")
+        finally:
+            con.close()
+
+    def test_dependency_cap_precedes_unresolved_stub_allocation(self):
+        import json
+        from pstb.metadata import _collect_view_dependencies
+
+        con, state = self._state(max_dependencies=1)
+        try:
+            view_id = state.node(
+                source="erp", schema="FIN", kind="view", name="AR_OPEN_V",
+                collector="db_catalog", evidence="ALL_OBJECTS",
+                authority="observed", confidence="confirmed")
+            objects = {("FIN", "AR_OPEN_V"): {
+                "id": view_id, "schema": "FIN", "name": "AR_OPEN_V",
+                "kind": "view"}}
+            rows = [{
+                "schema_name": "FIN", "view_name": "AR_OPEN_V",
+                "referenced_schema": "EXT", "referenced_object": name,
+                "referenced_type": "TABLE", "referenced_link": "REMOTE",
+            } for name in ("FIRST_EXTERNAL", "SECOND_EXTERNAL")]
+            db = SimpleNamespace(
+                dialect="oracle",
+                cfg=SimpleNamespace(db=SimpleNamespace(schema="FIN")))
+            with mock.patch(
+                    "pstb.metadata._view_dependency_pages",
+                    return_value=iter([(rows, False)])):
+                count = _collect_view_dependencies(
+                    state, "erp", db, objects, object_overflow=False)
+            self.assertEqual(count, 1)
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM nodes WHERE kind='external_object'"
+            ).fetchone()[0], 1)
+            edge = con.execute(
+                "SELECT attrs FROM edges WHERE kind='view_depends_on'"
+            ).fetchone()
+            self.assertEqual(
+                json.loads(edge["attrs"])["resolution_status"], "unresolved")
+            self.assertEqual(state.limit_hits[0]["layer"],
+                             "view_dependencies")
+        finally:
+            con.close()
+
+
 class CrossSourceTests(_FixtureCase):
     def test_source_and_kind_filters_run_before_the_scan_cap(self) -> None:
         con = sqlite3.connect(self.primary_path)
@@ -658,7 +896,9 @@ class NativeCatalogDialectTests(unittest.TestCase):
             return self.responses.pop(0)
 
     def test_configured_oracle_uses_owner_scoped_all_catalogs_and_cursors(self):
-        from pstb.metadata import _column_pages, _index_pages, _object_page
+        from pstb.metadata import (_column_pages, _constraint_pages,
+                                   _index_pages, _object_page,
+                                   _view_dependency_pages)
 
         objects = self._Recorder("oracle", "sysadm", [([], False)])
         _object_page(objects, ("SYSADM", "FIRST_TABLE"), 25)
@@ -703,8 +943,45 @@ class NativeCatalogDialectTests(unittest.TestCase):
              "owner": "SYSADM"},
         )
 
+        constraint_row = {
+            "schema_name": "SYSADM", "object_name": "CORP_AR_QUEUE",
+            "constraint_name": "CORP_AR_QUEUE_PK", "constraint_type": "P",
+            "column_name": "BUSINESS_UNIT", "ordinal_position": 1,
+        }
+        constraints = self._Recorder(
+            "oracle", "sysadm", [([constraint_row], True), ([], False)])
+        list(_constraint_pages(constraints, page_size=1))
+        self.assertIn("FROM ALL_CONSTRAINTS", constraints.calls[0]["sql"])
+        self.assertIn("JOIN ALL_CONS_COLUMNS", constraints.calls[0]["sql"])
+        self.assertNotIn("SEARCH_CONDITION", constraints.calls[0]["sql"])
+        self.assertEqual(
+            constraints.calls[1]["params"],
+            {"t": "CORP_AR_QUEUE", "c": "CORP_AR_QUEUE_PK", "p": 1,
+             "owner": "SYSADM"},
+        )
+
+        dependency_row = {
+            "schema_name": "SYSADM", "view_name": "CORP_AR_QUEUE_V",
+            "referenced_schema": "SYSADM",
+            "referenced_object": "CORP_AR_QUEUE",
+            "referenced_type": "TABLE", "referenced_link": "",
+        }
+        dependencies = self._Recorder(
+            "oracle", "sysadm", [([dependency_row], True), ([], False)])
+        list(_view_dependency_pages(dependencies, page_size=1))
+        self.assertIn("FROM ALL_DEPENDENCIES", dependencies.calls[0]["sql"])
+        self.assertNotIn("ALL_VIEWS", dependencies.calls[0]["sql"])
+        self.assertNotIn("TEXT", dependencies.calls[0]["sql"])
+        self.assertEqual(
+            dependencies.calls[1]["params"],
+            {"v": "CORP_AR_QUEUE_V", "rs": "SYSADM",
+             "ro": "CORP_AR_QUEUE", "rl": "", "owner": "SYSADM"},
+        )
+
     def test_unconfigured_oracle_stays_in_current_user_catalogs(self):
-        from pstb.metadata import _column_pages, _index_pages, _object_page
+        from pstb.metadata import (_column_pages, _constraint_pages,
+                                   _index_pages, _object_page,
+                                   _view_dependency_pages)
 
         objects = self._Recorder("oracle", "", [([], False)])
         _object_page(objects, None, 25)
@@ -722,8 +999,21 @@ class NativeCatalogDialectTests(unittest.TestCase):
         self.assertIn("JOIN USER_INDEXES", indexes.calls[0]["sql"])
         self.assertNotIn("ALL_IND_COLUMNS", indexes.calls[0]["sql"])
 
+        constraints = self._Recorder("oracle", "", [([], False)])
+        list(_constraint_pages(constraints, page_size=10))
+        self.assertIn("FROM USER_CONSTRAINTS", constraints.calls[0]["sql"])
+        self.assertIn("JOIN USER_CONS_COLUMNS", constraints.calls[0]["sql"])
+        self.assertNotIn("ALL_CONSTRAINTS", constraints.calls[0]["sql"])
+
+        dependencies = self._Recorder("oracle", "", [([], False)])
+        list(_view_dependency_pages(dependencies, page_size=10))
+        self.assertIn("FROM USER_DEPENDENCIES", dependencies.calls[0]["sql"])
+        self.assertNotIn("ALL_DEPENDENCIES", dependencies.calls[0]["sql"])
+
     def test_sqlserver_pages_advance_schema_object_and_index_cursors(self):
-        from pstb.metadata import _column_pages, _index_pages, _object_page
+        from pstb.metadata import (_column_pages, _constraint_pages,
+                                   _index_pages, _object_page,
+                                   _view_dependency_pages)
 
         objects = self._Recorder("sqlserver", "", [([], False)])
         _object_page(objects, ("FIN", "AR_QUEUE"), 25)
@@ -765,6 +1055,54 @@ class NativeCatalogDialectTests(unittest.TestCase):
             indexes.calls[1]["params"],
             {"s": "FIN", "t": "AR_QUEUE", "i": "AR_QUEUE_U1", "p": 2},
         )
+
+        constraint_row = {
+            "schema_name": "FIN", "object_name": "AR_QUEUE",
+            "constraint_name": "AR_QUEUE_FK1", "constraint_type": "F",
+            "column_name": "CUSTOMER_ID", "ordinal_position": 1,
+            "referenced_schema": "FIN", "referenced_object": "CUSTOMER",
+            "referenced_column": "CUSTOMER_ID",
+        }
+        constraints = self._Recorder(
+            "sqlserver", "", [([constraint_row], True), ([], False)])
+        list(_constraint_pages(constraints, page_size=1))
+        sql = constraints.calls[0]["sql"]
+        self.assertIn("FROM sys.key_constraints", sql)
+        self.assertIn("FROM sys.foreign_keys", sql)
+        self.assertIn("JOIN sys.foreign_key_columns", sql)
+        self.assertNotIn("definition", sql.lower())
+        key_constraint_arm = sql.split("UNION ALL", 1)[0]
+        self.assertNotIn("KC.is_disabled", key_constraint_arm)
+        self.assertNotIn("KC.is_not_trusted", key_constraint_arm)
+        self.assertIn("KI.is_disabled", key_constraint_arm)
+        self.assertEqual(
+            constraints.calls[1]["params"],
+            {"s": "FIN", "t": "AR_QUEUE", "c": "AR_QUEUE_FK1", "p": 1},
+        )
+
+        dependency_row = {
+            "schema_name": "FIN", "view_name": "AR_QUEUE_V",
+            "referenced_schema": "FIN", "referenced_object": "AR_QUEUE",
+            "referenced_type": "TABLE", "referenced_database": "",
+            "referenced_server": "",
+        }
+        dependencies = self._Recorder(
+            "sqlserver", "", [([dependency_row], True), ([], False)])
+        list(_view_dependency_pages(dependencies, page_size=1))
+        dep_sql = dependencies.calls[0]["sql"]
+        self.assertIn("sys.sql_expression_dependencies", dep_sql)
+        self.assertNotIn("sys.sql_modules", dep_sql)
+        self.assertNotIn("OBJECT_DEFINITION", dep_sql)
+        self.assertEqual(
+            dependencies.calls[1]["params"],
+            {"s": "FIN", "v": "AR_QUEUE_V", "rs": "FIN",
+             "ro": "AR_QUEUE", "rd": "", "rsv": ""},
+        )
+
+        scoped = self._Recorder("sqlserver", "fin", [([], False)])
+        list(_constraint_pages(scoped, page_size=10))
+        self.assertIn("UPPER(Q.schema_name)=:owner", scoped.calls[0]["sql"])
+        self.assertEqual(scoped.calls[0]["params"]["owner"], "FIN")
 
 
 class ArtifactStateTests(_FixtureCase):
@@ -936,6 +1274,8 @@ class SafetyAndBoundTests(_FixtureCase):
         catalog, _ = self._build()
         out = catalog.context("CORP_AR_QUEUE", source="default", limit=1)
         related = ((out.get("columns") or []) + (out.get("indexes") or [])
+                   + (out.get("constraints") or [])
+                   + (out.get("dependencies") or [])
                    + (out.get("mappings") or []))
         self.assertLessEqual(len(related), 1)
         self.assertTrue(out["truncated"])
@@ -945,6 +1285,8 @@ class SafetyAndBoundTests(_FixtureCase):
         self.assertLessEqual(
             len((enormous.get("columns") or [])
                 + (enormous.get("indexes") or [])
+                + (enormous.get("constraints") or [])
+                + (enormous.get("dependencies") or [])
                 + (enormous.get("mappings") or [])),
             100,
         )

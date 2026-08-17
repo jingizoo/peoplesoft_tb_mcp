@@ -25,6 +25,7 @@ defaults:
   retained_earnings_account: "3500"
   account_tree: ACCOUNT   # default PSTREE name for rollups
   ar_control_accounts: ["1100"]   # GL account(s) the AR subledger must tie to
+  ap_control_accounts: []          # Finance-approved AP liability accounts; empty = reconciliation refuses
   aging_buckets: [30, 60, 90]     # aging day edges -> current, 1-30, 31-60, 61-90, over_90
 
 db:
@@ -120,6 +121,7 @@ wiki:
 tools:
   allow_raw_sql: true     # guarded SELECT-only run_sql/list_tables/describe_table tools
   max_rows: 200           # cap on rows returned to the LLM
+  ap_reconciliation_line_cap: 50000  # per-side AP/GL activity read cap; runtime hard cap 100000
   reports_path: reports   # folder of nVision-style report definitions (JSON)
   question_log: logs/questions.jsonl   # every chat turn + failure flags ("" disables)
   txn_row_threshold: 1000 # a TRANSACTION table under this row count is flagged
@@ -159,9 +161,27 @@ metadata_catalog:
   max_objects: 100000
   max_fields: 500000
   max_indexes: 250000
+  max_constraints: 250000  # primary/unique/foreign-key definitions per source
+  max_constraint_columns: 1000000 # ordered columns across those constraints
+  max_dependencies: 250000 # view-to-object dependency edges per source
   max_peopletools_rows: 500000
   query_page_size: 5000
   stale_after_hours: 168
+
+# Optional hybrid retrieval. The catalog first chooses a bounded, explainable
+# candidate set; Vertex embeddings may only reorder those candidates. Enabling
+# this sends the user's search text and STRUCTURAL metadata names/labels to the
+# configured Google Cloud project. It never sends transaction rows and never
+# changes catalog confidence or satisfies financial evidence.
+semantic_retrieval:
+  enabled: false
+  provider: vertex
+  model: gemini-embedding-001
+  location: global
+  output_dimensionality: 768
+  candidate_limit: 20
+  semantic_weight: 0.35
+  timeout_seconds: 15       # each Vertex call; runtime clamps to 1-60 seconds
 
 # Daily transaction/interface and operational-process anomaly detection.
 # Physical table names are read from the live catalog; no PS_ prefix is

@@ -28,6 +28,7 @@ from .metadata import (MetadataCatalog, MetadataError,
 from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
+from .rerank import HybridReranker
 from .relationships import Relationships
 from .vendors import VendorNetwork
 from .report import ReportError, ReportRunner
@@ -61,6 +62,7 @@ process_graph = ProcessGraph(graph_path(cfg))
 metadata_catalog = MetadataCatalog(
     _metadata_path(cfg),
     stale_after_hours=getattr(cfg.metadata_catalog, "stale_after_hours", 168))
+metadata_reranker = HybridReranker.from_config(cfg)
 from .psquery import QueryCatalog
 from .sources import SourceRegistry
 engine.registry = SourceRegistry(cfg, db)
@@ -414,8 +416,18 @@ def search_metadata(query: str, source: str = "", kinds: str = "",
     source narrows to one configured database; kinds is an optional comma list
     such as table,view,record,field. Call get_metadata_context before querying
     an unfamiliar result. Metadata is not financial evidence."""
-    return _safe(metadata_catalog.search, query=query, source=source,
-                 kinds=kinds, limit=limit)
+    def _search() -> dict:
+        result = metadata_catalog.search(
+            query=query, source=source, kinds=kinds, limit=limit)
+        matches = result.get("matches") if isinstance(result, dict) else None
+        if not isinstance(matches, list) or not metadata_reranker.enabled:
+            return result
+        ranked = metadata_reranker.rerank(query, matches)
+        result["matches"] = ranked.pop("matches")
+        result["semantic_rerank"] = ranked
+        return result
+
+    return _safe(_search)
 
 
 @mcp.tool()
@@ -1193,6 +1205,44 @@ def get_open_payables(business_unit: str = "", as_of_date: str = "") -> dict:
     anything stuck in AP". This is the payables mirror of get_ar_aging."""
     return _safe(modules.open_payables, business_unit=business_unit,
                  as_of_date=as_of_date)
+
+
+@mcp.tool()
+def reconcile_ap_to_gl(
+    control_accounts: str = "",
+    business_unit: str = "",
+    ledger: str = "",
+    fiscal_year: int = 0,
+    period: int = 0,
+    as_of_date: str = "",
+) -> dict:
+    """AP/GL ACTIVITY RECONCILIATION: compare account-attributed AP
+    accounting activity to posted GL journal activity for one business unit.
+
+    control_accounts is a comma-separated Finance-approved list. If omitted,
+    defaults.ap_control_accounts must be configured; no account is guessed.
+    Empty fiscal_year/period resolves from as_of_date, or uses the latest
+    posted GL period when no date is supplied.
+
+    Read status/evaluated/ties before narrating a result. Evaluation requires
+    an AP accounting-line source with account, GL business unit, base amount,
+    posting/distribution status, and complete Journal Generator keys; those
+    keys are matched to posted PS_JRNL_HEADER/PS_JRNL_LN lines. Missing fields,
+    incomplete keys, mixed currencies, ambiguous rows, and safety caps fail
+    closed. Voucher gross/payment arithmetic is never substituted. The result
+    is signed selected-period activity (debits positive, credits negative),
+    not the ending open-liability balance; use delivered APY1400/APY1405 for
+    that separate control, and APY1410/APY1420 for delivered activity detail.
+    Observed categories identify exceptions without inventing their cause."""
+    return _safe(
+        modules.reconcile_ap_to_gl,
+        control_accounts=control_accounts,
+        business_unit=business_unit,
+        ledger=ledger,
+        fiscal_year=fiscal_year,
+        period=period,
+        as_of_date=as_of_date,
+    )
 
 
 @mcp.tool()

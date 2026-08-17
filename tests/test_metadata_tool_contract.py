@@ -8,6 +8,7 @@ financial evidence gate merely because its result is non-empty.
 from __future__ import annotations
 
 import inspect
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -41,12 +42,46 @@ class MetadataToolContractTests(unittest.TestCase):
         )
 
     def test_metadata_is_structural_and_never_financial_evidence(self) -> None:
-        from pstb.guards import FINANCIAL_EVIDENCE_TOOLS, STRUCTURAL_TOOLS
+        from pstb.guards import (FINANCIAL_EVIDENCE_TOOLS, STRUCTURAL_TOOLS,
+                                 financial_tool_domains,
+                                 financial_tool_is_relevant)
 
         for tool in ("describe_metadata_catalog", "search_metadata",
                      "get_metadata_context"):
             self.assertIn(tool, STRUCTURAL_TOOLS)
             self.assertNotIn(tool, FINANCIAL_EVIDENCE_TOOLS)
+            self.assertEqual(financial_tool_domains(tool), set())
+            self.assertFalse(financial_tool_is_relevant(
+                tool, "How many billing-interface rows are rejected?"))
+
+    def test_acceptance_pack_uses_metadata_first_custom_paths(self) -> None:
+        cases = {
+            c["id"]: c
+            for c in json.loads((ROOT / "evals" / "cases.json").read_text(
+                encoding="utf-8"))["cases"]
+        }
+        required = {
+            "custom-record": "get_metadata_context",
+            "custom-billing-record-no-prefix": "get_metadata_context",
+            "metadata-field-label-discovery": "search_metadata",
+            "metadata-ambiguous-source-schema": "get_metadata_context",
+            "metadata-live-evidence-boundary": "run_sql",
+        }
+        for case_id, required_tool in required.items():
+            self.assertIn(case_id, cases)
+            expect = cases[case_id]["expect"]
+            self.assertIn(required_tool, expect.get("any_tool") or [])
+            self.assertIn("search_records", expect.get("not_tool") or [])
+
+        live = cases["metadata-live-evidence-boundary"]
+        self.assertEqual(
+            live["expect"]["tool_args_contain"]["business_unit"], "US001")
+        self.assertEqual(live["expect"]["ordered_tools"], [
+            "search_metadata", "get_metadata_context", "run_sql"])
+        self.assertEqual(live["expect"]["all_tools"], [
+            "search_metadata", "get_metadata_context", "run_sql"])
+        self.assertIn("metadata alone is not an answer",
+                      live["question"].lower())
 
     def test_metadata_tools_receive_no_business_unit_scope_argument(self) -> None:
         from pstb.guards import _TOOL_SCOPE_ARGS
@@ -84,6 +119,46 @@ class MetadataToolContractTests(unittest.TestCase):
             self.assertIn(
                 f"if(name==='{tool}') return {renderer}(data);", html)
         self.assertIn("unresolved — do not guess", html)
+        self.assertIn("Declared keys & relationships", html)
+        self.assertIn("View lineage", html)
+        self.assertIn("database-native dependency catalog, no stored SQL", html)
+        self.assertIn("matched metadata:", html)
+        self.assertIn("semantic advisory order", html)
+        self.assertIn("deterministic fallback", html)
+        self.assertIn("semantic weight", html)
+
+    def test_semantic_reranker_is_advisory_inside_structural_search(self):
+        from pstb import server
+
+        class FakeReranker:
+            enabled = True
+
+            def rerank(self, query, matches):
+                return {
+                    "matches": list(reversed(matches)),
+                    "applied": True, "status": "applied",
+                    "boundary": "only reordered deterministic candidates",
+                }
+
+        class FakeCatalog:
+            def search(self, **kwargs):
+                return {"available": True, "matches": [
+                    {"object_id": "one", "confidence": "confirmed"},
+                    {"object_id": "two", "confidence": "candidate"},
+                ]}
+
+        old_catalog, old_reranker = server.metadata_catalog, server.metadata_reranker
+        try:
+            server.metadata_catalog = FakeCatalog()
+            server.metadata_reranker = FakeReranker()
+            got = server.search_metadata("business phrase")
+        finally:
+            server.metadata_catalog = old_catalog
+            server.metadata_reranker = old_reranker
+        self.assertEqual([row["object_id"] for row in got["matches"]],
+                         ["two", "one"])
+        self.assertEqual(got["matches"][0]["confidence"], "candidate")
+        self.assertTrue(got["semantic_rerank"]["applied"])
 
 
 class PublicQueryOwnerPortabilityTests(unittest.TestCase):

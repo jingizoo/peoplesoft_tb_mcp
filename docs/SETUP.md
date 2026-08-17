@@ -839,7 +839,8 @@ metadata_catalog:
   stale_after_hours: 168
 ```
 
-Use `--max-objects`, `--max-fields`, `--max-indexes`,
+Use `--max-objects`, `--max-fields`, `--max-indexes`, `--max-constraints`,
+`--max-constraint-columns`, `--max-dependencies`,
 `--max-peopletools-rows` or `--page-size` for a one-build override. The
 builder writes a mode-`0600` `.building` file and atomically publishes
 `metadata_catalog.db`; a failed or empty build preserves the prior artifact.

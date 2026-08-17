@@ -1615,6 +1615,21 @@ function renderMetadataSearch(d){
   c.append(el('h2',null,'Metadata matches'+
     (d.query?'<span class="sub">“'+esc(d.query)+'”</span>':'')));
   if(!metadataStatus(c,d)) return c;
+  const sr=d.semantic_rerank;
+  if(sr){
+    const applied=sr.applied===true, unavailable=sr.status==='unavailable';
+    const label=applied?'semantic advisory order':
+      unavailable?'deterministic fallback':'semantic ordering not needed';
+    const details=[];
+    if(applied&&sr.provider) details.push(sr.provider+(sr.model?' · '+sr.model:''));
+    if(applied&&Number.isFinite(Number(sr.weight)))
+      details.push(Math.round(Number(sr.weight)*100)+'% semantic weight');
+    if(sr.detail) details.push(sr.detail);
+    if(sr.boundary) details.push(sr.boundary);
+    c.append(el('div','pad','<span class="badge '+
+      (unavailable?'warn':'dim')+'">'+esc(label)+'</span> '+
+      esc(details.join(' · '))));
+  }
   const rows=d.matches||[];
   if(!rows.length){
     c.append(el('div','pad','No indexed object matched. '+esc(d.detail||'')));
@@ -1632,6 +1647,12 @@ function renderMetadataSearch(d){
       ((r.matched_terms||[]).length?'<div class="sub">terms: '+
         r.matched_terms.map(esc).join(', ')+' · coverage '+
         esc(Math.round((r.term_coverage||0)*100))+'%</div>':'')+
+      ((r.matched_metadata||[]).length?'<div class="sub">matched metadata: '+
+        r.matched_metadata.slice(0,5).map(m=>
+          esc((m.kind||'metadata')+' '+(m.name||''))+(
+            m.label?' — '+esc(m.label):'')+(
+            (m.facets||[]).length?' ['+m.facets.map(esc).join(', ')+']':'')
+        ).join(' · ')+'</div>':'')+
       '</td><td>'+metadataConfidence(r.confidence)+'</td></tr>').join('')+'</tbody>';
   const sc=el('div');sc.style.maxHeight='420px';sc.style.overflow='auto';sc.append(t);c.append(sc);
   if(d.truncated) c.append(el('div','pad warn','More matches exist; narrow the source, kind, or wording.'));
@@ -1671,6 +1692,28 @@ function renderMetadataContext(d){
     c.append(el('h2',null,'Indexes <span class="sub">ordered leading columns</span>'));
     c.append(genericTable(d.indexes.map(i=>({name:i.name,unique:i.unique?'yes':'no',
       columns:(i.columns||[]).join(' → '),coverage:i.coverage_note||''}))));
+  }
+  if((d.constraints||[]).length){
+    c.append(el('h2',null,'Declared keys & relationships <span class="sub">native database constraints</span>'));
+    c.append(genericTable(d.constraints.map(k=>({
+      name:k.name,type:(k.type||'').replace(/_/g,' '),
+      columns:(k.columns||[]).join(' → '),
+      references:k.reference
+        ?[k.reference.source,k.reference.schema,k.reference.object]
+          .filter(Boolean).join('.'):'',
+      column_pairs:(k.column_pairs||[]).map(p=>
+        (p.column||'')+' → '+(p.referenced_column||'')).join(' · '),
+      resolution:k.reference?k.reference.resolution_status:'',
+      completeness:k.rowset_complete===false?'partial':'complete'
+    }))));
+  }
+  if((d.dependencies||[]).length){
+    c.append(el('h2',null,'View lineage <span class="sub">database-native dependency catalog, no stored SQL</span>'));
+    c.append(genericTable(d.dependencies.map(x=>({
+      direction:x.direction,relationship:x.relationship,
+      source:x.source,schema:x.schema,object:x.object,kind:x.kind,
+      resolution:x.resolution_status,confidence:x.confidence
+    }))));
   }
   if((d.columns||[]).length){
     c.append(el('h2',null,'Columns & PeopleTools meaning'));
@@ -1940,6 +1983,11 @@ function resultBadge(d){
   if(!d||typeof d!=='object') return null;
   const bad=d.scope_status&&d.scope_status!=='ok';
   if(bad) return {text:'no data',cls:'bad'};
+  if(d.status==='no_data') return {text:'no data',cls:'bad'};
+  if(d.status==='incomplete'||d.evaluated===false)
+    return {text:'incomplete',cls:'warn'};
+  if(d.evaluated===true&&typeof d.ties==='boolean')
+    return {text:d.ties?'reconciled':'difference',cls:d.ties?'ok':'bad'};
   if(d.status==='checks_incomplete'||d.verdict==='incomplete'||
       (d.checks_incomplete||[]).length) return {text:'incomplete',cls:'warn'};
   if(Array.isArray(d.alerts)) return {text:d.alerts.length+' alert'+(d.alerts.length===1?'':'s'),
@@ -1986,6 +2034,7 @@ function renderToolResult(name,data,args){
     if(name==='get_procurement_chain') return renderProcurementChain(data);
     if(name==='get_invoice_totals') return renderInvoiceTotals(data);
     if(name==='get_open_payables') return renderOpenPayables(data);
+    if(name==='reconcile_ap_to_gl') return renderAPReconciliation(data);
     if(name==='get_vendor_payments') return renderVendorPayments(data);
     if(name==='get_duplicate_payments') return renderDuplicatePayments(data);
     if(name==='get_ar_aging') return renderAging(data);
@@ -2662,6 +2711,100 @@ function renderInvoiceTotals(d){
       'Excluded amounts are unreliable before finalization writes them — trust the bill counts.'));
   c.append(el('div','pad sub','Override: '+esc(pop.override||'')));
   frag.append(c);
+  return frag;
+}
+function renderAPReconciliation(d){
+  const frag=document.createDocumentFragment();
+  const evaluated=d.evaluated===true;
+  const noData=d.status==='no_data'||(d.scope_status&&d.scope_status!=='ok');
+  const badge=noData
+    ?'<span class="badge bad">No data</span>'
+    :(evaluated
+      ?'<span class="badge '+(d.ties?'ok':'bad')+'">'+
+        (d.ties?'Reconciled':'Difference')+'</span>'
+      :'<span class="badge warn">Incomplete — no conclusion</span>');
+  const period=(d.fiscal_year&&d.period)?' · FY'+esc(d.fiscal_year)+' P'+esc(d.period):'';
+  const head=el('div','card');
+  head.append(el('h2',null,'AP to GL reconciliation '+badge+
+    '<span class="sub">'+esc(d.business_unit||'')+' · '+esc(d.ledger||'')+period+'</span>'));
+  head.append(el('div','pad',esc(d.reason||d.detail||(
+    evaluated?'Both sides were evaluated on the disclosed basis.':
+    'The control did not have enough compatible evidence to evaluate.'))));
+  frag.append(head);
+
+  // A partial call may still have one observed side. Show it as an
+  // observation, never as a tie-out or implied zero for the missing side.
+  const present=v=>v!==null&&v!==undefined&&v!=='';
+  const observed=[];
+  if(present(d.subledger_total)) observed.push([
+    evaluated?'AP period activity':'AP side observed',money(d.subledger_total),
+    esc(d.currency||''),'dr']);
+  if(present(d.gl_balance)) observed.push([
+    evaluated?'GL period activity':'GL side observed',money(d.gl_balance),
+    esc(d.currency||''),'cr']);
+  if(evaluated&&present(d.difference)) observed.push([
+    'Difference',money(d.difference),'AP minus GL',d.ties?'':'cr']);
+  if(observed.length) frag.append(tiles(observed));
+
+  const basis=el('div','card');
+  basis.append(el('h2',null,'Control basis <span class="sub">what was actually compared</span>'));
+  const cutoff=d.cutoff||{};
+  const population=d.population||{};
+  const accounts=(d.control_accounts||[]).join(', ')||'not configured';
+  const rows=[
+    ['Control accounts',accounts,d.control_accounts_source||''],
+    ['Cut-off',cutoff.aligned?'aligned':'not aligned',
+      cutoff.reason||cutoff.gl_basis||d.as_of||''],
+    ['AP population',population.basis||d.subledger_basis||'not evaluated',
+      population.status||''],
+    ['Amount basis',d.amount_basis||'not established',
+      d.report_precedent||''],
+    ['Currency / sign',d.currency||'not established',
+      d.gl_sign_basis||d.currency_basis||''],
+  ];
+  const bt=el('table');
+  bt.innerHTML='<thead><tr><th>Basis</th><th>Value</th><th>Evidence</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr><td><b>'+esc(r[0])+'</b></td><td>'+esc(r[1])+'</td><td class="sub">'+
+      esc(r[2])+'</td></tr>').join('')+'</tbody>';
+  basis.append(bt);
+  frag.append(basis);
+
+  if(Object.keys(population).length){
+    const pc=el('div','card');
+    pc.append(el('h2',null,'Population coverage <span class="sub">journal-key and status completeness</span>'));
+    const metrics=[
+      ['AP rows read',population.ap_rows_read],
+      ['Distributed AP journal keys',population.ap_distributed_journal_keys],
+      ['GL rows read',population.gl_rows_read],
+      ['Posted GL journal lines',population.gl_posted_journal_lines],
+      ['Matched journal keys',population.matched_journal_keys],
+      ['Unmatched AP keys',population.unmatched_ap_keys],
+      ['Unmatched GL keys',population.unmatched_gl_keys],
+    ].filter(x=>present(x[1])).map(x=>({measure:x[0],count:x[1]}));
+    if(metrics.length) pc.append(genericTable(metrics));
+    if((population.status_groups||[]).length){
+      pc.append(el('h2',null,'AP posting-process status groups'));
+      pc.append(genericTable(population.status_groups));
+    }
+    frag.append(pc);
+  }
+
+  const cats=d.reconciling_categories||[];
+  if(cats.length){
+    const cc=el('div','card');
+    cc.append(el('h2',null,'Evidence and investigation paths <span class="sub">observed is not the same as inferred</span>'));
+    const ct=el('table');
+    ct.innerHTML='<thead><tr><th>Category</th><th>Evidence</th><th class="num">Amount</th><th>Explanation</th></tr></thead><tbody>'+
+      cats.map(x=>'<tr><td>'+esc((x.category||'').replace(/_/g,' '))+'</td><td><span class="badge '+
+        (x.evidence==='observed'?'ok':'dim')+'">'+esc(x.evidence||'not evaluated')+'</span></td><td class="num">'+
+        (present(x.amount)?money(x.amount):present(x.signed_amount)?money(x.signed_amount):'—')+
+        '</td><td>'+esc(x.note||'')+'</td></tr>').join('')+'</tbody>';
+    cc.append(ct);frag.append(cc);
+  }
+  if(!evaluated){
+    frag.append(el('div','card','<div class="pad"><span class="badge warn">Do not conclude</span> '+
+      'An incomplete result cannot support an AP balance, GL difference, pass, or fail conclusion.</div>'));
+  }
   return frag;
 }
 function renderAging(d){

@@ -33,6 +33,7 @@ _GL_TOOLS = {
     "explain_balance_change", "get_budget_variance", "drill_to_journals",
     "tb_integrity_check", "rollup_trial_balance", "search_accounts",
     "list_reports", "run_report", "list_playbooks", "run_playbook",
+    "reconcile_ap_to_gl",
     "list_trees", "get_tree_node_accounts", "get_exchange_rate",
 }
 _BI_AR_TOOLS = {
@@ -47,6 +48,7 @@ _AP_TOOLS = {
     "search_vendors", "get_vendor_payables_network", "get_match_exceptions",
     "get_procurement_chain", "get_cash_outlook", "get_vendor_intelligence",
     "get_open_payables", "get_vendor_payments", "get_duplicate_payments",
+    "reconcile_ap_to_gl",
     "get_entity_network", "get_concentration", "get_entity_connection",
     "get_coupa_invoices", "get_coupa_stuck_approvals", "get_coupa_rni",
     "get_coupa_supplier_spend", "get_coupa_budget_lines",

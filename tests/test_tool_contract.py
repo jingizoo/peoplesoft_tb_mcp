@@ -141,6 +141,18 @@ class FinancePresentationContractTests(unittest.TestCase):
         self.assertIn("not confirmed paid twice", self.html)
         self.assertIn("historical limitation", self.html)
 
+    def test_ap_reconciliation_leads_with_evaluation_status(self) -> None:
+        self.assertIn(
+            "if(name==='reconcile_ap_to_gl') return renderAPReconciliation(data);",
+            self.html,
+        )
+        self.assertIn("function renderAPReconciliation", self.html)
+        self.assertIn("Incomplete — no conclusion", self.html)
+        self.assertIn("An incomplete result cannot support", self.html)
+        self.assertIn("AP period activity", self.html)
+        self.assertIn("Population coverage", self.html)
+        self.assertIn("Amount basis", self.html)
+
     def test_starter_questions_are_grouped_by_controller_workstream(self) -> None:
         self.assertIn("starter-groups", self.html)
         for label in ("Billing & AR", "Accounts payable", "GL & close"):

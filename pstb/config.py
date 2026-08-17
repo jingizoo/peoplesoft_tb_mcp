@@ -25,6 +25,11 @@ class Defaults:
     retained_earnings_account: str = "3500"
     account_tree: str = "ACCOUNT"
     ar_control_accounts: list = field(default_factory=lambda: ["1100"])
+    # Site-governed AP liability accounts. Empty is deliberate: unlike the
+    # bundled AR example, no AP account number is portable enough to assume.
+    # reconcile_ap_to_gl fails closed until Finance configures this list or
+    # the caller explicitly supplies the approved accounts.
+    ap_control_accounts: list = field(default_factory=list)
     aging_buckets: list = field(default_factory=lambda: [30, 60, 90])
 
 
@@ -118,6 +123,10 @@ class ToolsCfg:
     # want it; what needs a deliberate hand is the third case.
     raw_sql_on_shared_bind: bool = False
     max_rows: int = 200
+    # Period AP/GL activity is read into bounded in-memory key maps. This cap
+    # applies independently to each side; runtime also enforces a 100k hard
+    # ceiling even if configuration is higher.
+    ap_reconciliation_line_cap: int = 50_000
     reports_path: str = "reports"
     question_log: str = "logs/questions.jsonl"
     # Facts about THIS installation, approved by an operator. A plain
@@ -162,9 +171,34 @@ class MetadataCatalogCfg:
     max_objects: int = 100_000
     max_fields: int = 500_000
     max_indexes: int = 250_000
+    max_constraints: int = 250_000
+    max_constraint_columns: int = 1_000_000
+    max_dependencies: int = 250_000
     max_peopletools_rows: int = 500_000
     query_page_size: int = 5_000
     stale_after_hours: int = 168
+
+
+@dataclass
+class SemanticRetrievalCfg:
+    """Optional semantic re-ranking for already-safe metadata candidates.
+
+    This is deliberately a re-ranker, not a vector database or an alternate
+    search path.  The deterministic catalog remains responsible for choosing
+    candidates and explaining relationship confidence; an embedding model may
+    only change their display order.  Disabled by default because enabling the
+    Vertex provider sends the query and structural metadata names to Google.
+    """
+    enabled: bool = False
+    provider: str = "vertex"       # currently: vertex
+    model: str = "gemini-embedding-001"
+    location: str = "global"
+    output_dimensionality: int = 768
+    candidate_limit: int = 20
+    semantic_weight: float = 0.35
+    # Per embedding request. Vertex receives one bounded candidate at a time,
+    # so an explicit timeout is required for deterministic fallback.
+    timeout_seconds: int = 15
 
 
 @dataclass
@@ -276,6 +310,8 @@ class Config:
     process_graph: ProcessGraphCfg = field(default_factory=ProcessGraphCfg)
     metadata_catalog: MetadataCatalogCfg = field(
         default_factory=MetadataCatalogCfg)
+    semantic_retrieval: SemanticRetrievalCfg = field(
+        default_factory=SemanticRetrievalCfg)
     anomalies: AnomalyCfg = field(default_factory=AnomalyCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
 
@@ -460,6 +496,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.tools, data.get("tools"))
         _apply_section(cfg.process_graph, data.get("process_graph"))
         _apply_section(cfg.metadata_catalog, data.get("metadata_catalog"))
+        _apply_section(cfg.semantic_retrieval, data.get("semantic_retrieval"))
         _apply_section(cfg.anomalies, data.get("anomalies"))
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))

@@ -17,6 +17,7 @@ from pstb.guards import (
     financial_tool_is_relevant,
     normalize_request_scope,
     question_financial_domains,
+    tool_result_status,
 )
 
 
@@ -67,6 +68,57 @@ def call(call_id, name, **args):
 
 
 class RequestScopeTests(unittest.TestCase):
+    def test_incomplete_ap_reconciliation_is_not_financial_evidence(self):
+        ok, reason = tool_result_status(
+            "reconcile_ap_to_gl",
+            json.dumps({
+                "status": "incomplete",
+                "evaluated": False,
+                "ties": None,
+                "gl_balance": 125000.0,
+                "reason": "AP accounting-line evidence is unavailable",
+            }),
+        )
+        self.assertFalse(ok)
+        self.assertIn("accounting-line", reason)
+
+    def test_evaluated_ap_reconciliation_can_ground_an_answer(self):
+        ok, reason = tool_result_status(
+            "reconcile_ap_to_gl",
+            json.dumps({
+                "status": "evaluated",
+                "evaluated": True,
+                "ties": False,
+                "subledger_total": 100.0,
+                "gl_balance": 75.0,
+                "difference": 25.0,
+            }),
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_ap_reconciliation_evidence_contract_is_whitelisted(self):
+        for payload in (
+            {"evaluated": True, "ties": True,
+             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+            {"status": "error", "evaluated": True, "ties": True,
+             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+            {"status": "evaluated", "evaluated": True, "ties": "yes",
+             "subledger_total": 0, "gl_balance": 0, "difference": 0},
+            {"status": "evaluated", "evaluated": True, "ties": True,
+             "subledger_total": None, "gl_balance": 0, "difference": 0},
+            {"status": "evaluated", "evaluated": True, "ties": True,
+             "subledger_total": float("nan"), "gl_balance": 0,
+             "difference": 0},
+            {"status": "evaluated", "evaluated": True, "ties": True,
+             "subledger_total": 0, "gl_balance": float("inf"),
+             "difference": 0},
+        ):
+            with self.subTest(payload=payload):
+                ok, _ = tool_result_status(
+                    "reconcile_ap_to_gl", json.dumps(payload))
+                self.assertFalse(ok)
+
     def test_scope_aliases_are_normalized_and_injected(self):
         scope = normalize_request_scope({
             "bu": " US200 ", "ledger": "ACTUALS", "fy": "2026", "per": "6",

@@ -42,6 +42,23 @@ class ControllerQuestionIntentTests(unittest.TestCase):
                 "Show GRNI at June close"):
             self.assertEqual(evidence_intent(question), "data", question)
 
+    def test_paid_as_a_verb_still_requires_ap_evidence(self) -> None:
+        from pstb.guards import evidence_intent
+        question = "Which records show we paid anything twice?"
+        self.assertEqual(evidence_intent(question), "data")
+        self.assertIn("ap", question_financial_domains(question))
+
+    def test_delivered_ap_reconciliation_report_names_require_evidence(self) -> None:
+        from pstb.guards import evidence_intent
+        for code in ("APY1400", "APY1405", "APY1410", "APY1420"):
+            question = f"Is the {code} reconciliation clean?"
+            self.assertEqual(evidence_intent(question), "data", question)
+            self.assertIn("ap", question_financial_domains(question), question)
+        for code in ("APY1410", "APY1420"):
+            self.assertIn(
+                "balance",
+                question_financial_domains(f"Does {code} reconcile?"), code)
+
     def test_gl_close_question_forces_a_data_turn(self) -> None:
         from pstb.guards import evidence_intent
         self.assertEqual(evidence_intent("Are we ready to close GL?"),

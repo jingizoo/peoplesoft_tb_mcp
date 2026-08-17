@@ -7,7 +7,8 @@ one local SQLite artifact read-only.
 
 The catalog keeps three claims separate:
 
-* observed -- a physical object/column/index visible in the database catalog;
+* observed -- a physical object, column, index, constraint, or dependency
+  visible in the database catalog;
 * declared -- a PeopleTools definition such as PSRECDEFN.SQLTABLENAME;
 * inferred -- a unique suffix mapping when no explicit physical name exists.
 
@@ -28,13 +29,16 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_FILENAME = "metadata_catalog.db"
 MAX_RESULT_CAP = 100
 
 HARD_MAX_OBJECTS = 1_000_000
 HARD_MAX_FIELDS = 5_000_000
 HARD_MAX_INDEXES = 2_000_000
+HARD_MAX_CONSTRAINTS = 2_000_000
+HARD_MAX_CONSTRAINT_COLUMNS = 5_000_000
+HARD_MAX_DEPENDENCIES = 2_000_000
 HARD_MAX_PEOPLETOOLS_ROWS = 5_000_000
 HARD_MAX_PAGE_SIZE = 25_000
 
@@ -84,6 +88,9 @@ class MetadataBuildLimits:
     max_objects: int = 100_000
     max_fields: int = 500_000
     max_indexes: int = 250_000
+    max_constraints: int = 250_000
+    max_constraint_columns: int = 1_000_000
+    max_dependencies: int = 250_000
     max_peopletools_rows: int = 500_000
     query_page_size: int = 5_000
     stale_after_hours: int = 168
@@ -108,6 +115,10 @@ class MetadataBuildLimits:
             ("max_objects", self.max_objects, HARD_MAX_OBJECTS),
             ("max_fields", self.max_fields, HARD_MAX_FIELDS),
             ("max_indexes", self.max_indexes, HARD_MAX_INDEXES),
+            ("max_constraints", self.max_constraints, HARD_MAX_CONSTRAINTS),
+            ("max_constraint_columns", self.max_constraint_columns,
+             HARD_MAX_CONSTRAINT_COLUMNS),
+            ("max_dependencies", self.max_dependencies, HARD_MAX_DEPENDENCIES),
             ("max_peopletools_rows", self.max_peopletools_rows,
              HARD_MAX_PEOPLETOOLS_ROWS),
             ("query_page_size", self.query_page_size, HARD_MAX_PAGE_SIZE),
@@ -185,7 +196,8 @@ CREATE TABLE notes (
   layer TEXT NOT NULL,
   note TEXT NOT NULL,
   ok INTEGER NOT NULL,
-  partial INTEGER NOT NULL
+  partial INTEGER NOT NULL,
+  status TEXT NOT NULL
 );
 """
 
@@ -216,10 +228,18 @@ class _Writer:
             "WHERE name=?", (status, peopletools_status, objects, fields, name))
 
     def note(self, source: str, layer: str, note: str, *, ok: bool = True,
-             partial: bool = False) -> None:
-        self.con.execute("INSERT INTO notes VALUES (?,?,?,?,?)",
-                         (source, layer, note, int(ok), int(partial)))
-        if not ok:
+             partial: bool = False, status: str = "") -> None:
+        layer_status = _s(status).lower() or (
+            "partial" if partial else "available" if ok else "unavailable")
+        if layer_status not in {"available", "unavailable", "partial"}:
+            raise MetadataError(f"invalid metadata layer status: {layer_status}")
+        self.con.execute("INSERT INTO notes VALUES (?,?,?,?,?,?)",
+                         (source, layer, note, int(ok), int(partial),
+                          layer_status))
+        # An unsupported optional layer is honestly unavailable without
+        # making the layers that were harvested incomplete. Read failures and
+        # configured caps are partial and do degrade the source snapshot.
+        if partial:
             self.degraded.add(source)
         if partial:
             self.partial = True
@@ -502,6 +522,682 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
         after = nxt
 
 
+def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
+    """Yield ordered key/foreign-key columns without reading application rows."""
+    dialect = db.dialect
+    configured = _u(getattr(db.cfg.db, "schema", ""))
+    if dialect == "sqlite":
+        return
+    after: tuple | None = None
+    while True:
+        if dialect == "oracle":
+            table, constraint, pos = after or ("", "", 0)
+            params = {"t": table, "c": constraint, "p": pos}
+            keyset = (
+                "(C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                "(C.CONSTRAINT_NAME>:c OR (C.CONSTRAINT_NAME=:c AND "
+                "CC.POSITION>:p))))")
+            if configured:
+                params["owner"] = configured
+                sql = (
+                    "SELECT C.OWNER AS schema_name,C.TABLE_NAME AS object_name,"
+                    "C.CONSTRAINT_NAME AS constraint_name,"
+                    "C.CONSTRAINT_TYPE AS constraint_type,"
+                    "CC.COLUMN_NAME AS column_name,CC.POSITION AS ordinal_position,"
+                    "C.R_OWNER AS referenced_schema,RC.TABLE_NAME AS referenced_object,"
+                    "RCC.COLUMN_NAME AS referenced_column,"
+                    "C.R_CONSTRAINT_NAME AS referenced_constraint,"
+                    "C.DELETE_RULE AS delete_rule,C.STATUS AS constraint_status,"
+                    "C.VALIDATED AS validated "
+                    "FROM ALL_CONSTRAINTS C JOIN ALL_CONS_COLUMNS CC ON "
+                    "CC.OWNER=C.OWNER AND CC.CONSTRAINT_NAME=C.CONSTRAINT_NAME "
+                    "LEFT JOIN ALL_CONSTRAINTS RC ON RC.OWNER=C.R_OWNER AND "
+                    "RC.CONSTRAINT_NAME=C.R_CONSTRAINT_NAME "
+                    "LEFT JOIN ALL_CONS_COLUMNS RCC ON RCC.OWNER=RC.OWNER AND "
+                    "RCC.CONSTRAINT_NAME=RC.CONSTRAINT_NAME AND "
+                    "RCC.POSITION=CC.POSITION WHERE C.OWNER=:owner AND "
+                    f"C.CONSTRAINT_TYPE IN ('P','U','R') AND {keyset} "
+                    "ORDER BY C.TABLE_NAME,C.CONSTRAINT_NAME,CC.POSITION")
+            else:
+                # USER_* keeps an unqualified connection in its current
+                # schema. A cross-schema FK whose target is not visible still
+                # retains R_OWNER/R_CONSTRAINT_NAME as an unresolved reference.
+                sql = (
+                    "SELECT USER AS schema_name,C.TABLE_NAME AS object_name,"
+                    "C.CONSTRAINT_NAME AS constraint_name,"
+                    "C.CONSTRAINT_TYPE AS constraint_type,"
+                    "CC.COLUMN_NAME AS column_name,CC.POSITION AS ordinal_position,"
+                    "C.R_OWNER AS referenced_schema,RC.TABLE_NAME AS referenced_object,"
+                    "RCC.COLUMN_NAME AS referenced_column,"
+                    "C.R_CONSTRAINT_NAME AS referenced_constraint,"
+                    "C.DELETE_RULE AS delete_rule,C.STATUS AS constraint_status,"
+                    "C.VALIDATED AS validated "
+                    "FROM USER_CONSTRAINTS C JOIN USER_CONS_COLUMNS CC ON "
+                    "CC.CONSTRAINT_NAME=C.CONSTRAINT_NAME "
+                    "LEFT JOIN USER_CONSTRAINTS RC ON "
+                    "RC.CONSTRAINT_NAME=C.R_CONSTRAINT_NAME "
+                    "LEFT JOIN USER_CONS_COLUMNS RCC ON "
+                    "RCC.CONSTRAINT_NAME=RC.CONSTRAINT_NAME AND "
+                    "RCC.POSITION=CC.POSITION WHERE "
+                    f"C.CONSTRAINT_TYPE IN ('P','U','R') AND {keyset} "
+                    "ORDER BY C.TABLE_NAME,C.CONSTRAINT_NAME,CC.POSITION")
+        elif dialect == "sqlserver":
+            schema, table, constraint, pos = after or ("", "", "", 0)
+            params = {"s": schema, "t": table, "c": constraint, "p": pos}
+            keyset = (
+                "(UPPER(Q.schema_name)>:s OR (UPPER(Q.schema_name)=:s AND "
+                "(UPPER(Q.object_name)>:t OR (UPPER(Q.object_name)=:t AND "
+                "(UPPER(Q.constraint_name)>:c OR "
+                "(UPPER(Q.constraint_name)=:c AND Q.ordinal_position>:p))))))")
+            if configured:
+                keyset = (
+                    "UPPER(Q.schema_name)=:owner AND "
+                    "(UPPER(Q.object_name)>:t OR (UPPER(Q.object_name)=:t AND "
+                    "(UPPER(Q.constraint_name)>:c OR "
+                    "(UPPER(Q.constraint_name)=:c AND Q.ordinal_position>:p))))")
+                params = {"owner": configured, "t": table,
+                          "c": constraint, "p": pos}
+            sql = (
+                "SELECT Q.schema_name,Q.object_name,Q.constraint_name,"
+                "Q.constraint_type,Q.column_name,Q.ordinal_position,"
+                "Q.referenced_schema,Q.referenced_object,Q.referenced_column,"
+                "Q.referenced_constraint,Q.delete_rule,Q.constraint_status,"
+                "Q.validated FROM ("
+                "SELECT S.name AS schema_name,O.name AS object_name,"
+                "KC.name AS constraint_name,KC.type AS constraint_type,"
+                "C.name AS column_name,IC.key_ordinal AS ordinal_position,"
+                "NULL AS referenced_schema,NULL AS referenced_object,"
+                "NULL AS referenced_column,NULL AS referenced_constraint,"
+                "NULL AS delete_rule,CASE KI.is_disabled WHEN 1 THEN "
+                "'DISABLED' ELSE 'ENABLED' END AS constraint_status,"
+                "'NOT APPLICABLE' AS validated FROM sys.key_constraints KC "
+                "JOIN sys.objects O ON O.object_id=KC.parent_object_id "
+                "JOIN sys.schemas S ON S.schema_id=O.schema_id "
+                "JOIN sys.indexes KI ON KI.object_id=O.object_id AND "
+                "KI.index_id=KC.unique_index_id "
+                "JOIN sys.index_columns IC ON IC.object_id=O.object_id AND "
+                "IC.index_id=KC.unique_index_id AND IC.key_ordinal>0 "
+                "JOIN sys.columns C ON C.object_id=IC.object_id AND "
+                "C.column_id=IC.column_id WHERE KC.type IN ('PK','UQ') "
+                "UNION ALL "
+                "SELECT S.name AS schema_name,O.name AS object_name,"
+                "FK.name AS constraint_name,'F' AS constraint_type,"
+                "PC.name AS column_name,FC.constraint_column_id AS ordinal_position,"
+                "RS.name AS referenced_schema,RO.name AS referenced_object,"
+                "RC.name AS referenced_column,NULL AS referenced_constraint,"
+                "FK.delete_referential_action_desc AS delete_rule,"
+                "CASE FK.is_disabled WHEN 1 THEN 'DISABLED' ELSE 'ENABLED' END,"
+                "CASE FK.is_not_trusted WHEN 1 THEN 'NOT TRUSTED' ELSE "
+                "'TRUSTED' END FROM sys.foreign_keys FK "
+                "JOIN sys.foreign_key_columns FC ON "
+                "FC.constraint_object_id=FK.object_id "
+                "JOIN sys.objects O ON O.object_id=FK.parent_object_id "
+                "JOIN sys.schemas S ON S.schema_id=O.schema_id "
+                "JOIN sys.columns PC ON PC.object_id=O.object_id AND "
+                "PC.column_id=FC.parent_column_id "
+                "LEFT JOIN sys.objects RO ON RO.object_id=FK.referenced_object_id "
+                "LEFT JOIN sys.schemas RS ON RS.schema_id=RO.schema_id "
+                "LEFT JOIN sys.columns RC ON RC.object_id=RO.object_id AND "
+                "RC.column_id=FC.referenced_column_id) Q "
+                f"WHERE {keyset} ORDER BY UPPER(Q.schema_name),"
+                "UPPER(Q.object_name),UPPER(Q.constraint_name),"
+                "Q.ordinal_position")
+        else:
+            return
+        page, truncated = db.query(sql, params, max_rows=page_size)
+        if not page:
+            return
+        yield page, truncated
+        if not truncated:
+            return
+        last = page[-1]
+        if dialect == "oracle":
+            nxt = (_u(last.get("object_name")),
+                   _u(last.get("constraint_name")),
+                   int(last.get("ordinal_position") or 0))
+        else:
+            nxt = (_u(last.get("schema_name")),
+                   _u(last.get("object_name")),
+                   _u(last.get("constraint_name")),
+                   int(last.get("ordinal_position") or 0))
+        if nxt == after:
+            raise MetadataError("native constraint pagination did not advance")
+        after = nxt
+
+
+def _view_dependency_pages(
+        db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
+    """Yield catalog-native view dependencies; never fetch view definitions."""
+    dialect = db.dialect
+    configured = _u(getattr(db.cfg.db, "schema", ""))
+    if dialect == "sqlite":
+        return
+    after: tuple | None = None
+    while True:
+        if dialect == "oracle":
+            view, ref_schema, ref_object, ref_link = after or (
+                "", "", "", "")
+            params = {"v": view, "rs": ref_schema, "ro": ref_object,
+                      "rl": ref_link}
+            keyset = (
+                "(NAME>:v OR (NAME=:v AND (NVL(REFERENCED_OWNER,'')>:rs OR "
+                "(NVL(REFERENCED_OWNER,'')=:rs AND "
+                "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
+                "NVL(REFERENCED_LINK_NAME,'')>:rl))))))")
+            if configured:
+                params["owner"] = configured
+                sql = (
+                    "SELECT OWNER AS schema_name,NAME AS view_name,"
+                    "REFERENCED_OWNER AS referenced_schema,"
+                    "REFERENCED_NAME AS referenced_object,"
+                    "REFERENCED_TYPE AS referenced_type,"
+                    "REFERENCED_LINK_NAME AS referenced_link FROM "
+                    "ALL_DEPENDENCIES WHERE OWNER=:owner AND TYPE='VIEW' AND "
+                    "REFERENCED_TYPE IN ('TABLE','VIEW','MATERIALIZED VIEW') AND "
+                    f"{keyset} ORDER BY NAME,NVL(REFERENCED_OWNER,''),"
+                    "REFERENCED_NAME,NVL(REFERENCED_LINK_NAME,'')")
+            else:
+                sql = (
+                    "SELECT USER AS schema_name,NAME AS view_name,"
+                    "REFERENCED_OWNER AS referenced_schema,"
+                    "REFERENCED_NAME AS referenced_object,"
+                    "REFERENCED_TYPE AS referenced_type,"
+                    "REFERENCED_LINK_NAME AS referenced_link FROM "
+                    "USER_DEPENDENCIES WHERE TYPE='VIEW' AND REFERENCED_TYPE IN "
+                    f"('TABLE','VIEW','MATERIALIZED VIEW') AND {keyset} "
+                    "ORDER BY NAME,NVL(REFERENCED_OWNER,''),REFERENCED_NAME,"
+                    "NVL(REFERENCED_LINK_NAME,'')")
+        elif dialect == "sqlserver":
+            view_schema, view, ref_schema, ref_object, ref_database, ref_server = (
+                after or ("", "", "", "", "", ""))
+            params = {"s": view_schema, "v": view, "rs": ref_schema,
+                      "ro": ref_object, "rd": ref_database,
+                      "rsv": ref_server}
+            keyset = (
+                "(UPPER(Q.schema_name)>:s OR (UPPER(Q.schema_name)=:s AND "
+                "(UPPER(Q.view_name)>:v OR (UPPER(Q.view_name)=:v AND "
+                "(UPPER(Q.referenced_schema)>:rs OR "
+                "(UPPER(Q.referenced_schema)=:rs AND "
+                "(UPPER(Q.referenced_object)>:ro OR "
+                "(UPPER(Q.referenced_object)=:ro AND "
+                "(UPPER(Q.referenced_database)>:rd OR "
+                "(UPPER(Q.referenced_database)=:rd AND "
+                "UPPER(Q.referenced_server)>:rsv))))))))))")
+            if configured:
+                keyset = (
+                    "UPPER(Q.schema_name)=:owner AND "
+                    "(UPPER(Q.view_name)>:v OR (UPPER(Q.view_name)=:v AND "
+                    "(UPPER(Q.referenced_schema)>:rs OR "
+                    "(UPPER(Q.referenced_schema)=:rs AND "
+                    "(UPPER(Q.referenced_object)>:ro OR "
+                    "(UPPER(Q.referenced_object)=:ro AND "
+                    "(UPPER(Q.referenced_database)>:rd OR "
+                    "(UPPER(Q.referenced_database)=:rd AND "
+                    "UPPER(Q.referenced_server)>:rsv))))))))")
+                params = {"owner": configured, "v": view,
+                          "rs": ref_schema, "ro": ref_object,
+                          "rd": ref_database, "rsv": ref_server}
+            sql = (
+                "SELECT Q.schema_name,Q.view_name,Q.referenced_schema,"
+                "Q.referenced_object,Q.referenced_type,Q.referenced_database,"
+                "Q.referenced_server "
+                "FROM (SELECT DISTINCT S.name AS schema_name,V.name AS view_name,"
+                "COALESCE(RS.name,D.referenced_schema_name,'') AS "
+                "referenced_schema,COALESCE(RO.name,D.referenced_entity_name,'') "
+                "AS referenced_object,CASE RO.type WHEN 'U' THEN 'TABLE' "
+                "WHEN 'V' THEN 'VIEW' ELSE 'UNRESOLVED' END AS referenced_type,"
+                "COALESCE(D.referenced_database_name,'') AS referenced_database,"
+                "COALESCE(D.referenced_server_name,'') AS referenced_server "
+                "FROM sys.views V JOIN sys.schemas S ON S.schema_id=V.schema_id "
+                "JOIN sys.sql_expression_dependencies D ON "
+                "D.referencing_id=V.object_id LEFT JOIN sys.objects RO ON "
+                "RO.object_id=D.referenced_id LEFT JOIN sys.schemas RS ON "
+                "RS.schema_id=RO.schema_id WHERE "
+                "COALESCE(RO.name,D.referenced_entity_name,'')<>'') Q WHERE "
+                f"{keyset} ORDER BY UPPER(Q.schema_name),UPPER(Q.view_name),"
+                "UPPER(Q.referenced_schema),UPPER(Q.referenced_object),"
+                "UPPER(Q.referenced_database),UPPER(Q.referenced_server)")
+        else:
+            return
+        page, truncated = db.query(sql, params, max_rows=page_size)
+        if not page:
+            return
+        yield page, truncated
+        if not truncated:
+            return
+        last = page[-1]
+        if dialect == "oracle":
+            nxt = (_u(last.get("view_name")),
+                   _u(last.get("referenced_schema")),
+                   _u(last.get("referenced_object")),
+                   _u(last.get("referenced_link")))
+        else:
+            nxt = (_u(last.get("schema_name")), _u(last.get("view_name")),
+                   _u(last.get("referenced_schema")),
+                   _u(last.get("referenced_object")),
+                   _u(last.get("referenced_database")),
+                   _u(last.get("referenced_server")))
+        if nxt == after:
+            raise MetadataError(
+                "native view-dependency pagination did not advance")
+        after = nxt
+
+
+def _external_object_node(
+        state: _Writer, source: str, schema: str, name: str, *,
+        evidence: str, parent: str, attrs: dict) -> str:
+    """Persist an observed reference name without claiming the object exists."""
+    ref_schema = _u(schema) or "UNKNOWN"
+    ref_name = _u(name) or "UNKNOWN"
+    payload = {**attrs, "resolution_status": "unresolved",
+               "structural_reference_only": True}
+    nid = state.node(
+        source=source, schema=ref_schema, kind="external_object", name=ref_name,
+        parent=parent, collector="db_catalog", evidence=evidence,
+        authority="observed", confidence="inconclusive", attrs=payload)
+    state.alias(source, f"{ref_schema}.{ref_name}", nid,
+                "unresolved structural reference")
+    return nid
+
+
+def _collect_constraints(
+        state: _Writer, source: str, db, object_keys: dict,
+        *, object_overflow: bool) -> int:
+    """Collect bounded PK/UQ/FK definitions and their ordered columns."""
+    limits = state.limits
+    count = 0
+    overflow = False
+    column_memberships = 0
+    column_overflow = False
+    incomplete_rows = False
+
+    def add_constraint(schema: str, obj: str, name: str, type_code: str,
+                       rows: list[dict], *, generated_name: bool = False,
+                       rowset_complete: bool = True) -> bool:
+        nonlocal count, overflow, column_memberships, column_overflow
+        if count >= limits.max_constraints:
+            overflow = True
+            return False
+        owner = object_keys.get((_u(schema) or "MAIN", _u(obj)))
+        if owner is None:
+            return True
+        code = _u(type_code)
+        ctype = {
+            "P": "primary_key", "PK": "primary_key",
+            "U": "unique", "UQ": "unique",
+            "R": "foreign_key", "F": "foreign_key",
+        }.get(code)
+        if not ctype:
+            return True
+        membership_remaining = (
+            limits.max_constraint_columns - column_memberships)
+        if rows and membership_remaining <= 0:
+            column_overflow = True
+            return False
+        if len(rows) > membership_remaining:
+            rows = rows[:membership_remaining]
+            rowset_complete = False
+            column_overflow = True
+        columns = [_u(row.get("column_name")) for row in rows
+                   if _s(row.get("column_name"))]
+        referenced_schema = next(
+            (_u(row.get("referenced_schema")) for row in rows
+             if _s(row.get("referenced_schema"))), "")
+        referenced_object = next(
+            (_u(row.get("referenced_object")) for row in rows
+             if _s(row.get("referenced_object"))), "")
+        referenced_constraint = next(
+            (_u(row.get("referenced_constraint")) for row in rows
+             if _s(row.get("referenced_constraint"))), "")
+        pairs = [{
+            "ordinal": int(row.get("ordinal_position") or pos),
+            "column": _u(row.get("column_name")),
+            "referenced_column": _u(row.get("referenced_column")) or None,
+        } for pos, row in enumerate(rows, 1)]
+        constraint_name = _u(name) or f"{ctype.upper()}"
+        evidence = {
+            "sqlite": "SQLite constraint PRAGMA",
+            "oracle": ("ALL_CONSTRAINTS/ALL_CONS_COLUMNS"
+                       if _u(getattr(db.cfg.db, "schema", "")) else
+                       "USER_CONSTRAINTS/USER_CONS_COLUMNS"),
+            "sqlserver": "sys.key_constraints/sys.foreign_keys",
+        }.get(db.dialect, "database constraint catalog")
+        ref_status = "not_applicable"
+        target = None
+        if ctype == "foreign_key":
+            target_schema = referenced_schema or owner["schema"]
+            target = object_keys.get((target_schema, referenced_object))
+            ref_status = "resolved" if target is not None else "unresolved"
+        attrs = {
+            "object": owner["name"],
+            "constraint_type": ctype,
+            "columns": columns,
+            "column_pairs": pairs,
+            "generated_name": bool(generated_name),
+            "rowset_complete": bool(rowset_complete),
+            "referenced_schema": referenced_schema or None,
+            "referenced_object": referenced_object or None,
+            "referenced_constraint": referenced_constraint or None,
+            "reference_status": ref_status,
+            "delete_rule": _s(rows[0].get("delete_rule")) or None,
+            "update_rule": _s(rows[0].get("update_rule")) or None,
+            "match_rule": _s(rows[0].get("match_type")) or None,
+            "status": _s(rows[0].get("constraint_status")) or None,
+            "validated": _s(rows[0].get("validated")) or None,
+        }
+        cid = state.node(
+            source=source, schema=owner["schema"], kind="constraint",
+            name=constraint_name, parent=owner["id"],
+            collector="db_catalog", evidence=evidence,
+            authority="observed", confidence="confirmed", attrs=attrs)
+        state.edge(
+            owner["id"], cid, "object_has_constraint",
+            confidence="confirmed", evidence=evidence,
+            collector="db_catalog", authority="observed",
+            attrs={"constraint_type": ctype, "columns": columns})
+        state.alias(source, constraint_name, cid, "constraint")
+        state.alias(source, f"{owner['schema']}.{owner['name']}."
+                    f"{constraint_name}", cid, "qualified constraint")
+        state.term(cid, "constraint columns", " ".join(columns))
+        for pos, column in enumerate(columns, 1):
+            column_id = _stable_id(
+                "column", source, owner["schema"], column, owner["id"])
+            if state.con.execute(
+                    "SELECT 1 FROM nodes WHERE id=?", (column_id,)).fetchone():
+                state.edge(
+                    cid, column_id, "constraint_has_column",
+                    confidence="confirmed", evidence=evidence,
+                    collector="db_catalog", authority="observed",
+                    attrs={"ordinal": pos})
+        if ctype == "foreign_key":
+            if target is None and (referenced_object or referenced_constraint):
+                target = {"id": _external_object_node(
+                    state, source, referenced_schema or owner["schema"],
+                    referenced_object or "UNKNOWN", evidence=(
+                        "unresolved foreign-key target from constraint catalog"),
+                    parent=(f"fk:{cid}:{referenced_constraint}"),
+                    attrs={
+                        "referenced_constraint": referenced_constraint or None,
+                        "referencing_schema": owner["schema"],
+                        "referencing_object": owner["name"],
+                    })}
+            if target is not None:
+                state.edge(
+                    cid, target["id"], "foreign_key_references_object",
+                    confidence=("confirmed" if ref_status == "resolved"
+                                else "inconclusive"),
+                    evidence=evidence, collector="db_catalog",
+                    authority="observed",
+                    attrs={"resolution_status": ref_status,
+                           "column_pairs": pairs})
+                state.term(cid, "referenced object",
+                           " ".join(filter(None, [referenced_schema,
+                                                  referenced_object])))
+                if ref_status == "resolved":
+                    for pair in pairs:
+                        ref_col = _u(pair.get("referenced_column"))
+                        if not ref_col:
+                            continue
+                        ref_col_id = _stable_id(
+                            "column", source, target["schema"], ref_col,
+                            target["id"])
+                        if state.con.execute(
+                                "SELECT 1 FROM nodes WHERE id=?",
+                                (ref_col_id,)).fetchone():
+                            state.edge(
+                                cid, ref_col_id,
+                                "foreign_key_references_column",
+                                confidence="confirmed", evidence=evidence,
+                                collector="db_catalog", authority="observed",
+                                attrs={"local_column": pair["column"],
+                                       "ordinal": pair["ordinal"]})
+        count += 1
+        column_memberships += len(rows)
+        return not column_overflow
+
+    try:
+        if object_overflow and db.dialect != "sqlite":
+            state.note(
+                source, "constraints",
+                "Native constraint harvest was skipped after the object "
+                "catalog hit its limit; key/foreign-key coverage is unknown.",
+                ok=False, partial=True)
+            return 0
+        if db.dialect == "sqlite":
+            stop = False
+            for owner in object_keys.values():
+                if owner["kind"] != "table" or stop:
+                    continue
+                pk_rows, pk_truncated = db.query(
+                    "SELECT cid,name AS column_name,pk AS ordinal_position FROM "
+                    "pragma_table_info(:table_name) WHERE pk>0 ORDER BY pk",
+                    {"table_name": owner["name"]},
+                    max_rows=limits.query_page_size)
+                incomplete_rows = incomplete_rows or pk_truncated
+                if pk_rows and not add_constraint(
+                        owner["schema"], owner["name"], "PRIMARY KEY", "P",
+                        [{**row, "constraint_status": "ENABLED"}
+                         for row in pk_rows], generated_name=True,
+                        rowset_complete=not pk_truncated):
+                    stop = True
+                    break
+                uniques, unique_truncated = db.query(
+                    "SELECT name,origin,partial FROM "
+                    "pragma_index_list(:table_name) WHERE origin='u' "
+                    "ORDER BY seq", {"table_name": owner["name"]},
+                    max_rows=limits.query_page_size)
+                incomplete_rows = incomplete_rows or unique_truncated
+                for unique in uniques:
+                    unique_name = _u(unique.get("name"))
+                    cols, col_truncated = db.query(
+                        "SELECT seqno,cid,name AS column_name FROM "
+                        "pragma_index_xinfo(:index_name) WHERE \"key\"=1 "
+                        "ORDER BY seqno", {"index_name": unique_name},
+                        max_rows=limits.query_page_size)
+                    incomplete_rows = incomplete_rows or col_truncated
+                    if not add_constraint(
+                            owner["schema"], owner["name"], unique_name, "U",
+                            [{**row, "ordinal_position":
+                              int(row.get("seqno") or 0) + 1,
+                              "constraint_status": "ENABLED"} for row in cols],
+                            generated_name=unique_name.startswith(
+                                "SQLITE_AUTOINDEX_"),
+                            rowset_complete=not col_truncated):
+                        stop = True
+                        break
+                if stop:
+                    break
+                foreign, foreign_truncated = db.query(
+                    "SELECT id,seq,\"table\" AS referenced_object,"
+                    "\"from\" AS column_name,\"to\" AS referenced_column,"
+                    "on_update AS update_rule,on_delete AS delete_rule,"
+                    "\"match\" AS match_type FROM "
+                    "pragma_foreign_key_list(:table_name) ORDER BY id,seq",
+                    {"table_name": owner["name"]},
+                    max_rows=limits.query_page_size)
+                incomplete_rows = incomplete_rows or foreign_truncated
+                by_id: dict[int, list[dict]] = {}
+                for row in foreign:
+                    by_id.setdefault(int(row.get("id") or 0), []).append({
+                        **row,
+                        "ordinal_position": int(row.get("seq") or 0) + 1,
+                        "referenced_schema": owner["schema"],
+                        "constraint_status": "ENABLED",
+                    })
+                for fk_id, rows in sorted(by_id.items()):
+                    if not add_constraint(
+                            owner["schema"], owner["name"],
+                            f"FOREIGN KEY {fk_id}", "R", rows,
+                            generated_name=True,
+                            rowset_complete=not foreign_truncated):
+                        stop = True
+                        break
+                if stop:
+                    break
+        else:
+            current = None
+            rows: list[dict] = []
+            stop = False
+            for page, _truncated in _constraint_pages(
+                    db, limits.query_page_size):
+                for row in page:
+                    key = (_u(row.get("schema_name")),
+                           _u(row.get("object_name")),
+                           _u(row.get("constraint_name")),
+                           _u(row.get("constraint_type")))
+                    if current is not None and key != current:
+                        if not add_constraint(*current, rows):
+                            stop = True
+                            break
+                        rows = []
+                    current = key
+                    rows.append(row)
+                if stop:
+                    break
+            if current is not None and not stop:
+                add_constraint(*current, rows)
+    except Exception as exc:
+        state.note(
+            source, "constraints",
+            f"primary/unique/foreign-key constraints could not be read "
+            f"({type(exc).__name__}); constraint coverage is unknown, not none",
+            ok=False, partial=True)
+        return count
+    if incomplete_rows:
+        state.note(
+            source, "constraints",
+            "At least one SQLite constraint definition exceeded the per-query "
+            "page size; retained constraint columns are partial.",
+            ok=False, partial=True)
+    if overflow:
+        state.limit(source, "constraints", limits.max_constraints, count)
+    if column_overflow:
+        state.limit(
+            source, "constraint_columns", limits.max_constraint_columns,
+            column_memberships)
+    if not overflow and not column_overflow and not incomplete_rows:
+        state.note(
+            source, "constraints",
+            f"Collected {count:,} primary, unique, and foreign-key "
+            "definitions from the native constraint catalog.",
+            status="available")
+    return count
+
+
+def _collect_view_dependencies(
+        state: _Writer, source: str, db, object_keys: dict,
+        *, object_overflow: bool) -> int:
+    """Collect bounded view-to-object edges without retaining definition SQL."""
+    limits = state.limits
+    if db.dialect == "sqlite":
+        state.note(
+            source, "view_dependencies",
+            "Unavailable: SQLite exposes no structured view-dependency "
+            "catalog. Full view SQL is deliberately not parsed or stored.",
+            ok=False, partial=False, status="unavailable")
+        return 0
+    if object_overflow:
+        state.note(
+            source, "view_dependencies",
+            "View dependency harvest was skipped after the object catalog hit "
+            "its limit; dependency coverage is unknown.",
+            ok=False, partial=True)
+        return 0
+    count = 0
+    overflow = False
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+    try:
+        stop = False
+        for page, _truncated in _view_dependency_pages(
+                db, limits.query_page_size):
+            for row in page:
+                view_schema = _u(row.get("schema_name")) or "MAIN"
+                view_name = _u(row.get("view_name"))
+                view = object_keys.get((view_schema, view_name))
+                if view is None or view["kind"] != "view":
+                    continue
+                # Native catalogs provide the resolved owner when they can.
+                # A blank owner on an unresolved/dynamic reference is unknown;
+                # do not guess that it shares the view's schema.
+                ref_schema = _u(row.get("referenced_schema")) or "UNKNOWN"
+                ref_name = _u(row.get("referenced_object"))
+                if not ref_name:
+                    continue
+                external_db = _u(row.get("referenced_database"))
+                external_server = _u(row.get("referenced_server"))
+                db_link = _u(row.get("referenced_link"))
+                raw_pair = (view["id"], external_server, external_db, db_link,
+                            ref_schema, ref_name)
+                if raw_pair in seen:
+                    continue
+                if count >= limits.max_dependencies:
+                    overflow = True
+                    stop = True
+                    break
+                target = (None if external_server or external_db or db_link else
+                          object_keys.get((ref_schema, ref_name)))
+                resolution = "resolved" if target is not None else "unresolved"
+                evidence = {
+                    "oracle": ("ALL_DEPENDENCIES" if
+                               _u(getattr(db.cfg.db, "schema", "")) else
+                               "USER_DEPENDENCIES"),
+                    "sqlserver": "sys.sql_expression_dependencies",
+                }.get(db.dialect, "database dependency catalog")
+                if target is None:
+                    target = {"id": _external_object_node(
+                        state, source, ref_schema, ref_name,
+                        evidence="unresolved view target from dependency catalog",
+                        parent=(f"view:{view['id']}:{external_server}:"
+                                f"{external_db}:{db_link}"),
+                        attrs={
+                            "referenced_server": external_server or None,
+                            "referenced_database": external_db or None,
+                            "referenced_link": db_link or None,
+                            "referenced_type": _u(row.get("referenced_type"))
+                            or None,
+                            "referencing_schema": view_schema,
+                            "referencing_object": view_name,
+                        })}
+                seen.add(raw_pair)
+                state.edge(
+                    view["id"], target["id"], "view_depends_on",
+                    confidence=("confirmed" if resolution == "resolved"
+                                else "inconclusive"),
+                    evidence=evidence, collector="db_catalog",
+                    authority="observed", attrs={
+                        "resolution_status": resolution,
+                        "referenced_schema": ref_schema,
+                        "referenced_object": ref_name,
+                        "referenced_type": _u(row.get("referenced_type"))
+                        or None,
+                        "referenced_server": external_server or None,
+                        "referenced_database": external_db or None,
+                        "referenced_link": db_link or None,
+                    })
+                state.term(view["id"], "view dependency",
+                           " ".join(filter(None, [ref_schema, ref_name])))
+                count += 1
+            if stop:
+                break
+    except Exception as exc:
+        state.note(
+            source, "view_dependencies",
+            f"view dependencies could not be read ({type(exc).__name__}); "
+            "dependency coverage is unknown, not none",
+            ok=False, partial=True)
+        return count
+    if overflow:
+        state.limit(
+            source, "view_dependencies", limits.max_dependencies, count)
+    else:
+        state.note(
+            source, "view_dependencies",
+            f"Collected {count:,} view dependency edges from the native "
+            "dependency catalog without reading or storing definition SQL.",
+            status="available")
+    return count
+
+
 def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
     limits = state.limits
     objects: list[dict] = []
@@ -753,6 +1449,10 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
                    partial=True)
     if index_overflow:
         state.limit(source, "indexes", limits.max_indexes, index_count)
+    _collect_constraints(
+        state, source, db, object_keys, object_overflow=object_overflow)
+    _collect_view_dependencies(
+        state, source, db, object_keys, object_overflow=object_overflow)
     return len(objects), fields
 
 
@@ -1025,7 +1725,8 @@ def _collect_peopletools(state: _Writer, source: str, db) -> str:
     else:
         state.note(source, "PSDBFIELD",
                    "PSDBFIELD is not readable; record membership remains but "
-                   "global field types/formats are unavailable.")
+                   "global field types/formats are unavailable.",
+                   ok=False, status="unavailable")
 
     rf_cols = _pt_columns(db, "PSRECFIELD")
     if {"RECNAME", "FIELDNAME"} <= rf_cols:
@@ -1113,7 +1814,8 @@ def _collect_peopletools(state: _Writer, source: str, db) -> str:
         state.note(
             source, "PSDBFLDLABL",
             "Field-label metadata is unavailable for this source/PeopleTools "
-            "shape; absence of a natural-language label is inconclusive.")
+            "shape; absence of a natural-language label is inconclusive.",
+            ok=False, status="unavailable")
 
     xlat_cols = _pt_columns(db, "PSXLATITEM")
     if {"FIELDNAME", "FIELDVALUE"} <= xlat_cols:
@@ -1156,7 +1858,7 @@ def _collect_peopletools(state: _Writer, source: str, db) -> str:
         state.note(
             source, "PSXLATITEM",
             "Translate-value metadata is unavailable; code meanings are not "
-            "represented by this snapshot.")
+            "represented by this snapshot.", ok=False, status="unavailable")
 
     # Page and PSQuery co-use are direct, high-value relationship evidence.
     pnl_cols = _pt_columns(db, "PSPNLFIELD")
@@ -1188,7 +1890,8 @@ def _collect_peopletools(state: _Writer, source: str, db) -> str:
         state.note(
             source, "PSPNLFIELD",
             "Page/record usage metadata is unavailable; record discovery "
-            "still uses definitions, fields and the native catalog.")
+            "still uses definitions, fields and the native catalog.",
+            ok=False, status="unavailable")
 
     qry_cols = _pt_columns(db, "PSQRYRECORD")
     qdef_cols = _pt_columns(db, "PSQRYDEFN")
@@ -1221,12 +1924,14 @@ def _collect_peopletools(state: _Writer, source: str, db) -> str:
             source, "PSQRYRECORD",
             "Saved-query relationships were skipped because this PeopleTools "
             "shape cannot prove public visibility; private query names were "
-            "not copied into the shared catalog.")
+            "not copied into the shared catalog.",
+            ok=False, status="unavailable")
     else:
         state.note(
             source, "PSQRYRECORD",
             "Public saved-query/record usage metadata is unavailable; private "
-            "queries are never copied as a fallback.")
+            "queries are never copied as a fallback.",
+            ok=False, status="unavailable")
     return "available" if source not in state.degraded else "partial"
 
 
@@ -1462,7 +2167,7 @@ class MetadataCatalog:
             note_count = int(con.execute(
                 "SELECT COUNT(*) FROM notes").fetchone()[0])
             notes = [dict(row) for row in con.execute(
-                "SELECT source,layer,note,ok,partial FROM notes "
+                "SELECT source,layer,note,ok,partial,status FROM notes "
                 "ORDER BY source,layer LIMIT 100")]
             try:
                 hits = json.loads(meta.get("limit_hits") or "[]")
@@ -1485,7 +2190,9 @@ class MetadataCatalog:
                 "coverage_note": (
                     "Names, definitions and relationships only. No transaction "
                     "rows, balances, customer/vendor values, credentials or "
-                    "full view SQL are stored. A metadata match can select a "
+                    "full view SQL are stored. Constraint and dependency names "
+                    "come only from native catalogs; unresolved targets stay "
+                    "explicit. A metadata match can select a "
                     "source; it cannot substantiate a financial conclusion."),
             }
         finally:
@@ -1739,6 +2446,12 @@ class MetadataCatalog:
                     "kind='object_has_column' LIMIT 21", (cid,)):
                 add_object(edge["src"])
 
+        def from_constraint(cid: str) -> None:
+            for edge in con.execute(
+                    "SELECT src FROM edges WHERE dst=? AND "
+                    "kind='object_has_constraint' LIMIT 21", (cid,)):
+                add_object(edge["src"])
+
         kind = start["kind"]
         if kind == "record":
             from_record(node_id)
@@ -1751,6 +2464,17 @@ class MetadataCatalog:
                     "SELECT src FROM edges WHERE dst=? AND "
                     "kind='object_has_index' LIMIT 21", (node_id,)):
                 add_object(edge["src"])
+        elif kind == "constraint":
+            from_constraint(node_id)
+        elif kind == "external_object":
+            for edge in con.execute(
+                    "SELECT src,kind FROM edges WHERE dst=? AND kind IN "
+                    "('view_depends_on','foreign_key_references_object') "
+                    "LIMIT 101", (node_id,)):
+                if edge["kind"] == "view_depends_on":
+                    add_object(edge["src"])
+                else:
+                    from_constraint(edge["src"])
         elif kind == "code_value":
             for edge in con.execute(
                     "SELECT src FROM edges WHERE dst=? AND "
@@ -1942,7 +2666,9 @@ class MetadataCatalog:
                             "logical record": 45, "field label": 35,
                             "translate value": 30, "description": 25,
                             "field name": 25, "used by page": 15,
-                            "used by query": 15}
+                            "used by query": 15, "constraint columns": 30,
+                            "referenced object": 30,
+                            "view dependency": 30}
             for nid, found in by_node.items():
                 row = con.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()
                 if row is None:
@@ -2138,6 +2864,8 @@ class MetadataCatalog:
 
             columns = []
             indexes = []
+            constraints = []
+            dependencies = []
             mappings = []
             relationships = []
             context_truncated = False
@@ -2173,6 +2901,89 @@ class MetadataCatalog:
                             "not a whole-table key."
                             if attrs.get("filtered") else None),
                         "evidence": [self._evidence(node)],
+                    })
+                for edge in con.execute(
+                        "SELECT * FROM edges WHERE src=? AND "
+                        "kind='object_has_constraint' ORDER BY dst LIMIT ?",
+                        (object_row["id"], cap + 1)):
+                    node = con.execute(
+                        "SELECT * FROM nodes WHERE id=?", (edge["dst"],)
+                    ).fetchone()
+                    if node is None:
+                        continue
+                    attrs = _json(node["attrs"])
+                    target_edge = con.execute(
+                        "SELECT * FROM edges WHERE src=? AND "
+                        "kind='foreign_key_references_object' LIMIT 1",
+                        (node["id"],),
+                    ).fetchone()
+                    reference = None
+                    if target_edge is not None:
+                        target = con.execute(
+                            "SELECT * FROM nodes WHERE id=?",
+                            (target_edge["dst"],),
+                        ).fetchone()
+                        if target is not None:
+                            target_attrs = _json(target["attrs"])
+                            reference = {
+                                "source": target["source"],
+                                "schema": target["schema_name"],
+                                "object": (None if target["name"] == "UNKNOWN"
+                                           else target["name"]),
+                                "kind": target["kind"],
+                                "resolution_status": _json(
+                                    target_edge["attrs"]).get(
+                                        "resolution_status") or
+                                    target_attrs.get("resolution_status") or
+                                    "unknown",
+                                "referenced_constraint": attrs.get(
+                                    "referenced_constraint"),
+                            }
+                    constraints.append({
+                        "name": node["name"],
+                        "type": attrs.get("constraint_type"),
+                        "columns": list(attrs.get("columns") or []),
+                        "column_pairs": list(attrs.get("column_pairs") or []),
+                        "reference": reference,
+                        "generated_name": bool(attrs.get("generated_name")),
+                        "rowset_complete": attrs.get("rowset_complete", True),
+                        "status": attrs.get("status"),
+                        "validated": attrs.get("validated"),
+                        "delete_rule": attrs.get("delete_rule"),
+                        "update_rule": attrs.get("update_rule"),
+                        "evidence": [self._evidence(node)],
+                    })
+                dependency_rows = con.execute(
+                    "SELECT E.src,E.dst,E.confidence,E.evidence,E.collector,"
+                    "E.authority,E.collected_at,E.attrs,N.source,"
+                    "N.schema_name,N.name,N.kind AS node_kind FROM edges E "
+                    "JOIN nodes N ON "
+                    "N.id=CASE WHEN E.src=? THEN E.dst ELSE E.src END "
+                    "WHERE E.kind='view_depends_on' AND (E.src=? OR E.dst=?) "
+                    "ORDER BY E.src,E.dst LIMIT ?",
+                    (object_row["id"], object_row["id"], object_row["id"],
+                     cap + 1),
+                ).fetchall()
+                for dep in dependency_rows:
+                    dep_attrs = _json(dep["attrs"])
+                    dependencies.append({
+                        "direction": ("outbound" if dep["src"] ==
+                                      object_row["id"] else "inbound"),
+                        "relationship": "view_depends_on",
+                        "source": dep["source"],
+                        "schema": dep["schema_name"],
+                        "object": dep["name"],
+                        "kind": dep["node_kind"],
+                        "resolution_status": dep_attrs.get(
+                            "resolution_status") or "unknown",
+                        "confidence": dep["confidence"],
+                        "evidence": [{
+                            "collector": dep["collector"],
+                            "evidence": dep["evidence"],
+                            "authority": dep["authority"],
+                            "confidence": dep["confidence"],
+                            "collected_at": dep["collected_at"],
+                        }],
                     })
                 col_rows = []
                 for edge in con.execute(
@@ -2257,16 +3068,25 @@ class MetadataCatalog:
                         item["translate_values"] = codes
                     columns.append(item)
 
-            total = len(mappings) + len(indexes) + len(columns)
+            total = (len(mappings) + len(constraints) + len(dependencies)
+                     + len(indexes) + len(columns))
             remaining = cap
             mappings_out = mappings[:remaining]
             remaining -= len(mappings_out)
+            constraints_out = constraints[:remaining]
+            remaining -= len(constraints_out)
+            dependencies_out = dependencies[:remaining]
+            remaining -= len(dependencies_out)
             indexes_out = indexes[:remaining]
             remaining -= len(indexes_out)
             columns_out = columns[:remaining]
             relationships.extend(
                 [{"relationship": "record_physicalizes_to", **item}
                  for item in mappings_out])
+            relationships.extend(
+                [{"relationship": "object_has_constraint", **item}
+                 for item in constraints_out])
+            relationships.extend(dependencies_out)
             subject = (self._object_summary(con, object_row)
                        if object_row is not None else
                        self._object_summary(con, chosen,
@@ -2287,14 +3107,17 @@ class MetadataCatalog:
                 "logical_records": subject.get("logical_records", []),
                 "columns": columns_out,
                 "indexes": indexes_out,
+                "constraints": constraints_out,
+                "dependencies": dependencies_out,
                 "mappings": mappings_out,
                 "relationships": relationships,
                 "notes": notes,
                 "truncated": total > cap or context_truncated,
                 "snapshot": snapshot,
                 "coverage_note": (
-                    "Object shape and mappings come from the offline metadata "
-                    "catalog. They contain no transaction rows and cannot "
+                    "Object shape, keys and lineage come from the offline "
+                    "metadata catalog. They contain no transaction rows or "
+                    "full view definitions and cannot "
                     "substantiate a financial conclusion."
                     + (" Build limits were reached; missing metadata is "
                        "inconclusive." if snapshot["limit_hits"] else "")),

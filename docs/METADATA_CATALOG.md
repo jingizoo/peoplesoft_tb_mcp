@@ -44,7 +44,9 @@ replaces the readable artifact only after a usable snapshot commits. A failed
 or empty rebuild does not destroy the last good catalog.
 
 Build once during deployment and after a PeopleSoft customization, schema,
-index, field-label, translate-value or saved-query change. A weekly rebuild is
+key/constraint, index, view, field-label, translate-value or saved-query
+change. Catalog schema version 2 adds native keys and view lineage, so an
+artifact built by the first release must be rebuilt. A weekly rebuild is
 a reasonable baseline for stable production metadata; schedule it nightly when
 warehouses or custom integration schemas change frequently. The default
 freshness target is seven days (`168` hours), so choose a cadence at least as
@@ -92,9 +94,9 @@ The build uses only catalog reads and `SELECT`/PRAGMA operations. Ask the DBA
 for the narrowest metadata visibility that covers the intended database and
 schema:
 
-- Oracle: visibility of objects, columns and indexes through `USER_*`, or
-  `ALL_*` for the single configured owner. Object visibility still follows the
-  privileges of the build account.
+- Oracle: visibility of objects, columns, indexes, constraints and dependencies
+  through `USER_*`, or `ALL_*` for the single configured owner. Object
+  visibility still follows the privileges of the build account.
 - SQL Server: `CONNECT` plus `VIEW DEFINITION` on the intended database or
   schema. Do not grant server-wide metadata visibility merely for this build.
 - SQLite: read access to the selected database file.
@@ -115,14 +117,30 @@ snapshot partial. An actual read error or configured cap does. If public
 visibility cannot be proven from the local PSQuery shape, saved-query
 relationships are skipped so private query names cannot leak.
 
-## What the first slice indexes
+## What the catalog indexes
 
 For every selected database source, the catalog stores:
 
 - tables and views, with source and schema;
 - columns with ordinal, data type, length and nullability;
 - indexes with ordered key columns, uniqueness, and a note for expression or
-  filtered indexes when available.
+  filtered indexes when available;
+- native primary-key, unique and foreign-key constraints with ordered local and
+  referenced columns, enable/trust or validation status when the database
+  exposes it, and delete/update rules when available;
+- native view-to-table/view dependencies on Oracle and SQL Server.
+
+Foreign-key and view targets are resolved only when the exact source/schema
+object was observed in the same build. A catalog reference to an object outside
+that scope remains an `external_object` with `resolution_status: unresolved`;
+it is never silently dropped or promoted to a live table. Cross-database,
+SQL Server linked-server and Oracle database-link names remain structural
+reference attributes, not a guessed mapping to another configured source.
+
+SQLite exposes primary, unique and foreign keys through structured PRAGMAs but
+has no structured dependency catalog. The build therefore records SQLite view
+lineage as `unavailable`; it does not parse or retain `sqlite_master.sql` merely
+to produce a speculative edge.
 
 For the selected PeopleTools source it can add:
 
@@ -150,7 +168,8 @@ search_metadata(query="Phoenix interface")
     -> ranked structural candidates with source, confidence and provenance
 
 get_metadata_context(identifier="ACME_TXN_HDR", source="default")
-    -> logical/physical mapping, columns, ordered indexes, labels and codes
+    -> logical/physical mapping, columns, declared keys, foreign-key targets,
+       native view dependencies, ordered indexes, labels and codes
 
 profile_record(table="ACME_TXN_HDR", source="default")
     or describe_table / compare_records / explain_query / join_path
@@ -180,7 +199,7 @@ Confidence is categorical and explainable. No model assigns a probability:
 | `confirmed` | Directly observed database structure, a declared PeopleTools relationship, a declared `SQLTABLENAME` matched to the expected live object type, or exact logical/physical catalog identity. |
 | `corroborated` | A unique live-catalog suffix resolved the logical record when no exact or declared mapping did; the catalog was complete enough to establish uniqueness. No prefix was assumed. |
 | `candidate` | A declared or unique-suffix name exists but is not visible as the expected live object type. It is a lead to verify, not a proven mapping. |
-| `inconclusive` | The name is ambiguous across schemas, the relevant catalog layer is partial, the record is non-SQL, or no defensible physical mapping exists. |
+| `inconclusive` | The name is ambiguous across schemas, the relevant catalog layer is partial, a referenced constraint/dependency target was not observed in scope, the record is non-SQL, or no defensible physical mapping exists. |
 
 `search_metadata` also returns an integer relevance score, term coverage,
 matched facets and matched metadata. Relevance says why the words matched;
@@ -200,6 +219,9 @@ metadata_catalog:
   max_objects: 100000
   max_fields: 500000
   max_indexes: 250000
+  max_constraints: 250000
+  max_constraint_columns: 1000000
+  max_dependencies: 250000
   max_peopletools_rows: 500000
   query_page_size: 5000
   stale_after_hours: 168
@@ -212,17 +234,24 @@ Their exact scope is:
 | `max_objects` | 100,000 | physical tables/views per selected source |
 | `max_fields` | 500,000 | physical columns per selected source |
 | `max_indexes` | 250,000 | index definitions per selected source |
+| `max_constraints` | 250,000 | primary/unique/foreign-key definitions per selected source |
+| `max_constraint_columns` | 1,000,000 | ordered column memberships across native constraints per selected source |
+| `max_dependencies` | 250,000 | view-to-object dependency edges per selected source |
 | `max_peopletools_rows` | 500,000 | rows per PeopleTools layer |
 | `query_page_size` | 5,000 | rows in one keyset page |
 | `stale_after_hours` | 168 | age after which readers disclose the snapshot as stale |
 
 One-build overrides are available as `--max-objects`, `--max-fields`,
-`--max-indexes`, `--max-peopletools-rows`, and `--page-size`. The defensive
-hard ceilings are 1,000,000 objects, 5,000,000 fields, 2,000,000 indexes,
-5,000,000 PeopleTools rows per layer, and 25,000 rows per page. Raise a normal
-limit only after `describe_metadata_catalog` identifies the exact layer that
-was truncated; do not widen sources or schemas merely to make an absence go
-away.
+`--max-indexes`, `--max-constraints`, `--max-constraint-columns`,
+`--max-dependencies`, `--max-peopletools-rows`, and `--page-size`. Put durable
+site limits in `config.yaml`; use command-line overrides only for one measured
+rebuild. The
+defensive hard ceilings are 1,000,000 objects, 5,000,000 fields, 2,000,000
+indexes, 2,000,000 constraints, 5,000,000 constraint-column memberships,
+2,000,000 dependency edges, 5,000,000 PeopleTools rows per layer, and 25,000
+rows per page. Raise a normal limit only
+after `describe_metadata_catalog` identifies the exact layer that was
+truncated; do not widen sources or schemas merely to make an absence go away.
 
 Search results default to 20 and context to 40. Both are bounded to at most
 100 items per call, independently of build size.
@@ -241,6 +270,10 @@ hits, collector notes, search mode and schema version.
   as a picture of the current customization.
 - **Unavailable or incompatible:** search/context return the exact rebuild
   command. Source databases are not queried as an implicit fallback.
+- **Layer unavailable:** `notes[].status` says `unavailable` when a platform
+  has no structured layer (notably SQLite view dependencies) or an optional
+  privacy-safe PeopleTools shape is absent. Other complete layers remain
+  usable and the unsupported layer alone does not make them partial.
 - **Failed rebuild:** the `.building` file is removed and the prior artifact,
   if any, remains readable. A successful partial rebuild can replace it because
   its coverage gaps are explicit; a completely empty harvest cannot.
@@ -252,8 +285,9 @@ failure.
 ## Security boundary
 
 The artifact excludes transaction rows, balances, customer and supplier
-values, credentials, operator grants and IDs, private query names, and full
-view SQL. It stores only the structural fields needed for discovery and
+values, credentials, operator grants and IDs, private query names, check
+expressions, and full view SQL. It stores only the structural names, ordered
+key columns, reference status and relationships needed for discovery and
 explainable mapping.
 
 Because the artifact has no business rows, it does not carry PeopleSoft
@@ -262,12 +296,16 @@ metadata selection, every live tool must apply the caller's authorized scope.
 Keep the artifact and host restricted to the same administrators who may see
 the selected schemas, and build only from intended sources.
 
-## First-slice limitations
+## Current limitations
 
-- Primary keys, foreign keys, constraints and database dependency/view-lineage
-  edges are not collected yet. Ordered indexes help query planning but are not
-  a substitute for declared keys. Use `join_path` and `explain_query` for live,
-  bounded join planning.
+- Native primary/unique/foreign keys are collected, but database check/default
+  expressions, triggers, grants and full definitions are intentionally not.
+  PeopleTools logical index/key definitions are a later layer. Use `join_path`
+  and `explain_query` for live, bounded join-plan verification.
+- Oracle and SQL Server expose native view dependency catalogs. SQLite does
+  not, so SQLite view lineage is explicitly unavailable rather than inferred
+  from stored SQL. Dynamic SQL and dependencies the database itself cannot
+  resolve remain explicit gaps.
 - Search is lexical and explainable; there are no embeddings or semantic
   reranker. Add approved site-memory facts when the business meaning is absent
   from every name, description, label, translate value, page and public query.
