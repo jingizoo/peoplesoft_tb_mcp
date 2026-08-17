@@ -20,6 +20,36 @@ from .config import Config
 from .db import Database, DbError
 
 BALANCE_EPS = 0.005
+
+#: The two amount bases PS_LEDGER actually supports. ``base`` sums
+#: POSTED_TOTAL_AMT, already translated to the business unit's base currency
+#: on every row; ``transaction`` reads POSTED_TRAN_AMT, denominated in each
+#: row's own CURRENCY_CD and therefore never summable across currencies.
+AMOUNT_BASES = ("base", "transaction")
+
+
+def normalize_amount_basis(value: str) -> str:
+    """Coerce a caller's amount_basis, refusing anything unrecognised.
+
+    Silently falling back to base would answer a transaction-currency
+    question with base-currency numbers and label them correctly — the
+    worst outcome, because nothing looks wrong.
+    """
+    text = str(value or "base").strip().lower()
+    if text in ("", "default"):
+        return "base"
+    if text in ("tran", "txn", "entered"):
+        return "transaction"
+    if text in ("reporting", "base_currency"):
+        return "base"
+    if text not in AMOUNT_BASES:
+        raise EngineError(
+            f"amount_basis {value!r} is not supported. Use 'base' for "
+            "base-currency amounts (POSTED_TOTAL_AMT, the figures that tie "
+            "to the trial balance) or 'transaction' for as-entered amounts "
+            "(POSTED_TRAN_AMT), which are reported per currency and never "
+            "summed together.")
+    return text
 # Period 999 is where PeopleSoft's Close Ledger writes the year-end
 # closing entries. It is an event, not a point in time.
 CLOSE_PERIOD = 999
@@ -856,6 +886,74 @@ class TBEngine:
             "fiscal_years_with_data": years,
         }
 
+    def currency_disclosure(self, business_unit: str, amount_basis: str,
+                            currency_filter: str = "",
+                            observed: Optional[list] = None) -> dict:
+        """What the amounts in this payload are denominated in, exactly.
+
+        Every ledger tool states this the same way, because the honest
+        answer is not obvious and the previous shorthand was wrong. The
+        trial balance used to report ``currency_filter: "base currency
+        only"`` while queries.basis_clause deliberately applies NO currency
+        predicate on the base basis — POSTED_TOTAL_AMT is already the base
+        amount on every row, including the CURRENCY_CD='EUR' row a journal
+        entered in euros produces. So the label named a filter that was not
+        applied, and a reader (or a model) had no way to tell that a
+        foreign-entered journal was inside the total. It always was, and
+        should be.
+        """
+        codes = sorted({str(code or "").strip().upper()
+                        for code in (observed or []) if str(code or "").strip()})
+        base = (self.base_currency_for(business_unit) or "").strip().upper()
+        wanted = (currency_filter or "").strip().upper()
+        explicit = wanted not in ("", "DETAIL")
+        if normalize_amount_basis(amount_basis) == "transaction":
+            return {
+                "amount_basis": "transaction",
+                "amount_column": "POSTED_TRAN_AMT",
+                "denominated_in": "each row's own CURRENCY_CD",
+                "base_currency": base or None,
+                "currencies_present": codes,
+                "currency_filter": wanted if explicit else None,
+                # What matters is how many currencies are actually in the
+                # result, not whether the caller asked for one. A filtered
+                # single-currency transaction result is the clearest case
+                # where a total IS meaningful.
+                "totals_are_summable": len(codes) <= 1,
+                "reason": (
+                    "Transaction-currency amounts in "
+                    + (", ".join(codes) or "no currency")
+                    + " cannot be added together; use totals.by_currency."
+                ) if len(codes) > 1 else "",
+                "reads": (
+                    "Amounts are as entered, in the transaction currency of "
+                    "each row. Report them per currency and never as one "
+                    "total."),
+            }
+        return {
+            "amount_basis": "base",
+            "amount_column": "POSTED_TOTAL_AMT",
+            "denominated_in": base or "the business unit's base currency",
+            "base_currency": base or None,
+            "currencies_present": codes,
+            # The honest statement of the base contract: CURRENCY_CD is the
+            # currency a row was ENTERED in, and it is not filtered, because
+            # every row's POSTED_TOTAL_AMT is already translated to base.
+            "currency_filter": wanted if explicit else None,
+            "includes_foreign_entered_activity": not explicit,
+            "totals_are_summable": True,
+            "reason": "",
+            "reads": (
+                "Amounts are base-currency"
+                + (f" ({base})" if base else "")
+                + ". CURRENCY_CD is the currency each journal was entered "
+                  "in and is NOT filtered — POSTED_TOTAL_AMT is already the "
+                  "base amount on every row, so foreign-entered activity is "
+                  "included, which is what makes the trial balance tie."
+                + (f" Restricted to rows entered in {wanted}."
+                   if explicit else "")),
+        }
+
     def base_currency_for(self, business_unit: str) -> str:
         """Base currency of a GL business unit, cached. Used to bind a literal
         currency into ledger queries instead of a column-to-column predicate."""
@@ -1057,6 +1155,7 @@ class TBEngine:
         currency: str = "",
         include_adjustments: bool = False,
         max_rows: int = 0,
+        amount_basis: str = "base",
     ) -> dict:
         scope_notes: list = []
         bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
@@ -1071,18 +1170,25 @@ class TBEngine:
             per = self._max_regular_period(fy, bu, led)
             include_adjustments = True
             basis = "post_adjustment"
+        basis_kind = normalize_amount_basis(amount_basis)
         extras = self._parse_group_by(group_by)
-        if currency.lower() == "detail" and "CURRENCY_CD" not in extras:
+        if ((currency.lower() == "detail" or basis_kind == "transaction")
+                and "CURRENCY_CD" not in extras):
+            # POSTED_TRAN_AMT is denominated in CURRENCY_CD. Summing it across
+            # currencies produces a number in no currency at all, so the
+            # transaction basis carries the currency as a key whether or not
+            # the caller asked to group by it.
             extras.append("CURRENCY_CD")
         rows = self._period_sums(
             bu, led, fy, per,
             extras=extras, dept=dept, currency=currency, account=account,
-            include_adj=include_adjustments,
+            include_adj=include_adjustments, amount_basis=basis_kind,
         )
         key_fields = ["account"] + [e.lower() for e in extras]
         piv = self._pivot(rows, key_fields, per, include_adjustments)
 
         out_rows = []
+        per_currency: dict = {}
         tot_beg = tot_act = tot_adj = tot_end = tot_dr = tot_cr = 0.0
         for key in sorted(piv.keys(), key=lambda k: tuple(str(x or "") for x in k)):
             slot = piv[key]
@@ -1113,9 +1219,56 @@ class TBEngine:
             tot_end += ending
             tot_dr += dr
             tot_cr += cr
+            code = str(row.get("currency_cd") or "").strip().upper()
+            bucket = per_currency.setdefault(
+                code or "UNSPECIFIED",
+                {"beginning": 0.0, "period_activity": 0.0,
+                 "adjustments": 0.0, "ending": 0.0,
+                 "ending_dr": 0.0, "ending_cr": 0.0, "row_count": 0})
+            bucket["beginning"] += slot["beginning"]
+            bucket["period_activity"] += slot["activity"]
+            bucket["adjustments"] += slot["adjustments"]
+            bucket["ending"] += ending
+            bucket["ending_dr"] += dr
+            bucket["ending_cr"] += cr
+            bucket["row_count"] += 1
 
         cap = int(max_rows or 0) or self.cfg.tools.max_rows
         truncated = len(out_rows) > cap
+        currency_note = self.currency_disclosure(
+            bu, basis_kind, currency, sorted(per_currency))
+        summable = currency_note["totals_are_summable"]
+        totals: dict = {}
+        if "CURRENCY_CD" in extras:
+            # Only when the currency is genuinely a dimension of the result.
+            # On the base basis every row is already in one currency, and a
+            # by_currency block keyed "UNSPECIFIED" would invent a
+            # distinction the data does not have.
+            totals["by_currency"] = {
+                code: {key: r2(value) if key != "row_count" else value
+                       for key, value in bucket.items()}
+                for code, bucket in sorted(per_currency.items())
+            }
+        if summable:
+            totals.update({
+                "beginning": r2(tot_beg),
+                "period_activity": r2(tot_act),
+                "adjustments": r2(tot_adj),
+                "ending": r2(tot_end),
+                "ending_dr": r2(tot_dr),
+                "ending_cr": r2(tot_cr),
+                "in_balance": abs(tot_end) < BALANCE_EPS,
+            })
+        else:
+            # Adding POSTED_TRAN_AMT across currencies yields a figure
+            # denominated in nothing. Withholding it is the whole point of
+            # the transaction basis; a null here is not missing data.
+            totals.update({
+                "beginning": None, "period_activity": None,
+                "adjustments": None, "ending": None,
+                "ending_dr": None, "ending_cr": None, "in_balance": None,
+                "withheld_reason": currency_note["reason"],
+            })
         result = {
             "business_unit": bu,
             "ledger": led,
@@ -1128,17 +1281,9 @@ class TBEngine:
             "row_count": len(out_rows),
             "truncated": truncated,
             "scope_status": "ok",
-            "amount_basis": "base",
-            "currency_filter": currency or "base currency only",
-            "totals": {
-                "beginning": r2(tot_beg),
-                "period_activity": r2(tot_act),
-                "adjustments": r2(tot_adj),
-                "ending": r2(tot_end),
-                "ending_dr": r2(tot_dr),
-                "ending_cr": r2(tot_cr),
-                "in_balance": abs(tot_end) < BALANCE_EPS,
-            },
+            "amount_basis": basis_kind,
+            "currency": currency_note,
+            "totals": totals,
             "note": ("Amounts are signed: debits positive, credits negative. "
                      "Base-currency rows only; statistical rows excluded."),
         }
