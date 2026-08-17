@@ -3244,8 +3244,8 @@ function renderAPReconciliation(d){
   if(present(d.subledger_total)) observed.push([
     evaluated?'AP period activity':'AP side observed',money(d.subledger_total),
     esc(d.currency||''),'dr']);
-  if(present(d.gl_balance)) observed.push([
-    evaluated?'GL period activity':'GL side observed',money(d.gl_balance),
+  if(present(d.gl_total)) observed.push([
+    evaluated?'GL period activity':'GL side observed',money(d.gl_total),
     esc(d.currency||''),'cr']);
   if(evaluated&&present(d.difference)) observed.push([
     'Difference',money(d.difference),'AP minus GL',d.ties?'':'cr']);
