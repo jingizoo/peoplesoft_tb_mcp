@@ -119,14 +119,27 @@ FINANCIAL_EVIDENCE_TOOLS = {
 # Request-scope field -> tool argument. The right-hand value differs only where
 # a tool calls its period "through_period". Tools not listed do not accept
 # financial scope parameters and are left untouched.
-# The ad-hoc tools are the only ones that can reach a second database, so
-# they are the only ones the source lock binds. Every curated financial tool
-# answers from the primary by construction and takes no source argument —
-# locking those would be asserting something that cannot vary.
+# These are the only data tools that can reach a selected secondary database;
+# every other data/control tool is refused while that context is active.
 _SOURCE_SCOPED_TOOLS = (
     "run_sql", "explain_query", "join_path", "search_records",
     "profile_record", "compare_records", "list_tables", "describe_table",
+    # These read the offline multi-source catalog rather than a live DB, but
+    # source is the same namespace boundary. A P2Go chat must not discover a
+    # default-database object and then present it as P2Go context.
+    "search_metadata", "get_metadata_context",
 )
+
+# These names look like generic database discovery, but their implementations
+# are deliberately tied to the primary PeopleSoft engine or to a global
+# un-namespaced record-memory store. Letting one run while a secondary source
+# is selected would mix primary structure/facts into a card labelled P2Go.
+_PRIMARY_ONLY_STRUCTURAL_TOOLS = frozenset({
+    "describe_record", "get_record_map",
+    "search_ps_queries", "describe_ps_query", "run_ps_query",
+    "trace_process", "describe_process_graph",
+    "remember_record_fact", "what_do_we_know_about",
+})
 
 _TOOL_SCOPE_ARGS = {
     # run_sql receives only the business unit, and only as context for the
@@ -267,6 +280,15 @@ _UNSCOPED_EXTERNAL_DATA_TOOLS = {
     "get_coupa_stuck_approvals", "get_coupa_budget_lines",
     "get_coupa_supplier_spend",
 }
+# With an explicit Finance database choice but no BU/ledger yet, source-aware
+# discovery remains useful but a curated/data tool must not fall through to
+# configured defaults. This set intentionally includes unscoped external
+# diagnostics as well as normal financial controls.
+_FINANCE_SCOPE_REQUIRED_TOOLS = frozenset(
+    (set(FINANCIAL_EVIDENCE_TOOLS) | set(_TOOL_SCOPE_ARGS)
+     | _UNSCOPED_DATA_TOOLS | _UNSCOPED_EXTERNAL_DATA_TOOLS)
+    - set(_SOURCE_SCOPED_TOOLS) - {"list_financial_scopes"}
+)
 # Structure, never amounts: a process trace must not satisfy the
 # grounding guard's demand for evidence behind a figure.
 STRUCTURAL_TOOLS = {"trace_process", "describe_process_graph",
@@ -1542,10 +1564,9 @@ def normalize_request_scope(scope: Mapping | None) -> dict:
     return normalized
 
 
-# Aliases the registry resolves to the primary. Kept in step with
-# pstb.sources._PRIMARY_ALIASES: a site that configures a real source under
-# one of these names is handled there, and the guard only needs to agree
-# that the DEFAULT spellings mean one thing.
+# Aliases the registry normally resolves to the primary. A configured source
+# is allowed to use one of these names and wins over the alias, so this set is
+# used only when the already-canonical selected source is exactly ``default``.
 _PRIMARY_SOURCE_WORDS = frozenset({
     "", "default", "peoplesoft", "people soft", "ps", "psft", "primary",
     "main", "finance", "erp", "gl"})
@@ -1560,11 +1581,11 @@ def _same_scope_value(field: str, left, right) -> bool:
     if field in ("business_unit", "ledger"):
         return str(left).strip().upper() == str(right).strip().upper()
     if field == "source":
-        # Source names are case-insensitive, and "" / "default" / the
-        # primary aliases are ONE database. Comparing the raw strings made
-        # a matching selection look like a conflict, which refused the very
-        # call the selector had just authorised.
-        return _source_key(left) == _source_key(right)
+        # Request scope has already been canonicalized by SourceRegistry.
+        # Do not collapse aliases here: a site may configure a real secondary
+        # source named ``finance`` and that selection must remain distinct
+        # from ``default``.
+        return str(left).strip().lower() == str(right).strip().lower()
     try:
         return int(left) == int(right)
     except (TypeError, ValueError):
@@ -1654,9 +1675,35 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
     questions such as "show all BUs" always see the full authorized catalog.
     """
     out = dict(args or {})
+    scope = normalize_request_scope(request_scope)
+    # The GUI/API validates request scope through SourceRegistry first, so a
+    # non-default value here is the canonical configured source name. Keep it
+    # asymmetric: aliases may describe the primary only when the selected
+    # canonical source is exactly ``default``. This prevents a configured
+    # secondary named ``finance`` from being collapsed back to the primary.
+    selected_source = str(scope.get("source") or "default").strip().lower()
+    # Secondary database contexts are closed by default. The only data tools
+    # allowed there are the ones whose contract accepts and is hard-pinned to
+    # ``source``; global policy/wiki lookup is source-neutral. A denylist here
+    # would let every newly added primary tool silently reopen this boundary.
+    if (selected_source != "default"
+            and tool_name not in _SOURCE_SCOPED_TOOLS
+            and tool_name not in POLICY_TOOLS):
+        raise ScopeConflict(
+            f"{tool_name} is not source-aware and "
+            f"cannot run while source {selected_source!r} is selected; use "
+            "a source-aware metadata/discovery tool or switch Database to "
+            "Finance"
+        )
+    if (scope.get("source") == "default"
+            and (not scope.get("business_unit") or not scope.get("ledger"))
+            and tool_name in _FINANCE_SCOPE_REQUIRED_TOOLS):
+        raise ScopeConflict(
+            f"{tool_name} requires a Finance business unit and ledger; "
+            "choose the financial scope before running this tool"
+        )
     if tool_name == "list_financial_scopes":
         return out
-    scope = normalize_request_scope(request_scope)
     # run_sql is NOT refused under a scope. Refusing it made every ad-hoc and
     # custom-record question ("list the files configured in PS_TU_FILE_INTFC")
     # impossible in the GUI, where a scope is always active. Instead the
@@ -1671,6 +1718,22 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
         current_value = _scope_value(field, current)
         if current_value is None:
             out[tool_arg] = requested
+        elif field == "source":
+            current_source = str(current_value).strip().lower()
+            matches = (
+                _source_key(current_value) == "default"
+                if selected_source == "default"
+                else current_source == selected_source
+            )
+            if not matches:
+                raise ScopeConflict(
+                    f"{tool_name}.{tool_arg}={current!r} conflicts with the "
+                    f"selected source {requested!r}"
+                )
+            # Always execute the exact registry-canonical selection. Besides
+            # fixing case variants, this prevents a primary alias such as
+            # ``finance`` from resolving to a same-named configured secondary.
+            out[tool_arg] = "default" if selected_source == "default" else requested
         elif not _same_scope_value(field, current_value, requested):
             if field in _SOFT_SCOPE_FIELDS:
                 # Time is a DEFAULT, not a lock. "Show the trial balance for

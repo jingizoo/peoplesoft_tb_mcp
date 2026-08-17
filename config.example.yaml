@@ -35,6 +35,15 @@ db:
   use_views: false        # set true once sql/oracle/XX_TB_*.sql views are deployed
   query_timeout_seconds: 120   # abort a query rather than hanging the UI        # set true once sql/oracle/XX_TB_*.sql views are deployed
 
+# Additional runtime database contexts for guarded ad-hoc discovery and SQL.
+# Uncomment to make P2Go available in Ask; building its metadata catalog alone
+# does not register a live source. Keep its Oracle credentials in .env as
+# PSTB_SRC_P2GO_DSN, PSTB_SRC_P2GO_USER and PSTB_SRC_P2GO_PASSWORD.
+# sources:
+#   p2go:
+#     backend: oracle
+#     schema: P2GO_SCHEMA
+
 # Concept overrides: which codes define a named population at THIS site.
 # Approved site-memory facts outrank this; the built-in seed backstops both.
 # semantics:

@@ -607,6 +607,43 @@ authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
    .venv/bin/python -m pstb.client.chat --ask "List the business units and ledgers."
    ```
 
+### Add P2Go as an Ask database context
+
+The Ask database selector is populated from configured runtime sources, not
+from the offline metadata artifact. Add P2Go under `sources:` in `config.yaml`:
+
+```yaml
+db:
+  backend: oracle
+  schema: SYSADM
+
+sources:
+  p2go:
+    backend: oracle
+    schema: P2GO_SCHEMA
+```
+
+Keep its read-only credentials in `.env`:
+
+```dotenv
+PSTB_SRC_P2GO_DSN=host:1521/SERVICE_NAME
+PSTB_SRC_P2GO_USER=readonly_p2go_user
+PSTB_SRC_P2GO_PASSWORD=...
+```
+
+Restart the GUI process after changing either file. Then open `/api/meta` on
+that process (for the default port,
+`http://127.0.0.1:8016/api/meta`) and confirm that `sources` contains both
+`default` and `p2go`. The **Database** selector appears in Ask only when at
+least two runtime sources are present.
+
+Choosing **Finance** keeps the context on the primary PeopleSoft connection;
+curated financial tools are available there. Choosing **p2go** hard-locks the
+context to guarded, source-aware discovery, read-only SQL, and metadata tools
+on P2Go. Source-unaware and curated financial tools are refused; switch the
+selector back to **Finance** to use them. A P2Go context has no PeopleSoft
+business unit, ledger, fiscal year, or period scope.
+
 Optionally have a DBA deploy the views in [`sql/oracle/`](../sql/oracle) and set
 `db.use_views: true` — see [VIEWS.md](VIEWS.md). The agent works without them.
 
