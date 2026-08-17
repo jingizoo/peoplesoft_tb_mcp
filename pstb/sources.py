@@ -36,6 +36,24 @@ class SourceRegistry:
         """The default source first, then the configured extras."""
         return ["default"] + sorted(self.cfg.sources)
 
+    def resolve_name(self, source: str = "") -> str:
+        """The canonical name get() would answer from, for provenance.
+
+        A payload that says which database answered is only useful if it says
+        the name the registry actually used: "peoplesoft" and "" and "default"
+        are one connection, and labelling a result with whichever alias the
+        caller happened to type would make two identical answers look like
+        they came from two places. Unknown names are returned unchanged so
+        the caller's own error path reports them.
+        """
+        name = (source or "").strip()
+        if name in ("", "default"):
+            return "default"
+        if (name.lower() in _PRIMARY_ALIASES
+                and name not in (self.cfg.sources or {})):
+            return "default"
+        return name
+
     def get(self, source: str = "") -> Database:
         """Database for a named source; '' or 'default' is the primary.
 

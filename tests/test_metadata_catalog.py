@@ -948,3 +948,63 @@ class SafetyAndBoundTests(_FixtureCase):
                 + (enormous.get("mappings") or [])),
             100,
         )
+
+
+class SourceProvenanceTests(unittest.TestCase):
+    """Which database answered must be in the payload, not inferred.
+
+    On a two-database deployment a table list from a reporting mart and one
+    from PeopleSoft were byte-indistinguishable: only search_records named a
+    source, and it meant something else by the word. So the reader, the card
+    and the model all had to guess, and the guess is always "PeopleSoft".
+    """
+
+    def test_every_ad_hoc_tool_names_the_database_that_answered(self) -> None:
+        from pstb import server as srv
+        for label, out in (
+                ("run_sql", srv.run_sql(sql="SELECT 1 AS x")),
+                ("list_tables", srv.list_tables(pattern="%LEDGER%")),
+                ("describe_table", srv.describe_table(table_name="PS_LEDGER")),
+                ("search_records", srv.search_records(query="ledger")),
+                ("join_path", srv.join_path(from_record="PS_ITEM",
+                                            to_record="PS_CUSTOMER"))):
+            with self.subTest(label):
+                self.assertEqual(out.get("source_database"), "default")
+
+    def test_it_does_not_collide_with_search_records_own_source_key(self):
+        # search_records uses "source" for where the record INFO came from
+        # (psrecdefn / database catalog). One key holding two meanings is how
+        # a mart result ends up badged with a PeopleTools word.
+        from pstb import server as srv
+        out = srv.search_records(query="ledger")
+        self.assertEqual(out.get("source"), "psrecdefn")
+        self.assertEqual(out.get("source_database"), "default")
+
+    def test_an_alias_reports_the_resolved_name_not_what_was_typed(self):
+        from pstb import server as srv
+        for alias in ("", "default", "peoplesoft", "PS", "main"):
+            with self.subTest(alias):
+                out = srv.list_tables(pattern="%LEDGER%", source=alias)
+                self.assertEqual(out.get("source_database"), "default")
+
+    def test_an_unknown_source_is_a_clean_error_not_a_raise(self) -> None:
+        # for_source used to be evaluated OUTSIDE _safe, so a typo reached
+        # the model as a crash-shaped "TOOL ERROR:" instead of the remedied
+        # message it was written to be.
+        from pstb import server as srv
+        out = srv.list_tables(pattern="%", source="nope")
+        self.assertIn("Unknown source", out.get("error", ""))
+        self.assertIn("Configured sources", out["error"])
+
+    def test_the_badge_is_muted_for_the_primary_and_loud_otherwise(self):
+        html = (ROOT / "pstb" / "gui" / "static" / "index.html").read_text()
+        self.assertIn("function sourceBadge(", html)
+        self.assertIn("source: the finance database", html)
+        self.assertIn("curated financial tools do not answer from it", html)
+        # The page chrome names no company or vendor; a smoke check enforces
+        # it and the first draft of this badge broke it.
+        self.assertNotIn("PeopleSoft", html.split("function sourceBadge(")[1]
+                         .split("function renderToolResult(")[0])
+        self.assertIn("function renderToolBody(", html,
+                      "the wrapper must delegate, not replace, the 40 "
+                      "existing renderers")
