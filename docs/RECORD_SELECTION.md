@@ -1,22 +1,53 @@
 # Choosing the right record
 
-`search_records` finds candidates by name and PeopleTools description. That is
-often not enough to pick between them.
+`search_metadata` is the preferred first step for an unfamiliar delivered,
+custom or cross-database concept. It searches an offline snapshot of physical
+objects, PeopleTools logical records, fields, labels, translate values, page
+use and public saved-query use, while preserving source and schema identity.
+
+`search_records` remains the live PeopleTools fallback when that artifact has
+not been built, and it includes approved site-memory facts. A name or
+description match alone is often not enough to pick between candidates.
 
 PeopleSoft ships many records with near-identical names, and every site adds
 more. A question about open invoices might plausibly mean `PS_ITEM`,
 `PS_BI_HDR`, a history shell, a staging table, or a custom `PS_XX_*` record.
 Names cannot separate those. Contents can.
 
-`profile_record` and `compare_records` supply the contents.
+`get_metadata_context` supplies explainable structural context;
+`profile_record` and `compare_records` supply live population evidence.
 
 ## The sequence
 
 ```
-search_records("open invoice")   ->  candidates, by description
-compare_records([...])           ->  which are readable, populated, and shaped right
-run_sql(...)                     ->  the actual question
+search_metadata(query="open invoice")
+    -> candidates across configured sources
+get_metadata_context(identifier="ACME_ITEM", source="default")
+    -> mapping, columns, indexes, labels/codes
+profile_record(table="ACME_ITEM", source="default")
+    -> live shape and population
+compare_records(tables=[...], source="default")
+    -> choose if several remain plausible
+curated tool or run_sql(...)
+    -> the scoped business question
 ```
+
+On Gemini 2.5 Pro this sequence is part of the tool-routing prompt. The model
+must use the physical object and source returned by the catalog; it must not add
+`PS_` or guess a company prefix. If an identifier is ambiguous across sources
+or schemas, `get_metadata_context` returns candidates rather than choosing by
+sort order.
+
+Catalog confidence is separate from search relevance:
+
+- `confirmed` is observed or directly declared metadata;
+- `corroborated` is a unique live-catalog suffix match with no assumed prefix;
+- `candidate` is a useful but unverified declared/type-mismatched lead;
+- `inconclusive` means ambiguity, partial coverage or no defensible mapping.
+
+A stale or partial snapshot remains useful for positive matches, but a miss is
+not evidence that a record does not exist. Check `describe_metadata_catalog`
+and see [METADATA_CATALOG.md](METADATA_CATALOG.md) for the complete contract.
 
 ## What a profile reports
 
@@ -43,6 +74,10 @@ An empty record is rarely what a question means, however well its name matches.
 `empty_or_unreadable` for that reason.
 
 ## Masking
+
+The offline metadata catalog stores and returns structure only, so its search
+and context calls contain no sampled source rows. The first row-bearing step is
+`profile_record` or `compare_records`.
 
 Sample rows leave this process and reach whichever model is configured. On the
 Gemini provider that means they leave your network.
@@ -82,11 +117,17 @@ evidence about shape, and must never be reported as totals.
 
 ## Records nobody could have guessed
 
-Profiling answers "which of these candidate tables fits". It cannot answer
-"which table is it" when the table is client-specific: no PeopleTools
-description, a name that encodes nothing, no wiki page. `search_records("interface
-file")` returns nothing, and no improvement to retrieval changes that — the
-information was never written anywhere the agent can read.
+The metadata catalog materially widens discovery: a client-specific physical
+name can be found through a logical record, field label, translate label, page
+or public saved query even when the name itself is opaque. Profiling then
+answers "which of these candidate tables fits".
+
+It still cannot recover meaning that was never recorded anywhere. A table with
+no useful name, PeopleTools description, field/label/code wording, page,
+public-query use or wiki documentation gives lexical search nothing to match.
+In that case `search_metadata("interface file")` and
+`search_records("interface file")` return nothing; embeddings would only make
+an unsupported guess sound more plausible.
 
 What exists instead is somebody saying it out loud, once:
 
@@ -122,11 +163,13 @@ Large-table queries on a real instance time out rather than erroring, and a
 timeout teaches nothing. Three mechanisms turn "it hung" into "here is what to
 change":
 
-**The index catalog.** `describe_table` now carries each index with its
-columns IN ORDER, because order is the whole game: the optimizer can only use
-an index whose leading columns appear in your predicates. A table with no
-readable index says so plainly — every query there is a full scan and no
-rewrite changes that.
+**The index catalog.** `get_metadata_context` carries the snapshot's indexes,
+and `describe_table` returns the live catalog; both keep columns IN ORDER,
+because order is the whole game: the optimizer can only use an index whose
+leading columns appear in your predicates. A table with no readable index says
+so plainly — every query there is a full scan and no rewrite changes that.
+The first metadata-catalog schema does not collect PK/FK or dependency edges,
+so an ordered index must not be presented as a declared relationship.
 
 **`explain_query`.** Asks the optimizer how it WOULD run a SELECT, without
 executing it. Returns the plan, each referenced table's rows and indexes, and

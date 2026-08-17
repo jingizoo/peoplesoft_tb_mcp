@@ -152,6 +152,22 @@ class ProcessGraphCfg:
 
 
 @dataclass
+class MetadataCatalogCfg:
+    """Offline, read-only catalog of structure across configured databases.
+
+    The artifact contains names, definitions and relationships only.  These
+    ceilings bound one refresh without turning the catalog into a copy of any
+    source database.
+    """
+    max_objects: int = 100_000
+    max_fields: int = 500_000
+    max_indexes: int = 250_000
+    max_peopletools_rows: int = 500_000
+    query_page_size: int = 5_000
+    stale_after_hours: int = 168
+
+
+@dataclass
 class AnomalyCfg:
     """Bounded, read-only transaction/process anomaly settings.
 
@@ -258,6 +274,8 @@ class Config:
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
     process_graph: ProcessGraphCfg = field(default_factory=ProcessGraphCfg)
+    metadata_catalog: MetadataCatalogCfg = field(
+        default_factory=MetadataCatalogCfg)
     anomalies: AnomalyCfg = field(default_factory=AnomalyCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
 
@@ -441,6 +459,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.wiki, data.get("wiki"))
         _apply_section(cfg.tools, data.get("tools"))
         _apply_section(cfg.process_graph, data.get("process_graph"))
+        _apply_section(cfg.metadata_catalog, data.get("metadata_catalog"))
         _apply_section(cfg.anomalies, data.get("anomalies"))
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))

@@ -21,6 +21,7 @@ With the virtualenv active:
 python scripts/mcp_probe.py                    # spawn the server over stdio, no LLM
 python scripts/diagnose_db.py                  # time each DB step (find slow queries)
 python scripts/diagnose_wiki.py                # prove the wiki is connected and real
+python scripts/build_metadata_catalog.py       # atomically refresh structural discovery
 python -m pstb.client.chat                     # chat REPL
 python -m pstb.client.chat --provider gemini   # chat via Gemini on Vertex AI
 python -m pstb.client.chat --provider claude   # chat via Claude on the Anthropic API
@@ -76,6 +77,12 @@ macOS/Linux shortcuts: `make venv`, `make seed`, `make smoke`, `make probe`,
   are batched and atomic, with explicit partial-source metadata and guarded
   node/edge/memory ceilings. Memory is preflighted before merge allocation;
   query-time walks stay separately bounded.
+- `pstb/metadata.py` — versioned, offline structural catalog across the primary
+  and named database sources. Native tables/views, columns and ordered indexes
+  are joined to available PeopleTools records, fields, labels, translate
+  values, pages and public saved-query use. Search is local FTS5 (substring
+  fallback), mappings carry categorical confidence/provenance, and atomic
+  replacement preserves the last good artifact on a failed build.
 - `pstb/report.py` — nVision-style report runner: timespan resolver (YTD/BAL/
   PER/QTD/Qn/ROLL12/-1Y) plus a grid engine over report JSONs in reports/.
 - `pstb/client/` — provider-agnostic agent loop plus `llm_ollama.py`,
@@ -128,10 +135,38 @@ flagged question is a candidate for a new curated tool or record-map entry.
 Multi-step chaining is deliberately NOT LangChain/LangGraph: the agent loop
 already feeds tool results back for up to 10 rounds, and the reliable way to
 reduce chain errors is to move routing and arithmetic INTO deterministic
-tools — get_record_map kills table-guessing before run_sql, and
-get_exchange_rate converts amounts server-side so the model never multiplies.
-A framework on top of MCP would add a dependency without fixing either
-failure mode.
+tools. For unfamiliar structure, Gemini 2.5 Pro follows
+`search_metadata` → `get_metadata_context` → a live profiling/query tool;
+`get_exchange_rate` converts amounts server-side so the model never
+multiplies. A framework on top of MCP would add a dependency without fixing
+either failure mode.
+
+### Metadata discovery contract
+
+`scripts/build_metadata_catalog.py` reads catalog structure with SELECT/PRAGMA
+only and publishes `metadata_catalog.db` atomically at mode `0600`. Source and
+schema are part of every identity; never collapse same-named objects across
+databases, never infer a `PS_` prefix, and never treat lexical relevance as
+mapping confidence. The four mapping tiers are `confirmed`, `corroborated`,
+`candidate` and `inconclusive`, each with an evidence basis.
+
+The MCP sequence is intentionally split:
+
+1. `describe_metadata_catalog` establishes version, freshness, coverage and
+   limit hits.
+2. `search_metadata` returns explainably ranked structural candidates.
+3. `get_metadata_context` resolves an exact candidate and returns columns,
+   ordered indexes, labels/codes and mapping provenance.
+4. A live tool applies caller business-unit scope and date/status/currency
+   basis. Metadata tools are structural and cannot satisfy financial evidence.
+
+Partial and stale artifacts remain readable with disclosure. Tests and callers
+must treat absence from a partial layer as inconclusive and must expect
+ambiguity responses rather than sort-order selection. The first schema version
+does not collect PK/FK/constraint/dependency lineage, use embeddings, or
+support quoted identifiers that differ only by case. See
+[METADATA_CATALOG.md](METADATA_CATALOG.md) for exact build limits, grants and
+source/dialect rules.
 
 ## Monitoring — from answering to noticing
 

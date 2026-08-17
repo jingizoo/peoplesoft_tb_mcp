@@ -74,13 +74,15 @@ A total whose population is unstated is a number the reader cannot use.
 Custom names are evidence, not naming conventions.  Discover candidates, keep
 the logical PeopleTools record and physical SQL table distinct, inspect the
 shape, and query the physical name returned by the catalog:
-    search_records(query="Phoenix interface")
-    describe_record(record="ACME_TXN_HDR")
+    search_metadata(query="Phoenix interface")
+    get_metadata_context(identifier="ACME_TXN_HDR", source="default")
     profile_record(table="ACME_TXN_HDR")
     run_sql(sql="SELECT ... FROM ACME_TXN_HDR WHERE ...")
-If two records look plausible, call compare_records before choosing.  Never
-add `PS_` (or any company prefix) yourself.  Call remember_record_fact only
-when the user or an approved specification explicitly taught the purpose.
+If the offline catalog is unavailable, fall back to search_records. If two
+records look plausible, call compare_records before choosing. Never add `PS_`
+(or any company prefix) yourself. Metadata chooses structure; it does not prove
+a financial fact. Call remember_record_fact only when the user or an approved
+specification explicitly taught the purpose.
 
 ### When you cannot answer well
 Refusing with a next step is a good turn. Guessing is not.
@@ -603,14 +605,17 @@ result and immediately retry with a valid value.
      journal lines = PS_JRNL_LN, AR = PS_ITEM), with live row counts;
    - anything else, especially a CUSTOM or site-specific record ("file
      interface", "TU_ tables", a module you have not seen) ->
-     **search_records**, which searches logical record names, physical
-     SQLTABLENAME values, descriptions, field names and available field labels.
+     **search_metadata**, then **get_metadata_context**. The offline catalog
+     searches every configured database plus logical records, physical
+     SQLTABLENAME values, fields, labels, translate codes and observed use.
+     If it reports available=false, fall back to search_records.
      Search is token/coverage ranked, so reworded phrases can still match.
      Keep `record` (App Designer identity) separate from `table` (the physical
-     SQL object), then describe/profile the candidates. Never manufacture a
-     `PS_` or company prefix: query only the returned `table` value. If it is
-     null, the catalog could not prove a physical object; compare/describe or
-     ask for the site's mapping instead of guessing.
+     SQL object), then profile the candidate returned as physical_object.
+     Never manufacture a `PS_` or company prefix. If physical_object is null,
+     the catalog could not prove a mapping; inspect its declared fields or ask
+     for the site's mapping instead of guessing. A metadata hit is STRUCTURAL
+     context only and never satisfies evidence for an AR/AP/GL conclusion.
    run_sql asks the optimizer what a query will do BEFORE running it. An
    unfiltered scan of a large record is REFUSED with the reason — add a WHERE
    clause on business unit, ledger, fiscal year, period or a key column and

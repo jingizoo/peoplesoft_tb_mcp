@@ -151,6 +151,18 @@ process_graph:
   memory_budget_mb: 512
   write_batch_size: 2000
 
+# Offline catalog of logical PeopleTools records and every configured
+# database's physical objects/columns/indexes. It stores STRUCTURE only -- no
+# transaction rows or balances -- and is rebuilt atomically by:
+#     .venv/bin/python scripts/build_metadata_catalog.py
+metadata_catalog:
+  max_objects: 100000
+  max_fields: 500000
+  max_indexes: 250000
+  max_peopletools_rows: 500000
+  query_page_size: 5000
+  stale_after_hours: 168
+
 # Daily transaction/interface and operational-process anomaly detection.
 # Physical table names are read from the live catalog; no PS_ prefix is
 # assumed. Inference is deliberately bounded and will not auto-scan a large,

@@ -20,7 +20,8 @@ _DISCOVERY_TOOLS = {
     "list_tables", "describe_table", "run_sql", "explain_query", "join_path",
     "get_record_map", "search_ps_queries", "describe_ps_query", "run_ps_query",
     "trace_process", "describe_process_graph", "remember_record_fact",
-    "what_do_we_know_about",
+    "what_do_we_know_about", "describe_metadata_catalog",
+    "search_metadata", "get_metadata_context",
 }
 _POLICY_TOOLS = {"wiki_health", "wiki_lookup", "wiki_search", "wiki_get_page",
                  "list_policy_terms", "resolve_policy_value"}

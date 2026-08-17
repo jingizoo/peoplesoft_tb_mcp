@@ -1589,6 +1589,114 @@ function renderRecords(d){
   sc.append(t); c.append(sc);
   return c;
 }
+function metadataStatus(c,d){
+  const s=d.snapshot||{};
+  if(d.available===false){
+    c.append(el('div','pad','<span class="badge bad">not built</span> '+
+      esc(d.detail||'')+'<pre class="mono">'+
+      esc(d.how_to_build||'python scripts/build_metadata_catalog.py')+'</pre>'));
+    return false;
+  }
+  c.append(el('div','pad','<span class="badge '+
+    (s.partial||s.stale?'warn':'ok')+'">'+
+    (s.partial?'partial':s.stale?'stale':'current')+'</span> '+
+    esc(s.built_at?'built '+s.built_at:'metadata snapshot')+
+    (s.note?'<div class="sub">'+esc(s.note)+'</div>':'')));
+  return true;
+}
+function metadataConfidence(v){
+  if(!v) return '—';
+  return typeof v==='object'
+    ? esc(v.tier||'')+(v.basis?'<div class="sub">'+esc(v.basis)+'</div>':'')
+    : esc(v);
+}
+function renderMetadataSearch(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'Metadata matches'+
+    (d.query?'<span class="sub">“'+esc(d.query)+'”</span>':'')));
+  if(!metadataStatus(c,d)) return c;
+  const rows=d.matches||[];
+  if(!rows.length){
+    c.append(el('div','pad','No indexed object matched. '+esc(d.detail||'')));
+    return c;
+  }
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>Logical record / meaning</th><th>Physical object</th><th>Source</th><th>Why it matched</th><th>Confidence</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr><td><b class="mono">'+
+      esc((r.logical_records||[]).join(', ')||r.name||'')+'</b>'+
+      (r.label?'<div class="sub">'+esc(r.label)+'</div>':'')+'</td><td>'+
+      (r.physical_object?'<span class="mono">'+esc(r.schema?r.schema+'.'+r.physical_object:r.physical_object)+'</span>':
+       '<span class="badge warn">unresolved — do not guess</span>')+
+      '</td><td>'+esc(r.source||'')+'<div class="sub">'+esc(r.kind||'')+'</div></td><td>'+
+      esc((r.match_reasons||[]).join(' · '))+
+      ((r.matched_terms||[]).length?'<div class="sub">terms: '+
+        r.matched_terms.map(esc).join(', ')+' · coverage '+
+        esc(Math.round((r.term_coverage||0)*100))+'%</div>':'')+
+      '</td><td>'+metadataConfidence(r.confidence)+'</td></tr>').join('')+'</tbody>';
+  const sc=el('div');sc.style.maxHeight='420px';sc.style.overflow='auto';sc.append(t);c.append(sc);
+  if(d.truncated) c.append(el('div','pad warn','More matches exist; narrow the source, kind, or wording.'));
+  c.append(el('div','pad sub',esc(d.coverage_note||d.note||'')));
+  return c;
+}
+function renderMetadataContext(d){
+  const c=el('div','card');
+  c.append(el('h2',null,'Metadata context'+
+    (d.identifier?'<span class="sub">'+esc(d.identifier)+'</span>':'')));
+  if(!metadataStatus(c,d)) return c;
+  if(d.ambiguous){
+    c.append(el('div','pad','<span class="badge warn">choice required</span> '+
+      esc(d.detail||'This name maps to more than one object.')));
+    if((d.candidates||[]).length) c.append(genericTable((d.candidates||[]).map(x=>({
+      source:x.source,schema:x.schema,physical_object:x.physical_object||x.name,
+      logical_records:(x.logical_records||[]).join(', '),kind:x.kind
+    }))));
+    return c;
+  }
+  if(!d.found){ c.append(el('div','pad',esc(d.detail||'No exact metadata object found.'))); return c; }
+  const o=d.object||d.subject||{};
+  c.append(el('div','pad','<b class="mono">'+
+    esc(o.physical_object?(o.schema?o.schema+'.':'')+o.physical_object:
+      (o.logical_records||[]).join(', ')||o.name||'')+'</b> '+
+    (!o.physical_object?'<span class="badge warn">physical mapping unresolved</span>':'')+
+    (o.label?'<div class="sub">'+esc(o.label)+'</div>':'')+
+    '<div class="sub">'+metadataConfidence(o.confidence)+'</div>'));
+  if((d.mappings||[]).length){
+    c.append(el('h2',null,'Logical → physical mapping'));
+    c.append(genericTable(d.mappings.map(m=>({
+      logical_record:m.logical_record,physical_object:m.physical_object,
+      confidence:m.confidence,basis:m.confidence_basis
+    }))));
+  }
+  if((d.indexes||[]).length){
+    c.append(el('h2',null,'Indexes <span class="sub">ordered leading columns</span>'));
+    c.append(genericTable(d.indexes.map(i=>({name:i.name,unique:i.unique?'yes':'no',
+      columns:(i.columns||[]).join(' → '),coverage:i.coverage_note||''}))));
+  }
+  if((d.columns||[]).length){
+    c.append(el('h2',null,'Columns & PeopleTools meaning'));
+    c.append(genericTable(d.columns.map(x=>({
+      position:x.ordinal,name:x.name,type:x.data_type||'',nullable:x.nullable||'',
+      label:x.field_label||'',codes:(x.translate_values||[]).map(v=>
+        v.value+' = '+(v.label||'')+(v.current?' (current)':'')).join(' · ')
+    }))));
+  }
+  (d.notes||[]).slice(0,6).forEach(n=>c.append(el('div','pad sub',esc(n))));
+  if(d.truncated) c.append(el('div','pad warn','Context was capped; raise the small result limit or narrow the identifier.'));
+  c.append(el('div','pad sub',esc(d.coverage_note||'')));
+  return c;
+}
+function renderMetadataCatalog(d){
+  const c=el('div','card');c.append(el('h2',null,'Metadata catalog coverage'));
+  if(!metadataStatus(c,d)) return c;
+  if((d.sources||[]).length) c.append(genericTable(d.sources));
+  if((d.limit_hits||[]).length){
+    c.append(el('h2',null,'Build limits'));
+    c.append(genericTable(d.limit_hits));
+  }
+  (d.notes||[]).filter(n=>!n.ok||n.partial).slice(0,12)
+    .forEach(n=>c.append(el('div','pad warn',esc(n.source+' · '+n.layer+': '+n.note))));
+  c.append(el('div','pad sub',esc(d.coverage_note||'')));return c;
+}
 function renderRecordDescription(d){
   const c=el('div','card');
   const physical=d.table||'';
@@ -1887,6 +1995,9 @@ function renderToolResult(name,data,args){
     if(name==='get_top_billing_customers') return renderTopBilling(data);
     if(name==='run_playbook') return renderPlaybook(data);
     if(name==='run_sql') return renderSql(data);
+    if(name==='search_metadata') return renderMetadataSearch(data);
+    if(name==='get_metadata_context') return renderMetadataContext(data);
+    if(name==='describe_metadata_catalog') return renderMetadataCatalog(data);
     if(name==='search_records') return renderRecords(data);
     if(name==='describe_record') return renderRecordDescription(data);
     if(name==='profile_record') return renderRecordProfile(data);
