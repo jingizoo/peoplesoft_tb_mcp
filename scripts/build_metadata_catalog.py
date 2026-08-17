@@ -47,6 +47,9 @@ def main(argv=None) -> int:
     parser.add_argument("--max-objects", type=int, default=None)
     parser.add_argument("--max-fields", type=int, default=None)
     parser.add_argument("--max-indexes", type=int, default=None)
+    parser.add_argument("--max-constraints", type=int, default=None)
+    parser.add_argument("--max-constraint-columns", type=int, default=None)
+    parser.add_argument("--max-dependencies", type=int, default=None)
     parser.add_argument("--max-peopletools-rows", type=int, default=None)
     parser.add_argument("--page-size", type=int, default=None)
     parser.add_argument("--quiet", action="store_true")
@@ -73,6 +76,9 @@ def main(argv=None) -> int:
             ("max_objects", "max_objects"),
             ("max_fields", "max_fields"),
             ("max_indexes", "max_indexes"),
+            ("max_constraints", "max_constraints"),
+            ("max_constraint_columns", "max_constraint_columns"),
+            ("max_dependencies", "max_dependencies"),
             ("max_peopletools_rows", "max_peopletools_rows"),
             ("page_size", "query_page_size")):
         value = getattr(args, arg_name)
@@ -97,6 +103,9 @@ def main(argv=None) -> int:
             f"limits: {limits.max_objects:,} objects/source; "
             f"{limits.max_fields:,} columns/source; "
             f"{limits.max_indexes:,} indexes/source; "
+            f"{limits.max_constraints:,} constraints/source; "
+            f"{limits.max_constraint_columns:,} constraint columns/source; "
+            f"{limits.max_dependencies:,} dependencies/source; "
             f"{limits.max_peopletools_rows:,} rows/PeopleTools layer; "
             f"{limits.query_page_size:,}/page", args.quiet)
         started = time.perf_counter()

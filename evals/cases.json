@@ -118,21 +118,18 @@
     },
     {
       "id": "custom-record",
-      "question": "What files are configured in the file interface?",
-      "scope": {
-        "business_unit": "US001",
-        "ledger": "ACTUALS"
-      },
+      "question": "Find the physical table behind the custom record TU_FILE_INTFC. Do not add PS_ or any company prefix. If metadata cannot prove the mapping, stop and say it is unresolved.",
+      "scope": {},
       "expect": {
         "any_tool": [
+          "get_metadata_context"
+        ],
+        "not_tool": [
           "search_records",
           "run_sql"
         ],
-        "answer_lacks": [
-          "do not have access",
-          "cannot"
-        ],
-        "_why": "custom records are reached by description search then SQL"
+        "not_refused": true,
+        "_why": "Metadata-first discovery must preserve an unresolved custom logical record without manufacturing PS_TU_FILE_INTFC or querying a guessed physical object."
       }
     },
     {
@@ -821,13 +818,81 @@
       },
       "expect": {
         "any_tool": [
-          "search_records"
+          "get_metadata_context"
         ],
         "not_tool": [
+          "search_records",
           "run_sql"
         ],
         "not_refused": true,
-        "_why": "The first step for an unfamiliar custom object is evidence-based PeopleTools/catalog discovery. A physical table prefix must never be manufactured from a delivered naming convention."
+        "_why": "The discovery turn must reach exact metadata context, retain the returned logical/physical/source identities, and never manufacture a physical prefix. It is not yet a request for transaction rows."
+      }
+    },
+    {
+      "id": "metadata-field-label-discovery",
+      "question": "Which record contains the field whose label is Approval Status? Show the exact label evidence. Do not query transaction rows.",
+      "scope": {},
+      "expect": {
+        "any_tool": [
+          "search_metadata"
+        ],
+        "not_tool": [
+          "search_records",
+          "profile_record",
+          "compare_records",
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "Field-label discovery belongs to the structural catalog. If the catalog has no exact Approval Status label, the honest result is inconclusive; a similar status column must not be relabelled as exact evidence."
+      }
+    },
+    {
+      "id": "metadata-ambiguous-source-schema",
+      "question": "Find VENDOR across every configured database. If it exists in more than one source or schema, do not choose one silently; show each candidate and tell me which source/schema I must specify.",
+      "scope": {},
+      "expect": {
+        "any_tool": [
+          "get_metadata_context"
+        ],
+        "not_tool": [
+          "search_records",
+          "profile_record",
+          "compare_records",
+          "run_sql"
+        ],
+        "not_refused": true,
+        "_why": "Exact context is responsible for exposing source/schema ambiguity. A structural question must not choose by sort order or read live rows."
+      }
+    },
+    {
+      "id": "metadata-live-evidence-boundary",
+      "question": "How many billing-interface rows are rejected for US001 right now? First identify the record without assuming a prefix, then use live scoped data; metadata alone is not an answer.",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS"
+      },
+      "expect": {
+        "any_tool": [
+          "run_sql"
+        ],
+        "all_tools": [
+          "search_metadata",
+          "get_metadata_context",
+          "run_sql"
+        ],
+        "ordered_tools": [
+          "search_metadata",
+          "get_metadata_context",
+          "run_sql"
+        ],
+        "not_tool": [
+          "search_records"
+        ],
+        "tool_args_contain": {
+          "business_unit": "US001"
+        },
+        "not_refused": true,
+        "_why": "The catalog may select PS_INTFC_BI (or the site's custom physical object), but only a successful live, caller-scoped query can support the rejected-row count. The retained call trace must show search_metadata -> get_metadata_context before run_sql."
       }
     },
     {

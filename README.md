@@ -199,9 +199,10 @@ Build the structural catalog after connecting the intended databases:
 .venv/bin/python scripts/build_metadata_catalog.py
 ```
 
-It indexes names, columns, ordered indexes, PeopleTools logical records,
-labels, translate values, page use and public saved-query use across `default`
-and every configured `sources:` database. It keeps source/schema identities
+It indexes names, columns, ordered indexes, declared primary/unique/foreign-key
+constraints, native view dependencies, PeopleTools logical records, labels,
+translate values, page use and public saved-query use across `default` and
+every configured `sources:` database. It keeps source/schema identities
 separate and resolves custom physical names from evidence — it never assumes
 `PS_` or another company prefix.
 
@@ -213,6 +214,9 @@ balances and cannot satisfy the financial-evidence gate. See
 [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) for source/schema scope,
 read-only grants, confidence tiers, exact limits, refresh cadence and partial
 or stale behavior.
+
+Optional semantic re-ranking and resumable controller workflows are described
+in [docs/AI_ORCHESTRATION.md](docs/AI_ORCHESTRATION.md).
 
 ## Wiki context (Confluence)
 
@@ -310,11 +314,14 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 - **Tool packs per module:** AP open vouchers/aging, Asset Management
   roll-forward tie-outs, commitment control, allocations, intercompany
   eliminations (see the end of docs/QUESTIONS.md).
-- **Metadata intelligence (first slice shipped):** the versioned offline
+- **Metadata intelligence (lineage slice shipped):** the versioned offline
   catalog grounds delivered and custom terminology in physical objects across
-  configured databases, with PeopleTools labels/codes and explainable mapping
-  confidence. PK/FK/dependency lineage and optional semantic reranking remain
-  future layers — see [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md).
+  configured databases, with PeopleTools labels/codes, native PK/UQ/FK and
+  view-dependency lineage, and explainable confidence. Optional Vertex
+  semantic re-ranking improves business-language discovery without changing
+  the candidate set or financial-evidence rules — see
+  [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) and
+  [docs/AI_ORCHESTRATION.md](docs/AI_ORCHESTRATION.md).
 - **Wiki-augmented answers (shipped):** `wiki_lookup` returns ranked passages
   with page/section provenance so policy answers quote real text and combine
   with ledger figures. Whether to add embeddings — and the evidence that would
@@ -326,10 +333,11 @@ chartfields, tree rollups, journal drill-down with ledger tie-out.
 pstb/            server.py (MCP) · engine.py (TB math) · queries.py · db.py ·
                  metadata.py · wiki.py · client/ (chat REPL + providers) ·
                  gui/ (web UI)
-scripts/         seed_sample_data.py · build_metadata_catalog.py ·
+scripts/         seed_sample_data.py · build_metadata_catalog.py · workflow.py ·
                  smoke_test.py · mcp_probe.py
 sql/oracle/      XX_TB_* view DDL for the real database
 docs/            SETUP.md (install) · QUESTIONS.md (catalog) · VIEWS.md ·
-                 METADATA_CATALOG.md · RECORD_SELECTION.md · DEVELOPMENT.md
+                 METADATA_CATALOG.md · AI_ORCHESTRATION.md ·
+                 RECORD_SELECTION.md · DEVELOPMENT.md
 sample_wiki/     sample policy pages served by the local wiki provider
 ```

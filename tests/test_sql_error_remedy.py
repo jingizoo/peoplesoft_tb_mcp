@@ -103,6 +103,37 @@ class EvalMatcherTests(unittest.TestCase):
             {"tool_args_contain": {"business_unit": "ALL"}}, calls)
         self.assertTrue(problems, "US001 must not satisfy ALL")
 
+    def test_ordered_tools_requires_successful_subsequence(self) -> None:
+        calls = [
+            {"tool": "search_metadata", "ok": True, "args": {}},
+            {"tool": "wiki_search", "ok": True, "args": {}},
+            {"tool": "get_metadata_context", "ok": True, "args": {}},
+            {"tool": "run_sql", "ok": True, "args": {}},
+        ]
+        problems = self._grade({
+            "all_tools": ["search_metadata", "get_metadata_context", "run_sql"],
+            "ordered_tools": [
+                "search_metadata", "get_metadata_context", "run_sql"],
+        }, calls)
+        self.assertEqual(problems, [])
+
+    def test_ordered_tools_rejects_reversed_or_failed_context(self) -> None:
+        reversed_calls = [
+            {"tool": "get_metadata_context", "ok": True, "args": {}},
+            {"tool": "search_metadata", "ok": True, "args": {}},
+            {"tool": "run_sql", "ok": True, "args": {}},
+        ]
+        self.assertTrue(self._grade({"ordered_tools": [
+            "search_metadata", "get_metadata_context", "run_sql"]},
+            reversed_calls))
+        failed = [
+            {"tool": "search_metadata", "ok": True, "args": {}},
+            {"tool": "get_metadata_context", "ok": False, "args": {}},
+            {"tool": "run_sql", "ok": True, "args": {}},
+        ]
+        self.assertTrue(self._grade({"all_tools": [
+            "search_metadata", "get_metadata_context", "run_sql"]}, failed))
+
 
 if __name__ == "__main__":
     unittest.main()

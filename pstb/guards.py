@@ -19,6 +19,7 @@ called:
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 
@@ -83,6 +84,7 @@ FINANCIAL_EVIDENCE_TOOLS = {
     "get_invoice_totals",
     "get_duplicate_payments",
     "get_open_payables",
+    "reconcile_ap_to_gl",
     "get_vendor_payments",
     "get_asset_register",
     "get_project_costs",
@@ -201,6 +203,11 @@ _TOOL_SCOPE_ARGS = {
                              "as_of_date": "as_of_date"},
     "get_open_payables": {"business_unit": "business_unit",
                         "as_of_date": "as_of_date"},
+    "reconcile_ap_to_gl": {
+        "business_unit": "business_unit", "ledger": "ledger",
+        "fiscal_year": "fiscal_year", "period": "period",
+        "as_of_date": "as_of_date",
+    },
     "get_vendor_payments": {"business_unit": "business_unit",
                           "as_of_date": "as_of_date"},
     "get_asset_register": {"business_unit": "business_unit",
@@ -371,8 +378,8 @@ _DATA_QUERY = re.compile(
     r"(?i)\b(?:amounts?|figures?|balances?|trial balances?|tb|ledgers?|accounts?|"
     r"activity|postings?|journals?|general ledger|gl|billing|invoices?|"
     r"receivables?|ar|aging|customers?|revenues?|"
-    r"payables?|accounts payable|ap|vouchers?|vendors?|suppliers?|"
-    r"payments?|disbursements?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
+    r"payables?|accounts payable|ap|APY14(?:00|05|10|20)|vouchers?|vendors?|suppliers?|"
+    r"payments?|paid|disbursements?|accru(?:e[ds]?|al|als|ed|ing)|grni|rni|"
     r"expenses?|variances?|budgets?|actuals?|financial statements?|reports?|"
     r"income statements?|balance sheets?|cash flow statements?|p\s*&\s*l|"
     r"profit and loss|profits?|earn(?:ed|ings?)?|sales|margins?|costs?|"
@@ -415,7 +422,7 @@ _DATA_ANCHOR_STRONG = re.compile(
 _QUESTION_DOMAINS = {
     "balance": re.compile(
         r"(?i)\b(?:balances?|trial balances?|tb|activity|postings?|suspense|"
-        r"debits?|credits?|general ledger|gl|close readiness|"
+        r"debits?|credits?|general ledger|gl|APY14(?:10|20)|close readiness|"
         r"ready to close|month[ -]end close|year[ -]end close)\b"
     ),
     "journal": re.compile(r"(?i)\bjournals?\b"),
@@ -431,8 +438,8 @@ _QUESTION_DOMAINS = {
         r"due|overdue|past[ -]due|collections?)\b"
     ),
     "ap": re.compile(
-        r"(?i)\b(?:payables?|accounts payable|ap|vouchers?|vendors?|suppliers?|"
-        r"payments?|disbursements?|pay(?:ment)?\s+runs?|"
+        r"(?i)\b(?:payables?|accounts payable|ap|APY14(?:00|05|10|20)|vouchers?|vendors?|suppliers?|"
+        r"payments?|paid|disbursements?|pay(?:ment)?\s+runs?|"
         r"accru(?:e[ds]?|al|als|ed|ing)|"
         r"grni|rni)\b"
         r"|\b(?:we|do\s+we|should\s+we|how\s+much\s+do\s+we)\s+owe\b"
@@ -511,6 +518,7 @@ _TOOL_DOMAINS = {
     "get_invoice_totals": {"billing", "report", "balance"},
     "get_duplicate_payments": {"ap", "report"},
     "get_open_payables": {"ap", "ar", "billing", "balance"},
+    "reconcile_ap_to_gl": {"ap", "balance"},
     "get_vendor_payments": {"ap", "report"},
     "get_asset_register": {"am", "report", "balance"},
     "get_project_costs": {"pc", "report", "variance"},
@@ -925,6 +933,33 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
         return False, str(payload.get("detail") or status)[:240]
     if payload.get("control_status") == "not_run":
         return False, str(payload.get("summary") or "control did not run")[:240]
+    # A reconciliation is financial evidence only after both sides were
+    # evaluated on a compatible basis.  The AP/GL control deliberately
+    # returns the GL side when AP accounting-line/JGR evidence is unavailable
+    # so an operator has a useful diagnostic.  That partial observation must
+    # never satisfy the answer gate or be narrated as a tie/difference.
+    if tool_name == "reconcile_ap_to_gl":
+        def numeric(value):
+            if (not isinstance(value, (int, float))
+                    or isinstance(value, bool)):
+                return False
+            try:
+                return math.isfinite(value)
+            except (TypeError, ValueError, OverflowError):
+                return False
+        complete_verdict = (
+            str(payload.get("status") or "").lower() == "evaluated"
+            and payload.get("evaluated") is True
+            and type(payload.get("ties")) is bool
+            and all(numeric(payload.get(field)) for field in (
+                "subledger_total", "gl_balance", "difference"))
+        )
+        if not complete_verdict:
+            return False, str(
+                payload.get("reason")
+                or payload.get("detail")
+                or "AP/GL reconciliation was not fully evaluated"
+            )[:240]
     # Evidence is judged on STRUCTURED fields only. Scanning prose for "no
     # data" failed every successful run_report, whose note legitimately
     # explains that "'—' means the ledger has no data for that column's
@@ -1033,6 +1068,7 @@ _SOURCE_OF_TOOL = {
     },
     "peoplesoft_ap": {
         "get_open_payables", "get_duplicate_payments", "get_vendor_payments",
+        "reconcile_ap_to_gl",
         "get_vendor_intelligence", "get_asset_register", "get_project_costs",
         "get_vendor_payables_network", "search_vendors",
         "get_match_exceptions", "get_procurement_chain",

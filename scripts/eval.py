@@ -17,6 +17,8 @@ docstrings is MEASURED rather than hoped.
 
 Assertions are deliberately structural, never "does this read well":
   any_tool           at least one of these tools was called
+  all_tools           every listed tool succeeded at least once
+  ordered_tools       listed tools succeeded in this order (other calls okay)
   not_tool           none of these tools was called
   tool_args_contain  a call carried these argument values
   answer_contains    the answer text contains each string
@@ -80,6 +82,25 @@ def _grade(case: dict, answer: str, calls: list) -> list:
             problems.append(
                 "every call to the expected tool(s) failed: "
                 + ", ".join(sorted({c["tool"] for c in attempts})))
+
+    successful = [c.get("tool") for c in calls if c.get("ok")]
+    want_all = expect.get("all_tools") or []
+    missing = [tool for tool in want_all if tool not in successful]
+    if missing:
+        problems.append(
+            f"expected every tool {want_all} to succeed; missing {missing}; "
+            f"successful calls were {successful or 'nothing'}")
+
+    ordered = expect.get("ordered_tools") or []
+    if ordered:
+        cursor = 0
+        for tool in successful:
+            if cursor < len(ordered) and tool == ordered[cursor]:
+                cursor += 1
+        if cursor != len(ordered):
+            problems.append(
+                f"expected successful tool sequence {ordered}; successful "
+                f"calls were {successful or 'nothing'}")
 
     for banned in expect.get("not_tool") or []:
         if banned in called:

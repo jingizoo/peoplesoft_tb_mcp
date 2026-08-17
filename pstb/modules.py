@@ -21,6 +21,8 @@ and mixed currencies are never silently summed.
 from __future__ import annotations
 
 import datetime as dt
+import math
+import re
 
 from .db import DbError
 from .engine import EngineError, TBEngine, r2
@@ -42,6 +44,8 @@ def _iso(s: str) -> dt.date:
 
 
 class ModulePacks:
+    AP_RECON_LINE_CAP = 50_000
+
     def __init__(self, engine: TBEngine):
         self.e = engine
         self.db = engine.db
@@ -264,6 +268,847 @@ class ModulePacks:
         if notes:
             out["record_notes"] = notes
         return out
+
+    # ---- AP: accounting activity to GL journals -------------------------
+    @staticmethod
+    def _ap_control_accounts(value, configured=None) -> tuple[list[str], str]:
+        """Return the governed account list and disclose where it came from."""
+        raw = value if value not in (None, "", []) else configured
+        source = "caller" if value not in (None, "", []) else (
+            "config defaults.ap_control_accounts" if raw else "not supplied")
+        if isinstance(raw, str):
+            values = raw.split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = []
+        accounts = list(dict.fromkeys(
+            str(account).strip() for account in values
+            if str(account).strip()))
+        return accounts, source
+
+    def reconcile_ap_to_gl(
+        self,
+        business_unit: str = "",
+        control_accounts: str = "",
+        ledger: str = "",
+        fiscal_year: int = 0,
+        period: int = 0,
+        as_of_date: str = "",
+    ) -> dict:
+        """Reconcile AP accounting activity to posted GL journal activity.
+
+        This is the APY1410/APY1420 control, not an open-liability balance
+        reconstruction.  Only AP accounting lines attributed to an approved
+        account and marked distributed by Journal Generator are eligible.
+        They are matched to posted GL journal lines on the complete available
+        Journal Generator key.  Voucher-header gross amounts and payment
+        cross-references never produce a reconciliation verdict here.
+        """
+        bu = self._bu(business_unit)
+        today = dt.date.today().isoformat()
+        supplied_asof = bool((as_of_date or "").strip())
+        try:
+            requested_asof = self._asof(as_of_date)
+        except ValueError as exc:
+            raise ModuleError(
+                "as_of_date must be an ISO date in YYYY-MM-DD format") from exc
+
+        configured = getattr(self.e.cfg.defaults, "ap_control_accounts", [])
+        accounts, account_source = self._ap_control_accounts(
+            control_accounts, configured)
+        led = self.e.resolve_ledger_for(bu, ledger)
+        base_currency = (self.e.base_currency_for(bu) or "").strip().upper()
+        base = {
+            "status": "incomplete",
+            "evaluated": False,
+            "ties": None,
+            "aggregate_ties": None,
+            "conclusion": "not_evaluated",
+            "business_unit": bu,
+            "ledger": led,
+            "as_of": requested_asof,
+            "control_accounts": accounts,
+            "control_accounts_source": account_source,
+            "subledger_total": None,
+            "gl_total": None,
+            "gl_balance": None,
+            "difference": None,
+            "currency": base_currency or None,
+            "tolerance": 0.01,
+            "reconciling_categories": [],
+        }
+
+        def fail(reason: str, **extra) -> dict:
+            return {**base, "reason": reason, **extra}
+
+        if not accounts:
+            return fail(
+                "AP control accounts were not supplied. Pass the Finance-"
+                "approved comma-separated account list in control_accounts; "
+                "no account is assumed from its number or description.",
+                cutoff={"aligned": False,
+                        "reason": "control-account basis is missing"},
+            )
+        if len(accounts) > 25:
+            return fail(
+                f"{len(accounts)} control accounts were supplied; the safety "
+                "cap is 25. Use the governed AP control-account set, not a "
+                "broad account range."
+            )
+        if bool(fiscal_year) != bool(period):
+            return fail(
+                "fiscal_year and period must be supplied together, or both "
+                "left blank to resolve from as_of_date/latest posted period."
+            )
+        if requested_asof > today:
+            return fail(
+                f"as_of_date {requested_asof} is after the current data date "
+                f"{today}; future activity is not evaluated."
+            )
+        if not base_currency:
+            return fail(
+                f"The GL base currency for business unit {bu} is unavailable. "
+                "AP and GL journal amounts are not compared without a governed "
+                "base-currency basis."
+            )
+
+        latest_fy, latest_period = self.e.last_posted_period(bu, led)
+        if not latest_fy:
+            try:
+                diagnosis = self.e._scope_diagnosis(bu, led, 0)
+            except Exception:
+                diagnosis = {}
+            return {
+                **base,
+                "status": "no_data",
+                "scope_status": "no_data",
+                "reason": (
+                    f"No posted GL period exists for {bu}/{led}; there is no "
+                    "journal population to reconcile. This is not a zero or "
+                    "pass."
+                ),
+                **({"scope_diagnosis": diagnosis} if diagnosis else {}),
+            }
+
+        resolved_asof = None
+        if supplied_asof:
+            try:
+                resolved_asof = self.e.resolve_period(requested_asof)
+            except EngineError as exc:
+                return fail(str(exc))
+        if fiscal_year and period:
+            fy, per = int(fiscal_year), int(period)
+            if resolved_asof and (
+                    fy != int(resolved_asof["fiscal_year"])
+                    or per != int(resolved_asof["period"])):
+                return fail(
+                    f"as_of_date {requested_asof} belongs to FY"
+                    f"{resolved_asof['fiscal_year']} period "
+                    f"{resolved_asof['period']}, not requested FY{fy} "
+                    f"period {per}. The two sides must use one period."
+                )
+        elif resolved_asof:
+            fy = int(resolved_asof["fiscal_year"])
+            per = int(resolved_asof["period"])
+        else:
+            fy, per = int(latest_fy), int(latest_period)
+
+        selected_period = None
+        try:
+            selected_period = next((
+                row for row in self.e.list_periods(fy).get("periods", [])
+                if int(row.get("period") or 0) == per
+            ), None)
+        except Exception:
+            selected_period = None
+        period_begin = (str(selected_period.get("begin_dt") or "")[:10]
+                        if selected_period else "")
+        period_end = (str(selected_period.get("end_dt") or "")[:10]
+                      if selected_period else "")
+        if not period_begin or not period_end:
+            return fail(
+                f"Fiscal-calendar dates for FY{fy} period {per} are not "
+                "available. AP accounting activity cannot be cut to the same "
+                "date basis as GL journal activity."
+            )
+        cutoff_date = requested_asof if supplied_asof else min(period_end, today)
+        if cutoff_date < period_begin or cutoff_date > period_end:
+            return fail(
+                f"Cutoff {cutoff_date} is outside FY{fy} period {per} "
+                f"({period_begin} through {period_end})."
+            )
+
+        cutoff = {
+            "aligned": True,
+            "fiscal_year": fy,
+            "period": per,
+            "period_begin": period_begin,
+            "period_end": period_end,
+            "through_date": cutoff_date,
+            "date_basis": (
+                "AP: ACCOUNTING_DT within selected period through cutoff; "
+                "GL: posted journal header FY/period and JOURNAL_DATE through "
+                "the same cutoff"
+            ),
+            "status_basis": (
+                "AP POST_STATUS_AP='P' and GL_DISTRIB_STATUS='D'; GL "
+                "JRNL_HDR_STATUS='P'"
+            ),
+            "reason": (
+                "Both populations use the selected business unit, ledger, "
+                "accounts, fiscal period and through-date."
+            ),
+        }
+        base.update({
+            "fiscal_year": fy,
+            "period": per,
+            "latest_posted": {"fiscal_year": int(latest_fy),
+                              "period": int(latest_period)},
+            "as_of": cutoff_date,
+            "cutoff": cutoff,
+        })
+
+        # Resolve from live metadata. A PeopleTools physical mapping wins,
+        # followed by one unique live-catalog suffix (including a company
+        # prefix). The delivered PS_ convention is only an exact-catalog
+        # fallback when richer metadata is unavailable; ambiguity never picks
+        # the first sort result.
+        source = ""
+        source_basis = ""
+        source_columns: set = set()
+        mapped = ""
+        try:
+            mapping_rows, _ = self.db.query(
+                "SELECT SQLTABLENAME AS sqltablename "
+                f"FROM {self.db.prefix}PSRECDEFN "
+                "WHERE UPPER(RECNAME) = :rec",
+                {"rec": "VCHR_ACCTG_LINE"},
+                max_rows=2,
+            )
+            if len(mapping_rows) == 1:
+                mapped = str(mapping_rows[0].get("sqltablename")
+                             or "").strip().upper()
+            elif len(mapping_rows) > 1:
+                return fail(
+                    "PSRECDEFN returned more than one VCHR_ACCTG_LINE "
+                    "definition; no physical object is selected."
+                )
+        except DbError:
+            pass
+        if mapped and not re.fullmatch(r"[A-Z][A-Z0-9_$#]*", mapped):
+            return fail(
+                "PSRECDEFN.SQLTABLENAME for VCHR_ACCTG_LINE is not a safe "
+                "single catalog identifier; no fallback is attempted.",
+                accounting_source=mapped,
+                accounting_source_basis="PSRECDEFN.SQLTABLENAME",
+            )
+        if mapped and re.fullmatch(r"[A-Z][A-Z0-9_$#]*", mapped):
+            columns = self._cols(mapped)
+            if columns:
+                source, source_columns = mapped, columns
+                source_basis = "PSRECDEFN.SQLTABLENAME"
+            else:
+                return fail(
+                    f"PSRECDEFN maps VCHR_ACCTG_LINE to {mapped}, but that "
+                    "physical object is not readable. The tool will not fall "
+                    "back to a similarly named table.",
+                    accounting_source=mapped,
+                    accounting_source_basis="PSRECDEFN.SQLTABLENAME",
+                )
+
+        suffix_candidates: list[str] = []
+        if not source:
+            try:
+                for row in self.e.list_tables("VCHR_ACCTG_LINE").get(
+                        "tables", []):
+                    name = str(row.get("table_name") or "").strip().upper()
+                    if (name == "VCHR_ACCTG_LINE"
+                            or name.endswith("_VCHR_ACCTG_LINE")):
+                        suffix_candidates.append(name)
+            except Exception:
+                pass
+            suffix_candidates = list(dict.fromkeys(suffix_candidates))
+        if not source and len(suffix_candidates) > 1:
+            return fail(
+                "More than one physical object matches VCHR_ACCTG_LINE and "
+                "PeopleTools metadata did not identify one governed mapping. "
+                "No object is chosen by prefix or sort order.",
+                accounting_source_candidates=suffix_candidates,
+            )
+        candidates = suffix_candidates or ["PS_VCHR_ACCTG_LINE"]
+        for candidate in candidates if not source else []:
+            if not re.fullmatch(r"[A-Z][A-Z0-9_$#]*", candidate):
+                continue
+            columns = self._cols(candidate)
+            if columns:
+                source, source_columns = candidate, columns
+                source_basis = (
+                    "unique live-catalog suffix"
+                    if suffix_candidates else
+                    "exact delivered catalog fallback; richer mapping unavailable"
+                )
+                break
+        if not source:
+            return fail(
+                "No unambiguous readable AP accounting-line source was "
+                "found for VCHR_ACCTG_LINE. Voucher headers and payment "
+                "cross-references are not an account-attributed substitute. "
+                "Run the delivered APY1410/APY1420 reconciliation, or "
+                "APY1400/APY1405 for open liability."
+            )
+        base.update({
+            "accounting_source": source,
+            "accounting_source_basis": source_basis,
+        })
+
+        required_ap = {
+            "BUSINESS_UNIT", "BUSINESS_UNIT_GL", "ACCOUNT", "ACCOUNTING_DT",
+            "MONETARY_AMOUNT", "CURRENCY_CD", "POST_STATUS_AP",
+            "GL_DISTRIB_STATUS", "JOURNAL_ID", "JOURNAL_DATE",
+            "UNPOST_SEQ", "JOURNAL_LINE", "LEDGER", "FISCAL_YEAR",
+            "ACCOUNTING_PERIOD", "POSTING_PROCESS",
+        }
+        missing_ap = sorted(required_ap - source_columns)
+        if missing_ap:
+            return fail(
+                f"{source} is missing the account/Journal Generator fields "
+                f"required for an exact AP-to-GL activity reconciliation: "
+                f"{', '.join(missing_ap)}. No voucher-header approximation "
+                "is made. Use APY1410/APY1420 (or APY1400/APY1405 for open "
+                "liability).",
+                accounting_source=source,
+                accounting_source_basis=source_basis,
+                missing_columns=missing_ap,
+            )
+
+        header_columns = self._cols("PS_JRNL_HEADER")
+        line_columns = self._cols("PS_JRNL_LN")
+        required_header = {
+            "BUSINESS_UNIT", "JOURNAL_ID", "JOURNAL_DATE", "UNPOST_SEQ",
+            "JRNL_HDR_STATUS", "FISCAL_YEAR", "ACCOUNTING_PERIOD",
+        }
+        required_line = {
+            "BUSINESS_UNIT", "JOURNAL_ID", "JOURNAL_DATE", "UNPOST_SEQ",
+            "JOURNAL_LINE", "LEDGER", "ACCOUNT", "CURRENCY_CD",
+            "MONETARY_AMOUNT",
+        }
+        missing_gl = [
+            *(f"PS_JRNL_HEADER.{column}"
+              for column in sorted(required_header - header_columns)),
+            *(f"PS_JRNL_LN.{column}"
+              for column in sorted(required_line - line_columns)),
+        ]
+        if missing_gl:
+            return fail(
+                "The exact posted GL journal population is unavailable: "
+                + ", ".join(missing_gl)
+                + ". No PS_LEDGER ending balance is substituted for period "
+                  "journal activity. Use APY1410/APY1420.",
+                accounting_source=source,
+                accounting_source_basis=source_basis,
+                missing_columns=missing_gl,
+            )
+
+        params: dict = {
+            "bu": bu,
+            "led": led,
+            "fy": fy,
+            "per": per,
+            "begin": period_begin,
+            "cutoff": cutoff_date,
+        }
+        account_binds = []
+        for index, account in enumerate(accounts):
+            name = f"acct_{index}"
+            params[name] = account
+            account_binds.append(f":{name}")
+        accounts_sql = ", ".join(account_binds)
+        p = self.db.prefix
+        configured_cap = getattr(
+            self.e.cfg.tools, "ap_reconciliation_line_cap",
+            self.AP_RECON_LINE_CAP)
+        try:
+            line_cap = max(1, min(int(configured_cap), 100_000))
+        except (TypeError, ValueError):
+            line_cap = self.AP_RECON_LINE_CAP
+        try:
+            ap_rows, ap_truncated = self.db.query(
+                "SELECT A.ACCOUNT AS account, A.ACCOUNTING_DT AS accounting_dt, "
+                "A.MONETARY_AMOUNT AS amount, A.CURRENCY_CD AS currency, "
+                "A.POST_STATUS_AP AS post_status_ap, "
+                "A.GL_DISTRIB_STATUS AS gl_distrib_status, "
+                "A.POSTING_PROCESS AS posting_process, "
+                "A.BUSINESS_UNIT_GL AS business_unit_gl, "
+                "A.JOURNAL_ID AS journal_id, A.JOURNAL_DATE AS journal_date, "
+                "A.UNPOST_SEQ AS unpost_seq, A.JOURNAL_LINE AS journal_line, "
+                "A.LEDGER AS ledger "
+                f"FROM {p}{source} A "
+                "WHERE A.BUSINESS_UNIT = :bu AND A.BUSINESS_UNIT_GL = :bu "
+                "AND A.FISCAL_YEAR = :fy AND A.ACCOUNTING_PERIOD = :per "
+                "AND (A.LEDGER = :led OR A.LEDGER IS NULL OR A.LEDGER = '') "
+                f"AND A.ACCOUNT IN ({accounts_sql}) "
+                "AND (A.ACCOUNTING_DT IS NULL OR ("
+                f"A.ACCOUNTING_DT >= {self.db.date_bind('begin')} "
+                f"AND A.ACCOUNTING_DT <= {self.db.date_bind('cutoff')}))",
+                params,
+                max_rows=line_cap,
+            )
+            gl_rows, gl_truncated = self.db.query(
+                "SELECT L.ACCOUNT AS account, L.MONETARY_AMOUNT AS amount, "
+                "L.CURRENCY_CD AS currency, H.JRNL_HDR_STATUS AS header_status, "
+                "L.BUSINESS_UNIT AS business_unit_gl, "
+                "L.JOURNAL_ID AS journal_id, L.JOURNAL_DATE AS journal_date, "
+                "L.UNPOST_SEQ AS unpost_seq, L.JOURNAL_LINE AS journal_line, "
+                "L.LEDGER AS ledger "
+                f"FROM {p}PS_JRNL_LN L JOIN {p}PS_JRNL_HEADER H ON "
+                "H.BUSINESS_UNIT = L.BUSINESS_UNIT "
+                "AND H.JOURNAL_ID = L.JOURNAL_ID "
+                "AND H.JOURNAL_DATE = L.JOURNAL_DATE "
+                "AND H.UNPOST_SEQ = L.UNPOST_SEQ "
+                "WHERE H.BUSINESS_UNIT = :bu AND H.FISCAL_YEAR = :fy "
+                "AND H.ACCOUNTING_PERIOD = :per AND L.LEDGER = :led "
+                f"AND L.ACCOUNT IN ({accounts_sql}) "
+                f"AND H.JOURNAL_DATE <= {self.db.date_bind('cutoff')}",
+                params,
+                max_rows=line_cap,
+            )
+        except DbError as exc:
+            return fail(
+                "The AP/GL journal populations could not be read safely: "
+                f"{exc}. No reconciliation verdict is produced.",
+                accounting_source=source,
+            )
+        if ap_truncated or gl_truncated:
+            return fail(
+                f"The selected period exceeds the {line_cap:,}-"
+                "row safety cap on AP or GL journal lines. Results are "
+                "partial, so no total or tie is reported; narrow the account "
+                "set/date or run APY1410/APY1420.",
+                accounting_source=source,
+                population={
+                    "status": "partial",
+                    "ap_rows_returned": len(ap_rows),
+                    "gl_rows_returned": len(gl_rows),
+                    "ap_truncated": ap_truncated,
+                    "gl_truncated": gl_truncated,
+                },
+            )
+
+        def text_value(row: dict, name: str) -> str:
+            return str(row.get(name) or "").strip().upper()
+
+        def numeric_amount(row: dict, source_name: str) -> float:
+            raw = row.get("amount")
+            if raw is None:
+                raise ValueError(
+                    f"{source_name}.MONETARY_AMOUNT is null")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{source_name}.MONETARY_AMOUNT is nonnumeric") from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"{source_name}.MONETARY_AMOUNT is not finite")
+            return value
+
+        def key_for(row: dict) -> tuple:
+            return (
+                text_value(row, "business_unit_gl"),
+                text_value(row, "journal_id"),
+                str(row.get("journal_date") or "")[:10],
+                str(row.get("journal_line") if row.get("journal_line") is not None
+                    else ""),
+                text_value(row, "ledger"),
+                text_value(row, "account"),
+            )
+
+        def valid_journal_line(row: dict) -> bool:
+            try:
+                return int(row.get("journal_line")) > 0
+            except (TypeError, ValueError):
+                return False
+
+        ap_eligible: list[dict] = []
+        ap_status_groups: dict[tuple, dict] = {}
+        missing_keys: list[dict] = []
+        ledger_ambiguous: list[dict] = []
+        for row in ap_rows:
+            accounting_date = str(row.get("accounting_dt") or "")[:10]
+            try:
+                parsed_accounting_date = _iso(accounting_date).isoformat()
+            except (TypeError, ValueError):
+                return fail(
+                    f"{source}.ACCOUNTING_DT is blank or invalid inside the "
+                    "selected fiscal population; no cut-off-safe AP total is "
+                    "reported.", accounting_source=source)
+            if not (period_begin <= parsed_accounting_date <= cutoff_date):
+                return fail(
+                    f"{source}.ACCOUNTING_DT {parsed_accounting_date} is "
+                    "outside the selected cut-off despite its fiscal-year/"
+                    "period classification; no AP total is reported.",
+                    accounting_source=source)
+            post_status = text_value(row, "post_status_ap")
+            distrib_status = text_value(row, "gl_distrib_status")
+            ledger_value = text_value(row, "ledger")
+            status_key = (post_status or "(blank)",
+                          distrib_status or "(blank)",
+                          ledger_value or "(blank)",
+                          text_value(row, "posting_process") or "(blank)")
+            status_group = ap_status_groups.setdefault(status_key, {
+                "post_status_ap": status_key[0],
+                "gl_distrib_status": status_key[1],
+                "ledger": status_key[2],
+                "posting_process": status_key[3],
+                "line_count": 0,
+                "signed_amount": 0.0,
+            })
+            status_group["line_count"] += 1
+            try:
+                row["_numeric_amount"] = numeric_amount(row, source)
+                status_group["signed_amount"] += row["_numeric_amount"]
+            except ValueError as exc:
+                return fail(
+                    f"{exc}; "
+                    "no AP total is reported.", accounting_source=source)
+            if post_status != "P" or distrib_status != "D":
+                continue
+            if not ledger_value:
+                ledger_ambiguous.append({
+                    "account": text_value(row, "account"),
+                    "ledger": ledger_value or None,
+                    "journal_id": text_value(row, "journal_id") or None,
+                })
+                continue
+            key = key_for(row)
+            if any(value == "" for value in key) or not valid_journal_line(row):
+                missing_keys.append({
+                    "account": text_value(row, "account"),
+                    "journal_id": text_value(row, "journal_id") or None,
+                    "journal_date": str(row.get("journal_date") or "")[:10] or None,
+                    "journal_line": row.get("journal_line"),
+                })
+                continue
+            ap_eligible.append(row)
+
+        if ledger_ambiguous:
+            return fail(
+                "Distributed AP accounting lines have a blank ledger, so "
+                "they cannot be assigned to the selected ledger "
+                f"{led} without assumption.",
+                accounting_source=source,
+                ledger_evidence_issues=ledger_ambiguous[:20],
+            )
+        if missing_keys:
+            return fail(
+                "Distributed AP accounting lines lack a complete Journal "
+                "Generator drill-down key. An aggregate amount can coincide "
+                "without proving transfer to GL, so no tie is reported. Run "
+                "APY1410/APY1420.",
+                accounting_source=source,
+                journal_key_issues=missing_keys[:20],
+            )
+
+        try:
+            for row in gl_rows:
+                row["_numeric_amount"] = numeric_amount(row, "PS_JRNL_LN")
+        except ValueError as exc:
+            return fail(
+                f"{exc}; no GL total is reported.",
+                accounting_source=source,
+            )
+
+        posted_gl = [row for row in gl_rows
+                     if text_value(row, "header_status") == "P"]
+        nonposted_gl = [row for row in gl_rows
+                        if text_value(row, "header_status") != "P"]
+        if not ap_eligible and not posted_gl and (ap_rows or gl_rows):
+            return fail(
+                "Rows exist in the selected scope, but none form an eligible "
+                "distributed-AP-to-posted-GL population. A zero from excluded "
+                "posting statuses is not a reconciliation pass.",
+                accounting_source=source,
+                population={
+                    "status": "incomplete",
+                    "ap_rows_read": len(ap_rows),
+                    "gl_rows_read": len(gl_rows),
+                    "ap_status_groups": [
+                        {**group,
+                         "signed_amount": r2(group["signed_amount"])}
+                        for _, group in sorted(ap_status_groups.items())
+                    ],
+                },
+            )
+        ap_currencies = {text_value(row, "currency") for row in ap_eligible}
+        gl_currencies = {text_value(row, "currency") for row in posted_gl}
+        observed_currencies = ap_currencies | gl_currencies
+        if "" in observed_currencies or (
+                observed_currencies and observed_currencies != {base_currency}):
+            return fail(
+                "AP and posted GL journal activity is not one governed base-"
+                f"currency population. GL base is {base_currency}; observed "
+                f"currencies are {', '.join(sorted(c or '(blank)' for c in observed_currencies))}. "
+                "Mixed or blank currencies are not summed or translated.",
+                accounting_source=source,
+                mixed_currencies=sorted(c or "(blank)"
+                                        for c in observed_currencies),
+            )
+
+        ap_by_key: dict[tuple, dict] = {}
+        for row in ap_eligible:
+            key = key_for(row)
+            bucket = ap_by_key.setdefault(key, {"amount": 0.0,
+                                                "source_line_count": 0})
+            bucket["amount"] += row["_numeric_amount"]
+            bucket["source_line_count"] += 1
+
+        gl_by_key: dict[tuple, dict] = {}
+        duplicate_gl_keys: list[dict] = []
+        for row in posted_gl:
+            key = key_for(row)
+            if any(value == "" for value in key) or not valid_journal_line(row):
+                return fail(
+                    "A posted GL control-account journal line lacks the exact "
+                    "journal key required for reconciliation.",
+                    accounting_source=source,
+                )
+            if key in gl_by_key:
+                duplicate_gl_keys.append({
+                    "journal_id": key[1], "journal_date": key[2],
+                    "journal_line": key[3], "account": key[5],
+                })
+            else:
+                gl_by_key[key] = {"amount": row["_numeric_amount"]}
+        if duplicate_gl_keys:
+            return fail(
+                "Posted GL journal keys are not unique, so an exact AP-to-GL "
+                "match would fan out. No tie is reported.",
+                accounting_source=source,
+                duplicate_gl_keys=duplicate_gl_keys[:20],
+            )
+
+        ap_total = r2(sum(row["amount"] for row in ap_by_key.values()))
+        gl_total = r2(sum(row["amount"] for row in gl_by_key.values()))
+        if not ap_rows and not gl_rows:
+            return {
+                **base,
+                "status": "no_data",
+                "scope_status": "no_data",
+                "accounting_source": source,
+                "reason": (
+                    "No AP accounting lines or GL control-account journal "
+                    "lines exist in the selected period/cutoff. This is not "
+                    "a reconciliation pass or a zero balance."
+                ),
+                "population": {"status": "no_data", "ap_rows": 0,
+                               "gl_rows": 0},
+            }
+
+        ap_keys, gl_keys = set(ap_by_key), set(gl_by_key)
+        only_ap = sorted(ap_keys - gl_keys)
+        only_gl = sorted(gl_keys - ap_keys)
+        amount_mismatches = []
+        for key in sorted(ap_keys & gl_keys):
+            ap_amount = r2(ap_by_key[key]["amount"])
+            gl_amount = r2(gl_by_key[key]["amount"])
+            if abs(ap_amount - gl_amount) >= 0.01:
+                amount_mismatches.append({
+                    "journal_id": key[1], "journal_date": key[2],
+                    "journal_line": key[3], "account": key[5],
+                    "ap_amount": ap_amount,
+                    "gl_amount": gl_amount,
+                    "difference": r2(ap_amount - gl_amount),
+                })
+
+        pending_ap_groups = []
+        outside_ap_groups = []
+        for (post_status, distrib_status, row_ledger, _process), group in sorted(
+                ap_status_groups.items()):
+            item = {**group, "signed_amount": r2(group["signed_amount"])}
+            if post_status == "P" and distrib_status != "D":
+                pending_ap_groups.append(item)
+            elif post_status != "P":
+                outside_ap_groups.append(item)
+
+        categories: list[dict] = []
+        if only_ap:
+            only_ap_amount = r2(sum(ap_by_key[key]["amount"]
+                                    for key in only_ap))
+            categories.append({
+                "category": "distributed_ap_without_posted_gl_key",
+                "evidence": "observed",
+                "key_count": len(only_ap),
+                "signed_amount": only_ap_amount,
+                "amount": only_ap_amount,
+                "included_in_subledger_total": True,
+                "note": (
+                    "Journal Generator keys exist on AP accounting lines but "
+                    "no posted GL line with the same complete key is in scope."
+                ),
+            })
+        if only_gl:
+            only_gl_amount = r2(sum(gl_by_key[key]["amount"]
+                                    for key in only_gl))
+            categories.append({
+                "category": "posted_gl_without_ap_accounting_key",
+                "evidence": "observed",
+                "key_count": len(only_gl),
+                "signed_amount": only_gl_amount,
+                "amount": only_gl_amount,
+                "included_in_gl_total": True,
+                "note": (
+                    "A posted control-account journal line has no matching AP "
+                    "accounting key. This may be a direct/reclassification "
+                    "journal or a mapping gap; this tool did not attribute "
+                    "the cause."
+                ),
+            })
+        if amount_mismatches:
+            categories.append({
+                "category": "matched_journal_key_amount_difference",
+                "evidence": "observed",
+                "key_count": len(amount_mismatches),
+                "rows": amount_mismatches[:20],
+            })
+        if pending_ap_groups:
+            categories.append({
+                "category": "ap_accounting_not_distributed_to_gl",
+                "evidence": "observed",
+                "status_groups": pending_ap_groups,
+                "included_in_subledger_total": False,
+                "note": (
+                    "These AP-posted lines are not GL_DISTRIB_STATUS D and "
+                    "remain outside the distributed reconciliation population."
+                ),
+            })
+        if outside_ap_groups:
+            categories.append({
+                "category": "ap_accounting_not_ap_posted",
+                "evidence": "observed",
+                "status_groups": outside_ap_groups,
+                "included_in_subledger_total": False,
+            })
+        if nonposted_gl:
+            nonposted_gl_amount = r2(sum(row["_numeric_amount"]
+                                         for row in nonposted_gl))
+            categories.append({
+                "category": "control_account_journals_not_gl_posted",
+                "evidence": "observed",
+                "line_count": len(nonposted_gl),
+                "signed_amount": nonposted_gl_amount,
+                "amount": nonposted_gl_amount,
+                "header_statuses": sorted({
+                    text_value(row, "header_status") or "(blank)"
+                    for row in nonposted_gl
+                }),
+                "included_in_gl_total": False,
+            })
+
+        difference = r2(ap_total - gl_total)
+        aggregate_ties = abs(difference) < 0.01
+        key_complete = not (only_ap or only_gl or amount_mismatches
+                            or pending_ap_groups or outside_ap_groups
+                            or nonposted_gl)
+        ties = bool(aggregate_ties and key_complete)
+        if difference:
+            categories.append({
+                "category": "ap_gl_activity_residual",
+                "evidence": "observed_residual",
+                "signed_amount": difference,
+                "amount": difference,
+                "calculation": "distributed AP activity - posted GL activity",
+                "note": "The amount is observed; its cause is not asserted.",
+            })
+
+        population = {
+            "status": "complete",
+            "basis": (
+                f"All {source} rows in FY{fy} period {per} through "
+                f"{cutoff_date} for the selected AP/GL business unit and "
+                "control accounts; the compared AP total includes every "
+                "posting process whose row is AP-posted, GL-distributed and "
+                f"assigned to ledger {led}."
+            ),
+            "date_basis": cutoff["date_basis"],
+            "status_basis": cutoff["status_basis"],
+            "accounting_source": source,
+            "ap_rows_read": len(ap_rows),
+            "ap_distributed_source_lines": sum(
+                row["source_line_count"] for row in ap_by_key.values()),
+            "ap_distributed_journal_keys": len(ap_by_key),
+            "gl_rows_read": len(gl_rows),
+            "gl_posted_journal_lines": len(posted_gl),
+            "matched_journal_keys": len(ap_keys & gl_keys),
+            "unmatched_ap_keys": len(only_ap),
+            "unmatched_gl_keys": len(only_gl),
+            "journal_key": [
+                "BUSINESS_UNIT_GL", "JOURNAL_ID", "JOURNAL_DATE",
+                "JOURNAL_LINE", "LEDGER", "ACCOUNT",
+            ],
+            "status_groups": [
+                {**group, "signed_amount": r2(group["signed_amount"])}
+                for _, group in sorted(ap_status_groups.items())
+            ],
+            "truncated": False,
+            "line_safety_cap": line_cap,
+        }
+        conclusion = (
+            "reconciled"
+            if ties else
+            "aggregate_tie_with_key_or_status_exceptions"
+            if aggregate_ties else
+            "difference"
+        )
+        reason = (
+            "Distributed AP accounting activity matches posted GL journal "
+            "activity on every available Journal Generator key within 0.01."
+            if ties else
+            "The aggregate amounts are equal, but exact journal-key or "
+            "posting-status exceptions prevent a clean reconciliation."
+            if aggregate_ties else
+            "Distributed AP accounting activity does not reconcile to posted "
+            "GL journal activity. Observed categories identify where to "
+            "investigate; they do not assert a cause."
+        )
+        return {
+            **base,
+            "status": "evaluated",
+            "evaluated": True,
+            "ties": ties,
+            "aggregate_ties": aggregate_ties,
+            "conclusion": conclusion,
+            "accounting_source": source,
+            "subledger_total": ap_total,
+            "gl_total": gl_total,
+            # Compatibility alias for the evidence gate/controller card. The
+            # amount_basis below is authoritative: this is signed period
+            # activity, not an ending balance despite the legacy key name.
+            "gl_balance": gl_total,
+            "difference": difference,
+            "currency_basis": (
+                f"{base_currency} base-currency MONETARY_AMOUNT on both AP "
+                "accounting lines and GL journal lines; mixed or blank "
+                "currency populations fail closed"
+            ),
+            "gl_sign_basis": (
+                "Signed selected-period activity: debits positive, credits "
+                "negative; gl_balance is a compatibility alias for gl_total, "
+                "not an ending balance"
+            ),
+            "population": population,
+            "reconciling_categories": categories,
+            "reason": reason,
+            "amount_basis": (
+                "Signed base-currency period activity: debits positive, "
+                "credits negative. This is not an AP open-liability ending "
+                "balance. Use APY1400/APY1405 for that separate control."
+            ),
+            "report_precedent": (
+                "PeopleSoft APY1410/APY1420 journal/account reconciliation; "
+                "APY1400/APY1405 remains the open-liability reconciliation"
+            ),
+        }
 
     # ---- AP: whom did we pay ---------------------------------------------
     def vendor_intelligence(self, business_unit: str = "",

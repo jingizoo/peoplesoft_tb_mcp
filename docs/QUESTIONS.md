@@ -212,6 +212,7 @@ search_records + run_sql (+ pivot); this map is the fast path.
 | What do we owe, and to whom? | `get_open_payables` |
 | How much is overdue / due this week? | `get_open_payables` (overdue_total, due_within_7_days) |
 | Anything stuck in AP nobody can see? | `get_open_payables` → pipeline_exceptions (recycle/unposted) |
+| Does AP accounting activity reconcile to the GL control for this period? | `reconcile_ap_to_gl(control_accounts=<Finance-approved list>, fiscal_year=..., period=..., as_of_date=...)` — exact AP accounting/JGEN-to-posted-GL journal keys; missing evidence and mixed currency fail closed |
 | Whom did we pay, how much, when? | `get_vendor_payments` |
 | Top vendors by spend | `get_vendor_payments` (empty vendor ranks all) |
 | When did we last pay X? | `get_vendor_payments(vendor=...)` → last_payment_dt |

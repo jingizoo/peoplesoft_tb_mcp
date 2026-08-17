@@ -53,8 +53,11 @@ class GeminiShortlistTests(unittest.TestCase):
     AVAILABLE = {
         "get_trial_balance", "tb_integrity_check", "run_playbook",
         "get_open_payables", "get_vendor_payments", "get_duplicate_payments",
+        "reconcile_ap_to_gl",
         "get_coupa_rni", "search_records", "describe_record",
         "profile_record", "compare_records", "run_sql", "explain_query",
+        "describe_metadata_catalog", "search_metadata",
+        "get_metadata_context",
         "wiki_lookup", "wiki_search", "wiki_get_page", "get_asset_register",
         "get_ar_aging", "get_invoice_totals", "get_billing_workbench",
         "resolve_period", "list_financial_scopes", "detect_transaction_anomalies",
@@ -74,13 +77,23 @@ class GeminiShortlistTests(unittest.TestCase):
         self.assertIn("tb_integrity_check", got)
         self.assertNotIn("get_coupa_rni", got)
 
-    def test_custom_question_keeps_the_full_discovery_sequence(self):
+    def test_ap_gl_activity_question_keeps_the_governed_reconciliation(self):
+        got = set(routing_tool_names(
+            "Does AP accounting activity for period 6 reconcile to the "
+            "Finance-approved GL control account?", self.AVAILABLE))
+        self.assertIn("reconcile_ap_to_gl", got)
+        self.assertNotIn("get_asset_register", got)
+
+    def test_custom_question_keeps_metadata_first_discovery_sequence(self):
         got = set(routing_tool_names(
             "Which custom record has the approval status field?",
             self.AVAILABLE))
-        for name in ("search_records", "describe_record", "profile_record",
-                     "compare_records", "run_sql"):
+        for name in ("search_metadata", "get_metadata_context",
+                     "profile_record", "compare_records", "run_sql"):
             self.assertIn(name, got)
+        self.assertIn("search_records", got,
+                      "live PeopleTools search remains the unavailable-"
+                      "artifact fallback")
 
     def test_small_talk_is_not_constrained(self):
         self.assertEqual(routing_tool_names("thanks", self.AVAILABLE), [])
