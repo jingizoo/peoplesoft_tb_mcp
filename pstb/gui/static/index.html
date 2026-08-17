@@ -1906,7 +1906,11 @@ function renderGeneric(name,d){
     // Scalar context (totals, counts, the mode line) still matters —
     // shown compactly under the table instead of being dropped.
     if(!Array.isArray(d)){
-      const scalars=Object.entries(d).filter(([,v])=>v!==null&&typeof v!=='object')
+      // source_database is rendered by sourceBadge below; leaving it here
+      // too printed "source database: default" under every ad-hoc table AND
+      // again as the badge.
+      const scalars=Object.entries(d).filter(([k,v])=>v!==null&&typeof v!=='object'
+          &&k!=='source_database')
         .map(([k,v])=>esc(k.replace(/_/g,' '))+': '+
           (typeof v==='number'&&/amt|amount|balance|total|paid|due|gross|net/.test(k)?money(v):esc(v)))
         .slice(0,8);
@@ -1952,7 +1956,37 @@ function resultBadge(d){
   if(d.readable!==undefined) return {text:d.readable?'readable':'not readable',cls:d.readable?'ok':'bad'};
   return null;
 }
+// WHICH DATABASE ANSWERED. Only the ad-hoc tools reach a second source, and
+// only they carry source_database — every curated financial tool answers from
+// the primary finance database by construction, so a badge there is noise
+// asserting something that cannot vary. Muted for the primary, highlighted
+// otherwise: the surprising case is the one worth the reader's eye, and a
+// table of warehouse rows that looks like finance data is what this stops.
+function sourceBadge(data){
+  const name = data && data.source_database;
+  if(!name) return null;
+  const primary = String(name).toLowerCase() === 'default';
+  // Vendor-neutral wording: the page chrome names no company or vendor, and
+  // a smoke check enforces it. "the finance database" is also the more
+  // useful label — it says what the connection IS to the reader.
+  const line = el('div','pad');
+  line.innerHTML = primary
+    ? '<span class="sub">source: the finance database</span>'
+    : '<span class="badge warn">source: '+esc(name)+'</span>'
+      + '<span class="sub"> — a separate database, not the finance system; '
+      + 'curated financial tools do not answer from it</span>';
+  return line;
+}
 function renderToolResult(name,data,args){
+  const body = renderToolBody(name,data,args);
+  if(!body) return body;
+  const badge = sourceBadge(data);
+  if(!badge) return body;
+  const wrap = document.createDocumentFragment();
+  wrap.append(body, badge);
+  return wrap;
+}
+function renderToolBody(name,data,args){
   if(!data||typeof data!=='object') return null;
   if(data.error) { const c=el('div','card'); c.append(el('h2',null,esc(name)+' <span class="badge bad">error</span>'),
       el('div','pad',esc(data.error))); return c; }

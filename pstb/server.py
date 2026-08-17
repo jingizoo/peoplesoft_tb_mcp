@@ -131,6 +131,38 @@ def _safe(fn, /, **kw) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _sourced(source: str, method: str, /, **kw) -> dict:
+    """Run an ad-hoc tool against a named source, and SAY which one answered.
+
+    Two things this fixes, both discovered on a two-database deployment.
+
+    Provenance. Only search_records named its source, so a table list from a
+    reporting mart and one from PeopleSoft were indistinguishable in the
+    payload, in the card, and to the model. "Which database is this?" is the
+    first question anyone asks of a multi-source answer, and it had no
+    answer. The name is the one the REGISTRY resolved, not the alias the
+    caller typed, so "peoplesoft" and "" and "default" all report default
+    rather than looking like three databases.
+
+    Resolution errors. The call used to read
+    ``_safe(engine.for_source(source).list_tables, ...)``, which evaluates
+    for_source OUTSIDE _safe — so a mistyped source raised through the
+    handler and reached the model as a crash-shaped "TOOL ERROR:" instead of
+    the clean, remedied {"error": ...} the message was written to be.
+    Resolving inside the try puts it back on the intended path.
+    """
+    try:
+        bound = engine.for_source(source)
+        label = (engine.registry.resolve_name(source)
+                 if engine.registry is not None else "default")
+    except (EngineError, DbError) as e:
+        return {"error": str(e)}
+    out = _safe(getattr(bound, method), **kw)
+    if isinstance(out, dict):
+        out.setdefault("source_database", label)
+    return out
+
+
 @mcp.tool()
 def get_trial_balance(
     business_unit: str = "",
@@ -1021,7 +1053,7 @@ if cfg.tools.allow_raw_sql:
                 list_binds={"accts": {"from_result": "r2", "field": "accounts"}} — r2
                 is the result_id of the earlier result, field is a dot path into it
                 ("accounts", "rows[].account", "customers[].cust_id")."""
-        return _safe(engine.for_source(source).run_sql, sql=sql, max_rows=max_rows,
+        return _sourced(source, "run_sql", sql=sql, max_rows=max_rows,
                      business_unit=business_unit, policy_binds=policy_binds,
                      pivot=pivot, list_binds=list_binds, partition=partition)
 
@@ -1034,7 +1066,7 @@ if cfg.tools.allow_raw_sql:
                 a query times out. Returns row counts, each table's INDEXES with their
                 column order, which full scans are planned, and the leading columns
                 your WHERE/JOIN must include."""
-        return _safe(engine.for_source(source).explain_query, sql=sql)
+        return _sourced(source, "explain_query", sql=sql)
 
     @mcp.tool()
     def join_path(from_record: str, to_record: str, source: str = "") -> dict:
@@ -1046,7 +1078,7 @@ if cfg.tools.allow_raw_sql:
                 selected scope already fixes), and a confidence. Guessing a join
                 against PS_LEDGER or PS_ITEM does not fail fast — it consumes the
                 whole query timeout."""
-        return _safe(engine.for_source(source).join_path,
+        return _sourced(source, "join_path",
                      from_record=from_record, to_record=to_record)
 
     @mcp.tool()
@@ -1058,7 +1090,7 @@ if cfg.tools.allow_raw_sql:
                 "asset profile", "TU_FILE"). Returns the PeopleTools record name, the
                 physical table to query, the description, and approximate row counts,
                 most-populated first."""
-        return _safe(engine.for_source(source).search_records, query=query, limit=limit)
+        return _sourced(source, "search_records", query=query, limit=limit)
 
     @mcp.tool()
     def describe_record(record: str) -> dict:
@@ -1081,7 +1113,7 @@ if cfg.tools.allow_raw_sql:
                 Personal columns (names, addresses, tax and bank identifiers) are
                 masked to a shape-preserving placeholder. fill_percent and value_counts
                 are measured over the rows sampled, so never report them as totals."""
-        return _safe(engine.for_source(source).profile_record,
+        return _sourced(source, "profile_record",
                      table=table, sample_rows=sample_rows)
 
     @mcp.tool()
@@ -1093,18 +1125,18 @@ if cfg.tools.allow_raw_sql:
                 which are readable, populated, and carry the columns and status codes
                 the question implies. Sites keep live vs history vs staging vs custom
                 copies of one record; names cannot separate those and contents can."""
-        return _safe(engine.for_source(source).compare_records,
+        return _sourced(source, "compare_records",
                      tables=tables, sample_rows=sample_rows)
 
     @mcp.tool()
     def list_tables(pattern: str = "", source: str = "") -> dict:
         """List tables/views matching a pattern (e.g. 'JRNL' or 'PS_LEDGER%')."""
-        return _safe(engine.for_source(source).list_tables, pattern=pattern)
+        return _sourced(source, "list_tables", pattern=pattern)
 
     @mcp.tool()
     def describe_table(table_name: str, source: str = "") -> dict:
         """Column names and types for one table/view (e.g. PS_JRNL_HEADER)."""
-        return _safe(engine.for_source(source).describe_table, table_name=table_name)
+        return _sourced(source, "describe_table", table_name=table_name)
 
 
 @mcp.tool()
