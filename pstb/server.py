@@ -181,6 +181,7 @@ def get_trial_balance(
     currency: str = "",
     include_adjustments: bool = False,
     max_rows: int = 0,
+    amount_basis: str = "base",
 ) -> dict:
     """    Trial balance by account: beginning balance, period activity, ending balance, DR/CR.
     Amounts are signed: debits positive, credits negative.
@@ -190,12 +191,20 @@ def get_trial_balance(
     account: exact "1000", range "6000-6999", list "1000,1100", or prefix "60%".
     group_by: extra chartfields, comma-separated (e.g. "DEPTID" or "DEPTID,PROJECT_ID").
     currency: filter to one currency code, or "detail" to break out by currency.
-    include_adjustments: fold adjustment-period (998) amounts into ending balances."""
+    include_adjustments: fold adjustment-period (998) amounts into ending balances.
+    amount_basis: "base" (default) reports POSTED_TOTAL_AMT — already in the
+    unit's base currency on every row, including rows a journal entered in
+    EUR produced, which is why it ties. "transaction" reports POSTED_TRAN_AMT
+    as entered; it is keyed by CURRENCY_CD, reported in totals.by_currency,
+    and NO grand total is produced because amounts in different currencies
+    cannot be added. Use it for "what did we actually spend in EUR", never to
+    tie out. Read the `currency` block before quoting any figure."""
     return _safe(
         engine.trial_balance,
         business_unit=business_unit, fiscal_year=fiscal_year, period=period,
         ledger=ledger, group_by=group_by, dept=dept, account=account,
-        currency=currency, include_adjustments=include_adjustments, max_rows=max_rows,
+        currency=currency, include_adjustments=include_adjustments,
+        max_rows=max_rows, amount_basis=amount_basis,
     )
 
 

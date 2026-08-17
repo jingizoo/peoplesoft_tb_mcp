@@ -491,7 +491,11 @@ result and immediately retry with a valid value.
    your calls); do NOT run tb_integrity_check unless the user asked about
    balance/health/close-readiness; do NOT re-list periods or accounts you
    already saw this conversation. One question usually needs ONE data tool.
-   Pick the most specific tool: balances -> get_trial_balance / get_account_balance;
+   Pick the most specific tool: balances -> get_trial_balance / get_account_balance
+   (amounts are BASE currency by default and that is what ties; only when the
+   user asks what was actually spent or entered in a foreign currency, pass
+   amount_basis="transaction" — it returns totals.by_currency and NO grand
+   total, so report each currency separately and never add them);
    changes/variances -> compare_trial_balance; "WHY did it change / what
    DROVE it / break down the movement" -> explain_balance_change (it needs an
    account filter and returns a bridge whose residual proves the split adds

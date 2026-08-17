@@ -1759,6 +1759,27 @@ def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
     # returns the GL side when AP accounting-line/JGR evidence is unavailable
     # so an operator has a useful diagnostic.  That partial observation must
     # never satisfy the answer gate or be narrated as a tie/difference.
+    if tool_name == "get_trial_balance":
+        # The transaction basis reads POSTED_TRAN_AMT, denominated in each
+        # row's own CURRENCY_CD. The engine withholds the grand total for
+        # exactly that reason, so a payload that carries a grand total AND
+        # more than one currency has had the two reconciled somewhere it
+        # should not have been — refuse rather than let a figure in no
+        # currency reach a reader.
+        currency = payload.get("currency") or {}
+        totals = payload.get("totals") or {}
+        if (isinstance(currency, Mapping)
+                and currency.get("amount_basis") == "transaction"
+                and currency.get("totals_are_summable") is False
+                and isinstance(totals, Mapping)
+                and totals.get("ending") is not None):
+            return False, (
+                "A transaction-currency trial balance reported a single "
+                "ending total across "
+                + ", ".join(currency.get("currencies_present") or [])
+                + ". Amounts in different currencies cannot be added; read "
+                  "totals.by_currency."
+            )[:240]
     if tool_name == "reconcile_ap_to_gl":
         def numeric(value):
             if (not isinstance(value, (int, float))
