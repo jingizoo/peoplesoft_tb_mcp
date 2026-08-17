@@ -100,20 +100,31 @@ def build_provider(name: str, cfg: Config, tools: list[ToolSpec]) -> LLMProvider
     prompt = system_prompt(cfg, memory=SiteMemory(cfg.resolve_path(
         getattr(cfg.tools, "site_memory", "site_memory.json"))),
         provider=name)
+    provider = None
     if name == "gemini":
         from .llm_gemini import GeminiVertexProvider
 
-        return GeminiVertexProvider(cfg, prompt, tools)
-    if name == "claude":
+        provider = GeminiVertexProvider(cfg, prompt, tools)
+    elif name == "claude":
         from .llm_claude import ClaudeProvider
 
-        return ClaudeProvider(cfg, prompt, tools)
-    if name == "ollama":
+        provider = ClaudeProvider(cfg, prompt, tools)
+    elif name == "ollama":
         from .llm_ollama import OllamaProvider
 
-        return OllamaProvider(cfg, prompt, tools)
-    raise SystemExit(
-        f"Unknown provider {name!r} — use 'ollama', 'gemini' or 'claude'")
+        provider = OllamaProvider(cfg, prompt, tools)
+    if provider is None:
+        raise SystemExit(
+            f"Unknown provider {name!r} — use 'ollama', 'gemini' or 'claude'")
+    # This is accounting semantics, not merely prompt advice. The evidence
+    # gate uses it too, so a model cannot satisfy a Coupa-authority receipt
+    # question with the PeopleSoft fallback tool (or vice versa).
+    provider.procurement_authority = (
+        "coupa" if getattr(getattr(cfg, "coupa", None),
+                           "po_receipt_authority", False) is True
+        else "peoplesoft"
+    )
+    return provider
 
 
 def _field(obj, *names, default=None):
@@ -419,6 +430,42 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # back for something it has.
     observed_asked: set = set()
     required_financial_domains = question_financial_domains(user_text)
+    procurement_authority = str(
+        getattr(provider, "procurement_authority", "") or "").lower()
+    strict_unconfigured_domains = {
+        # These claims require curated completeness/status contracts. A
+        # successful ad-hoc SELECT is not enough to authorize them because it
+        # cannot prove the population, cross-system bridge, or point-in-time
+        # semantics the question asks for.
+        "journal_netting", "journal_posted_by", "journal_historical_status",
+        "po_grni_candidates", "coupa_rni_candidates",
+        "coupa_receipt_export_state", "rni_allocation",
+        "rni_receipt_matching", "ap_completeness",
+        "coupa_to_ps_posting",
+        "coupa_export_delivery",
+        "coupa_receiving_export_population",
+        "coupa_receipt_export_detail",
+    }
+    if procurement_authority == "coupa":
+        strict_unconfigured_domains.add("grni")
+    # Source-less RNI wording follows the deployment's configured purchasing
+    # authority. Explicit "Coupa"/"PeopleSoft" questions already receive a
+    # source-specific domain in guards.py and override this default.
+    #
+    # `grni` rides along: "show me received not invoiced" names no system,
+    # and on a Coupa-authority site the PeopleSoft receipt control is the
+    # wrong answer to it even though both are candidate populations. With no
+    # authority configured the domain stays generic and either control can
+    # ground it — which is what guards.RUNTIME_RESOLVED_DOMAINS records.
+    for generic in ("rni_candidates", "grni"):
+        if generic not in required_financial_domains:
+            continue
+        if procurement_authority == "coupa":
+            required_financial_domains.discard(generic)
+            required_financial_domains.add("coupa_rni_candidates")
+        elif procurement_authority == "peoplesoft":
+            required_financial_domains.discard(generic)
+            required_financial_domains.add("po_grni_candidates")
     # Tell the provider whether this question should open with a tool call.
     # The Gemini provider forces function-calling mode ANY on that first
     # turn (greedy-decoded), which makes "answered from memory without
@@ -705,7 +752,11 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                                 # financial evidence for that question. Without
                                 # this, correct run_sql answers were replaced by
                                 # a false "could not obtain a PeopleSoft result".
-                                covered = required_financial_domains or {"adhoc"}
+                                covered = (
+                                    required_financial_domains
+                                    - strict_unconfigured_domains
+                                ) or ({"adhoc"}
+                                      if not required_financial_domains else set())
                             covered_financial_domains.update(covered)
                     else:
                         last_db_problem = (problem or blocked
@@ -787,20 +838,56 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     elif intent == "data" and not (
         relevant_financial_db_ok if financial_fact_required else db_ok
     ):
-        # Some questions ask for a fact this deployment deliberately cannot
+        # A question can ask for a fact this deployment deliberately cannot
         # prove. "I could not obtain a successful PeopleSoft result" is the
         # wrong sentence for those: the tool DID succeed, and the reader is
-        # left with no idea what to ask instead. Say what is missing, and
-        # keep the ordinary failure visible when both are true.
+        # left with no idea what to ask instead. guards declares every such
+        # hole with its own remedy, and the invariant test makes sure none
+        # goes undeclared. Ordinary incompleteness — a tool that ran and
+        # could not establish its population — keeps its own wording below.
         by_design, also_failed = unsupported_domain_reason(
             required_financial_domains - covered_financial_domains)
-        generic = ("I could not obtain a successful PeopleSoft result for "
-                   "this question. No wiki content was used in its place.")
-        if by_design and also_failed:
-            answer = by_design + " I also could not obtain a PeopleSoft " \
-                                 "result for the rest of the question."
+        if by_design:
+            answer = by_design + (
+                " I also could not obtain a governed result for the rest of "
+                "the question." if also_failed else "")
+        elif "ap_completeness" in required_financial_domains:
+            answer = (
+                "AP completeness is incomplete. The playbook found one or "
+                "more control legs that could not establish a complete "
+                "period-end population; this is not an AP-close pass."
+                + (f" Detail: {last_db_problem}" if last_db_problem else "")
+            )
+        elif "coupa_rni_candidates" in required_financial_domains:
+            answer = (
+                "The Coupa PO-line review candidate population is "
+                "incomplete, so no candidate amount or clean-zero conclusion "
+                "is available. Booked status not evaluated."
+                + (f" Detail: {last_db_problem}" if last_db_problem else "")
+            )
+        elif "coupa_receipt_export_state" in required_financial_domains:
+            answer = (
+                "The Coupa receipt export-flag population is incomplete, so "
+                "I cannot conclude whether the selected receipts were marked "
+                "exported. Even a complete export flag would prove transport "
+                "state only, not PeopleSoft booking or GL posting."
+                + (f" Detail: {last_db_problem}" if last_db_problem else "")
+            )
+        elif required_financial_domains & {
+                "po_grni_candidates", "rni_candidates"}:
+            answer = (
+                "The received-not-invoiced review candidate population is "
+                "incomplete, so no candidate amount or clean-zero conclusion "
+                "is available. Booked status not evaluated."
+                + (f" Detail: {last_db_problem}" if last_db_problem else "")
+            )
         else:
-            answer = by_design or generic
+            answer = (
+                "I could not obtain a successful PeopleSoft or other governed "
+                "financial result complete for this question. No wiki content "
+                "was used in its place."
+                + (f" Detail: {last_db_problem}" if last_db_problem else "")
+            )
         gate_replaced_answer = True
     elif intent == "policy" and not policy_ok:
         answer = (

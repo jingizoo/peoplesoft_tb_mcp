@@ -615,6 +615,119 @@ Optionally have a DBA deploy the views in [`sql/oracle/`](../sql/oracle) and set
 basis contract, no user authorization boundary, and raw SQL is enabled in the
 shipped config (`tools.allow_raw_sql: false` turns it off).
 
+## 6a. Connect Coupa as the PO/receipt authority
+
+Use this profile when every purchase order and receipt lives in Coupa and only
+invoices or accounting may reach PeopleSoft. The connector is read-only. Give
+its service identity only the Coupa read scopes it needs.
+
+Put the instance URL and one authentication method in `.env`:
+
+```dotenv
+COUPA_BASE_URL=https://your-company.coupahost.com
+COUPA_CLIENT_ID=<read-only OAuth client id>
+COUPA_CLIENT_SECRET=<read-only OAuth client secret>
+COUPA_SCOPE=core.invoice.read core.purchase_order.read core.inventory.receiving.read core.supplier.read
+```
+
+An existing read-only API key can be used instead:
+
+```dotenv
+COUPA_BASE_URL=https://your-company.coupahost.com
+COUPA_API_KEY=<read-only API key>
+```
+
+Choose OAuth or the API key, not both. The receiving scope is required for
+dated receipt-event evidence; PO-line summary amounts are not a substitute.
+Then configure the tenant-specific business-unit semantics in `config.yaml`:
+
+```yaml
+coupa:
+  po_receipt_authority: true
+  # Required: the Coupa company/calendar IANA timezone, not the server zone.
+  business_timezone: "America/New_York"
+  # Example only. Verify this exact dotted path against your Coupa receipt JSON.
+  business_unit_path: "custom-fields.erp-business-unit"
+  # Live controls require exact tenant-tested server query keys. Coupa query
+  # spelling varies by resource/release; never infer a custom field's exposed
+  # API spelling or a company prefix from the JSON response path.
+  receipt_business_unit_filter: "custom_fields[erp_business_unit]"
+  invoice_business_unit_filter: "invoice_lines[custom_fields][erp_business_unit]"
+  # Enable only after proving the invoice query returns every header with an
+  # in-scope PO/order-line even after an invoice distribution-account change.
+  invoice_scope_order_line_invariant: true
+  business_unit_map:
+    US001: US_CORP
+  invoice_eligible_statuses: [approved]
+  receipt_eligible_statuses: [created]
+  rni_max_rows: 50000
+```
+
+`business_timezone` must be the Coupa company's IANA timezone. The current-only
+control calculates “today” in that governed zone; it does not inherit the app
+server's local date around midnight. `business_unit_path` is not portable
+across Coupa tenants. It must identify one
+unambiguous Coupa value on each receiving transaction. `business_unit_map`
+maps the caller's authorized PeopleSoft BU to that value. Leave neither to a
+guess: a blank/unreadable path or unmapped unit must return `incomplete`, never
+an all-company scan. Live evaluation requires the two exact server filter
+keys even for a standard account segment. `invoice_scope_order_line_invariant`
+is a reviewed tenant assertion, not
+a convenience switch: leave it false until a Coupa API test proves that an
+invoice-account reassignment cannot hide a header that still references an
+in-scope order line. Coupa `paid` is a boolean, not a delivered invoice-header
+status; the default eligible header status is `approved`. Receipt status is
+tenant-extensible text, so add only tested values to
+`receipt_eligible_statuses`. `rni_max_rows` is a configurable safety cap; the
+runtime hard ceiling remains 100,000 rows per endpoint.
+
+Restart the server after changing `.env` or `config.yaml`, then run
+`coupa_health`. Production acceptance requires both:
+
+```text
+mode: live
+ok: true
+```
+
+A blank `COUPA_BASE_URL` deliberately selects bundled fixtures. That is useful
+for a demonstration, but `mode: fixtures` fails production acceptance.
+
+Next ask, in the active BU and selected date:
+
+> Show Coupa PO lines with net receipt activity above eligible invoice
+> coverage at the selected period end, by currency.
+
+For a historical selected period end, that question is expected to return
+`incomplete`: the standard Coupa invoice API does not reconstruct approval
+status at a past cut-off. For a current-date operational collection, before
+using an observed candidate amount require `source=coupa`, `mode=live`, requested and
+mapped BU/path, requested/data-as-of dates, receipt and invoice event IDs and
+dates, eligible status basis, same-PO-line matching precision, per-currency
+counts and amounts, page/cap/freshness coverage, and missing-key/date/currency
+exceptions. The answer must call these **Coupa PO-line review candidates**,
+label receipt IDs as contributing evidence rather than exact matches, and
+state **booked status not evaluated**. Receipt and invoice
+endpoints are paged sequentially, so `collection_complete=true` is still
+`point_in_time_complete=false` and `atomic=false`; say “observed in the
+completed sequential collection,” never “the exact current population.” A
+nonzero `min_amount` is the same nominal native-unit threshold in every
+currency, not one comparable materiality threshold.
+
+Two controls remain deliberately outside that candidate result:
+
+- The current `ap_completeness` / `coupa_to_ap_tie` path is a diagnostic, not
+  production period-end completeness evidence: it does not yet prove complete
+  Coupa pagination, the same BU, and the selected as-of cut-off on both sides.
+  `coupa_to_ap_tie` remains a **current diagnostic only**.
+  The broad control therefore remains `incomplete`; the distinct business fact
+  “Did every approved Coupa invoice become a PeopleSoft voucher?” is `not
+  established` until a governed cross-system bridge is added.
+- “What booked receipt-accrual liability posted to PeopleSoft GL?” requires a
+  separately governed Coupa-interface → PeopleSoft accounting/JGEN → posted-GL
+  bridge. Neither `get_coupa_rni` nor `get_po_grni_candidates` can establish
+  it. Without that bridge, answer `not established`; do not prepare a journal
+  entry from the candidate total.
+
 ## 7. Connect the company wiki (Confluence)
 
 The wiki supplies policy context — suspense rules, capitalization thresholds,

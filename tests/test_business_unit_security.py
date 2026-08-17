@@ -144,6 +144,16 @@ class ToolGateTests(unittest.TestCase):
         self.assertIn("run_sql", why)
         self.assertIn("curated tools", why)
 
+    def test_unscoped_coupa_diagnostics_are_off_for_restricted_users(self):
+        for tool in ("coupa_to_ap_tie", "get_coupa_invoices",
+                     "get_coupa_stuck_approvals",
+                     "get_coupa_budget_lines",
+                     "get_coupa_supplier_spend"):
+            why = unit_access_block(tool, {}, self.RESTRICTED)
+            self.assertIn(tool, why)
+            self.assertIn("no governed business-unit argument", why)
+            self.assertEqual(unit_access_block(tool, {}, self.OPEN), "")
+
     def test_ad_hoc_sql_can_be_allowed_deliberately(self) -> None:
         self.assertEqual(unit_access_block(
             "run_sql", {"business_unit": "US001"}, self.RESTRICTED,

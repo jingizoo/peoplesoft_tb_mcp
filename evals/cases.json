@@ -265,13 +265,20 @@
       },
       "expect": {
         "any_tool": [
-          "run_playbook",
-          "coupa_to_ap_tie",
+          "run_playbook"
+        ],
+        "not_tool": [
           "get_coupa_rni",
-          "get_open_payables"
+          "get_po_grni_candidates"
+        ],
+        "tool_args_contain": {
+          "playbook": "ap_completeness"
+        },
+        "answer_contains": [
+          "incomplete"
         ],
         "not_refused": true,
-        "_why": "a broad AP-completeness question should run the composed playbook (ideal) or at minimum reach the AP tools \u2014 never refuse or answer from the ledger alone."
+        "_why": "A broad AP-completeness conclusion needs the composed playbook and cannot pass from a candidate list. At this Coupa-first deployment the current Coupa-to-AP leg lacks complete pagination, same-BU proof and the selected as-of cut-off, so the honest production conclusion is incomplete."
       }
     },
     {
@@ -421,12 +428,16 @@
         "period": 6
       },
       "expect": {
-        "any_tool": [
+        "not_tool": [
           "coupa_to_ap_tie",
-          "run_playbook"
+          "get_coupa_rni",
+          "get_po_grni_candidates"
+        ],
+        "answer_contains": [
+          "not established"
         ],
         "not_refused": true,
-        "_why": "the cross-system reconciliation chip."
+        "_why": "The current Coupa-to-AP diagnostic is not fully paged, BU-aligned, or selected-as-of complete. Until that governed bridge is implemented, neither it nor an RNI candidate list may certify that all approved Coupa invoices reached AP."
       }
     },
     {
@@ -785,13 +796,140 @@
         "tool_args_contain": {
           "playbook": "ap_completeness"
         },
+        "not_tool": [
+          "get_coupa_rni",
+          "get_po_grni_candidates"
+        ],
+        "answer_contains": [
+          "incomplete"
+        ],
         "not_refused": true,
-        "_why": "A broad AP accrual question is a composed completeness review. A PO-only GRNI candidate list, Coupa snapshot, or current open-payables population alone cannot support the full conclusion; the playbook must distinguish booked AP, missing intake, and each incomplete source."
+        "_why": "A broad AP accrual question is a composed completeness review. A PO-only GRNI candidate list, Coupa snapshot, or current open-payables population alone cannot support the full conclusion; the playbook must distinguish booked AP, missing intake, and each incomplete source. The present Coupa-to-AP diagnostic is not BU-, pagination-, or period-end-complete, so it cannot yield a production pass."
+      }
+    },
+    {
+      "id": "coupa-rni-period-end-candidates",
+      "question": "Show Coupa PO lines with net receipt activity above eligible invoice coverage at the selected period end, by currency.",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "any_tool": [
+          "get_coupa_rni"
+        ],
+        "not_tool": [
+          "get_po_grni_candidates",
+          "get_match_exceptions"
+        ],
+        "tool_args_contain": {
+          "business_unit": "US001",
+          "as_of_date": "2026-06-30"
+        },
+        "answer_contains": [
+          "Coupa PO-line review candidate",
+          "booked status not evaluated",
+          "incomplete"
+        ],
+        "not_refused": true,
+        "_why": "The selected-period question must use the configured Coupa authority with BU and cut-off scope. The recorded fixture/current invoice state cannot prove immutable invoice eligibility at the historical cut-off, so acceptance requires an explicit incomplete result while preserving the candidate-only and not-booked classifications."
+      }
+    },
+    {
+      "id": "coupa-rni-current-event-candidates",
+      "question": "Which current Coupa PO lines have net receipt activity above eligible invoice coverage?",
+      "scope": {
+        "business_unit": "US001"
+      },
+      "expect": {
+        "any_tool": [
+          "get_coupa_rni"
+        ],
+        "not_tool": [
+          "get_po_grni_candidates",
+          "get_match_exceptions"
+        ],
+        "tool_args_contain": {
+          "business_unit": "US001"
+        },
+        "answer_contains": [
+          "Coupa PO-line review candidate",
+          "booked status not evaluated",
+          "incomplete"
+        ],
+        "not_refused": true,
+        "_why": "Current Coupa PO-line candidates are source-specific, BU-scoped and candidate-only; receipt IDs are contributing evidence, not individual receipt-to-invoice matches. The eval server uses recorded fixtures, which are never production evidence, so Gemini must call the right tool but label the conclusion incomplete rather than accept fixture numbers."
+      }
+    },
+    {
+      "id": "coupa-invoices-to-ap-period-end-incomplete",
+      "question": "Did every approved Coupa invoice through the selected period end become a PeopleSoft voucher?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "not_tool": [
+          "run_playbook",
+          "coupa_to_ap_tie",
+          "get_coupa_rni",
+          "get_po_grni_candidates"
+        ],
+        "answer_contains": [
+          "not established"
+        ],
+        "not_refused": true,
+        "_why": "Whether every approved invoice became a voucher is a cross-system business fact, not the status of the broader AP-completeness control. No current governed tool proves its complete pagination, same-BU population and selected-as-of bridge, so the fact remains not established; an incomplete playbook run or receipt-event candidate list cannot answer it."
+      }
+    },
+    {
+      "id": "coupa-receipt-level-matching-protection",
+      "question": "For Coupa receipt R123, which invoice covers it?",
+      "scope": {
+        "business_unit": "US001"
+      },
+      "expect": {
+        "not_tool": [
+          "get_coupa_rni",
+          "get_po_grni_candidates",
+          "get_coupa_invoices"
+        ],
+        "answer_contains": [
+          "not established",
+          "matching-allocation"
+        ],
+        "not_refused": true,
+        "_why": "PO-line aggregate invoice coverage cannot identify which individual receipt was covered. That claim requires complete Coupa matching-allocation evidence, so neither candidate tool nor a generic invoice list may satisfy it."
+      }
+    },
+    {
+      "id": "coupa-booked-grni-protection",
+      "question": "What booked receipt-accrual liability from those Coupa candidates posted to PeopleSoft GL at the selected period end?",
+      "scope": {
+        "business_unit": "US001",
+        "ledger": "ACTUALS",
+        "fiscal_year": 2026,
+        "period": 6
+      },
+      "expect": {
+        "not_tool": [
+          "get_coupa_rni",
+          "get_po_grni_candidates"
+        ],
+        "answer_contains": [
+          "not established"
+        ],
+        "not_refused": true,
+        "_why": "A candidate population is not booked or posted accounting evidence. Until a separately governed Coupa-interface to PeopleSoft accounting, Journal Generator and posted-GL bridge exists, Gemini must withhold the amount and say the posting leg is not established."
       }
     },
     {
       "id": "ps-grni-review-candidates",
-      "question": "Which current PO-linked PeopleSoft received-not-invoiced items should we review today?",
+      "question": "Which current PO-linked received-not-invoiced items in the configured ERP should we review today?",
       "scope": {
         "business_unit": "US001"
       },

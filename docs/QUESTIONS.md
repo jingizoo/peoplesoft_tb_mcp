@@ -208,12 +208,26 @@ one call that answers it. Anything not on this map still routes through
 search_records + run_sql (+ pivot); this map is the fast path.
 
 ### AP — Payables
+
+At a Coupa-first site (`coupa.po_receipt_authority: true`), Coupa owns the PO
+and receipt population. A source-less PO, receipt, or received-not-invoiced
+question therefore follows the Coupa path; the PeopleSoft Purchasing path is
+used only when the user explicitly asks for that separate source. A Coupa RNI
+result is a PO-line **review-candidate** population supported by contributing
+receipt-event evidence. It is never, by itself, evidence that AP, receipt
+accounting, Journal Generator, or the GL
+booked or posted an accrual.
+
 | question | call |
 |---|---|
 | What do we owe, and to whom? | `get_open_payables` |
 | How much is overdue / due this week? | `get_open_payables` (overdue_total, due_within_7_days) |
 | Anything stuck in AP nobody can see? | `get_open_payables` → pipeline_exceptions (recycle/unposted) |
-| Which current PO-linked PeopleSoft received-not-invoiced items should we review today? | `get_po_grni_candidates()` — current-state, same-BU schedule-level document candidates by currency; a past date is incomplete; excludes non-PO/cross-BU coverage and does not prove a booked PO_RECVACCR/JGEN/GL accrual |
+| Show Coupa PO lines with net receipt activity above eligible invoice coverage at the selected period end, by currency. | `get_coupa_rni(business_unit=..., as_of_date=...)` — Coupa-authority path; production evidence requires `source=coupa`, `mode=live`, complete BU/date/population coverage and a per-currency result. If the source cannot reproduce immutable invoice eligibility at a historical cut-off, the answer is `incomplete`, not today's population relabelled as period end. Always say `booked status not evaluated`. |
+| Which current Coupa PO lines have net receipt activity above eligible invoice coverage? | `get_coupa_rni(business_unit=..., as_of_date=...)` — current Coupa PO-line review candidates only, supported by contributing receipt-event IDs; disclose order-line aggregate precision, missing keys/dates, pagination and display truncation before using the amount. The receipt/invoice endpoints are a completed sequential collection, not an atomic exact-instant snapshot. Individual receipt-to-invoice attribution requires Coupa matching allocations. |
+| Did every approved Coupa invoice through the selected period end become a PeopleSoft voucher? | No current governed tool proves this cross-system business fact. `run_playbook(playbook="ap_completeness")` may report that the broader control is `incomplete`, but neither it, the current `coupa_to_ap_tie` diagnostic, nor a Coupa RNI candidate list establishes complete pagination, the same BU and the selected cut-off on both systems. Answer `not established`. |
+| What booked receipt-accrual liability from those Coupa candidates posted to PeopleSoft GL at the selected period end? | Requires a separately governed Coupa-interface → PeopleSoft accounting/JGEN → posted-GL evidence path. `get_coupa_rni` and `get_po_grni_candidates` are forbidden as sole evidence; without the bridge, answer `not established`. |
+| Which current PO-linked received-not-invoiced items in the configured ERP should we review today? | `get_po_grni_candidates()` — explicit PeopleSoft fallback; current-state, same-BU schedule-level document candidates by currency. A past date is incomplete; excludes non-PO/cross-BU coverage and does not prove a booked PO_RECVACCR/JGEN/GL accrual. |
 | Does AP accounting activity reconcile to the GL control for this period? | `reconcile_ap_to_gl(control_accounts=<Finance-approved list>, fiscal_year=..., period=..., as_of_date=...)` — exact AP accounting/JGEN-to-posted-GL journal keys; missing evidence and mixed currency fail closed |
 | Whom did we pay, how much, when? | `get_vendor_payments` |
 | Top vendors by spend | `get_vendor_payments` (empty vendor ranks all) |

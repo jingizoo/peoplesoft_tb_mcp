@@ -7,9 +7,11 @@ bare interpreter.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass
@@ -243,6 +245,52 @@ class AnomalyCfg:
 
 
 @dataclass
+class CoupaCfg:
+    """Non-secret Coupa procurement semantics for this deployment.
+
+    Credentials remain in ``.env``.  These values describe where purchasing
+    truth lives and how a Coupa receipt is scoped to a PeopleSoft business
+    unit.  There is no portable Coupa account segment for business unit, so a
+    blank path deliberately makes the scoped RNI control incomplete rather
+    than scanning every company.
+    """
+    po_receipt_authority: bool = False
+    # IANA timezone of the Coupa company/calendar used for API date cutoffs.
+    # Required when Coupa is the PO/receipt authority so "today" does not
+    # silently follow the application host around midnight.
+    business_timezone: str = ""
+    # Dotted JSON path on a receiving transaction, for example
+    # ``account.segment-1`` or a tenant custom field.  A split allocation is
+    # not silently collapsed to this field; the control reports it incomplete
+    # unless its unit can be established unambiguously.
+    business_unit_path: str = ""
+    # Exact tenant-tested Coupa query keys required for live evaluation.
+    # Query spelling varies by resource/release and is therefore never
+    # derived from the JSON response path. These are key names, never values.
+    receipt_business_unit_filter: str = ""
+    invoice_business_unit_filter: str = ""
+    # Required assertion for evaluated live RNI. True means the configured
+    # invoice filter is tenant-tested to return every invoice header whose
+    # line references an in-scope PO/order-line, even after distribution-
+    # account reassignment. A generic invoice-account BU filter is not enough.
+    invoice_scope_order_line_invariant: bool = False
+    # Optional PeopleSoft BU -> Coupa value translation when the two systems
+    # use different codes, e.g. {US001: US_CORP}.
+    business_unit_map: dict = field(default_factory=dict)
+    # Only these current Coupa invoice-header states reduce a receipt
+    # candidate.  Pending/draft invoices remain visible as exceptions because
+    # they have not reached the approved outbound-to-ERP population.
+    invoice_eligible_statuses: list = field(
+        default_factory=lambda: ["approved"])
+    # Coupa defines receipt status as tenant-extensible text. Only reviewed
+    # values enter the event population; any other observed value fails the
+    # candidate control closed.
+    receipt_eligible_statuses: list = field(
+        default_factory=lambda: ["created"])
+    rni_max_rows: int = 50_000
+
+
+@dataclass
 class PsApiCfg:
     """Query Access Service credentials and limits.
 
@@ -313,6 +361,7 @@ class Config:
     semantic_retrieval: SemanticRetrievalCfg = field(
         default_factory=SemanticRetrievalCfg)
     anomalies: AnomalyCfg = field(default_factory=AnomalyCfg)
+    coupa: CoupaCfg = field(default_factory=CoupaCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
 
     @classmethod
@@ -332,6 +381,96 @@ def _apply_section(obj: Any, data: Optional[dict]) -> None:
     for k, v in data.items():
         if k in names and v is not None:
             setattr(obj, k, v)
+
+
+def _validate_coupa(cfg: CoupaCfg) -> None:
+    """Fail closed on malformed procurement-authority configuration.
+
+    Python truthiness would turn YAML ``"false"`` into true, which is not an
+    acceptable failure mode for choosing the system of record or an egress
+    population. Mapping/status shapes also reach row-security arithmetic and
+    therefore must not be silently coerced.
+    """
+    if type(cfg.po_receipt_authority) is not bool:
+        raise RuntimeError("coupa.po_receipt_authority must be true or false")
+    if not isinstance(cfg.business_timezone, str):
+        raise RuntimeError("coupa.business_timezone must be an IANA timezone")
+    cfg.business_timezone = cfg.business_timezone.strip()
+    if cfg.po_receipt_authority and not cfg.business_timezone:
+        raise RuntimeError(
+            "coupa.business_timezone is required when Coupa is the "
+            "PO/receipt authority")
+    if cfg.business_timezone:
+        try:
+            ZoneInfo(cfg.business_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise RuntimeError(
+                "coupa.business_timezone must be a valid IANA timezone"
+            ) from exc
+    if type(cfg.invoice_scope_order_line_invariant) is not bool:
+        raise RuntimeError(
+            "coupa.invoice_scope_order_line_invariant must be true or false")
+    if not isinstance(cfg.business_unit_path, str):
+        raise RuntimeError("coupa.business_unit_path must be a string")
+    for field_name in (
+            "receipt_business_unit_filter",
+            "invoice_business_unit_filter"):
+        value = getattr(cfg, field_name)
+        if not isinstance(value, str):
+            raise RuntimeError(f"coupa.{field_name} must be a string")
+        value = value.strip()
+        if value and not re.fullmatch(r"[A-Za-z0-9_\-\[\]]+", value):
+            raise RuntimeError(
+                f"coupa.{field_name} must be a safe Coupa scalar query key")
+        setattr(cfg, field_name, value)
+    if not isinstance(cfg.business_unit_map, dict):
+        raise RuntimeError("coupa.business_unit_map must be a mapping")
+    normalized_map = {}
+    for raw_key, raw_value in cfg.business_unit_map.items():
+        if (not isinstance(raw_key, (str, int)) or isinstance(raw_key, bool)
+                or not isinstance(raw_value, (str, int))
+                or isinstance(raw_value, bool)):
+            raise RuntimeError(
+                "coupa.business_unit_map keys and values must be text")
+        key, value = str(raw_key).strip(), str(raw_value).strip()
+        if not key or not value:
+            raise RuntimeError(
+                "coupa.business_unit_map keys and values cannot be blank")
+        normalized_map[key] = value
+    cfg.business_unit_map = normalized_map
+    for field_name in ("invoice_eligible_statuses",
+                       "receipt_eligible_statuses"):
+        configured = getattr(cfg, field_name)
+        if (not isinstance(configured, list) or not configured
+                or any(not isinstance(value, str) or not value.strip()
+                       for value in configured)):
+            raise RuntimeError(
+                f"coupa.{field_name} must be a non-empty list of text")
+        normalized = [value.strip().lower() for value in configured]
+        if len(normalized) != len(set(normalized)):
+            raise RuntimeError(
+                f"coupa.{field_name} must not contain duplicates")
+        if field_name == "invoice_eligible_statuses":
+            delivered_ineligible = {
+                "new", "ap_hold", "draft", "on_hold", "pending_receipt",
+                "rejected", "abandoned", "disputed", "pending_approval",
+                "booking_hold", "save_as_draft", "pending_action", "voided",
+                "processing", "invalid", "payable_adjustment",
+            }
+            unsafe = sorted(set(normalized) & delivered_ineligible)
+            if unsafe:
+                raise RuntimeError(
+                    "coupa.invoice_eligible_statuses contains delivered "
+                    "non-approved status value(s): " + ", ".join(unsafe))
+            if "paid" in normalized and "approved" not in normalized:
+                raise RuntimeError(
+                    "coupa.invoice_eligible_statuses cannot use paid without "
+                    "approved; Coupa paid is a boolean, not a header status")
+        setattr(cfg, field_name, normalized)
+    if (not isinstance(cfg.rni_max_rows, int)
+            or isinstance(cfg.rni_max_rows, bool)
+            or not 1 <= cfg.rni_max_rows <= 100_000):
+        raise RuntimeError("coupa.rni_max_rows must be between 1 and 100000")
 
 
 def _env(name: str, current: str) -> str:
@@ -498,6 +637,8 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.metadata_catalog, data.get("metadata_catalog"))
         _apply_section(cfg.semantic_retrieval, data.get("semantic_retrieval"))
         _apply_section(cfg.anomalies, data.get("anomalies"))
+        _apply_section(cfg.coupa, data.get("coupa"))
+        _validate_coupa(cfg.coupa)
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))
         if isinstance(data.get("semantics"), dict):

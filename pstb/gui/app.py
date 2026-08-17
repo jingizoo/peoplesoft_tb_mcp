@@ -1301,6 +1301,16 @@ def meta(request: Request = None):
         ),
         "llm": {"provider": cfg.llm.provider,
                 "model": provider_model(cfg)},
+        "procurement": {
+            "authority": (
+                "coupa" if getattr(getattr(cfg, "coupa", None),
+                                   "po_receipt_authority", False) is True
+                else "peoplesoft"
+            ),
+            "coupa_receipt_events": bool(
+                getattr(getattr(cfg, "coupa", None),
+                        "po_receipt_authority", False) is True),
+        },
         # The page reads this to decide whether to render the sign-in form
         # before anything else. is_authentication is stated, not implied:
         # a user ID with no password identifies nobody.
@@ -1606,7 +1616,7 @@ def diagnostics(include_timings: int = 0):
     from pstb.connectors import coupa as _coupa_mod
     return _guard(_diag.run, db=engine.db, engine=engine,
                   include_timings=bool(include_timings),
-                  connectors=[_coupa_mod.from_env()])
+                  connectors=[_coupa_mod.from_env(cfg=cfg)])
 
 
 @app.get("/api/question-report")
@@ -1667,7 +1677,7 @@ def export_csv(payload: dict, request: Request = None):
             body = dict(body, args=args)
     registry = _export.build_registry(
         engine=engine, ar=ar, modules=ModulePacks(engine),
-        report_runner=report_runner, coupa=_coupa_mod.from_env(),
+        report_runner=report_runner, coupa=_coupa_mod.from_env(cfg=cfg),
         qas=_qas_from_config())
     out = _guard(_export.export, tool=tool, args=body.get("args") or {},
                  registry=registry, payload=body.get("result"))

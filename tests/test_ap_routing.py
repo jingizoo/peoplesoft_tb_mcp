@@ -139,8 +139,7 @@ class RegistrationTests(unittest.TestCase):
     PACK_TOOLS = ("get_open_payables", "get_vendor_payments",
                   "get_asset_register", "get_project_costs",
                   "get_coupa_invoices", "get_coupa_stuck_approvals",
-                  "get_coupa_rni", "get_coupa_supplier_spend",
-                  "coupa_to_ap_tie")
+                  "get_coupa_rni", "get_coupa_supplier_spend")
 
     def test_pack_tools_count_as_financial_evidence(self) -> None:
         for tool in self.PACK_TOOLS:
@@ -150,6 +149,10 @@ class RegistrationTests(unittest.TestCase):
             self.assertTrue(financial_tool_domains(tool),
                             f"{tool} has no domains, so it can never cover "
                             "a question's requirement")
+
+    def test_incomplete_coupa_to_ap_diagnostic_is_not_evidence(self) -> None:
+        self.assertNotIn("coupa_to_ap_tie", FINANCIAL_EVIDENCE_TOOLS)
+        self.assertEqual(financial_tool_domains("coupa_to_ap_tie"), set())
 
     def test_open_payables_covers_the_overdue_vendor_question(self) -> None:
         needed = question_financial_domains("overdue vendor invoices")
