@@ -104,23 +104,35 @@ class OweDirectionTests(unittest.TestCase):
 
     def test_every_question_domain_is_coverable_by_some_tool(self) -> None:
         # A domain no tool can ground is a refusal machine: any question
-        # matching it can never pass the gate no matter what runs.  The one
-        # deliberate exception is broad/booked GRNI: no current curated tool
-        # proves it, so it must remain gated until governed accounting-line
-        # evidence is added (guarded run_sql can still ground an approved
-        # site-specific source dynamically).
-        from pstb.guards import _QUESTION_DOMAINS
-        intentionally_dynamic = {"grni"}
+        # matching it can never pass the gate no matter what runs.
+        #
+        # `grni` used to be exempted here on the reasoning that no curated
+        # tool proves BROAD or BOOKED received-not-invoiced. Both halves of
+        # that are true, but the exemption was carrying the plain question
+        # too — "show me received not invoiced for US001" reached the gate
+        # requiring a domain nothing declared, and died with "I could not
+        # obtain a successful PeopleSoft result" after the right tool had
+        # already succeeded. Breadth and bookedness now have their own
+        # domains (grni_complete, grni_booked) and their own refusal text in
+        # UNSUPPORTED_DOMAIN_REASONS; `grni` itself is answerable, because
+        # PO-linked candidates ARE received-not-invoiced evidence and the
+        # payload contract already forbids them claiming to be complete.
+        from pstb.guards import _QUESTION_DOMAINS, UNSUPPORTED_DOMAIN_REASONS
         coverable = set()
         for domains in _TOOL_DOMAINS.values():
             coverable |= domains
         for name in _QUESTION_DOMAINS:
-            if name in intentionally_dynamic:
+            if name in UNSUPPORTED_DOMAIN_REASONS:
                 continue
             self.assertIn(name, coverable,
                           f"domain {name!r} exists in questions but no tool "
                           "can ever ground it")
-        self.assertNotIn("grni", _TOOL_DOMAINS["get_po_grni_candidates"])
+        self.assertIn("grni", _TOOL_DOMAINS["get_po_grni_candidates"])
+        # The narrower claims stay off it.
+        self.assertNotIn("grni_complete",
+                         _TOOL_DOMAINS["get_po_grni_candidates"])
+        self.assertNotIn("grni_booked",
+                         _TOOL_DOMAINS["get_po_grni_candidates"])
 
 
 class RegistrationTests(unittest.TestCase):

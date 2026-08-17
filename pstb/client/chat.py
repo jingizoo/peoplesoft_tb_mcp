@@ -43,6 +43,7 @@ from ..guards import (
     filter_scope_payload,
     tool_result_status,
     unit_access_block,
+    unsupported_domain_reason,
     rate_caveat,
     rate_findings,
     ungrounded_figures,
@@ -786,10 +787,20 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     elif intent == "data" and not (
         relevant_financial_db_ok if financial_fact_required else db_ok
     ):
-        answer = (
-            "I could not obtain a successful PeopleSoft result for this "
-            "question. No wiki content was used in its place."
-        )
+        # Some questions ask for a fact this deployment deliberately cannot
+        # prove. "I could not obtain a successful PeopleSoft result" is the
+        # wrong sentence for those: the tool DID succeed, and the reader is
+        # left with no idea what to ask instead. Say what is missing, and
+        # keep the ordinary failure visible when both are true.
+        by_design, also_failed = unsupported_domain_reason(
+            required_financial_domains - covered_financial_domains)
+        generic = ("I could not obtain a successful PeopleSoft result for "
+                   "this question. No wiki content was used in its place.")
+        if by_design and also_failed:
+            answer = by_design + " I also could not obtain a PeopleSoft " \
+                                 "result for the rest of the question."
+        else:
+            answer = by_design or generic
         gate_replaced_answer = True
     elif intent == "policy" and not policy_ok:
         answer = (

@@ -430,9 +430,34 @@ _DATA_ANCHOR_STRONG = re.compile(
     # because they occur naturally in policy wording.
     r"\b(?:balances?|amounts?|totals?|aging|open items?)\b)"
 )
+# A journal noun ANYWHERE in the question. The three patterns below all
+# describe things that can also be asked about a voucher, an invoice or an
+# asset ("were the AP vouchers posted at period end?"), and answering those
+# from PS_JRNL_HEADER would be the wrong record. Requiring the noun keeps
+# each pattern to the population it can actually prove.
+_JOURNAL_NOUN = re.compile(
+    r"(?i)\b(?:journals?|jrnl|journal entr(?:y|ies)|je|general ledger|gl|"
+    # A journal id standing in for the noun: "what was J123's status at
+    # June 30" never says the word.
+    r"j[a-z]{0,3}\d{3,})\b")
+# The netting PREDICATE, not the noun "balance". "What journals make up the
+# 1100 balance?" is a drill-down that drill_to_journals answers; matching it
+# here stole the balance domain and left the question groundable only by a
+# line-netting result nobody asked for.
+_NETTING_PREDICATE = (
+    r"(?:net(?:s|ted|ting)?\s+(?:out|to\s+zero)|\bnetting\b|"
+    r"balance[sd]?\s+to\s+zero|(?:in|out\s+of)\s+balance|"
+    r"\bunbalanced\b|\bnot\s+balanced\b|\bbalanced\b|"
+    r"debits?\s*(?:=|equals?|match(?:es)?|tie[sd]?\s+to)\s*(?:the\s+)?"
+    r"credits?)"
+)
 _JOURNAL_NETTING_QUERY = re.compile(
-    r"(?i)(?:\bjournals?\b.{0,80}\b(?:net(?:s|ted|ting)?|balance[sd]?)\b|"
-    r"\b(?:net(?:s|ted|ting)?|balance[sd]?)\b.{0,80}\bjournals?\b)"
+    r"(?i)(?:\bjournals?\b.{0,80}" + _NETTING_PREDICATE + r"|"
+    + _NETTING_PREDICATE + r".{0,80}\bjournals?\b|"
+    # "do the journal lines balance" — balance as a VERB, which only reads
+    # that way behind do/does/did.
+    r"\bdo(?:es|id)?\s+(?:the\s+|this\s+|that\s+|these\s+|those\s+)?"
+    r"journals?\b.{0,40}\bbalance\b)"
 )
 _JOURNAL_POSTED_BY_QUERY = re.compile(
     r"(?i)(?:\b(?:was|were|is)\b.{0,80}\bposted\b.{0,40}\b(?:by|as of|at)\b|"
@@ -451,6 +476,18 @@ _PO_GRNI_CANDIDATE_QUERY = re.compile(
     r"\bschedule[- ]level\b|"
     r"\b(?:grni|rni|received[ -]not[ -]invoiced)\b.{0,60}"
     r"\b(?:candidates?|review)\b)"
+)
+# Asking for the WHOLE received-not-invoiced position. The PO-linked control
+# excludes non-PO receipts, inventory/miscellaneous accruals and cross-unit
+# relationships, so it is a fair answer to "show me received not invoiced"
+# and a misleading one to "what is our total GRNI".
+_COMPLETE_GRNI_QUERY = re.compile(
+    r"(?i)(?:\b(?:all|total|complete|entire|overall|full|every|whole)\b"
+    r".{0,40}\b(?:grni|rni|received[ -]not[ -]invoiced|uninvoiced receipts?|"
+    r"receipt[ -]accruals?)\b|"
+    r"\b(?:grni|rni|received[ -]not[ -]invoiced)\b.{0,40}"
+    r"\b(?:in total|overall|across (?:all|every)|company[- ]wide)\b|"
+    r"\bnon[- ]po\b)"
 )
 _BOOKED_GRNI_QUERY = re.compile(
     r"(?i)\b(?:booked|generated|posted|liabilit(?:y|ies)|po_recvaccr|"
@@ -553,8 +590,11 @@ _TOOL_DOMAINS = {
     "get_match_exceptions": {"ap", "report", "balance"},
     # Receipt/voucher schedule arithmetic supports the AP accrual-candidate
     # population only. It does not prove a booked GL receipt-accrual balance,
-    # so deliberately do not grant it the balance domain.
-    "get_po_grni_candidates": {"po_grni_candidates"},
+    # so deliberately do not grant it the balance domain. It IS the
+    # received-not-invoiced evidence, though: withholding the grni domain
+    # left "show me received not invoiced" with no tool at all, and the
+    # payload's own candidate_basis is what stops it reading as a liability.
+    "get_po_grni_candidates": {"po_grni_candidates", "grni"},
     "get_entity_network": {"billing", "customer", "ar", "ap", "report"},
     "get_concentration": {"billing", "customer", "ar", "ap", "report",
                           "balance"},
@@ -719,25 +759,48 @@ def requires_financial_evidence(question: str) -> bool:
 
 def question_financial_domains(question: str) -> set[str]:
     """Financial fact domains explicitly present in a user question."""
+    text = question or ""
     domains = {
         domain
         for domain, pattern in _QUESTION_DOMAINS.items()
-        if pattern.search(question or "")
+        if pattern.search(text)
     }
-    if _JOURNAL_NETTING_QUERY.search(question or ""):
+    journal_subject = bool(_JOURNAL_NOUN.search(text))
+    if _JOURNAL_NETTING_QUERY.search(text):
         # Exact journal netting is narrower than trial-balance integrity.
         # It remains its own capability so a complete header-status result
         # cannot satisfy the question when JRNL_LN evidence was unavailable.
         domains.discard("balance")
         domains.add("journal_netting")
-    if _JOURNAL_POSTED_BY_QUERY.search(question or ""):
+    if journal_subject and _JOURNAL_POSTED_BY_QUERY.search(text):
         domains.add("journal")
         domains.add("journal_posted_by")
-    elif _JOURNAL_HISTORICAL_STATUS_QUERY.search(question or ""):
+    elif journal_subject and _JOURNAL_HISTORICAL_STATUS_QUERY.search(text):
         domains.add("journal")
         domains.add("journal_historical_status")
-    if (_PO_GRNI_CANDIDATE_QUERY.search(question or "")
-            and not _BOOKED_GRNI_QUERY.search(question or "")):
+    if _QUESTION_DOMAINS["grni"].search(text):
+        if _BOOKED_GRNI_QUERY.search(text):
+            # "What GRNI liability is booked in the GL?" is a different fact
+            # from "what should we review", and nothing here can prove it.
+            # Name it so the refusal can say what is missing instead of
+            # claiming the database produced no result.
+            domains.discard("grni")
+            domains.add("grni_booked")
+        elif _COMPLETE_GRNI_QUERY.search(text):
+            # Breadth, not bookedness. A PO-linked candidate population is
+            # the honest answer to "show me received not invoiced" and the
+            # wrong answer to "what is our TOTAL GRNI", because the parts it
+            # excludes are exactly the parts that word is asking about.
+            domains.discard("grni")
+            domains.add("grni_complete")
+        else:
+            # "What is our GRNI balance?" wants the received-not-invoiced
+            # amount, not a GL account balance. Leaving the balance domain
+            # required a second, unrelated ledger call before the receipt
+            # answer was allowed to stand.
+            domains.discard("balance")
+    if (_PO_GRNI_CANDIDATE_QUERY.search(text)
+            and not _BOOKED_GRNI_QUERY.search(text)):
         domains.discard("grni")
         domains.discard("ap")
         domains.add("po_grni_candidates")
@@ -747,6 +810,50 @@ def question_financial_domains(question: str) -> set[str]:
 def financial_tool_domains(tool_name: str) -> set[str]:
     """Fact domains a curated tool can directly ground."""
     return set(_TOOL_DOMAINS.get(tool_name, set()))
+
+
+# Domains a question can require that NO tool will ever ground, on purpose.
+# Splitting a broad domain into a narrow one is how this module stops a
+# nearby result from answering a question it does not cover — but a domain
+# with no owner and no entry here is a question the agent can never answer,
+# and it fails with the generic "I could not obtain a successful PeopleSoft
+# result", which is untrue when the tool succeeded and offers no way
+# forward. Every deliberate hole gets a sentence saying what is missing and
+# what CAN be asked instead. tests/test_domain_coverage.py enforces that
+# nothing is missing from both this map and _TOOL_DOMAINS.
+UNSUPPORTED_DOMAIN_REASONS = {
+    "grni_complete": (
+        "I cannot give you a COMPLETE received-not-invoiced position. The "
+        "control here reads PO-linked receipt schedules in one business "
+        "unit; it excludes non-PO receipts, inventory and miscellaneous "
+        "receipt accruals, and cross-business-unit PO/voucher "
+        "relationships. Ask for the PO-linked review candidates and I will "
+        "show those with their exclusions stated, or have an approved "
+        "site-specific query added for the rest."
+    ),
+    "grni_booked": (
+        "A BOOKED receipt-accrual liability cannot be proven here. That "
+        "needs the delivered accounting source — RECV_LN_ACCTG, Journal "
+        "Generator distribution and the posted GL journal — and this "
+        "deployment reads PO receipt and voucher documents only. Ask which "
+        "received-not-invoiced items to review or accrue at a cut-off date "
+        "and I can answer that from PO-linked receipt schedules."
+    ),
+}
+
+
+def unsupported_domain_reason(missing) -> tuple[str, bool]:
+    """(text for the deliberate holes in ``missing``, any ordinary misses).
+
+    The second element matters: a question can be part structurally
+    impossible and part ordinary outage, and collapsing the two would either
+    hide a real failure behind a design note or bury the design note under a
+    generic shrug. The caller says both things.
+    """
+    wanted = set(missing or ())
+    holes = sorted(wanted & set(UNSUPPORTED_DOMAIN_REASONS))
+    text = " ".join(UNSUPPORTED_DOMAIN_REASONS[name] for name in holes)
+    return text, bool(wanted - set(holes))
 
 
 def financial_result_domains(tool_name: str, content: str) -> set[str]:

@@ -77,7 +77,7 @@ class RegistrationAndRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             _TOOL_DOMAINS["get_po_grni_candidates"],
-            {"po_grni_candidates"},
+            {"po_grni_candidates", "grni"},
         )
         self.assertNotIn(
             "balance", _TOOL_DOMAINS["get_po_grni_candidates"],
@@ -90,14 +90,33 @@ class RegistrationAndRoutingTests(unittest.TestCase):
             "get_journal_status", "Does the trial balance tie?"))
         self.assertFalse(financial_tool_is_relevant(
             "get_po_grni_candidates", "Which vendors do we owe?"))
+        # Bookedness and breadth are the two claims a candidate list must
+        # never authorize. Each has its own domain and its own refusal text;
+        # neither is grantable by get_po_grni_candidates.
         for question in (
             "What GRNI is booked today?",
             "What is the booked receipt-accrual liability?",
-            "Do we have any GRNI?",
         ):
-            self.assertIn("grni", question_financial_domains(question),
+            self.assertIn("grni_booked", question_financial_domains(question),
                           question)
             self.assertFalse(financial_tool_is_relevant(
+                "get_po_grni_candidates", question), question)
+        for question in (
+            "What is our total GRNI?",
+            "Show me all received not invoiced",
+            "What is the complete RNI position?",
+        ):
+            self.assertIn("grni_complete",
+                          question_financial_domains(question), question)
+            self.assertFalse(financial_tool_is_relevant(
+                "get_po_grni_candidates", question), question)
+        # The plain question is answerable — it was not before, and that was
+        # the regression this pair of assertions now pins.
+        for question in ("Do we have any GRNI?",
+                         "Show me received not invoiced for US001"):
+            self.assertIn("grni", question_financial_domains(question),
+                          question)
+            self.assertTrue(financial_tool_is_relevant(
                 "get_po_grni_candidates", question), question)
         candidate = (
             "Which PO-linked received-not-invoiced items should we accrue "

@@ -232,6 +232,15 @@ class GRNIControl:
                 "business_unit is required; GRNI never scans all business "
                 "units by default."
             )
+        if bu.strip().upper() in ("ALL", "*"):
+            # Passed through as a literal unit this read "no receipts found
+            # for ALL", which a reader takes as "no GRNI anywhere" rather
+            # than "ALL is not a business unit".
+            raise ModuleError(
+                f"{bu!r} is not a business unit. This control evaluates one "
+                "unit at a time because the receipt, PO and voucher units "
+                "must match; name a single business unit."
+            )
         try:
             cutoff = dt.date.fromisoformat(
                 (as_of_date or "").strip()[:10]
