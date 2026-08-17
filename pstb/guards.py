@@ -96,6 +96,15 @@ FINANCIAL_EVIDENCE_TOOLS = {
 # Request-scope field -> tool argument. The right-hand value differs only where
 # a tool calls its period "through_period". Tools not listed do not accept
 # financial scope parameters and are left untouched.
+# The ad-hoc tools are the only ones that can reach a second database, so
+# they are the only ones the source lock binds. Every curated financial tool
+# answers from the primary by construction and takes no source argument —
+# locking those would be asserting something that cannot vary.
+_SOURCE_SCOPED_TOOLS = (
+    "run_sql", "explain_query", "join_path", "search_records",
+    "profile_record", "compare_records", "list_tables", "describe_table",
+)
+
 _TOOL_SCOPE_ARGS = {
     # run_sql receives only the business unit, and only as context for the
     # disclosure note — the SQL text itself is never rewritten.
@@ -199,6 +208,9 @@ _TOOL_SCOPE_ARGS = {
     "get_project_costs": {"business_unit": "business_unit",
                         "as_of_date": "as_of_date"},
 }
+_TOOL_SCOPE_ARGS.update(
+    {name: {**_TOOL_SCOPE_ARGS.get(name, {}), "source": "source"}
+     for name in _SOURCE_SCOPED_TOOLS})
 
 # Tools that understand business_unit="ALL" as "every unit, each row
 # labelled with its own". Only these may widen past the selected unit;
@@ -325,6 +337,13 @@ _BU_ALL_VALUES = {"ALL", "*"}
 _SOFT_SCOPE_FIELDS = {"fiscal_year", "period", "as_of_date"}
 
 _SCOPE_ALIASES = {
+    # WHICH DATABASE. Hard, like business_unit and for the same reason: the
+    # selector is a promise about what the reader is looking at, and a
+    # promise the model can step around is a label rather than a guard. A
+    # tool asked for a source the person did not select is refused, not
+    # quietly redirected — silently rewriting it would answer a different
+    # question than the one the model composed.
+    "source": ("source", "database", "db"),
     "business_unit": ("business_unit", "bu"),
     "ledger": ("ledger",),
     "fiscal_year": ("fiscal_year", "fy"),
@@ -671,7 +690,7 @@ def _scope_value(field: str, value):
         if not _ISO_DATE.match(value):
             raise ValueError("as_of_date must be YYYY-MM-DD")
         return value
-    if field in ("business_unit", "ledger"):
+    if field in ("business_unit", "ledger", "source"):
         value = str(value).strip()
         return value or None
     if isinstance(value, bool):
@@ -714,9 +733,29 @@ def normalize_request_scope(scope: Mapping | None) -> dict:
     return normalized
 
 
+# Aliases the registry resolves to the primary. Kept in step with
+# pstb.sources._PRIMARY_ALIASES: a site that configures a real source under
+# one of these names is handled there, and the guard only needs to agree
+# that the DEFAULT spellings mean one thing.
+_PRIMARY_SOURCE_WORDS = frozenset({
+    "", "default", "peoplesoft", "people soft", "ps", "psft", "primary",
+    "main", "finance", "erp", "gl"})
+
+
+def _source_key(value) -> str:
+    name = str(value or "").strip().lower()
+    return "default" if name in _PRIMARY_SOURCE_WORDS else name
+
+
 def _same_scope_value(field: str, left, right) -> bool:
     if field in ("business_unit", "ledger"):
         return str(left).strip().upper() == str(right).strip().upper()
+    if field == "source":
+        # Source names are case-insensitive, and "" / "default" / the
+        # primary aliases are ONE database. Comparing the raw strings made
+        # a matching selection look like a conflict, which refused the very
+        # call the selector had just authorised.
+        return _source_key(left) == _source_key(right)
     try:
         return int(left) == int(right)
     except (TypeError, ValueError):

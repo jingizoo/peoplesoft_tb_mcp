@@ -345,6 +345,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 
   <main>
     <div class="scope" id="scope">
+      <label id="l-source" hidden>Database<select id="f-source"></select></label>
+      <span id="source-note" class="sub" hidden></span>
       <label>Business unit<select id="f-bu"></select></label>
       <label>Ledger<select id="f-ledger"></select></label>
       <label>Fiscal year<input id="f-fy" type="number" step="1"></label>
@@ -501,10 +503,15 @@ function canonicalScope(value){
   // uses its own current-period default. Business unit and ledger are the
   // only fields that must always be pinned.
   const num=v=>(v===null||v===undefined||v===''||v==='any')?null:(Number(v)||null);
-  return {
+  const out={
     business_unit:String(value.business_unit),ledger:String(value.ledger),
     fiscal_year:num(value.fiscal_year),period:num(value.period)
   };
+  // Only a NON-primary choice travels. Sending "default" would pin every
+  // ad-hoc call to an argument it does not send, and the guard would refuse
+  // the single-database deployment that is every deployment today.
+  if(value.source&&String(value.source)!=='default') out.source=String(value.source);
+  return out;
 }
 function scopeLabel(value){
   if(!value) return 'Choose financial scope';
@@ -512,10 +519,42 @@ function scopeLabel(value){
   const per=value.period?('P'+value.period):'any period';
   const name=buName(value.business_unit);
   const unit=value.business_unit+(name?(' '+name):'');
+  if(value.source&&value.source!=='default')
+    return 'database '+value.source+' — ad-hoc only';
   return unit+' · '+value.ledger+' · '+fy+' · '+per;
+}
+// Populate the database chooser and hide it when there is nothing to
+// choose. A one-item dropdown is a question with one answer — it teaches
+// the reader that a decision exists where none does.
+function syncSourceControl(value){
+  const wrap=$('#l-source'), sel=$('#f-source');
+  if(!wrap||!sel) return;
+  const list=(META&&META.sources)||[];
+  if(list.length<2){ wrap.hidden=true; return; }
+  wrap.hidden=false;
+  if(!sel.options.length)
+    list.forEach(s=>sel.append(new Option(
+      s.source==='default'?'Finance (all business units)':s.source, s.source)));
+  sel.value=(value&&value.source)||'default';
+  // BU / ledger / year / period are finance-system concepts. On another
+  // database they have no meaning and no honest value to show, so they are
+  // hidden rather than left displaying a stale selection that reads as if
+  // it still applied.
+  const psOnly = sel.value==='default';
+  ['#f-bu','#f-ledger','#f-fy','#f-per'].forEach(id=>{
+    const el2=$(id); if(el2&&el2.parentElement) el2.parentElement.hidden=!psOnly;
+  });
+  const note=$('#source-note');
+  if(note){
+    note.hidden=psOnly;
+    note.textContent=psOnly?'':
+      'Ad-hoc queries only on '+sel.value+' — curated financial tools '+
+      'answer from the finance database.';
+  }
 }
 function syncScopeControls(value){
   if(!value) return;
+  syncSourceControl(value);
   const bu=$('#f-bu'),lg=$('#f-ledger'),fy=$('#f-fy'),per=$('#f-per');
   if(![...bu.options].some(o=>o.value===value.business_unit))
     bu.append(new Option(value.business_unit,value.business_unit));
@@ -3182,6 +3221,14 @@ function showSignIn(){
   }
   bu.addEventListener('change',async()=>{await rescope(false); render();});
   lg.addEventListener('change',async()=>{await rescope(true); render();});
+  const srcSel=$('#f-source');
+  if(srcSel) srcSel.addEventListener('change',()=>{
+    // Re-sync rather than re-query: choosing a database changes which chips
+    // apply, not which units exist. The chat scope picks the new value up
+    // from canonicalScope on the next question.
+    syncSourceControl({source:srcSel.value}); render();
+  });
+  syncSourceControl(null);
   $('#brandsub').textContent=META.defaults.business_unit+' · '+META.defaults.ledger;
   if(META.security&&META.security.enabled&&META.security.signed_in){
     const who=el('div');
