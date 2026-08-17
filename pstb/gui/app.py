@@ -52,6 +52,12 @@ STATIC = Path(__file__).parent / "static"
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+# The GUI builds its own engine, and TBEngine.registry defaults to None — so
+# without this the database chooser saw no sources however many were
+# configured, and _validated_scope had nothing to validate a selection
+# against. pstb/server.py does the same on its side.
+from ..sources import SourceRegistry as _SourceRegistry
+engine.registry = _SourceRegistry(cfg, db)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 relationships = Relationships(ar)
@@ -1135,7 +1141,31 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
             status_code=400,
             detail="period must be between 1 and 999",
         )
+    # WHICH DATABASE. Validated against the registry rather than trusted:
+    # the selector is a guard, and a guard that accepts an unknown name is a
+    # typo away from being no guard at all. Absent means the primary, which
+    # is every existing deployment and every existing request.
+    source = str(raw.get("source") or raw.get("db") or "").strip()
+    if source:
+        known = engine.registry.names() if engine.registry is not None else ["default"]
+        if engine.registry is not None:
+            resolved = engine.registry.resolve_name(source)
+        else:
+            resolved = "default"
+        if resolved not in known:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Unknown database source {source!r}. Configured: "
+                        f"{', '.join(known)}."),
+            )
+        source = resolved
+
     scope = {"business_unit": bu, "ledger": ledger}
+    if source and source != "default":
+        # Only a NON-primary selection is carried. Pinning "default" would
+        # lock every ad-hoc call to an argument it never sends, turning the
+        # common single-database deployment into a stream of conflicts.
+        scope["source"] = source
     # Omit a cleared field entirely: apply_request_scope only injects what is
     # present, so an omitted period leaves each tool on its own default.
     if fiscal_year is not None:
@@ -1252,6 +1282,11 @@ def meta(request: Request = None):
             "account_tree": d.account_tree,
         },
         "build": _build_info(),
+        # The databases this deployment can reach. The selector needs them
+        # to exist before anyone can pick one, and the single-source case
+        # (every deployment today) gets a one-item list the UI hides.
+        "sources": (engine.registry.describe()
+                    if engine.registry is not None else []),
         "mcp_session": {"shared": _MCP["session"] is not None,
                         "state": _MCP.get("state", "starting"),
                         **({"error": _MCP["error"]} if _MCP["error"]
