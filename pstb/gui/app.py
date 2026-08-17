@@ -1048,6 +1048,41 @@ def _site_memory():
 def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
     """Resolve and validate a client scope exclusively from DB-discovered values."""
     raw = requested if isinstance(requested, dict) else {}
+
+    # A named secondary database is a complete scope of its own.  It has no
+    # PeopleSoft business unit, ledger or accounting-period dimensions, and
+    # forcing it through PS_LEDGER both mislabels the context and makes the
+    # secondary unavailable whenever the primary is down.  Validate the
+    # source before doing any PeopleSoft discovery and return only that hard
+    # boundary.  An explicit ``default`` is preserved: in a multi-source UI it
+    # means the person deliberately selected Finance, so an ad-hoc attempt to
+    # reach another source must conflict rather than silently widen.
+    source_supplied = "source" in raw or "db" in raw
+    source = str(raw.get("source") or raw.get("db") or "").strip()
+    if source_supplied:
+        known = (engine.registry.names()
+                 if engine.registry is not None else ["default"])
+        resolved = (engine.registry.resolve_name(source)
+                    if engine.registry is not None else "default")
+        if resolved not in known:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Unknown database source {source!r}. Configured: "
+                        f"{', '.join(known)}."),
+            )
+        source = resolved
+        if source != "default":
+            return {"source": source}
+        if not any(
+            key in raw
+            for key in ("business_unit", "bu", "ledger", "fiscal_year",
+                        "fy", "period", "per")
+        ):
+            # The multi-source selector can explicitly pin Finance before a
+            # BU is chosen. Keep that database lock, but do not invent a
+            # financial scope from configured defaults.
+            return {"source": "default"}
+
     catalog = catalog or _financial_scope_catalog()
     all_options = _scope_options(catalog)
     if not all_options:
@@ -1141,31 +1176,9 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
             status_code=400,
             detail="period must be between 1 and 999",
         )
-    # WHICH DATABASE. Validated against the registry rather than trusted:
-    # the selector is a guard, and a guard that accepts an unknown name is a
-    # typo away from being no guard at all. Absent means the primary, which
-    # is every existing deployment and every existing request.
-    source = str(raw.get("source") or raw.get("db") or "").strip()
-    if source:
-        known = engine.registry.names() if engine.registry is not None else ["default"]
-        if engine.registry is not None:
-            resolved = engine.registry.resolve_name(source)
-        else:
-            resolved = "default"
-        if resolved not in known:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"Unknown database source {source!r}. Configured: "
-                        f"{', '.join(known)}."),
-            )
-        source = resolved
-
     scope = {"business_unit": bu, "ledger": ledger}
-    if source and source != "default":
-        # Only a NON-primary selection is carried. Pinning "default" would
-        # lock every ad-hoc call to an argument it never sends, turning the
-        # common single-database deployment into a stream of conflicts.
-        scope["source"] = source
+    if source_supplied:
+        scope["source"] = source or "default"
     # Omit a cleared field entirely: apply_request_scope only injects what is
     # present, so an omitted period leaves each tool on its own default.
     if fiscal_year is not None:
@@ -1221,12 +1234,19 @@ def _provider_key(
     session_id: str, provider_name: str, scope: Optional[dict]
 ) -> tuple:
     if not scope:
-        return (session_id, provider_name, "__KNOWLEDGE_ONLY__", "", 0, 0)
+        return (
+            session_id, provider_name, "__KNOWLEDGE_ONLY__", "", "", 0, 0
+        )
     return (
         session_id,
         provider_name,
-        scope["business_unit"],
-        scope["ledger"],
+        # A named source is a hard database boundary, not a display label.
+        # Keeping it out of this key reused provider history and prior tool
+        # payloads after a user switched between Finance and a secondary
+        # database with the same BU/ledger chips still underneath.
+        str(scope.get("source") or "default").strip().lower(),
+        scope.get("business_unit") or "",
+        scope.get("ledger") or "",
         # Time fields are optional: a cleared year/period means "any", and
         # the session key must stay stable rather than raising KeyError.
         scope.get("fiscal_year") or 0,
@@ -2031,7 +2051,7 @@ async def chat(payload: dict, request: Request = None):
     turn_token = (str((payload or {}).get("turn_token") or "")[:64]
                   or f"srv-{_uuid.uuid4().hex[:16]}")
     displaced = _activity_begin(session_id, turn_token,
-                                "Checking the financial scope")
+                                "Checking the database context")
 
     from ..client.chat import agent_turn, tool_result_limit
     from ..client.prompt import system_prompt
@@ -2056,19 +2076,40 @@ async def chat(payload: dict, request: Request = None):
     # be live work forever; the poll showed a question that had already
     # 500'd as still running.
     try:
-        try:
-            # This async route must not perform synchronous Oracle/SQL
-            # Server I/O on FastAPI's event loop.
-            catalog = await asyncio.to_thread(_financial_scope_catalog)
-        except Exception as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Financial scope discovery failed: {e}") from e
+        requested_scope = payload.get("scope")
+        raw_source = ""
+        if isinstance(requested_scope, dict):
+            raw_source = str(
+                requested_scope.get("source")
+                or requested_scope.get("db") or ""
+            ).strip()
+        resolved_source = (
+            engine.registry.resolve_name(raw_source)
+            if engine.registry is not None else "default"
+        )
+        secondary_requested = bool(
+            raw_source and resolved_source != "default"
+        )
+
+        if secondary_requested:
+            # A named secondary source is independent of PS_LEDGER. Do not
+            # make it wait for (or fail with) a primary-database discovery
+            # query that cannot validate anything about this context.
+            catalog = {"scopes": []}
+        else:
+            try:
+                # This async route must not perform synchronous Oracle/SQL
+                # Server I/O on FastAPI's event loop.
+                catalog = await asyncio.to_thread(_financial_scope_catalog)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Financial scope discovery failed: {e}") from e
 
         # Scope discovery is deterministic and does not need an LLM round
         # trip. It also works before the user has chosen a BU, which is the
         # key escape hatch from a bad configured default.
-        if _is_scope_catalog_question(message):
+        if not secondary_requested and _is_scope_catalog_question(message):
             options = _scope_options(catalog)
             return {
                 "answer": (
@@ -2090,13 +2131,12 @@ async def chat(payload: dict, request: Request = None):
                 "turn_id": None,
             }
 
-        requested_scope = payload.get("scope")
         has_requested_scope = bool(
             isinstance(requested_scope, dict)
             and any(
                 requested_scope.get(name) not in (None, "", 0, "0")
                 for name in ("business_unit", "bu", "ledger", "fiscal_year",
-                             "fy", "period", "per")
+                             "fy", "period", "per", "source", "db")
             )
         )
         active_scope: Optional[dict] = None
@@ -2118,11 +2158,24 @@ async def chat(payload: dict, request: Request = None):
                 # Validation can fall back to a latest-posted-period lookup
                 # when a catalog record has no activity metadata, so it is
                 # also offloaded.
-                _activity_phase(session_id, turn_token,
-                                "Validating the scope against PS_LEDGER")
+                _activity_phase(
+                    session_id, turn_token,
+                    (f"Validating database source {resolved_source}"
+                     if secondary_requested
+                     else "Validating the scope against PS_LEDGER"),
+                )
                 active_scope = await asyncio.to_thread(
                     _validated_scope, requested_scope, catalog
                 )
+                if (
+                    active_scope == {"source": "default"}
+                    and _question_requires_scope(message)
+                ):
+                    raise _ScopeRequired(
+                        "Choose a business unit and ledger before asking a "
+                        "financial-data question.",
+                        _scope_options(catalog),
+                    )
             except _ScopeRequired as e:
                 return {
                     "scope_required": True,
@@ -2169,7 +2222,36 @@ async def chat(payload: dict, request: Request = None):
             prompt = system_prompt(cfg, surface="gui",
                                    memory=_site_memory(),
                                    provider=provider_name)
-            if active_scope:
+            if (active_scope
+                    and active_scope.get("source") not in
+                    (None, "", "default")):
+                source = active_scope["source"]
+                prompt += (
+                    "\n\n## Active database context selected by the user\n"
+                    f"- Database source: {source}\n"
+                    "This is a hard database boundary. Only guarded ad-hoc "
+                    "discovery and read-only SQL tools that accept source= "
+                    f"may query {source}, and they must use source={source}. "
+                    "Do not attach PeopleSoft business-unit, ledger, fiscal "
+                    "year, or accounting-period claims to this context. "
+                    "Curated financial tools remain bound to the PeopleSoft "
+                    "primary database; do not use one to claim it answered "
+                    f"from {source}. If the requested fact needs a curated "
+                    "PeopleSoft control, tell the user to switch Database "
+                    "back to Finance."
+                )
+            elif (active_scope
+                  and not active_scope.get("business_unit")):
+                prompt += (
+                    "\n\n## Active Finance database context selected by the user\n"
+                    "The primary database is hard-selected, but no business "
+                    "unit or ledger has been selected. Guarded ad-hoc "
+                    "discovery and read-only SQL may use source=default. "
+                    "Do not call a curated financial tool or state a balance, "
+                    "transaction total, party amount, or control conclusion "
+                    "until the user chooses a financial scope."
+                )
+            elif active_scope:
                 prompt += (
                     "\n\n## Active scope selected by the user and verified "
                     "against PS_LEDGER\n"

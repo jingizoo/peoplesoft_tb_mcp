@@ -86,9 +86,13 @@ class MetadataToolContractTests(unittest.TestCase):
     def test_metadata_tools_receive_no_business_unit_scope_argument(self) -> None:
         from pstb.guards import _TOOL_SCOPE_ARGS
 
-        for tool in ("describe_metadata_catalog", "search_metadata",
-                     "get_metadata_context"):
-            self.assertNotIn(tool, _TOOL_SCOPE_ARGS)
+        self.assertNotIn("describe_metadata_catalog", _TOOL_SCOPE_ARGS)
+        for tool in ("search_metadata", "get_metadata_context"):
+            self.assertEqual(
+                _TOOL_SCOPE_ARGS.get(tool), {"source": "source"},
+                "metadata discovery follows the selected database namespace "
+                "but must never inherit PeopleSoft BU/ledger/time fields",
+            )
 
     def test_gemini_custom_discovery_shortlist_includes_metadata_sequence(self):
         from pstb.client.llm_gemini import routing_tool_names

@@ -129,7 +129,11 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .composer input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
 .composer input:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .chat-context{display:flex;align-items:center;gap:8px;padding:8px 18px 0;background:var(--panel);
-  color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+  color:var(--muted);font-size:11.5px;border-top:1px solid var(--line);flex-wrap:wrap}
+.chat-source{display:flex;align-items:center;gap:5px;color:var(--muted)}
+.chat-source select{padding:4px 8px;border:1px solid var(--line);border-radius:6px;
+  background:var(--bg);color:var(--ink);font-weight:600}
+.chat-source select:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .build-tag{margin-left:auto;color:var(--muted);font-size:11px;font-family:ui-monospace,monospace;cursor:help}
 .scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .tool-card{margin:6px 0}
@@ -380,7 +384,8 @@ const $=s=>document.querySelector(s), el=(t,c,h)=>{const n=document.createElemen
 const money=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const coupaAmount=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:9});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, SCOPE_YEARS=[], CARDSEQ=0;
+let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, LAST_FINANCE_SCOPE=null;
+let SCOPE_YEARS=[], CARDSEQ=0;
 let SCOPE_YEARS_STALE=false;
 function lazyLoadScopeYears(){
   if(!SCOPE_YEARS_STALE||!CHAT_SCOPE) return;
@@ -499,7 +504,22 @@ function flattenScopes(scopes){
   }));
 }
 function canonicalScope(value){
-  if(!value||!value.business_unit||!value.ledger) return null;
+  if(!value) return null;
+  // A secondary database has no Finance BU, ledger or accounting-period
+  // dimensions. Its source name is the complete hard scope: retaining the
+  // finance fields here would make the request look more constrained than
+  // it really is.
+  if(value.source&&String(value.source)!=='default')
+    return {source:String(value.source)};
+  if(!value.business_unit||!value.ledger){
+    // In a multi-database deployment, Finance-without-a-BU is still a real
+    // hard database choice. Keep that sentinel so an ad-hoc tool cannot
+    // reach P2Go while the selector visibly says Finance; the scope chip
+    // separately asks for BU/ledger before curated financial questions.
+    if(String(value.source||'')==='default'&&
+       ((META&&META.sources)||[]).length>=2) return {source:'default'};
+    return null;
+  }
   // null fiscal_year/period mean ANY — the question decides and each tool
   // uses its own current-period default. Business unit and ledger are the
   // only fields that must always be pinned.
@@ -508,54 +528,103 @@ function canonicalScope(value){
     business_unit:String(value.business_unit),ledger:String(value.ledger),
     fiscal_year:num(value.fiscal_year),period:num(value.period)
   };
-  // Only a NON-primary choice travels. Sending "default" would pin every
-  // ad-hoc call to an argument it does not send, and the guard would refuse
-  // the single-database deployment that is every deployment today.
-  if(value.source&&String(value.source)!=='default') out.source=String(value.source);
+  // A single-database deployment remains exactly as before: no source key.
+  // With a real chooser, however, Finance is an explicit selection and must
+  // travel as "default" so the hard guard refuses a tool call aimed at a
+  // secondary database the person did not select.
+  if(value.source&&String(value.source)!=='default')
+    out.source=String(value.source);
+  else if(((META&&META.sources)||[]).length>=2)
+    out.source='default';
   return out;
 }
 function scopeLabel(value){
   if(!value) return 'Choose financial scope';
+  if(value.source&&value.source!=='default')
+    return 'database '+value.source+' — ad-hoc only';
+  if(value.source==='default'&&(!value.business_unit||!value.ledger))
+    return 'Finance database — choose financial scope';
   const fy=value.fiscal_year?('FY'+value.fiscal_year):'any year';
   const per=value.period?('P'+value.period):'any period';
   const name=buName(value.business_unit);
   const unit=value.business_unit+(name?(' '+name):'');
-  if(value.source&&value.source!=='default')
-    return 'database '+value.source+' — ad-hoc only';
   return unit+' · '+value.ledger+' · '+fy+' · '+per;
+}
+// The Ask view is the visible product surface, so its database control is
+// constructed in the always-visible context bar. The older #f-source lives
+// in the hidden browse toolbar and is deliberately not relied upon here.
+function buildChatSourceSelect(){
+  const list=(META&&META.sources)||[];
+  if(list.length<2) return null;
+  const label=el('label','chat-source');
+  label.id='chat-source-label';
+  label.append(el('span',null,'Database'));
+  const sel=el('select');
+  sel.id='chat-source';
+  sel.setAttribute('aria-label','Database context');
+  list.forEach(s=>sel.append(new Option(
+    s.source==='default'?'Finance':s.source, s.source)));
+  sel.value=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
+  sel.onchange=()=>setChatSource(sel.value);
+  label.append(sel);
+  return label;
+}
+// Database is a hard boundary, unlike year and period defaults. Changing
+// this select always goes through setChatScope, which is the same path used
+// by the financial scope chooser and therefore the same scope sent to chat.
+function setChatSource(source){
+  const name=String(source||'default');
+  const current=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
+  if(name===current) return;
+  if(name==='default'){
+    setChatScope(LAST_FINANCE_SCOPE||{source:'default'},true);
+    return;
+  }
+  if(CHAT_SCOPE&&(!CHAT_SCOPE.source||CHAT_SCOPE.source==='default'))
+    LAST_FINANCE_SCOPE={...CHAT_SCOPE};
+  setChatScope({source:name},true);
+  dismissScopeChoosers();
 }
 // Populate the database chooser and hide it when there is nothing to
 // choose. A one-item dropdown is a question with one answer — it teaches
 // the reader that a decision exists where none does.
 function syncSourceControl(value){
   const wrap=$('#l-source'), sel=$('#f-source');
-  if(!wrap||!sel) return;
   const list=(META&&META.sources)||[];
-  if(list.length<2){ wrap.hidden=true; return; }
-  wrap.hidden=false;
-  if(!sel.options.length)
+  if(list.length<2){ if(wrap) wrap.hidden=true; return; }
+  if(wrap) wrap.hidden=false;
+  if(sel&&!sel.options.length)
     list.forEach(s=>sel.append(new Option(
       s.source==='default'?'Finance (all business units)':s.source, s.source)));
-  sel.value=(value&&value.source)||'default';
+  const selected=(value&&value.source)||'default';
+  if(sel) sel.value=selected;
+  const chatSel=$('#chat-source');
+  if(chatSel) chatSel.value=selected;
   // BU / ledger / year / period are finance-system concepts. On another
   // database they have no meaning and no honest value to show, so they are
   // hidden rather than left displaying a stale selection that reads as if
   // it still applied.
-  const psOnly = sel.value==='default';
+  const psOnly = selected==='default';
   ['#f-bu','#f-ledger','#f-fy','#f-per'].forEach(id=>{
     const el2=$(id); if(el2&&el2.parentElement) el2.parentElement.hidden=!psOnly;
   });
+  ['#scope-fy','#scope-per'].forEach(id=>{
+    const el2=$(id); if(el2) el2.hidden=!psOnly;
+  });
+  const starters=$('#chat-starters');
+  if(starters) starters.hidden=!psOnly;
   const note=$('#source-note');
   if(note){
     note.hidden=psOnly;
     note.textContent=psOnly?'':
-      'Ad-hoc queries only on '+sel.value+' — curated financial tools '+
-      'answer from the finance database.';
+      'Ad-hoc queries only on '+sel.value+
+      ' — switch to Finance for curated financial tools.';
   }
 }
 function syncScopeControls(value){
   if(!value) return;
   syncSourceControl(value);
+  if(value.source&&value.source!=='default') return;
   const bu=$('#f-bu'),lg=$('#f-ledger'),fy=$('#f-fy'),per=$('#f-per');
   if(![...bu.options].some(o=>o.value===value.business_unit))
     bu.append(new Option(value.business_unit,value.business_unit));
@@ -592,6 +661,12 @@ function applyScopeCatalog(){
   // the conversation asks, rather than inheriting a sample BU.
   const opts=flattenScopes(META.financial_scopes||[]);
   if(opts.length===1&&!CHAT_SCOPE) setChatScope(opts[0],false);
+  // The visible selector starts on Finance. In a multi-database deployment
+  // that choice must be a real hard scope even before a BU is selected;
+  // otherwise an empty request scope would still permit an explicit P2Go
+  // tool call while the control says Finance.
+  else if(!CHAT_SCOPE&&((META&&META.sources)||[]).length>=2)
+    setChatScope({source:'default'},false);
   if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
   return opts;
 }
@@ -633,12 +708,35 @@ function updateScopeChip(){
   chip.textContent=scopeLabel(CHAT_SCOPE);
 }
 function setChatScope(value,announce){
+  const previousSource=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
   let next=canonicalScope(value);
-  if(!next) return;
+  // Switching back to Finance before a BU has ever been selected removes
+  // the secondary source pin and returns to the honest "choose" state. It
+  // still travels through this hard-scope path; it never invents a BU.
+  if(!next){
+    if(!value||String(value.source||'')!=='default') return;
+    const changed=Boolean(CHAT_SCOPE);
+    if(previousSource!=='default') CHAT_SESSION_ID=makeSessionId();
+    CHAT_SCOPE=null; syncSourceControl({source:'default'}); updateScopeChip();
+    if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
+    if(announce&&changed&&$('#msgs')){
+      $('#msgs').append(el('div','msg bot',
+        '<div class="who">New database context</div>'+esc(scopeLabel(null))+
+        '<br><span style="color:var(--muted)">Conversation history is isolated from every other scope.</span>'));
+      $('#msgs').scrollTop=$('#msgs').scrollHeight;
+    }
+    return;
+  }
   // A year/period chosen before any business unit must not be discarded.
   if(!CHAT_SCOPE&&value&&value.__fromChooser&&Object.keys(PENDING_TIME).length)
     next=canonicalScope({...next,...PENDING_TIME});
   const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
+  const nextSource=(next&&next.source)||'default';
+  // send() captures the session id and drops a response when it no longer
+  // matches. Rotating here (not only in the select handler) also covers a
+  // user who leaves a secondary database through the finance scope chooser.
+  if(previousSource!==nextSource) CHAT_SESSION_ID=makeSessionId();
+  if(!next.source||next.source==='default') LAST_FINANCE_SCOPE={...next};
   CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
   if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
   // The fiscal-year list costs MIN/MAX aggregates over PS_LEDGER — heavy on
@@ -676,6 +774,8 @@ function buildTimeSelects(){
   fySel.id='scope-fy'; fySel.title='Fiscal year for questions that do not name one';
   const perSel=el('select','scope-time');
   perSel.id='scope-per'; perSel.title='Period for questions that do not name one';
+  const financeOnly=!(CHAT_SCOPE&&CHAT_SCOPE.source&&CHAT_SCOPE.source!=='default');
+  fySel.hidden=!financeOnly;perSel.hidden=!financeOnly;
   const fill=()=>{
     const cur=CHAT_SCOPE||PENDING_TIME||{};
     fySel.innerHTML='';perSel.innerHTML='';
@@ -4149,6 +4249,9 @@ function viewChat(){
     msgs.append(holder);
   }
   const chips=el('div','starter-groups');
+  chips.id='chat-starters';
+  chips.hidden=Boolean(CHAT_SCOPE&&CHAT_SCOPE.source&&
+    CHAT_SCOPE.source!=='default');
   const starterGroups=["Billing & AR","Accounts payable","GL & close"].map(label=>{
     const box=el('div','starter-group');
     box.append(el('div','starter-label',esc(label)));
@@ -4179,6 +4282,8 @@ function viewChat(){
     starterGroups[i<5?0:i<9?1:2].append(c);
   });
   const context=el('div','chat-context','<span>Active data context</span>');
+  const sourceControl=buildChatSourceSelect();
+  if(sourceControl) context.append(sourceControl);
   const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
   contextButton.id='active-scope';
   contextButton.onclick=()=>{
@@ -4247,10 +4352,12 @@ async function send(messageOverride,appendUser){
   // answers stale:true for a token that no longer owns the slot.
   const turnToken=makeSessionId();
   const poll=setInterval(async()=>{
+    if(sendSession!==CHAT_SESSION_ID){ clearInterval(poll); return; }
     try{
       const a=await (await fetch('/api/activity?session_id='+
-        encodeURIComponent(CHAT_SESSION_ID)+'&turn='+
+        encodeURIComponent(sendSession)+'&turn='+
         encodeURIComponent(turnToken))).json();
+      if(sendSession!==CHAT_SESSION_ID){ clearInterval(poll); return; }
       const secs=Math.round((Date.now()-tStart)/1000);
       const ev=(a.stale?[]:(a.events||[]));
       const running=[...ev].reverse().find(e=>e.status==='running');
@@ -4273,7 +4380,7 @@ async function send(messageOverride,appendUser){
     try{
       r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
-          message:m,session_id:CHAT_SESSION_ID,scope:CHAT_SCOPE||{},
+          message:m,session_id:sendSession,scope:CHAT_SCOPE||{},
           turn_token:turnToken
         }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
@@ -4390,6 +4497,7 @@ async function send(messageOverride,appendUser){
   }catch(e){
     clearInterval(poll);
     think.remove();
+    if(sendSession!==CHAT_SESSION_ID) return;
     const m2=e.name==='AbortError'
       ? 'Timed out after '+(REQ_TIMEOUT_MS/1000)+'s. The tool call is still running against the '+
         'database — narrow the scope, or raise db.query_timeout_seconds.'

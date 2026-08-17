@@ -55,7 +55,46 @@ class DummyProvider:
         self.reset_count += 1
 
 
+class DummyRegistry:
+    def names(self):
+        return ["default", "p2go"]
+
+    def resolve_name(self, source):
+        value = str(source or "").strip()
+        return "default" if value in ("", "default", "finance") else value
+
+
 class ScopeValidationTests(unittest.TestCase):
+    def test_secondary_source_is_a_complete_scope_without_ps_ledger(self):
+        with (
+            patch.object(gui.engine, "registry", DummyRegistry()),
+            patch.object(gui, "_financial_scope_catalog",
+                         side_effect=AssertionError("must not query PS_LEDGER")),
+        ):
+            self.assertEqual(
+                gui._validated_scope({"source": "p2go"}),
+                {"source": "p2go"},
+            )
+
+    def test_unknown_secondary_source_is_rejected_by_registry(self):
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            with self.assertRaises(HTTPException) as caught:
+                gui._validated_scope({"source": "not-configured"}, CATALOG)
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("Unknown database source", caught.exception.detail)
+
+    def test_explicit_finance_selection_is_preserved_as_a_hard_lock(self):
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            self.assertEqual(
+                gui._validated_scope({"source": "default"}, CATALOG),
+                {"source": "default"},
+            )
+            result = gui._validated_scope(
+                {"source": "default", "business_unit": "CA001",
+                 "ledger": "ACTUALS"}, CATALOG)
+        self.assertEqual(result["source"], "default")
+        self.assertEqual(result["business_unit"], "CA001")
+
     def test_multiple_business_units_require_an_explicit_choice(self):
         with self.assertRaises(gui._ScopeRequired) as caught:
             gui._validated_scope({}, CATALOG)
@@ -142,6 +181,29 @@ class ScopeValidationTests(unittest.TestCase):
 
 
 class ProviderSessionStoreTests(unittest.TestCase):
+    def test_history_is_isolated_by_database_source(self):
+        finance = gui._provider_key(
+            "session-one", "gemini",
+            {"business_unit": "10000", "ledger": "ACTUALS",
+             "fiscal_year": 2026, "period": 6},
+        )
+        p2go = gui._provider_key(
+            "session-one", "gemini",
+            {"source": "p2go", "business_unit": "10000",
+             "ledger": "ACTUALS", "fiscal_year": 2026, "period": 6},
+        )
+        self.assertNotEqual(finance, p2go)
+        self.assertEqual(finance[2], "default")
+        self.assertEqual(p2go[2], "p2go")
+
+    def test_source_only_context_has_a_stable_provider_key(self):
+        key = gui._provider_key(
+            "session-one", "gemini", {"source": "p2go"})
+        self.assertEqual(
+            key,
+            ("session-one", "gemini", "p2go", "", "", 0, 0),
+        )
+
     def test_history_is_isolated_by_session_and_validated_scope(self):
         now = [0.0]
         store = gui._ProviderSessionStore(
@@ -274,6 +336,22 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertTrue(result["scope_required"])
         self.assertEqual(result["tool_calls"], [])
         self.assertEqual(len(result["scope_options"]), 3)
+
+    def test_finance_database_lock_without_bu_still_requires_financial_scope(self):
+        payload = {
+            "message": "Does the trial balance balance?",
+            "session_id": "session-0001",
+            "scope": {"source": "default"},
+        }
+        with (
+            patch.object(gui.engine, "registry", DummyRegistry()),
+            patch.object(gui, "_financial_scope_catalog",
+                         return_value=CATALOG),
+        ):
+            result = asyncio.run(gui.chat(payload))
+        self.assertTrue(result["scope_required"])
+        self.assertEqual(result["tool_calls"], [])
+        self.assertIn("business unit and ledger", result["answer"])
 
     def test_chat_requires_browser_session_and_scope_fields(self):
         with self.assertRaises(HTTPException) as session_error:
