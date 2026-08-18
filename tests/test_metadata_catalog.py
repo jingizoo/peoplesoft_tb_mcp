@@ -895,6 +895,45 @@ class NativeCatalogDialectTests(unittest.TestCase):
                 raise AssertionError(f"unexpected catalog query: {sql}")
             return self.responses.pop(0)
 
+    def test_oracle_first_pages_omit_empty_string_cursor_binds(self):
+        """Oracle treats '' as NULL, so an empty keyset cursor returns no rows."""
+        from pstb.metadata import (_column_pages, _constraint_pages,
+                                   _index_pages, _object_page,
+                                   _view_dependency_pages)
+
+        objects = self._Recorder("oracle", "p2go", [([], False)])
+        _object_page(objects, None, 25)
+        self.assertEqual(objects.calls[0]["params"], {"owner": "P2GO"})
+        self.assertNotIn(":n", objects.calls[0]["sql"])
+
+        columns = self._Recorder("oracle", "p2go", [([], False)])
+        list(_column_pages(columns, page_size=25))
+        self.assertEqual(columns.calls[0]["params"], {"owner": "P2GO"})
+        self.assertNotIn(":t", columns.calls[0]["sql"])
+        self.assertNotIn(":p", columns.calls[0]["sql"])
+
+        indexes = self._Recorder("oracle", "p2go", [([], False)])
+        list(_index_pages(indexes, page_size=25))
+        self.assertEqual(indexes.calls[0]["params"], {"owner": "P2GO"})
+        self.assertNotIn(":t", indexes.calls[0]["sql"])
+        self.assertNotIn(":i", indexes.calls[0]["sql"])
+        self.assertNotIn(":p", indexes.calls[0]["sql"])
+
+        constraints = self._Recorder("oracle", "p2go", [([], False)])
+        list(_constraint_pages(constraints, page_size=25))
+        self.assertEqual(
+            constraints.calls[0]["params"], {"owner": "P2GO"})
+        self.assertNotIn(":t", constraints.calls[0]["sql"])
+        self.assertNotIn(":c", constraints.calls[0]["sql"])
+        self.assertNotIn(":p", constraints.calls[0]["sql"])
+
+        dependencies = self._Recorder("oracle", "p2go", [([], False)])
+        list(_view_dependency_pages(dependencies, page_size=25))
+        self.assertEqual(
+            dependencies.calls[0]["params"], {"owner": "P2GO"})
+        for bind in (":v", ":rs", ":ro", ":rl"):
+            self.assertNotIn(bind, dependencies.calls[0]["sql"])
+
     def test_configured_oracle_uses_owner_scoped_all_catalogs_and_cursors(self):
         from pstb.metadata import (_column_pages, _constraint_pages,
                                    _index_pages, _object_page,
@@ -972,6 +1011,16 @@ class NativeCatalogDialectTests(unittest.TestCase):
         self.assertIn("FROM ALL_DEPENDENCIES", dependencies.calls[0]["sql"])
         self.assertNotIn("ALL_VIEWS", dependencies.calls[0]["sql"])
         self.assertNotIn("TEXT", dependencies.calls[0]["sql"])
+        self.assertIn(
+            "NVL(REFERENCED_OWNER,CHR(0))", dependencies.calls[1]["sql"])
+        self.assertIn("NVL(:rs,CHR(0))", dependencies.calls[1]["sql"])
+        self.assertIn(
+            "NVL(REFERENCED_LINK_NAME,CHR(0))",
+            dependencies.calls[1]["sql"],
+        )
+        self.assertIn("NVL(:rl,CHR(0))", dependencies.calls[1]["sql"])
+        self.assertNotIn("NVL(REFERENCED_OWNER,'')",
+                         dependencies.calls[1]["sql"])
         self.assertEqual(
             dependencies.calls[1]["params"],
             {"v": "CORP_AR_QUEUE_V", "rs": "SYSADM",
@@ -987,28 +1036,38 @@ class NativeCatalogDialectTests(unittest.TestCase):
         _object_page(objects, None, 25)
         self.assertIn("FROM USER_OBJECTS", objects.calls[0]["sql"])
         self.assertNotIn("ALL_OBJECTS", objects.calls[0]["sql"])
+        self.assertEqual(objects.calls[0]["params"], {})
+        self.assertNotIn(":n", objects.calls[0]["sql"])
 
         columns = self._Recorder("oracle", "", [([], False)])
         list(_column_pages(columns, page_size=10))
         self.assertIn("FROM USER_TAB_COLUMNS", columns.calls[0]["sql"])
         self.assertNotIn("ALL_TAB_COLUMNS", columns.calls[0]["sql"])
+        self.assertEqual(columns.calls[0]["params"], {})
+        self.assertNotIn(":t", columns.calls[0]["sql"])
 
         indexes = self._Recorder("oracle", "", [([], False)])
         list(_index_pages(indexes, page_size=10))
         self.assertIn("FROM USER_IND_COLUMNS", indexes.calls[0]["sql"])
         self.assertIn("JOIN USER_INDEXES", indexes.calls[0]["sql"])
         self.assertNotIn("ALL_IND_COLUMNS", indexes.calls[0]["sql"])
+        self.assertEqual(indexes.calls[0]["params"], {})
+        self.assertNotIn(":t", indexes.calls[0]["sql"])
 
         constraints = self._Recorder("oracle", "", [([], False)])
         list(_constraint_pages(constraints, page_size=10))
         self.assertIn("FROM USER_CONSTRAINTS", constraints.calls[0]["sql"])
         self.assertIn("JOIN USER_CONS_COLUMNS", constraints.calls[0]["sql"])
         self.assertNotIn("ALL_CONSTRAINTS", constraints.calls[0]["sql"])
+        self.assertEqual(constraints.calls[0]["params"], {})
+        self.assertNotIn(":t", constraints.calls[0]["sql"])
 
         dependencies = self._Recorder("oracle", "", [([], False)])
         list(_view_dependency_pages(dependencies, page_size=10))
         self.assertIn("FROM USER_DEPENDENCIES", dependencies.calls[0]["sql"])
         self.assertNotIn("ALL_DEPENDENCIES", dependencies.calls[0]["sql"])
+        self.assertEqual(dependencies.calls[0]["params"], {})
+        self.assertNotIn(":v", dependencies.calls[0]["sql"])
 
     def test_sqlserver_pages_advance_schema_object_and_index_cursors(self):
         from pstb.metadata import (_column_pages, _constraint_pages,
