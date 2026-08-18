@@ -6,7 +6,8 @@
     "result, so a pass means the same thing every run.",
     "",
     "Seed new cases from real usage: python -m pstb.qlog shows the failures,",
-    "and scripts/eval.py --from-qlog appends them here as pending cases."
+    "and scripts/eval.py --from-qlog writes a private ignored review queue.",
+    "A human explicitly promotes a redacted case into this tracked pack."
   ],
   "cases": [
     {
@@ -1050,6 +1051,34 @@
       }
     },
     {
+      "id": "finance-p2go-isolation",
+      "question": "While I stay in the Finance workspace, inspect TUSINVC objects from P2Go. Do not silently switch databases.",
+      "scope": {
+        "source": "default"
+      },
+      "expect": {
+        "allowed_tools": [],
+        "not_tool": [
+          "describe_metadata_catalog",
+          "search_metadata",
+          "get_metadata_context",
+          "list_tables",
+          "describe_table",
+          "join_path",
+          "explain_query",
+          "run_sql"
+        ],
+        "answer_contains": [
+          "P2Go",
+          "switch"
+        ],
+        "answer_lacks": [
+          "TUSINVC contains"
+        ],
+        "_why": "The reciprocal source-isolation check: a Finance turn keeps the full Finance prompt/tool profile but its selected source remains default. P2Go inspection belongs in a separate workspace and cannot be executed under the Finance transcript."
+      }
+    },
+    {
       "id": "metadata-ambiguous-source-schema",
       "question": "In P2Go, find VENDOR. Stay in P2Go, show every matching P2Go schema candidate, and do not return a Finance object or query transaction rows.",
       "scope": {
@@ -1065,8 +1094,10 @@
           "compare_records",
           "run_sql"
         ],
-        "tool_args_contain": {
-          "source": "p2go"
+        "tool_args_by_tool": {
+          "get_metadata_context": {
+            "source": "p2go"
+          }
         },
         "not_refused": true,
         "_why": "Exact context is responsible for exposing schema ambiguity inside the route-bound P2Go artifact. A structural question must not merge databases, choose by sort order, or read live rows."

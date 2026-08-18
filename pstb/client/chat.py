@@ -27,6 +27,7 @@ from ..config import Config, load_config
 from ..guards import (
     FINANCIAL_EVIDENCE_TOOLS,
     POLICY_EVIDENCE_TOOLS,
+    SOURCE_SILO_PROPOSAL_TOOLS,
     ScopeConflict,
     apply_request_scope,
     attribution_caveat,
@@ -50,7 +51,9 @@ from ..guards import (
     ungrounded_figures,
     unevidenced_verdict,
 )
-from ..qlog import QuestionLog
+from ..qlog import QuestionLog, observe_tool_call
+from ..quality import runtime_groundedness
+from ..source_knowledge import explicit_metadata_lesson
 from .llm_base import (
     PROVIDERS,
     LLMProvider,
@@ -408,6 +411,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      user_text: str, qlog=None, surface: str = "terminal",
                      turn_meta: Optional[dict] = None,
                      scope: dict | None = None,
+                     source_context: dict | None = None,
                      tool_observer: Callable | None = None,
                      tool_started: Callable | None = None,
                      prior_payloads: list | None = None,
@@ -424,6 +428,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     """
     request_scope = normalize_request_scope(scope)
     source_silo = str(request_scope.get("source") or "").strip()
+    expected_result_source = str(
+        (source_context or {}).get("canonical_source")
+        or request_scope.get("source") or "default"
+    ).strip() or "default"
     if source_silo.casefold() == "default":
         source_silo = ""
     intent = evidence_intent(user_text)
@@ -610,13 +618,32 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             blocked = ""
             next_step = ""
             was_scope_block = False
-            # Row security first: a unit this person was never granted is
-            # refused before the scope lock even looks at it, because the
-            # scope lock's question ("does this match what you selected")
-            # has no opinion about units you could never select.
+            # A model may not convert its own guess into durable metadata,
+            # even as a pending proposal.  The current USER turn must both
+            # name the exact target and contain explicit teaching/correction
+            # language.  The source-knowledge store independently keeps the
+            # proposal inactive until a host operator approves it.
+            if (call.name in SOURCE_SILO_PROPOSAL_TOOLS
+                    and not explicit_metadata_lesson(
+                        user_text, effective_args.get("identifier", ""))):
+                blocked = (
+                    "EXPLICIT_TEACHING_REQUIRED: metadata meaning proposals "
+                    "are allowed only when the user explicitly names and "
+                    "teaches or corrects that exact table/view"
+                )
+                next_step = (
+                    "Do not infer or propose metadata. Ask the user to name "
+                    "the exact table/view and explicitly state its durable "
+                    "business meaning."
+                )
+            # Row security precedes the ordinary scope lock: a unit this
+            # person was never granted is refused before asking whether it
+            # matches the selected scope.
             denied = unit_access_block(call.name, effective_args, access,
                                        allow_raw_sql=allow_raw_sql)
-            if denied:
+            if blocked:
+                pass
+            elif denied:
                 blocked = denied
                 next_step = (
                     "Ask about a business unit this user is authorised for, "
@@ -790,12 +817,16 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                                 and "has columns:" in
                                 str(problem or blocked or out or "")):
                             sql_remedy_pending = True
-                logged_calls.append({
-                    "tool": call.name,
-                    "ok": ok,
-                    **({"error": (problem or blocked or out)[:240]}
-                       if not ok else {}),
-                })
+                logged_calls.append(observe_tool_call(
+                    tool=call.name,
+                    output=out,
+                    ms=elapsed_ms,
+                    ok=ok,
+                    problem=(problem or blocked),
+                    expected_source=expected_result_source,
+                    allowed_schemas=(source_context or {}).get(
+                        "schema_allowlist") or (),
+                ))
                 if ok:
                     # Successful results get an id (r1, r2, ...) the model
                     # can REFERENCE in later rounds instead of retyping the
@@ -943,6 +974,11 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             )
         gate_replaced_answer = True
 
+    # Remember whether the evidence/scope gate, rather than a later answer
+    # guard, replaced the model's response. The quality log stores only this
+    # bounded outcome; it never stores the answer or the evidence behind it.
+    evidence_gate_blocked = gate_replaced_answer
+
     # MECHANICAL number grounding. The prompt forbids inventing figures and
     # the verdict guard catches unevidenced judgements, but neither makes a
     # fabricated amount IMPOSSIBLE to state. Every figure in the answer must
@@ -950,6 +986,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # refused rather than shown. Numbers have been fabricated by 8B models in
     # this exact product ($1,234,567.89 alongside balanced=true), so this is
     # the difference between "told not to" and "cannot".
+    invented = []
     if not gate_replaced_answer and turn_payloads:
         # Ground against RECENT turns too. A follow-up legitimately restates
         # a figure the conversation already fetched — the model can see that
@@ -970,8 +1007,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             )
             gate_replaced_answer = True
             logged_calls.append({"tool": "_number_guard", "ok": False,
-                                 "error": "ungrounded figures: "
-                                          + ", ".join(invented[:5])})
+                                 "refusal_category": "tool_error",
+                                 "result_completeness": {
+                                     "status": "refused"}})
 
     # A compliance verdict needs a rule AND a figure. If one side is missing,
     # say so rather than letting a half-grounded judgement stand.
@@ -985,7 +1023,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 "again for both the rule and the balance.]"
             )
             logged_calls.append({"tool": "_verdict_guard", "ok": False,
-                                 "error": f"verdict without {missing}"})
+                                 "refusal_category": "tool_error",
+                                 "result_completeness": {
+                                     "status": "refused"}})
 
     # Rates get a caveat, never a withhold. A percentage passes the figure
     # guard untouched (see guards._FIGURE_EXEMPT), so "the standard rate is
@@ -1017,25 +1057,65 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     # same two reasons the rate caveat is not: reading prose to decide what
     # a sentence claimed is arguable, and a healthy turn must not be logged
     # as a failure.
+    attribution_findings = []
     if not gate_replaced_answer:
-        attribution = attribution_caveat(misattributed_figures(
+        attribution_findings = misattributed_figures(
             answer, list(turn_payloads) + list(prior_payloads or []),
-            intent))
+            intent)
+        attribution = attribution_caveat(attribution_findings)
         if attribution:
             answer += "\n\n" + attribution
 
+    real_calls = [call for call in logged_calls
+                  if not str(call.get("tool") or "").startswith("_")]
+    groundedness = runtime_groundedness(
+        intent=intent,
+        evidence_calls=len(real_calls),
+        successful_evidence_calls=sum(
+            call.get("ok") is True for call in real_calls),
+        failed_evidence_calls=sum(
+            call.get("ok") is not True for call in real_calls),
+        guard_blocked=gate_replaced_answer,
+        missing_evidence=evidence_gate_blocked,
+        unsupported_figures=invented,
+        unverified_verdict=bool(missing),
+        source_mismatch_count=sum(
+            (call.get("result_source_verified") is False
+             or call.get("refusal_category") == "source_boundary")
+            for call in real_calls),
+        source_misattribution_count=len(attribution_findings),
+    )
+
     if qlog is not None:
-        turn_id = qlog.log_turn(surface=surface, provider=provider.name,
-                                question=user_text, calls=logged_calls,
-                                rounds=rounds, answer=answer,
-                                hit_round_limit=hit_limit, scope=scope)
+        try:
+            turn_id = qlog.log_turn(
+                surface=surface, provider=provider.name,
+                question=user_text, calls=logged_calls,
+                rounds=rounds, answer=answer,
+                hit_round_limit=hit_limit, scope=scope,
+                source_context=source_context)
+        except Exception:
+            # Observability is downstream of the answer. A malformed
+            # untrusted payload, full disk, or exporter failure must never
+            # turn a completed user request into an application error.
+            turn_id = ""
+        if turn_id:
+            try:
+                qlog.log_quality(turn_id, groundedness)
+            except Exception:
+                # Quality collection is an append-only observer. The turn id
+                # remains valid even if this second record cannot be written.
+                pass
         # Per CALL, not on the function. Stashing it on agent_turn made the
         # id a process global that every concurrent turn overwrote: two
         # colleagues asking at once, and a thumbs-down on one answer logged
         # against the other one's turn. The caller's own dict cannot race
         # with anybody else's.
         if turn_meta is not None:
-            turn_meta["turn_id"] = turn_id
+            if turn_id:
+                turn_meta["turn_id"] = turn_id
+            else:
+                turn_meta.pop("turn_id", None)
         agent_turn.last_turn_id = turn_id   # terminal client, single turn
     return answer
 

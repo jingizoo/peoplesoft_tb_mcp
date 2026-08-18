@@ -189,7 +189,8 @@ if(CHAT_SESSION_ID!==financeSession||CHAT_SCOPE.business_unit!=='US001'||
         intro = self._function("populateSiloIntro", "function ensureSiloMessages")
         self.assertIn("sourceBadgeHtml(silo.source)", chat)
         self.assertIn("if(silo.source==='default')", chat)
-        self.assertIn("Read-only semantic and relationship queries only", chat)
+        self.assertIn(
+            "Database read-only · governed metadata suggestions", chat)
         self.assertIn("Finance scopes and curated controls are not available", intro)
         finance_branch = chat.index("if(silo.source==='default')")
         self.assertGreater(chat.index("chips=el('div','starter-groups')"),
@@ -208,8 +209,14 @@ if(CHAT_SESSION_ID!==financeSession||CHAT_SCOPE.business_unit!=='US001'||
         prompt = source_silo_prompt("p2go")
         self.assertIn("p2go", prompt)
         self.assertIn("search_metadata", prompt)
+        self.assertIn("propose_metadata_meaning", prompt)
         self.assertIn("relationship", prompt.lower())
         self.assertIn("read-only", prompt.lower())
+        self.assertIn("user explicitly names", prompt.lower())
+        self.assertIn("pending", prompt.lower())
+        self.assertIn("submitted for review", prompt.lower())
+        self.assertIn("never propose something inferred", prompt.lower())
+        self.assertIn("private local review queue", prompt.lower())
         for forbidden in ("wiki_lookup", "get_trial_balance", "PS_LEDGER",
                           "FISCAL_YEAR", "BUSINESS_UNIT"):
             self.assertNotIn(forbidden, prompt)

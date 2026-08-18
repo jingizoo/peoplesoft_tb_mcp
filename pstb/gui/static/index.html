@@ -119,6 +119,12 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .fb{margin-top:8px;cursor:pointer;opacity:.45;font-size:13px;user-select:none;width:fit-content;
   background:none;border:0;color:inherit;padding:0}
 .fb:hover{opacity:1}
+.feedback-actions{display:flex;align-items:center;gap:9px;margin-top:8px}
+.feedback-actions .fb{margin-top:0}
+.feedback-box{margin-top:9px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);
+  white-space:normal;font-size:12px}
+.feedback-box label{display:block;margin:5px 0;color:var(--ink)}
+.feedback-box input[type=checkbox]{width:auto;margin-right:6px}
 .msg.bot .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
   font-weight:650;margin-bottom:6px}
 .msg.bot{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
@@ -511,7 +517,11 @@ async function api(path,opts){
   }
   clearTimeout(timer);
   const j=await r.json().catch(()=>({detail:'bad response'}));
-  if(!r.ok) throw new Error(j.detail||j.error||('HTTP '+r.status));
+  if(!r.ok){
+    const err=new Error(j.detail||j.error||('HTTP '+r.status));
+    err.status=r.status;
+    throw err;
+  }
   return j;
 }
 const scope=()=>({bu:$('#f-bu').value,ledger:$('#f-ledger').value,fy:$('#f-fy').value||0,per:$('#f-per').value||0});
@@ -710,8 +720,8 @@ function syncSourceControl(value){
   if(note){
     note.hidden=psOnly;
     note.textContent=psOnly?'':
-      'Ad-hoc queries only on '+sel.value+
-      ' — switch to Finance for curated financial tools.';
+      'Read-only queries on '+sel.value+
+      ' — explicit table-meaning corrections can be submitted for approval.';
   }
 }
 function syncScopeControls(value){
@@ -1973,15 +1983,25 @@ function renderMetadataSearch(d){
     c.append(el('div','pad','No indexed object matched. '+esc(d.detail||'')));
     return c;
   }
+  if(d.ambiguous){
+    c.append(el('div','pad','<span class="badge warn">choice required</span> '+
+      esc(d.detail||'More than one governed object matches this wording.')));
+  }
   const t=el('table');
   t.innerHTML='<thead><tr><th>Logical record / meaning</th><th>Physical object</th><th>Source</th><th>Why it matched</th><th>Confidence</th></tr></thead><tbody>'+
-    rows.map(r=>'<tr><td><b class="mono">'+
+    rows.map(r=>{const learned=r.approved_source_meanings||[];return '<tr><td><b class="mono">'+
       esc((r.logical_records||[]).join(', ')||r.name||'')+'</b>'+
-      (r.label?'<div class="sub">'+esc(r.label)+'</div>':'')+'</td><td>'+
+      (r.label?'<div class="sub">'+esc(r.label)+'</div>':'')+
+      learned.map(m=>'<div><span class="badge ok">approved meaning</span> '+
+        esc(m.meaning||'')+((m.aliases||[]).length?'<div class="sub">aliases: '+
+        m.aliases.map(esc).join(', ')+'</div>':'')+'</div>').join('')+'</td><td>'+
       (r.physical_object?'<span class="mono">'+esc(r.schema?r.schema+'.'+r.physical_object:r.physical_object)+'</span>':
        '<span class="badge warn">unresolved — do not guess</span>')+
       '</td><td>'+esc(r.source||'')+'<div class="sub">'+esc(r.kind||'')+'</div></td><td>'+
       esc((r.match_reasons||[]).join(' · '))+
+      learned.map(m=>m.matched_on?'<div class="sub">'+esc(m.matched_on)+
+        ((m.matched_terms||[]).length?' · '+m.matched_terms.map(esc).join(', '):'')+
+        '</div>':'').join('')+
       ((r.matched_terms||[]).length?'<div class="sub">terms: '+
         r.matched_terms.map(esc).join(', ')+' · coverage '+
         esc(Math.round((r.term_coverage||0)*100))+'%</div>':'')+
@@ -1991,7 +2011,7 @@ function renderMetadataSearch(d){
             m.label?' — '+esc(m.label):'')+(
             (m.facets||[]).length?' ['+m.facets.map(esc).join(', ')+']':'')
         ).join(' · ')+'</div>':'')+
-      '</td><td>'+metadataConfidence(r.confidence)+'</td></tr>').join('')+'</tbody>';
+      '</td><td>'+metadataConfidence(r.confidence)+'</td></tr>'}).join('')+'</tbody>';
   const sc=el('div');sc.style.maxHeight='420px';sc.style.overflow='auto';sc.append(t);c.append(sc);
   if(d.truncated) c.append(el('div','pad warn','More matches exist; narrow the source, kind, or wording.'));
   c.append(el('div','pad sub',esc(d.coverage_note||d.note||'')));
@@ -2005,7 +2025,9 @@ function renderMetadataContext(d){
   if(d.ambiguous){
     c.append(el('div','pad','<span class="badge warn">choice required</span> '+
       esc(d.detail||'This name maps to more than one object.')));
-    if((d.candidates||[]).length) c.append(genericTable((d.candidates||[]).map(x=>({
+    const choices=(d.candidates||[]).length
+      ?(d.candidates||[]):(d.approved_alias_candidates||[]);
+    if(choices.length) c.append(genericTable(choices.map(x=>({
       source:x.source,schema:x.schema,physical_object:x.physical_object||x.name,
       logical_records:(x.logical_records||[]).join(', '),kind:x.kind
     }))));
@@ -2019,6 +2041,14 @@ function renderMetadataContext(d){
     (!o.physical_object?'<span class="badge warn">physical mapping unresolved</span>':'')+
     (o.label?'<div class="sub">'+esc(o.label)+'</div>':'')+
     '<div class="sub">'+metadataConfidence(o.confidence)+'</div>'));
+  if((d.approved_source_meanings||[]).length){
+    c.append(el('h2',null,'Approved local meaning <span class="sub">object-selection pointer only</span>'));
+    c.append(genericTable(d.approved_source_meanings.map(m=>({
+      meaning:m.meaning,aliases:(m.aliases||[]).join(', '),
+      authority:m.authority,status:m.status
+    }))));
+    c.append(el('div','pad sub',esc(d.source_knowledge_note||'')));
+  }
   if((d.mappings||[]).length){
     c.append(el('h2',null,'Logical → physical mapping'));
     c.append(genericTable(d.mappings.map(m=>({
@@ -2073,6 +2103,15 @@ function renderMetadataCatalog(d){
   if((d.limit_hits||[]).length){
     c.append(el('h2',null,'Build limits'));
     c.append(genericTable(d.limit_hits));
+  }
+  const learning=d.source_knowledge||{},counts=learning.counts||{};
+  if(Object.keys(counts).length){
+    c.append(el('h2',null,'Governed metadata meanings <span class="sub">local and source-bound</span>'));
+    c.append(genericTable([{
+      approved:Number(counts.approved||0),pending_review:Number(counts.pending||0),
+      rejected:Number(counts.rejected||0),revoked:Number(counts.revoked||0)
+    }]));
+    c.append(el('div','pad sub',esc(learning.note||'')));
   }
   (d.notes||[]).filter(n=>!n.ok||n.partial).slice(0,12)
     .forEach(n=>c.append(el('div','pad warn',esc(n.source+' · '+n.layer+': '+n.note))));
@@ -4169,27 +4208,179 @@ function renderDiagTimings(tm){
   c.append(t);
   return c;
 }
+function qualitySourceLabel(source){
+  return source==='default'?'Finance':source==='p2go'?'P2Go':String(source||'Unknown');
+}
+function qualityRate(n,d){
+  return d?((100*Number(n||0)/Number(d)).toFixed(1)+'%'):'\u2014';
+}
+function qualitySample(n,minimum){
+  return Number(n||0)<Number(minimum||20)
+    ? ' <span class="badge warn">small sample</span>' : '';
+}
+function qualityCounts(rows,label){
+  const entries=Object.entries(rows||{}).filter(([,count])=>Number(count)>0);
+  if(!entries.length)return '';
+  return '<div style="margin-top:10px"><b>'+esc(label)+'</b><div style="margin-top:6px">'+
+    entries.map(([name,count])=>'<span class="badge dim" style="margin:0 5px 5px 0">'+
+      esc(String(name).replaceAll('_',' '))+' \u00b7 '+Number(count).toLocaleString()+'</span>').join('')+
+    '</div></div>';
+}
+function renderQualitySource(s){
+  const q=s.quality||{},g=q.groundedness||{},f=q.feedback||{},u=q.user_rated_relevance||{},
+    review=q.review_status_counts||{},minimum=q.minimum_sample||20;
+  const section=el('div','pad');
+  section.style.borderTop='1px solid var(--line)';
+  section.append(el('div',null,'<b>'+esc(qualitySourceLabel(s.source_database))+
+    ' answer quality</b> <span class="sub">source-specific; no cross-database average</span>'));
+  const tiles=el('div','tiles'); tiles.style.marginTop='10px';
+  const gt=el('div','tile');
+  gt.innerHTML='<div class="k">Mechanical groundedness</div><div class="v">'+
+    qualityRate(g.passed,g.assessed)+'</div><div class="n"><b>'+Number(g.passed||0).toLocaleString()+
+    ' / '+Number(g.assessed||0).toLocaleString()+'</b> assessed passed'+
+    qualitySample(g.assessed,minimum)+'<br>blocked '+Number(g.blocked||0).toLocaleString()+
+    ' \u00b7 unknown '+Number(g.unknown||0).toLocaleString()+' \u00b7 N/A '+
+    Number(g.not_applicable||0).toLocaleString()+'<br>coverage '+Number(g.records||0).toLocaleString()+
+    ' / '+Number((g.records||0)+(g.unscored||0)).toLocaleString()+' turns scored \u00b7 '+
+    Number(g.unscored||0).toLocaleString()+' unscored</div>';
+  const rt=el('div','tile');
+  rt.innerHTML='<div class="k">User-rated relevance proxy</div><div class="v">'+
+    qualityRate(u.relevant,u.assessed)+'</div><div class="n"><b>'+Number(u.relevant||0).toLocaleString()+
+    ' / '+Number(u.assessed||0).toLocaleString()+'</b> good vs not-relevant votes'+
+    qualitySample(u.assessed,minimum)+'<br>User votes are a sparse proxy, not an automated relevance score. '+
+    'Other bad-vote reasons stay separate.</div>';
+  const ft=el('div','tile');
+  ft.innerHTML='<div class="k">User helpfulness</div><div class="v">'+
+    qualityRate(f.good,f.responses)+'</div><div class="n"><b>'+Number(f.good||0).toLocaleString()+
+    ' / '+Number(f.responses||0).toLocaleString()+'</b> feedback responses good'+
+    qualitySample(f.responses,minimum)+'<br>'+Number(f.bad||0).toLocaleString()+' bad \u00b7 '+
+    Number(f.unreviewed||0).toLocaleString()+' no vote</div>';
+  const active=['open','triaged','eval_added','fix_in_progress','fixed']
+    .reduce((total,key)=>total+Number(review[key]||0),0);
+  const qt=el('div','tile');
+  qt.innerHTML='<div class="k">Feedback workflow</div><div class="v">'+active.toLocaleString()+
+    '</div><div class="n">active review item'+(active===1?'':'s')+'<br>'+[
+      ['open',review.open],['triaged',review.triaged],['eval added',review.eval_added],
+      ['fix in progress',review.fix_in_progress],['fixed',review.fixed],
+      ['verified',review.verified],['dismissed',review.dismissed]
+    ].filter(([,count])=>Number(count)>0).map(([name,count])=>
+      esc(name)+' '+Number(count).toLocaleString()).join(' \u00b7 ')+'</div>';
+  tiles.append(gt,rt,ft,qt); section.append(tiles);
+
+  const reasons=qualityCounts(g.reason_counts,'Mechanical grounding reasons')+
+    qualityCounts(f.category_counts,'User feedback reasons');
+  if(reasons)section.append(el('div',null,reasons));
+
+  const trends=(q.trends||[]).filter(row=>Number(row.groundedness_assessed||0)>0||
+    Number(row.groundedness_unscored||0)>0||Number(row.user_rated_relevance_assessed||0)>0||
+    Number(row.feedback_good||0)>0||Number(row.feedback_bad||0)>0).slice(-14);
+  if(trends.length){
+    const t=el('table'); t.style.marginTop='12px';
+    t.innerHTML='<thead><tr><th>Date</th><th>Quality coverage</th><th>Groundedness</th><th>User-rated relevance proxy</th><th>Feedback</th></tr></thead><tbody>'+trends.map(row=>
+      '<tr><td>'+esc(row.date||'')+'</td><td>'+Number(row.groundedness_scored||0)+' / '+Number(row.turns||0)+
+      ' scored</td><td>'+Number(row.groundedness_passed||0)+' / '+
+      Number(row.groundedness_assessed||0)+' passed</td><td>'+Number(row.user_rated_relevance_relevant||0)+
+      ' / '+Number(row.user_rated_relevance_assessed||0)+' relevant</td><td>'+Number(row.feedback_good||0)+
+      ' good \u00b7 '+Number(row.feedback_bad||0)+' bad</td></tr>').join('')+'</tbody>';
+    section.append(el('div',null,'<b>Recent quality trend</b> <span class="sub">daily sample counts; last 14 observed days</span>'));
+    section.append(t);
+  }
+  return section;
+}
+function renderQualityQueue(rows,total,truncated){
+  if(!(rows||[]).length)return null;
+  const c=el('div');
+  const count=Number(total===undefined?rows.length:total);
+  c.append(el('h2',null,'Answer review queue <span class="sub">showing '+rows.length+' of '+count+
+    (truncated?' \u00b7 truncated':'')+'; active work first; safe local IDs and structural reasons only</span>'));
+  const statuses=['open','triaged','eval_added','fix_in_progress','fixed','verified','dismissed'];
+  const t=el('table');
+  t.innerHTML='<thead><tr><th>When</th><th>Source</th><th>Local turn</th><th>Grounding / feedback</th><th>Tools</th><th>Status</th></tr></thead><tbody>'+rows.map(row=>{
+    const reasons=[...(row.grounding_reasons||[]),...(row.feedback_categories||[])];
+    return '<tr><td>'+esc(row.ts||'')+'</td><td><b>'+esc(qualitySourceLabel(row.source_database))+
+      '</b></td><td><code>'+esc(row.turn_id||'')+'</code></td><td><span class="badge '+
+      (row.groundedness==='blocked'?'bad':row.groundedness==='unknown'?'warn':'dim')+'">'+
+      esc(row.groundedness||'not scored')+'</span> <span class="badge '+
+      (row.feedback==='bad'?'bad':row.feedback==='good'?'ok':'dim')+'">'+esc(row.feedback||'no vote')+
+      '</span>'+(reasons.length?'<div class="sub">'+reasons.map(x=>esc(String(x).replaceAll('_',' '))).join(' \u00b7 ')+'</div>':'')+
+      '</td><td>'+esc((row.tools||[]).join(', ')||'\u2014')+'</td><td><select class="review-status" data-turn="'+
+      esc(row.turn_id||'')+'" aria-label="Review status for '+esc(row.turn_id||'')+'" style="width:auto;max-width:155px">'+
+      statuses.map(status=>'<option value="'+status+'"'+(status===(row.review_status||'open')?' selected':'')+'>'+esc(status.replaceAll('_',' '))+'</option>').join('')+
+      '</select><div class="review-error sub" aria-live="polite"></div></td></tr>';
+  }).join('')+'</tbody>';
+  const sc=el('div'); sc.style.maxHeight='360px'; sc.style.overflow='auto'; sc.append(t); c.append(sc);
+  sc.querySelectorAll('.review-status').forEach(select=>select.onchange=async()=>{
+    const prior=select.dataset.prior||'open',error=select.parentNode.querySelector('.review-error');
+    select.disabled=true; error.textContent='';
+    try{
+      const r=await fetch('/api/question-review',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({turn_id:select.dataset.turn,status:select.value})});
+      let body={};try{body=await r.json();}catch(e){}
+      if(!r.ok)throw new Error(body.detail||body.error||'Could not update review status');
+      select.dataset.prior=select.value;
+    }catch(e){select.value=prior;error.textContent=e.message;}
+    select.disabled=false;
+  });
+  sc.querySelectorAll('.review-status').forEach(select=>select.dataset.prior=select.value);
+  return c;
+}
 function renderQlogReport(r){
   const c=el('div','card');
   c.append(el('h2',null,'Question log <span class="sub">'+
+    'machine-local operator diagnostics \u00b7 '+
     (r.turns?r.turns+' turns, '+r.failed+' failed or thumbed down':'no turns logged yet')+'</span>'));
   if(r.error){ c.append(el('div','pad',esc(r.error))); return c; }
   if(r.note){ c.append(el('div','pad',esc(r.note))); return c; }
+  const sourceRows=Object.values(r.sources||{});
+  if(sourceRows.length){
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Source</th><th>Boundary / scope</th><th class="num">Turns</th><th class="num">Failed</th><th>Catalog</th></tr></thead><tbody>'+sourceRows.map(s=>{
+      const cx=s.source_context||{},schemas=cx.schema_allowlist||[];
+      const schemaBoundary=schemas.length
+        ? ((cx.default_schema?cx.default_schema+' default; ':'')+schemas.join(', '))
+        : '';
+      const financeScopes=(s.scopes||[]).slice(0,3).map(x=>[x.business_unit,x.ledger,
+          x.fiscal_year?'FY'+x.fiscal_year:'',x.period?'P'+x.period:''].filter(Boolean).join(' / ')).join('; ');
+      const boundary=[schemaBoundary,financeScopes].filter(Boolean).join(' · ');
+      const cat=s.catalog||{},coverage=cat.schema_coverage||{},counts=coverage.object_counts||{},latest=cat.latest_build||{};
+      const coverageText=Object.keys(counts).length
+        ? ' · '+Object.entries(counts).map(([k,v])=>k+' '+v).join(', ')
+        : '';
+      const refreshText=latest.status
+        ? ' · refresh '+latest.status+(latest.published?' published':' not published')
+        : '';
+      const catalog=cat.status
+        ? cat.status+(cat.fingerprint?' · '+cat.fingerprint.slice(0,12):'')+coverageText+refreshText
+        : 'not observed';
+      return '<tr><td><b>'+esc(qualitySourceLabel(s.source_database))+'</b></td><td>'+esc(boundary||'none')+'</td>'+
+        '<td class="num">'+Number(s.turns||0).toLocaleString()+'</td><td class="num">'+Number(s.failed||0).toLocaleString()+'</td>'+
+        '<td>'+esc(catalog)+'</td></tr>';
+    }).join('')+'</tbody>';
+    c.append(t);
+    sourceRows.forEach(s=>c.append(renderQualitySource(s)));
+  }
   if(r.suggestions&&r.suggestions.length){
     c.append(el('div','pad','<b>What to do next, in order</b><br>'+
       r.suggestions.map((s2,i)=>(i+1)+'. '+esc(s2)).join('<br>')));
+  } else if(r.review_queue_active_total){
+    c.append(el('div','pad','<span class="badge warn">review pending</span> see the answer review queue below'));
+  } else if(r.failed){
+    c.append(el('div','pad','<span class="badge warn">failure observed</span> below the repeat/tool-error suggestion thresholds; inspect recent failed turns'));
   } else if(r.turns){
-    c.append(el('div','pad','<span class="badge ok">nothing actionable</span> no failures, errors or repeats'));
+    c.append(el('div','pad','<span class="badge ok">nothing actionable</span> no active review or threshold-triggered failure pattern'));
   }
   if(r.recent_failed&&r.recent_failed.length){
     const t=el('table');
-    t.innerHTML='<thead><tr><th>When</th><th>Question</th><th>Flags</th></tr></thead><tbody>'+
-      r.recent_failed.map(f=>'<tr><td>'+esc(f.ts)+'</td><td>'+esc(f.question)+'</td>'+
+    t.innerHTML='<thead><tr><th>When</th><th>Source</th><th>Local turn</th><th>Flags</th></tr></thead><tbody>'+
+      r.recent_failed.map(f=>'<tr><td>'+esc(f.ts)+'</td><td>'+esc(qualitySourceLabel(f.source_database))+'</td>'+
+        '<td><code>'+esc(f.turn_id||'')+'</code></td>'+
         '<td>'+f.flags.map(x=>'<span class="badge warn">'+esc(x)+'</span>').join(' ')+'</td></tr>').join('')+
       '</tbody>';
     const sc=el('div'); sc.style.maxHeight='260px'; sc.style.overflow='auto'; sc.append(t);
     c.append(sc);
   }
+  const queue=renderQualityQueue(r.review_queue||[],r.review_queue_total,r.review_queue_truncated);
+  if(queue)c.append(queue);
   return c;
 }
 function renderDiagConnectors(cx){
@@ -4249,7 +4440,16 @@ async function viewDiag(){
     try{
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
-      try{ holder.append(renderQlogReport(await api('/api/question-report'))); }catch(e2){}
+      try{
+        holder.append(renderQlogReport(await api('/api/question-report')));
+      }catch(e2){
+        const qc=el('div','card');
+        qc.append(el('h2',null,'Answer quality <span class="sub">Finance and P2Go</span>'));
+        qc.append(el('div','pad',e2.status===403
+          ? '<span class="badge warn">operator access required</span> Quality diagnostics are machine-local. Open the app on the host or through an SSH tunnel, and use a privileged operator when row security is enabled.'
+          : '<span class="badge warn">temporarily unavailable</span> '+esc(e2.message||'The quality report could not be loaded.')));
+        holder.append(qc);
+      }
     }catch(e){ holder.innerHTML=''; holder.append(el('div','msg err',esc(e.message))); }
     quick.disabled=timed.disabled=false;
   }
@@ -4327,6 +4527,52 @@ async function openAccount(account,descr,ctx){
     '<h2 style="border-top:1px solid var(--line)">Journal detail — period '+scope().per+'</h2>'+jhtml;
 }
 
+async function postAnswerFeedback(turnId,verdict,categories){
+  const r=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({turn_id:turnId,verdict,categories:categories||[]})});
+  let body={}; try{body=await r.json();}catch(e){}
+  if(!r.ok)throw new Error(body.detail||body.error||'Could not save feedback');
+}
+function bindAnswerFeedback(holder,turnId){
+  const buttons=[...holder.querySelectorAll('.fb')];
+  const good=holder.querySelector('.fb-good'),bad=holder.querySelector('.fb-bad');
+  function finish(label){
+    buttons.forEach(button=>{button.disabled=true;button.style.pointerEvents='none';});
+    holder.querySelectorAll('.feedback-box').forEach(box=>box.remove());
+    const done=el('span','sub',label); holder.append(done);
+  }
+  if(good)good.onclick=async()=>{
+    good.disabled=true;
+    try{await postAnswerFeedback(turnId,'good',[]);finish('Thanks \u2014 marked helpful.');}
+    catch(e){good.disabled=false;good.title=e.message;}
+  };
+  if(bad)bad.onclick=()=>{
+    if(holder.querySelector('.feedback-box'))return;
+    const choices=[
+      ['not_relevant','Does not answer my question'],
+      ['unsupported_claim','Claim is not supported by the shown sources'],
+      ['wrong_number','A number is wrong'],['wrong_source','Used the wrong source'],
+      ['incomplete','Answer is incomplete'],['too_slow','Took too long'],['other','Other']
+    ];
+    const box=el('div','feedback-box');
+    box.innerHTML='<b>What should we improve?</b>'+choices.map(([value,label])=>
+      '<label><input type="checkbox" value="'+value+'">'+esc(label)+'</label>').join('')+
+      '<div class="feedback-error sub" aria-live="polite"></div>';
+    const save=el('button','btn','Send feedback'),cancel=el('button','btn ghost','Cancel');
+    cancel.style.marginLeft='7px'; box.append(save,cancel); holder.append(box);
+    cancel.onclick=()=>box.remove();
+    save.onclick=async()=>{
+      const categories=[...box.querySelectorAll('input:checked')].map(input=>input.value);
+      const error=box.querySelector('.feedback-error');
+      if(!categories.length){error.textContent='Choose at least one reason.';return;}
+      save.disabled=cancel.disabled=true; error.textContent='';
+      try{await postAnswerFeedback(turnId,'bad',categories);
+        finish('Thanks \u2014 added to the review queue.');}
+      catch(e){save.disabled=cancel.disabled=false;error.textContent=e.message;}
+    };
+  };
+}
+
 /* ---------- chat ---------- */
 function populateSiloIntro(silo,status){
   const msgs=silo.messagesNode; if(!msgs)return;
@@ -4341,7 +4587,8 @@ function populateSiloIntro(silo,status){
     hero.innerHTML='<h1>Ask '+esc(d.label)+'</h1>'+sourceBadgeHtml(silo.source)+
       '<p>This workspace answers only from '+esc(d.label)+
       ' using read-only semantic and relationship discovery plus guarded queries. '+
-      'Finance scopes and curated controls are not available here.</p>';
+      'You may explicitly teach an exact table meaning; it stays pending until '+
+      'operator approval. Finance scopes and curated controls are not available here.</p>';
   }
   msgs.append(hero);
   if(silo.source==='default'&&!silo.scope){
@@ -4502,7 +4749,7 @@ function viewChat(){
     };context.append(contextButton);
     buildTimeSelects().forEach(sel=>context.append(sel));
   }else{
-    context.append(el('span','sub','Read-only semantic and relationship queries only'));
+    context.append(el('span','sub','Database read-only · governed metadata suggestions'));
   }
   const build=el('span','build-tag');
   build.id='build-tag';
@@ -4694,12 +4941,12 @@ async function send(messageOverride,appendUser){
       b.innerHTML='<div class="who">'+sourceBadgeHtml(silo.source)+
         ' · assistant commentary — cards above are verified source results</div>'+trail+
         linkFigures(mdLite(esc(j.answer)),buildFigureIndex(turnCardMeta))+
-        (j.turn_id?'<button class="fb" type="button" data-turn="'+esc(j.turn_id)+
-          '" aria-label="Flag this answer as wrong or unhelpful">&#128078;</button>':'');
-      const fb=b.querySelector('.fb');
-      if(fb) fb.onclick=async()=>{ fb.textContent='logged \u2713'; fb.style.pointerEvents='none';
-        try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({turn_id:fb.dataset.turn,verdict:'bad'})}); }catch(e){} };
+        (j.turn_id?'<div class="feedback-actions" data-turn="'+esc(j.turn_id)+'">'+
+          '<span class="sub">Was this helpful?</span><button class="fb fb-good" type="button" '+
+          'aria-label="Mark this answer helpful">&#128077;</button><button class="fb fb-bad" type="button" '+
+          'aria-label="Tell us what should improve">&#128078;</button></div>':'');
+      const feedbackHolder=b.querySelector('.feedback-actions');
+      if(feedbackHolder)bindAnswerFeedback(feedbackHolder,j.turn_id);
       // Copy the ANSWER as it was written, not the rendered HTML: the
       // figure links and the provenance underlines are this page's
       // furniture, and pasting them into an email produces markup nobody

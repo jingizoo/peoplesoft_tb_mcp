@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from .config import normalize_db_schemas
 
 
 SCHEMA_VERSION = 2
+BUILD_STATUS_VERSION = 1
 DEFAULT_FILENAME = "metadata_catalog.db"
 SOURCE_CATALOG_DIR = "metadata_catalogs"
 MAX_RESULT_CAP = 100
@@ -152,6 +154,208 @@ def source_catalog_path(cfg, source: str = "default") -> Path:
 def catalog_path(cfg, source: str = "default") -> Path:
     """Backward-compatible public name for :func:`source_catalog_path`."""
     return source_catalog_path(cfg, source)
+
+
+def build_status_path(path: Path) -> Path:
+    """Durable, secret-free status for the latest attempted refresh.
+
+    The catalog itself is replaced only after a usable build.  Keeping the
+    attempt status beside it prevents a failed refresh from being hidden by a
+    still-readable prior snapshot.
+    """
+    artifact = Path(path)
+    return artifact.with_name(artifact.name + ".status.json")
+
+
+def _safe_schema_coverage(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    configured_value = value.get("configured")
+    if not isinstance(configured_value, (list, tuple)):
+        configured_value = []
+    configured = [
+        str(item) for item in configured_value
+        if _IDENT.fullmatch(str(item or ""))
+    ][:100]
+    counts = value.get("object_counts")
+    safe_counts = {}
+    if isinstance(counts, dict):
+        for schema in configured:
+            try:
+                safe_counts[schema] = max(int(counts.get(schema) or 0), 0)
+            except (TypeError, ValueError):
+                safe_counts[schema] = 0
+    missing_value = value.get("missing")
+    if not isinstance(missing_value, (list, tuple)):
+        missing_value = []
+    missing = [
+        str(item) for item in missing_value
+        if str(item) in configured
+    ]
+    out = {
+        "configured": configured,
+        "object_counts": safe_counts,
+        "missing": missing,
+        "complete": bool(value.get("complete")) and not missing,
+    }
+    default = str(value.get("default") or "")
+    if default in configured:
+        out["default"] = default
+    return out
+
+
+def read_build_status(path: Path, source: str = "") -> dict:
+    """Read the bounded refresh status; malformed/unrelated files vanish."""
+    try:
+        raw = json.loads(build_status_path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if raw.get("schema_version") != BUILD_STATUS_VERSION:
+        return {}
+    canonical = _s(raw.get("source_database"))
+    if not canonical or (source and canonical != _s(source)):
+        return {}
+    status = str(raw.get("status") or "")
+    if status not in {"building", "complete", "partial", "failed"}:
+        return {}
+    published = bool(raw.get("published"))
+    if published != (status in {"complete", "partial"}):
+        return {}
+    run_id = str(raw.get("build_run_id") or "")
+    attempted_at = str(raw.get("attempted_at") or "")
+    if (not re.fullmatch(r"[a-f0-9]{32}", run_id)
+            or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", attempted_at)):
+        return {}
+    out = {
+        "schema_version": BUILD_STATUS_VERSION,
+        "source_database": canonical,
+        "build_run_id": run_id,
+        "attempted_at": attempted_at,
+        "published": published,
+        "status": status,
+    }
+    for key in ("snapshot_id", "previous_snapshot_id"):
+        digest = str(raw.get(key) or "")
+        if re.fullmatch(r"[a-f0-9]{12,128}", digest):
+            out[key] = digest
+    if published and "snapshot_id" not in out:
+        return {}
+    category = str(raw.get("failure_category") or "")
+    if category in {"metadata_unavailable", "build_error",
+                    "status_write_error"}:
+        out["failure_category"] = category
+    coverage = _safe_schema_coverage(raw.get("schema_coverage"))
+    if coverage:
+        out["schema_coverage"] = coverage
+    return out
+
+
+def write_build_status(path: Path, record: dict) -> None:
+    """Atomically persist a bounded refresh event with mode ``0600``."""
+    target = build_status_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safe = _validated_build_status(record)
+    fd = -1
+    tmp_name = ""
+    try:
+        # A fixed ``.building`` name followed symlinks and allowed a local
+        # attacker to overwrite an unrelated file. mkstemp creates a random,
+        # exclusive file and returns the already-open descriptor, so neither
+        # the write nor chmod re-resolves a path supplied by somebody else.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".building",
+            dir=str(target.parent))
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(safe, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+        # Open the final path without following a symlink before tightening
+        # mode. os.replace replaced the directory entry, but the descriptor
+        # check keeps this invariant explicit and testable.
+        final_fd = os.open(
+            target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fchmod(final_fd, 0o600)
+        finally:
+            os.close(final_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            if tmp_name:
+                Path(tmp_name).unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _validated_build_status(record: object) -> dict:
+    """Validate an in-memory status through the same public shape."""
+    if not isinstance(record, dict):
+        raise MetadataError("Metadata build status must be an object")
+    source = _s(record.get("source_database"))
+    run_id = str(record.get("build_run_id") or "")
+    attempted = str(record.get("attempted_at") or "")
+    status = str(record.get("status") or "")
+    published = bool(record.get("published"))
+    if (not source or not re.fullmatch(r"[a-f0-9]{32}", run_id)
+            or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", attempted)
+            or status not in {"building", "complete", "partial", "failed"}):
+        raise MetadataError("Metadata build status is incomplete or invalid")
+    if published != (status in {"complete", "partial"}):
+        raise MetadataError("Metadata build status publication is inconsistent")
+    out = {
+        "schema_version": BUILD_STATUS_VERSION,
+        "source_database": source,
+        "build_run_id": run_id,
+        "attempted_at": attempted,
+        "published": published,
+        "status": status,
+    }
+    for key in ("snapshot_id", "previous_snapshot_id"):
+        digest = str(record.get(key) or "")
+        if digest and re.fullmatch(r"[a-f0-9]{12,128}", digest):
+            out[key] = digest
+    if published and "snapshot_id" not in out:
+        raise MetadataError("Published metadata build status needs a snapshot")
+    category = str(record.get("failure_category") or "")
+    if category in {"metadata_unavailable", "build_error",
+                    "status_write_error"}:
+        out["failure_category"] = category
+    coverage = _safe_schema_coverage(record.get("schema_coverage"))
+    if coverage:
+        out["schema_coverage"] = coverage
+    return out
+
+
+def _build_status_for_snapshot(path: Path, source: str,
+                               snapshot_id: str) -> dict:
+    """Bind a successful status sidecar to the artifact it describes.
+
+    A copied artifact, interrupted publish, or failed status update can leave
+    the two adjacent files from different runs. Such a sidecar is not health
+    evidence for this snapshot; retain only a bounded mismatch signal.
+    """
+    status = read_build_status(path, source)
+    if (status.get("published") is True
+            and str(status.get("snapshot_id") or "") != str(snapshot_id or "")):
+        return {
+            **status,
+            "published": False,
+            "status": "failed",
+            "failure_category": "snapshot_mismatch",
+            "snapshot_matches": False,
+        }
+    if status.get("published") is True:
+        status["snapshot_matches"] = True
+    return status
 
 
 def _db_config_fingerprint(root: Path, db_cfg) -> str:
@@ -2295,6 +2499,7 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
         con.execute("PRAGMA temp_store=FILE")
         con.executescript(_DDL)
         state = _Writer(con, limits)
+        schema_coverage: dict[str, dict] = {}
         for source, db in source_list:
             state.source(source, db)
             objects = fields = 0
@@ -2304,6 +2509,50 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                 objects, fields = _collect_native(state, source, db)
                 if source == peopletools_source:
                     pt_status = _collect_peopletools(state, source, db)
+                configured_schemas = list(_configured_schemas(db))
+                if configured_schemas:
+                    observed = {
+                        str(row["schema_name"] or "").upper(): int(row["n"])
+                        for row in con.execute(
+                            "SELECT schema_name,COUNT(*) AS n FROM nodes "
+                            "WHERE source=? AND kind IN ('table','view') "
+                            "GROUP BY schema_name",
+                            (source,),
+                        )
+                    }
+                    counts = {
+                        schema: int(observed.get(schema, 0))
+                        for schema in configured_schemas
+                    }
+                    missing = [schema for schema, count in counts.items()
+                               if count == 0]
+                    schema_coverage[source] = {
+                        "default": configured_schemas[0],
+                        "configured": configured_schemas,
+                        "object_counts": counts,
+                        "missing": missing,
+                        "complete": not missing,
+                    }
+                    if missing:
+                        state.note(
+                            source,
+                            "schema_coverage",
+                            "Configured schema(s) returned no TABLE/VIEW "
+                            "metadata: " + ", ".join(missing) + ". Absence "
+                            "from this snapshot is inconclusive; verify the "
+                            "service/PDB, exact owner names, and normal-session "
+                            "catalog grants.",
+                            ok=False,
+                            partial=True,
+                        )
+                    else:
+                        state.note(
+                            source,
+                            "schema_coverage",
+                            "Every configured schema returned at least one "
+                            "TABLE/VIEW object.",
+                            status="available",
+                        )
                 if source in state.degraded:
                     status = "partial"
             except Exception as exc:
@@ -2357,6 +2606,8 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
             "stale_after_hours": str(limits.stale_after_hours),
             "source_fingerprints": json.dumps(
                 source_fingerprints, sort_keys=True, separators=(",", ":")),
+            "schema_coverage": json.dumps(
+                schema_coverage, sort_keys=True, separators=(",", ":")),
         }
         if len(source_fingerprints) == 1:
             info["source_fingerprint"] = next(
@@ -2509,8 +2760,23 @@ class MetadataCatalog:
             limit_hits = json.loads(meta.get("limit_hits") or "[]")
         except (TypeError, ValueError):
             limit_hits = []
+        try:
+            schema_coverage = json.loads(meta.get("schema_coverage") or "{}")
+        except (TypeError, ValueError):
+            schema_coverage = {}
+        selected_coverage = (
+            schema_coverage.get(self.source)
+            if self.source else schema_coverage
+        )
+        latest_build = _build_status_for_snapshot(
+            self.path, self.source, meta.get("snapshot_id", ""))
         return {
             "id": meta.get("snapshot_id", ""),
+            # Secret-free endpoint/schema digest.  Keeping it beside the
+            # build id/version lets observability distinguish a stale catalog
+            # from a catalog built for a different configured boundary,
+            # without recording a DSN, login or credential.
+            "source_fingerprint": meta.get("source_fingerprint", ""),
             "schema_version": int(meta.get("schema_version") or 0),
             "built_at": built,
             "age_hours": round(age_hours, 1) if age_hours is not None else None,
@@ -2521,6 +2787,8 @@ class MetadataCatalog:
                        else "complete"),
             "sources": sources,
             "sources_degraded": degraded,
+            "schema_coverage": selected_coverage or {},
+            "latest_build": latest_build,
             "limit_hits": limit_hits,
             "note": (
                 "This is a derived metadata snapshot, not live financial "
@@ -2533,15 +2801,18 @@ class MetadataCatalog:
         }
 
     def describe(self) -> dict:
+        latest_build = read_build_status(self.path, self.source)
         if self.binding_error:
             return {"available": False,
                     "source_database": self.source or None,
                     "detail": self.binding_error,
+                    "latest_build": latest_build,
                     "how_to_build": "python scripts/build_metadata_catalog.py"}
         if not self.available():
             return {"available": False,
                     "source_database": self.source or None,
                     "detail": f"No metadata catalog at {self.path.name}.",
+                    "latest_build": latest_build,
                     "how_to_build": "python scripts/build_metadata_catalog.py"}
         try:
             con = self._open()
@@ -2549,6 +2820,7 @@ class MetadataCatalog:
             return {"available": False,
                     "source_database": self.source or None,
                     "detail": str(exc),
+                    "latest_build": latest_build,
                     "how_to_build": "python scripts/build_metadata_catalog.py"}
         try:
             meta = self._meta(con)
@@ -2569,6 +2841,12 @@ class MetadataCatalog:
                 hits = json.loads(meta.get("limit_hits") or "[]")
             except (TypeError, ValueError):
                 hits = []
+            try:
+                schema_coverage = json.loads(
+                    meta.get("schema_coverage") or "{}")
+            except (TypeError, ValueError):
+                schema_coverage = {}
+            snapshot = self._snapshot(con)
             return {
                 "available": True,
                 "source_database": self.source or (
@@ -2576,10 +2854,15 @@ class MetadataCatalog:
                 "path": self.path.name,
                 "schema_version": meta.get("schema_version", ""),
                 "source_fingerprint": meta.get("source_fingerprint", ""),
-                "snapshot": self._snapshot(con),
+                "snapshot": snapshot,
                 "sources": sources,
                 "node_kinds": kinds,
                 "edge_kinds": edges,
+                "schema_coverage": (
+                    schema_coverage.get(self.source, {})
+                    if self.source else schema_coverage
+                ),
+                "latest_build": snapshot.get("latest_build") or {},
                 "limit_hits": hits,
                 "notes": notes,
                 "note_count": note_count,
@@ -3211,6 +3494,7 @@ class MetadataCatalog:
                     "source": src, "source_database": src,
                     "from": self._node(start), "to": self._node(goal),
                     "hops": [], "hop_count": 0, "sql": sql,
+                    "relationship_evidence_classes": ["same_object"],
                     "queryable_join": True, "snapshot": snapshot,
                 }
 
@@ -3262,6 +3546,8 @@ class MetadataCatalog:
                     "source": src, "source_database": src,
                     "from": self._node(start), "to": self._node(goal),
                     "hops": [], "hop_count": None,
+                    "relationship_evidence_classes": [
+                        "foreign_key", "view_dependency"],
                     "searched_hops": hops_cap,
                     "visited_objects": len(visited),
                     "graph_truncated": graph_truncated,
@@ -3279,6 +3565,10 @@ class MetadataCatalog:
                 "source": src, "source_database": src,
                 "from": self._node(start), "to": self._node(goal),
                 "hops": found_path, "hop_count": len(found_path),
+                "relationship_evidence_classes": sorted({
+                    str(hop.get("relationship") or "")
+                    for hop in found_path if hop.get("relationship")
+                }),
                 "sql": sql, "queryable_join": queryable,
                 "visited_objects": len(visited),
                 "graph_truncated": graph_truncated,

@@ -127,10 +127,117 @@ silently pick up the next breaking SDK major.
 
 ## Question log & multi-step chaining
 
-Every chat turn is appended to `logs/questions.jsonl` with auto failure flags
-(tool_error / no_tool_calls / max_rounds / gave_up) plus thumbs-down feedback
-from the web UI. Review the failure backlog with `python -m pstb.qlog`; each
-flagged question is a candidate for a new curated tool or record-map entry.
+When question logging is enabled, each successfully persisted chat turn is
+appended to `logs/questions.jsonl` with auto failure flags (tool_error /
+no_tool_calls / max_rounds / gave_up), followed by a separate bounded
+runtime-grounding record when that append succeeds, and explicit good/bad
+feedback from the web UI. Bad
+feedback carries only allowlisted reasons (`not_relevant`,
+`unsupported_claim`, `wrong_number`, `wrong_source`, `incomplete`, `too_slow`,
+or `other`). Free-text feedback is deliberately not stored because it can
+contain credentials, object names, customer identifiers, or other private
+text that a heuristic redactor cannot classify reliably. Each turn accepts
+one immutable rating. Review the failure backlog
+and deterministic, source-separated summary with:
+
+```bash
+.venv/bin/python -m pstb.qlog logs/questions.jsonl
+.venv/bin/python -m pstb.qlog_report logs/questions.jsonl
+```
+
+The Diagnostics view reads the same summary through `/api/question-report`.
+Turns are grouped by their resolved canonical source (`default` for Finance,
+`p2go` for P2Go), and repeated failures, tool error/latency counts, catalog
+state, relationship-path evidence, groundedness, a user-rated relevance
+proxy, feedback
+reasons, trends, and review status stay in that source's bucket. Use the
+per-source summaries as the operational rates; the top-level total is only a
+volume/backlog count and must not blend Finance and P2Go quality.
+
+Groundedness and relevance have deliberately different collection bases:
+
+- **Mechanical groundedness** is attempted for every newly logged turn from
+  the runtime
+  source/evidence/number/verdict guards as `passed`, `blocked`, `unknown`, or
+  `not_applicable`. `passed` means the checks this runtime can prove passed; it
+  does not assert whole-answer semantic entailment. Unknown and N/A are never
+  counted as passes or failures. The dashboard's scored/unscored coverage
+  makes legacy turns and append failures visible instead of treating missing
+  quality records as passes.
+- **User-rated relevance proxy** is calculated only from explicit ratings: a
+  helpful vote is positive and a bad vote carrying `not_relevant` is negative.
+  Because the positive control asks whether the answer was helpful, this is a
+  relevance proxy rather than a dedicated relevance judgment. Unrated turns
+  and bad votes for other reasons stay outside the denominator. Sparse
+  feedback is never treated as implicit approval.
+
+There is no live LLM-as-judge in this path. Whole-answer semantic relevance
+and nonnumeric entailment require an explicitly approved offline eval judge or
+human review, because scoring them means exposing the question, answer, and
+bounded evidence to another evaluator. Until such a judge is configured and
+calibrated, those turns remain unscored rather than receiving a synthetic pass.
+
+The Diagnostics review queue moves a local turn through `open`, `triaged`,
+`eval_added`, `fix_in_progress`, `fixed`, `verified`, or `dismissed`. Operators
+use the safe local turn ID to inspect the protected log, promote a reviewed and
+redacted failure with `scripts/eval.py --from-qlog`, run the affected Finance or
+P2Go suite, deploy the fix, and then mark it verified. Review records are
+append-only and move forward through the lifecycle; terminal verified or
+dismissed items cannot be reopened from this dashboard.
+
+The local JSONL record deliberately keeps a narrow per-tool observability
+envelope:
+
+- canonical source, default schema and configured schema allowlist;
+- Finance scope when present (business unit, ledger, fiscal year and period);
+- tool name, success, elapsed milliseconds and whether its result source
+  exactly matched the expected canonical source;
+- declared completeness/truncation state and a categorized refusal reason;
+- catalog fingerprint/snapshot/version/time plus complete/partial/stale state;
+- per-allowed-schema TABLE/VIEW counts, missing owners and coverage status;
+- relationship-path found/confidence/evidence class and target schema owners.
+
+Separate quality/review records retain only the local turn ID, rubric basis,
+bounded status/counts/reason codes, categorical feedback, and review status.
+They contain no question, answer, judge prompt/rationale, SQL, binds, rows,
+object names, or raw errors. The report reads the active log plus its retained
+rotations oldest-to-newest, deduplicates a turn at rotation boundaries, and
+uses the latest feedback/quality/review record for that turn.
+
+The envelope does **not** persist tool arguments or extract SQL text, binds,
+result rows, object/column names, raw database errors, credentials, usernames,
+passwords, access tokens or DSNs from tool payloads. The turn record also
+stores no answer text, only its character count. The user's question (capped
+at 8,000 characters) is stored locally so a failure remains actionable.
+Credential assignments,
+connection locators, bearer tokens, qualified object-name disclosures and
+SQL-shaped text are redacted before persistence. Ordinary business identifiers
+can still be sensitive, so neither the CLI summaries nor the Diagnostics
+API/UI return that private text: they expose
+the random local turn ID, source, structural flags and tools so an authorized
+operator can locate the protected JSONL record when necessary. Active and
+rotated files are owner-only (`0600`); the default rotation is 10 MiB with
+three backups (`questions.jsonl.1` through `.3`). Treat the file and that
+endpoint as sensitive: keep them on a restricted host/path and apply your
+normal access and retention policy. The web report/review API is machine-local
+even when the application is shared (use an SSH tunnel); with row security
+enabled it additionally requires a configured privileged operator. This is
+necessary because the PeopleSoft user-id chooser is a scope selector, not
+authentication. There is no OTLP, hosted collector or
+other external telemetry exporter in this implementation; logging is the
+configured local JSONL file only. A generic `truncated: false` does not become
+a completeness claim: without an explicit evidence contract, its status
+remains `unknown`.
+
+Each auto-flagged, mechanically blocked, or negatively rated question is a
+candidate for a source-specific
+eval, curated tool or record-map entry. `scripts/eval.py --from-qlog` joins
+feedback to its turn and writes an owner-only, git-ignored review queue at
+`logs/eval-pending.json`, preserving the source/scope needed to reproduce it.
+It never edits tracked eval packs. A human must review and redact private
+identifiers, state the expected behavior, and explicitly promote an approved
+case into the Finance or P2Go pack; the command never decides the expected
+answer automatically.
 
 Multi-step chaining is deliberately NOT LangChain/LangGraph: the agent loop
 already feeds tool results back for up to 10 rounds, and the reliable way to
@@ -196,24 +303,91 @@ Exit codes are for schedulers: `0` nothing changed, `1` something changed,
 
 Snapshots and an append-only history live in `logs/monitor/`.
 
-## Evals — pinning MODEL behavior
+## Source-aware evals — pinning MODEL behavior
 
-```
-.venv/bin/python scripts/eval.py              # every case, exit 1 on failure
-.venv/bin/python scripts/eval.py --case ar-aging
-.venv/bin/python scripts/eval.py --from-qlog  # seed cases from real failures
+```bash
+.venv/bin/python scripts/eval.py --suite finance
+.venv/bin/python scripts/eval.py --suite p2go
+.venv/bin/python scripts/eval.py --suite all --json eval-all.json
+.venv/bin/python scripts/eval.py --suite finance --case ar-aging
+.venv/bin/python scripts/eval.py --from-qlog  # seed pending cases from failures
 ```
 
-The suites pin SQL and engine behavior; `evals/cases.json` pins what the
+The suites pin SQL and engine behavior; the source-specific packs pin what the
 MODEL does — which tool it picks, whether it refuses, whether it reaches for
-the wiki when it should query the ledger. Assertions are structural
-(`any_tool`, `not_tool`, `tool_args_contain`, `answer_lacks`, `not_refused`),
-never "does this read well", so a pass means the same thing every run. Run it
-after any change to prompts, tool docstrings, or the model — it caught a
-false positive in the number guard on its very first run.
+the wiki when it should query the ledger, and whether each successful result
+comes from the selected database. The runner mirrors the GUI runtime profile:
 
-Real failures are the best eval material: `--from-qlog` turns flagged turns
-into pending cases for a human to grade.
+- Finance receives `system_prompt`, the provider's production prompt variant,
+  the full Finance tool profile, and the selected BU/ledger/time scope.
+- P2Go receives `source_silo_prompt("p2go")` and only
+  `SOURCE_SILO_TOOLS`; it cannot pass by borrowing a PeopleSoft/Coupa/wiki or
+  curated Finance tool.
+
+Assertions are structural (`any_tool`, `all_tools`, `allowed_tools`,
+`failed_tools`, ordered successful calls, argument values, result fields,
+exact result sets, allowed result values, answer inclusions/exclusions and
+refusal state), never "does this read well". Every successful source-aware tool
+result must name the exact selected canonical source, including `default` for
+Finance. Multiple contradictory calls cannot be stitched together to satisfy
+one result contract.
+P2Go's named argument and result assertions are tied to a successful call of
+the expected tool, so an errored attempt or an unrelated successful call cannot
+supply its evidence. Its expected boundary refusals are separately tied to the
+named failed call.
+
+The P2Go pack discovers safe object examples from P2Go's own offline artifact.
+It covers an unqualified `P2GO` object, an explicitly qualified `TUSINVC`
+object, semantic search, ambiguity across allowed owners, an allowed
+cross-schema relationship, a guarded explain/read, an outside-owner refusal
+and Finance/P2Go isolation. Its always-runnable health gate fails an
+unavailable, partial or stale catalog, including a snapshot in which either
+P2Go owner is missing, an extra owner enters the boundary, the latest refresh
+failed, or the refresh status names a different snapshot. If the deployment
+has no real catalog example for another structural scenario, that case is
+reported **N/A**, not passed using an invented object. Build the P2Go catalog
+before treating its suite as complete.
+
+`--suite all` prints and writes separate `finance` and `p2go` summaries. Its
+exit code is nonzero if either runnable source pack fails; never replace those
+two pass rates with one blended percentage. The optional `--json` file is an
+owner-only (`0600`), atomic local developer artifact and includes answer text
+and observed tool arguments; its result excerpts are bounded to
+structural/source facts and do not include transaction rows. Standard
+eval-output names are git-ignored. Protect it like test evidence and do not
+confuse it with the restricted question-log telemetry envelope described
+above.
+
+Real failures are the best eval material: `--from-qlog` copies redacted flagged
+turns into the ignored owner-only review queue for a human to grade and promote.
+
+### Operational acceptance checklist
+
+1. Configure P2Go with `schema: P2GO` and
+   `schemas: [P2GO, TUSINVC]`; keep Finance as canonical source `default`.
+2. Run `.venv/bin/python scripts/build_metadata_catalog.py`. Reject the build
+   for deployment acceptance if it prints `MISSING SCHEMAS p2go`, or if
+   `describe_metadata_catalog(source="p2go")` reports either owner with zero
+   objects, `schema_coverage.complete: false`, `partial: true`, or `stale: true`.
+3. Run the Finance and P2Go suites separately (or `--suite all`) with the
+   production provider. Require every runnable case in **each** source to pass;
+   review every P2Go N/A rather than counting it as success.
+4. Confirm the P2Go cases use only the source-silo tool profile, every
+   successful structural/query result names `source_database: p2go`, both
+   allowed owners are represented, and an outside owner is refused before a
+   live database call. Confirm Finance still uses its curated controls and
+   never resolves through P2Go.
+5. Ask one representative question in `/finance` and `/p2go`, then run
+   `.venv/bin/python -m pstb.qlog_report logs/questions.jsonl`. Require separate
+   `default` and `p2go` summaries with the expected scope/schema context,
+   timings, catalog/relationship status, and quality denominators. Submit one
+   good vote and one categorized bad vote in a test environment; confirm they
+   appear only in their respective source panels and that the bad vote enters
+   the operator review queue.
+6. Inspect a sample JSONL record before production rollout. It may contain the
+   bounded user question and categorical feedback, but its tool records must contain
+   no SQL, arguments, binds, rows, raw errors, credentials or connection
+   locators. Confirm the active file and any `.1`-`.3` backups are mode `0600`.
 
 ## Testing
 

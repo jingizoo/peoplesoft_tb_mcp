@@ -150,8 +150,31 @@ and retry tuning built in — `gemini-2.5-flash` is the cheaper/faster option;
 Whichever you pick, measure it rather than assuming:
 
 ```bash
-.venv/bin/python scripts/eval.py --provider claude
+.venv/bin/python scripts/eval.py --suite finance --provider claude
+.venv/bin/python scripts/eval.py --suite p2go --provider claude
+.venv/bin/python scripts/eval.py --suite all --provider claude --json eval-all.json
 ```
+
+Finance and P2Go are scored separately even with `--suite all`; one workspace
+cannot hide a regression in the other. The runner uses the same Finance prompt
+and full tool profile as Ask for Finance cases, and the same source-silo prompt
+and closed structural/query tool profile as `/p2go` for P2Go cases. P2Go cases
+also verify the configured `P2GO` + `TUSINVC` schema boundary from that source's
+own catalog. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#source-aware-evals--pinning-model-behavior)
+for the acceptance gates and privacy-safe local observability contract. JSON
+eval evidence is written atomically with owner-only permissions and standard
+output names are git-ignored.
+
+The **Diagnostics** page also keeps live answer-quality signals separate by
+workspace. The quality panel is machine-local (or available through an SSH
+tunnel) and, when row security is enabled, requires a privileged operator; a
+remote user sees that access requirement instead of an empty panel. It shows runtime evidence-grounding checks, explicit user
+helpfulness and a user-rated relevance proxy, reason counts, trends, and the
+operator review queue for Finance and P2Go. “Mechanical groundedness passed” means the source,
+evidence, numeric-claim, and verdict guards passed; it is not a claim that a
+second model proved every sentence. Semantic model judging is intentionally
+off by default so production questions, answers, SQL, and rows are not silently
+sent to another evaluator.
 
 ## Restricting data by business unit
 
@@ -244,6 +267,13 @@ balances and cannot satisfy the financial-evidence gate. See
 [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) for source/schema scope,
 read-only grants, confidence tiers, exact limits, refresh cadence and partial
 or stale behavior.
+
+For cryptic custom objects, a user can explicitly teach an exact source table
+meaning. The chat stores this as a pending, source-isolated proposal; a host
+operator must approve it before it affects semantic search. Approved meanings
+remain pointers to catalog objects and never become joins, SQL, policies or
+database writes. See the governed-learning section in
+[docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md#governed-local-meanings-for-cryptic-custom-objects).
 
 Optional semantic re-ranking and resumable controller workflows are described
 in [docs/AI_ORCHESTRATION.md](docs/AI_ORCHESTRATION.md).

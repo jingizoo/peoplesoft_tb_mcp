@@ -15,6 +15,7 @@ config.yaml.bak-*
 .setup-probe-config.yaml
 BUILD_INFO.json
 site_memory.json
+source_knowledge/
 
 # Per-deployment configuration. Every one of these is settings for THIS
 # machine, so none of them is tracked and `git pull` cannot overwrite them.
@@ -42,7 +43,18 @@ entity_graph.db.building
 # Built by scripts/build_metadata_catalog.py -- source structure, no rows.
 metadata_catalog.db
 metadata_catalog.db.building
+metadata_catalog.db.status.json
+metadata_catalog.db.status.json.building
+.*metadata_catalog.db.status.json.*.building
 
 # Per-source semantic catalogs and proven relationship graphs.
 metadata_catalogs/*.db
 metadata_catalogs/*.db.building
+metadata_catalogs/*.db.status.json
+metadata_catalogs/*.db.status.json.building
+metadata_catalogs/.*.db.status.json.*.building
+
+# Sensitive local eval evidence (answers/tool args) and review queues.
+eval-*.json
+*-eval.json
+evals-output*.json

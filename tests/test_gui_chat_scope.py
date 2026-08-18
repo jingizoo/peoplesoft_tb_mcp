@@ -266,15 +266,27 @@ class SourceRouteTests(unittest.TestCase):
 
 class ProviderSessionStoreTests(unittest.TestCase):
     def test_secondary_provider_receives_only_the_closed_generic_profile(self):
-        from pstb.guards import SOURCE_SILO_TOOLS
+        from pstb.guards import (
+            SOURCE_SILO_CHAT_TOOLS,
+            SOURCE_SILO_PROPOSAL_TOOLS,
+            SOURCE_SILO_TOOLS,
+        )
 
         offered = [SimpleNamespace(name=name) for name in (
-            sorted(SOURCE_SILO_TOOLS)
+            sorted(SOURCE_SILO_CHAT_TOOLS)
             + ["get_trial_balance", "wiki_lookup", "remember_record_fact",
                "a_future_tool"]
         )]
         p2go = gui._provider_tools_for_scope(offered, {"source": "p2go"})
-        self.assertEqual({tool.name for tool in p2go}, SOURCE_SILO_TOOLS)
+        self.assertEqual(
+            {tool.name for tool in p2go}, SOURCE_SILO_CHAT_TOOLS)
+        self.assertEqual(
+            SOURCE_SILO_PROPOSAL_TOOLS, {"propose_metadata_meaning"})
+        self.assertNotIn(
+            "propose_metadata_meaning", SOURCE_SILO_TOOLS,
+            "the read/export allowlist must not acquire a local write merely "
+            "because chat can submit a pending proposal",
+        )
         finance = gui._provider_tools_for_scope(
             offered, {"source": "default", "business_unit": "US001"})
         self.assertEqual(finance, offered)

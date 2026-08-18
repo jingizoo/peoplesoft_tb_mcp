@@ -3434,6 +3434,19 @@ class TBEngine:
         # for the ALL_* catalog bind when explicitly quoted.
         return owner, table
 
+    def _target_owners(self, refs) -> list[str]:
+        """Owners touched by a guarded query, without retaining object names.
+
+        This small structural projection is safe to place in observability:
+        it proves which configured schema boundary a SQL/explain call reached
+        while omitting the statement, binds, tables and returned rows.
+        """
+        owners = {
+            owner for owner, _ in (self._table_target(ref) for ref in refs)
+            if owner
+        }
+        return sorted(owners)
+
     def _require_allowed_schema_refs(self, scrubbed: str) -> None:
         """Apply the same schema boundary to execution and EXPLAIN paths."""
         for ref in self._table_refs(scrubbed):
@@ -3573,6 +3586,8 @@ class TBEngine:
             reachable = [h.right for h in graph.paths_from(start)][:8]
             return {
                 "from": start, "to": goal, "found": False,
+                "relationship_evidence_classes": [
+                    "shared_columns_and_indexes"],
                 "note": (f"No join path found from {start} to {goal} within "
                          f"{GRAPH_MAX_HOPS} hops of shared key columns. They "
                          "may genuinely not be related, or the link may run "
@@ -3582,6 +3597,8 @@ class TBEngine:
             }
         out = path.as_dict()
         out.update({"from": start, "to": goal, "found": True})
+        out["relationship_evidence_classes"] = [
+            "shared_columns_and_indexes"]
         # Said every time, because a path presented as fact is a path
         # nobody checks: shared column names are strong evidence of a
         # relationship and are not a declared foreign key.
@@ -3635,7 +3652,12 @@ class TBEngine:
             info = {"table": t, "approx_rows": self._approx_rows(t),
                     "indexes": self.db.indexes(catalog_name)}
             table_info.append(info)
-        out: dict = {"sql": s, "plan": plan, "tables": table_info}
+        out: dict = {
+            "sql": s,
+            "plan": plan,
+            "tables": table_info,
+            "target_owners": self._target_owners(refs),
+        }
         advice: list = []
         for step in (plan.get("steps") or []):
             options = str(step.get("options") or "").upper()
@@ -3920,7 +3942,8 @@ class TBEngine:
         # or worse, burn the query timeout first.
         ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
         problems, unqualified = [], []
-        for ref in self._table_refs(scrubbed):
+        refs = self._table_refs(scrubbed)
+        for ref in refs:
             parsed = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(ref)
             _, bare = self._table_target(ref)
             if bare.upper() in ctes or bare.upper() == "DUAL":
@@ -4040,7 +4063,8 @@ class TBEngine:
                 raise EngineError(self._sql_error_remedy(s, e))
             partition_info = None
         out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
-               "sql_executed": s}
+               "sql_executed": s,
+               "target_owners": self._target_owners(refs)}
         if partition_info:
             out["partitioned"] = partition_info
         if pivot:

@@ -134,6 +134,7 @@ class MultiSchemaRuntimeTests(unittest.TestCase):
     def test_unqualified_query_resolves_to_default_schema(self) -> None:
         out = self.engine.run_sql("SELECT * FROM INVOICE")
         self.assertIn("FROM P2GO.INVOICE", out["sql_executed"])
+        self.assertEqual(out["target_owners"], ["P2GO"])
         lookup = next(c for c in self.db.calls
                       if "FROM ALL_OBJECTS" in c["sql"].upper())
         self.assertEqual(lookup["params"], {"o": "P2GO", "n": "INVOICE"})
@@ -170,6 +171,7 @@ class MultiSchemaRuntimeTests(unittest.TestCase):
         ])
         self.assertEqual(out["tables"][0]["table"],
                          "TUSINVC.ARCHIVE_INVOICE")
+        self.assertEqual(out["target_owners"], ["TUSINVC"])
 
     def test_explain_qualifies_unqualified_name_with_default(self) -> None:
         out = self.engine.explain_query("SELECT * FROM INVOICE")
@@ -246,6 +248,7 @@ class MultiSchemaRuntimeTests(unittest.TestCase):
              ("TUSINVC", "ARCHIVE_INVOICE")},
         )
         self.assertIn("TUSINVC.ARCHIVE_INVOICE", out["sql_executed"])
+        self.assertEqual(out["target_owners"], ["P2GO", "TUSINVC"])
 
     def test_unqualified_comma_join_qualifies_every_factor(self) -> None:
         out = self.engine.run_sql(

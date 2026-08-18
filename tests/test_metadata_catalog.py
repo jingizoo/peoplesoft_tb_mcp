@@ -1236,6 +1236,21 @@ class NativeCatalogDialectTests(unittest.TestCase):
             artifact, [("p2go", source)], peopletools_source="none")
 
         catalog = MetadataCatalog(artifact, source="p2go")
+        described = catalog.describe()
+        self.assertEqual(
+            described["schema_coverage"],
+            {
+                "default": "P2GO",
+                "configured": ["P2GO", "TUSINVC"],
+                "object_counts": {"P2GO": 3, "TUSINVC": 2},
+                "missing": [],
+                "complete": True,
+            },
+        )
+        self.assertEqual(
+            described["snapshot"]["schema_coverage"],
+            described["schema_coverage"],
+        )
         ambiguous = catalog.context("SHARED", source="p2go")
         self.assertFalse(ambiguous["found"])
         self.assertTrue(ambiguous["ambiguous"])
@@ -1280,6 +1295,64 @@ class NativeCatalogDialectTests(unittest.TestCase):
             {("confirmed", "table", "TUSINVC"),
              ("inconclusive", "external_object", "OTHER")})
         self.assertEqual(real_outside, 0)
+
+    def test_missing_configured_schema_is_partial_and_observable(self):
+        class OneOwnerOracle:
+            dialect = "oracle"
+            prefix = "P2GO."
+
+            def __init__(self, root):
+                self.cfg = Config(
+                    root=root,
+                    db=DbCfg(
+                        backend="oracle", schema="P2GO",
+                        schemas=["P2GO", "TUSINVC"],
+                        oracle_dsn="db.example:1521/service"),
+                )
+
+            def query(self, sql, params=None, max_rows=None):
+                if "FROM ALL_OBJECTS" in sql:
+                    rows = [{"schema_name": "P2GO",
+                             "object_name": "ORDERS",
+                             "object_type": "TABLE"}]
+                elif "FROM ALL_TAB_COLUMNS" in sql:
+                    rows = [{"schema_name": "P2GO",
+                             "object_name": "ORDERS",
+                             "column_name": "ID",
+                             "ordinal_position": 1}]
+                elif any(name in sql for name in (
+                        "ALL_IND_COLUMNS", "ALL_CONSTRAINTS",
+                        "ALL_DEPENDENCIES")):
+                    rows = []
+                else:
+                    raise AssertionError(sql)
+                return rows[:int(max_rows)], False
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        artifact = root / "partial-schema.db"
+        info = build_catalog(
+            artifact, [("p2go", OneOwnerOracle(root))],
+            peopletools_source="none")
+        self.assertEqual(info["partial"], "yes")
+
+        catalog = MetadataCatalog(artifact, source="p2go")
+        described = catalog.describe()
+        coverage = described["schema_coverage"]
+        self.assertFalse(coverage["complete"])
+        self.assertEqual(coverage["object_counts"],
+                         {"P2GO": 1, "TUSINVC": 0})
+        self.assertEqual(coverage["missing"], ["TUSINVC"])
+        self.assertTrue(described["snapshot"]["partial"])
+        self.assertEqual(described["snapshot"]["status"], "partial")
+        self.assertTrue(any(
+            note["layer"] == "schema_coverage" and note["partial"] == 1
+            for note in described["notes"]
+        ))
+        searched = catalog.search("ORDERS", source="p2go")
+        self.assertEqual(searched["snapshot"]["schema_coverage"]["missing"],
+                         ["TUSINVC"])
 
     def test_empty_multi_schema_build_names_the_attempted_boundaries(self):
         class EmptyOracle:

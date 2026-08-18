@@ -30,7 +30,7 @@ from .. import queries as query_sql
 from ..ar import ARBilling, ARError
 from ..relationships import Relationships
 from ..vendors import VendorNetwork
-from ..qlog import QuestionLog
+from ..qlog import FeedbackAlreadyRecorded, QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..security import RowSecurity, SecurityError, access_scope
@@ -76,6 +76,40 @@ try:
     wiki = make_wiki(cfg)
 except WikiError:
     wiki = None
+
+
+def _source_log_context(source: str) -> dict:
+    """Connection-free schema boundary for the structural question log.
+
+    The registry description is derived from active configuration only.  Do
+    not open the metadata artifact or source database merely to emit telemetry:
+    catalog build identity is captured when a metadata tool actually observes
+    it, and a chat turn must not become slower or less available because its
+    logger wanted another probe.
+    """
+    canonical = str(source or "default").strip() or "default"
+    try:
+        canonical = engine.registry.resolve_name(canonical)
+        item = next(
+            (row for row in engine.registry.describe()
+             if row.get("source") == canonical),
+            {},
+        )
+    except Exception:
+        # Telemetry is subordinate to the request.  Focused integrations and
+        # a partially initialised registry may expose routing without the
+        # connection-free descriptor; that must never change a 400/answer
+        # into a logging-shaped 500.
+        item = {}
+    schemas = list(item.get("schemas") or [])
+    default = str(item.get("schema") or "")
+    if default and default not in schemas:
+        schemas.insert(0, default)
+    return {
+        "canonical_source": canonical,
+        "default_schema": default,
+        "schema_allowlist": schemas,
+    }
 
 # ---------------------------------------------------------------- MCP session
 # One server subprocess for the LIFETIME OF THE PROCESS, not one per chat turn.
@@ -264,6 +298,9 @@ async def _lifespan(_app):
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
               redoc_url=None, lifespan=_lifespan)
 
+_QUALITY_WRITE_PATHS = frozenset({"/api/feedback", "/api/question-review"})
+_QUALITY_WRITE_MAX_BYTES = 8 * 1024
+
 
 @app.middleware("http")
 async def _access_guard(request, call_next):
@@ -273,6 +310,28 @@ async def _access_guard(request, call_next):
     readily as it would read an admin page, so the check cannot be scoped
     to one prefix. See pstb/gui/localguard.py for what each rule stops.
     """
+    if (request.method == "POST"
+            and request.url.path in _QUALITY_WRITE_PATHS):
+        raw_length = request.headers.get("content-length", "")
+        try:
+            content_length = int(raw_length) if raw_length else -1
+        except ValueError:
+            content_length = _QUALITY_WRITE_MAX_BYTES + 1
+        if (content_length < 0
+                or request.headers.get("transfer-encoding", "")):
+            response = JSONResponse(
+                status_code=411,
+                content={"error": "a bounded Content-Length is required"},
+            )
+            localguard.apply_security_headers(response.headers)
+            return response
+        if content_length > _QUALITY_WRITE_MAX_BYTES:
+            response = JSONResponse(
+                status_code=413,
+                content={"error": "quality update body is too large"},
+            )
+            localguard.apply_security_headers(response.headers)
+            return response
     status, reason = localguard.rejection(request.scope)
     if status:
         response = JSONResponse(status_code=status,
@@ -310,7 +369,8 @@ _OPEN_PATHS = frozenset({
 # question, or "no access to the numbers" silently becomes "no access to the
 # handbook either".
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
-                       "/api/chat/reset", "/api/question-report")
+                       "/api/chat/reset", "/api/question-report",
+                       "/api/question-review")
 
 
 def _needs_unit_check(path: str) -> bool:
@@ -1293,9 +1353,9 @@ def _provider_tools_for_scope(tools: list, scope: Optional[dict]) -> list:
     source = str((scope or {}).get("source") or "").strip()
     if not source or source == "default":
         return list(tools)
-    from ..guards import SOURCE_SILO_TOOLS
+    from ..guards import SOURCE_SILO_CHAT_TOOLS
     return [tool for tool in tools
-            if getattr(tool, "name", "") in SOURCE_SILO_TOOLS]
+            if getattr(tool, "name", "") in SOURCE_SILO_CHAT_TOOLS]
 
 
 def _session_id(payload: dict) -> str:
@@ -1683,18 +1743,78 @@ def diagnostics(include_timings: int = 0):
                   connectors=[_coupa_mod.from_env(cfg=cfg)])
 
 
+def _require_question_log_operator(request: Request) -> None:
+    """Protect diagnostics/review state without trusting the OPRID alone.
+
+    The PeopleSoft user-id chooser is explicitly not authentication.  The
+    operator dashboard therefore remains machine-local (an SSH tunnel arrives
+    as loopback) even when the rest of the app is shared on a VPN.
+    """
+    if (request is None
+            or not localguard.peer_is_loopback(request.scope.get("client"))):
+        raise HTTPException(
+            status_code=403,
+            detail="Question-log diagnostics are machine-local; use an SSH "
+                   "tunnel to the application host.")
+    if row_security.enabled:
+        access = access_for_request(request)
+        if access is None or not getattr(access, "privileged", False):
+            raise HTTPException(
+                status_code=403,
+                detail="Question-log diagnostics are restricted to "
+                       "configured privileged operators.")
+
+
 @app.get("/api/question-report")
-def question_report():
+def question_report(request: Request):
     """Deterministic what-to-optimize-next report over the question log."""
+    _require_question_log_operator(request)
     from pstb import qlog_report as _qr
     if not qlog.path:
         return {"turns": 0, "failed": 0, "flags": {}, "tools": [],
+                "sources": {},
                 "repeat_failures": [], "recent_failed": [], "suggestions": [],
                 "note": "question logging is not configured"}
-    r = _guard(_qr.analyze, path=qlog.path)
+    # Pass the live log object, not its pathname, so the report reader uses
+    # the same startup-pinned/no-follow directory boundary as the writer.
+    r = _guard(_qr.analyze, path=qlog)
     if isinstance(r, dict) and "error" not in r:
         r["text"] = _qr.report_text(r)
     return r
+
+
+@app.get("/api/question-review")
+def question_review(request: Request, turn_id: str = ""):
+    """Return only the bounded review status for one protected local turn."""
+    _require_question_log_operator(request)
+    candidate = str(turn_id or "")
+    if not candidate:
+        raise HTTPException(status_code=400, detail="turn_id required")
+    if not qlog.has_turn(candidate):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
+    return {"turn_id": candidate,
+            "status": qlog.review_status(candidate) or "unreviewed"}
+
+
+@app.post("/api/question-review")
+def update_question_review(payload: dict, request: Request = None):
+    """Append an operator's triage/fix/verification lifecycle state."""
+    _require_question_log_operator(request)
+    candidate = str((payload or {}).get("turn_id") or "")
+    if not candidate:
+        raise HTTPException(status_code=400, detail="turn_id required")
+    if not qlog.has_turn(candidate):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
+    try:
+        recorded = qlog.log_review(
+            candidate, (payload or {}).get("status", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not recorded:
+        raise HTTPException(
+            status_code=503, detail="review status could not be recorded")
+    return {"ok": True, "turn_id": candidate,
+            "status": qlog.review_status(candidate)}
 
 
 def _export_csv_for_source(canonical: str, payload: dict,
@@ -1761,16 +1881,21 @@ def _export_csv_for_source(canonical: str, payload: dict,
                 tool, args, {"source": canonical})
         except ScopeConflict as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        captured = body.get("result")
-        if captured is not None:
-            source_ok, problem = source_result_status(
-                tool, json.dumps(captured, default=str),
-                {"source": canonical},
-            )
-            if not source_ok:
-                raise HTTPException(status_code=400, detail=problem)
     elif "source" in args:
         args["source"] = "default"
+
+    # Captured structural cards are used when a tool has no safe export
+    # re-run. Verify them for Finance as well as secondary workspaces: a stale
+    # P2Go card must never become a file labelled ``finance`` merely because
+    # the default route was selected.
+    captured = body.get("result")
+    if captured is not None:
+        source_ok, problem = source_result_status(
+            tool, json.dumps(captured, default=str),
+            {"source": canonical},
+        )
+        if not source_ok:
+            raise HTTPException(status_code=400, detail=problem)
 
     # The unit rides in the BODY here, where the query-string gate cannot
     # see it — and export re-runs the tool at the full population ceiling,
@@ -2214,6 +2339,7 @@ async def chat(payload: dict, request: Request = None):
             engine.registry.resolve_name(raw_source)
             if engine.registry is not None else "default"
         )
+        source_log_context = _source_log_context(resolved_source)
         secondary_requested = bool(
             raw_source and resolved_source != "default"
         )
@@ -2531,6 +2657,7 @@ async def chat(payload: dict, request: Request = None):
                     qlog=qlog,
                     surface="gui",
                     scope=active_scope,
+                    source_context=source_log_context,
                     tool_observer=_observe_and_record,
                     tool_started=_on_started,
                     prior_payloads=prior_payloads,
@@ -2729,8 +2856,22 @@ def feedback(payload: dict):
     turn_id = (payload or {}).get("turn_id", "")
     if not turn_id:
         raise HTTPException(status_code=400, detail="turn_id required")
-    qlog.log_feedback(turn_id, (payload or {}).get("verdict", "bad"),
-                      (payload or {}).get("note", ""))
+    if not qlog.has_turn(turn_id):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
+    try:
+        recorded = qlog.log_feedback(
+            turn_id,
+            (payload or {}).get("verdict", "bad"),
+            (payload or {}).get("note", ""),
+            categories=(payload or {}).get("categories") or (),
+        )
+    except FeedbackAlreadyRecorded as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not recorded:
+        raise HTTPException(
+            status_code=503, detail="feedback could not be recorded")
     return {"ok": True}
 
 

@@ -46,6 +46,23 @@ class LockTests(unittest.TestCase):
         out = apply_request_scope("list_tables", {}, MART)
         self.assertEqual(out["source"], "p2go")
 
+    def test_metadata_proposal_is_injected_into_only_the_selected_source(self):
+        args = {
+            "identifier": "main.JOB_HDR",
+            "meaning": "P2Go integration job headers",
+            "aliases": "job header",
+        }
+        out = apply_request_scope("propose_metadata_meaning", args, MART)
+        self.assertEqual(out["source"], "p2go")
+        self.assertEqual(out["identifier"], "main.JOB_HDR")
+
+        with self.assertRaises(ScopeConflict):
+            apply_request_scope(
+                "propose_metadata_meaning",
+                {**args, "source": "default"},
+                MART,
+            )
+
     def test_a_matching_choice_passes(self) -> None:
         out = apply_request_scope("list_tables", {"source": "p2go"}, MART)
         self.assertEqual(out["source"], "p2go")
