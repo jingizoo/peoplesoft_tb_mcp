@@ -648,17 +648,20 @@ class TBEngine:
             return cached[1]
         return None
 
-    def resolve_tree_ctl(self, setid: str, tree: str, business_unit: str) -> str:
+    def resolve_tree_ctl(self, setid: str, tree: str, business_unit: str,
+                         as_of: str = "") -> str:
         """SETCNTRLVALUE for a tree: the business unit when the tree is
         BU-controlled, otherwise the blank SetID-controlled value. Without it
         a BU-controlled tree matches every unit's copy at once and node totals
         come out multiplied — while still looking balanced."""
-        key = (setid, tree, business_unit)
+        key = (setid, tree, business_unit, as_of)
         if key in self._tree_ctl:
             return self._tree_ctl[key]
+        ctl_params = {"setid": setid, "tree": tree}
         try:
-            rows, _ = self.db.query(q.tree_ctl_values(self.db),
-                                    {"setid": setid, "tree": tree}, max_rows=50)
+            rows, _ = self.db.query(
+                q.tree_ctl_values(self.db, ctl_params, as_of),
+                ctl_params, max_rows=50)
         except DbError:
             rows = []
         values = [str(r.get("setcntrlvalue") or "") for r in rows]
@@ -886,6 +889,35 @@ class TBEngine:
             "fiscal_years_with_data": years,
         }
 
+    def period_end_date(self, fiscal_year: int, period: int) -> str:
+        """END_DT of a fiscal period, or "" when the calendar cannot say.
+
+        This is the date effective-dated master data must be read at for an
+        answer ABOUT that period. Returning "" rather than guessing is
+        deliberate: a site whose calendar is missing should keep today's
+        behaviour and be told so, not silently get a fabricated cut-off.
+        """
+        try:
+            fy, per = int(fiscal_year), int(period)
+        except (TypeError, ValueError):
+            return ""
+        if fy <= 0 or per <= 0:
+            return ""
+        try:
+            rows = (self.list_periods(fy) or {}).get("periods") or []
+        except (EngineError, DbError):
+            return ""
+        exact = [r for r in rows if int(r.get("period") or 0) == per]
+        if not exact:
+            # Adjustment and closing periods (998/999) have no calendar row
+            # of their own on many installations; the year's last regular
+            # period end is the right as-of date for them.
+            regular = [r for r in rows if 0 < int(r.get("period") or 0) <= 900]
+            if not regular:
+                return ""
+            exact = [max(regular, key=lambda r: int(r["period"]))]
+        return str(exact[0].get("end_dt") or "")[:10]
+
     def currency_disclosure(self, business_unit: str, amount_basis: str,
                             currency_filter: str = "",
                             observed: Optional[list] = None) -> dict:
@@ -1073,6 +1105,7 @@ class TBEngine:
         account: str = "",
         include_adj: bool = False,
         amount_basis: str = "base",
+        as_of: str = "",
     ) -> list[dict]:
         extras = extras or []
         params: dict = {
@@ -1093,6 +1126,7 @@ class TBEngine:
             params=params,
             amount_basis=amount_basis,
             base_currency=self.base_currency_for(bu),
+            as_of=as_of,
         )
         if self.cfg.db.use_views:
             params.pop("setid", None)
@@ -1179,10 +1213,15 @@ class TBEngine:
             # transaction basis carries the currency as a key whether or not
             # the caller asked to group by it.
             extras.append("CURRENCY_CD")
+        # Account names, types and statuses are effective-dated. Read them at
+        # the period being reported, not at the day the report was run, or an
+        # FY2025 comparative pulled in FY2026 carries FY2026 account names.
+        as_of = self.period_end_date(fy, per)
         rows = self._period_sums(
             bu, led, fy, per,
             extras=extras, dept=dept, currency=currency, account=account,
             include_adj=include_adjustments, amount_basis=basis_kind,
+            as_of=as_of,
         )
         key_fields = ["account"] + [e.lower() for e in extras]
         piv = self._pivot(rows, key_fields, per, include_adjustments)
@@ -1283,6 +1322,17 @@ class TBEngine:
             "scope_status": "ok",
             "amount_basis": basis_kind,
             "currency": currency_note,
+            "master_data": {
+                # Which vintage of account names/types/statuses decorated
+                # these rows. Two prints of the same statement that disagree
+                # are only explainable if each says what it read.
+                "effective_date": as_of or None,
+                "basis": ("period end" if as_of
+                          else "today — the calendar could not supply this "
+                               "period's end date, so account attributes may "
+                               "be later than the period reported"),
+                "applies_to": "account description, type and status",
+            },
             "totals": totals,
             "note": ("Amounts are signed: debits positive, credits negative. "
                      "Base-currency rows only; statistical rows excluded."),
@@ -2343,8 +2393,14 @@ class TBEngine:
         bu, fy, per, led = self._defaults(business_unit, fiscal_year, period, ledger, notes=scope_notes)
         tree = (tree_name or "").strip() or self.cfg.defaults.account_tree
         setid = self.resolve_setid(bu)
+        # A tree reorganised this year restates last year's rollup if it is
+        # read at today: the same accounts land under different nodes, so a
+        # prior-year departmental report changes shape with no ledger change.
+        tree_as_of = self.period_end_date(fy, per)
+        effdt_params = {"setid": setid, "tree": tree}
         rows, _ = self.db.query(
-            q.tree_effdt(self.db), {"setid": setid, "tree": tree}, max_rows=1
+            q.tree_effdt(self.db, effdt_params, tree_as_of),
+            effdt_params, max_rows=1
         )
         effdt = rows[0]["effdt"] if rows else None
         if not effdt:
@@ -2354,7 +2410,7 @@ class TBEngine:
         params = {
             "tsetid": setid,
             "tree": tree,
-            "tctl": self.resolve_tree_ctl(setid, tree, bu),
+            "tctl": self.resolve_tree_ctl(setid, tree, bu, tree_as_of),
             "teffdt": str(effdt)[:10],
             "lvl": int(level or 2),
             "bu": bu,

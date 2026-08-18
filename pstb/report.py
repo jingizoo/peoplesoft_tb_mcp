@@ -198,8 +198,9 @@ class ReportRunner:
         key = (setid, tree, node, bu)
         if key in self._range_cache:
             return self._range_cache[key]
-        rows, _ = self.db.query(q.tree_effdt(self.db),
-                                {"setid": setid, "tree": tree}, max_rows=1)
+        effdt_params = {"setid": setid, "tree": tree}
+        rows, _ = self.db.query(q.tree_effdt(self.db, effdt_params),
+                                effdt_params, max_rows=1)
         effdt = rows[0]["effdt"] if rows else None
         if not effdt:
             trees, _ = self.db.query(q.trees_list(self.db), {}, max_rows=50)

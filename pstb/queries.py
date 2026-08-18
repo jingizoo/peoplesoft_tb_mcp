@@ -134,6 +134,29 @@ def amount_col(db: Database, amount_basis: str, alias: str = "L") -> str:
     return f"{alias}.POSTED_TOTAL_AMT"
 
 
+def asof_expr(db: Database, params: dict, as_of: str = "",
+              key: str = "asof") -> str:
+    """SQL for the date effective-dated master data should be read AT.
+
+    PeopleSoft master data is effective-dated: PS_GL_ACCOUNT_TBL,
+    PSTREEDEFN and friends hold one row per EFFDT, and the correct row is
+    the latest one on or before the date the ANSWER is about. Reading them
+    at ``today`` instead silently relabels history — an FY2025 comparative
+    pulled in FY2026 shows FY2026 account descriptions and FY2026 tree
+    structure, so two prints of the same statement disagree and neither
+    says why.
+
+    Passing "" keeps the old behaviour for the genuinely current questions
+    (account search, "what does this tree look like now"), where today IS
+    the right as-of date.
+    """
+    text = (as_of or "").strip()[:10]
+    if not text:
+        return db.today_expr()
+    params[key] = text
+    return f":{key}"
+
+
 def acct_join(db: Database) -> str:
     """Effective-dated LEFT JOIN from ledger alias L to PS_GL_ACCOUNT_TBL alias A."""
     p, today = db.prefix, db.today_expr()
@@ -188,6 +211,7 @@ def tb_period_sums(
     params: dict,
     amount_basis: str = "base",
     base_currency: str = "",
+    as_of: str = "",
 ) -> str:
     """Period-level sums by account (+extras), through :maxper for :bu/:ledger/:fy."""
     p = db.prefix
@@ -227,7 +251,10 @@ def tb_period_sums(
     # against every ledger row, which is unusably slow on a real ledger.
     extra_inner_sel = "".join(f", L.{c}" for c in extras)
     extra_outer_sel = "".join(f", T.{c} AS {c.lower()}" for c in extras)
-    today = db.today_expr()
+    # The account attributes belong to the PERIOD being reported, not to the
+    # day the report was run. Without this an FY2025 trial balance printed in
+    # FY2026 carries FY2026 account names.
+    today = asof_expr(db, params, as_of)
     # The account table supplies DECORATION on top of an already-correct
     # aggregate: the balances come from the subquery above and do not depend
     # on it. A site whose PS_GL_ACCOUNT_TBL lacks DESCR or EFF_STATUS must
@@ -413,7 +440,7 @@ def trees_list(db: Database) -> str:
   FROM {db.prefix}PSTREEDEFN GROUP BY SETID, TREE_NAME ORDER BY TREE_NAME"""
 
 
-def tree_ctl_values(db: Database) -> str:
+def tree_ctl_values(db: Database, params: dict, as_of: str = "") -> str:
     """Control values a tree is defined under.
 
     PSTREE* records are keyed by SETCNTRLVALUE as well as SETID/TREE_NAME.
@@ -421,13 +448,19 @@ def tree_ctl_values(db: Database) -> str:
     matches every control value at once and multiplies node totals — while
     still summing to a balanced-looking number.
     """
-    p, today = db.prefix, db.today_expr()
+    p, today = db.prefix, asof_expr(db, params, as_of)
     return f"""SELECT DISTINCT SETCNTRLVALUE AS setcntrlvalue FROM {p}PSTREEDEFN
  WHERE SETID = :setid AND TREE_NAME = :tree AND EFFDT <= {today}"""
 
 
-def tree_effdt(db: Database) -> str:
-    p, today = db.prefix, db.today_expr()
+def tree_effdt(db: Database, params: dict, as_of: str = "") -> str:
+    """The tree VERSION in force at the as-of date.
+
+    A tree reorganised this year restates last year's rollup if it is read
+    at today: the same accounts land under different nodes, so a prior-year
+    departmental report changes shape without any ledger row changing.
+    """
+    p, today = db.prefix, asof_expr(db, params, as_of)
     return f"""SELECT MAX(EFFDT) AS effdt FROM {p}PSTREEDEFN
  WHERE SETID = :setid AND TREE_NAME = :tree AND EFFDT <= {today}"""
 
