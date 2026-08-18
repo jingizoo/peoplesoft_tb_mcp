@@ -66,7 +66,7 @@ SCOPE_CACHE_TTL_SECONDS = 900.0  # 15 min: the catalog is setup data, not balanc
 
 _SQL_DENY = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|"
-    r"EXECUTE|EXEC|CALL|COMMIT|ROLLBACK|LOCK|RENAME|PRAGMA|ATTACH|VACUUM)\b",
+    r"EXECUTE|EXEC|CALL|COMMIT|ROLLBACK|LOCK|RENAME|INTO|PRAGMA|ATTACH|VACUUM)\b",
     re.IGNORECASE,
 )
 
@@ -3108,8 +3108,16 @@ class TBEngine:
         return out
 
     # ------------------------------------------------------------- raw SQL
+    # Python's ``\w`` is Unicode-aware, but an ASCII ``[A-Za-z_]`` first
+    # character is not. SQL Server regular identifiers may begin with a
+    # Unicode letter, so using the latter in either the source-boundary guard
+    # or the table extractor creates the same bypass twice: the remote name is
+    # not refused and then no table is left for catalog validation. ``[^\W\d]``
+    # is a Unicode word character other than a decimal digit.
+    _UNQUOTED_SQL_IDENTIFIER = r"(?:[^\W\d]|[_#@])[\w$#@]*"
     _TABLE_REF_RE = re.compile(
-        r"(?is)\b(?:FROM|JOIN)\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)"
+        rf"(?is)\b(?:FROM|JOIN)\s+({_UNQUOTED_SQL_IDENTIFIER}"
+        rf"(?:\.{_UNQUOTED_SQL_IDENTIFIER})?)"
     )
     _CTE_RE = re.compile(r"(?is)\b([A-Za-z_]\w*)\s+AS\s*\(")
     _FUNC_FROM_HEAD = re.compile(r"(?is)\b(EXTRACT|TRIM|SUBSTRING)\s*\(")
@@ -3155,6 +3163,61 @@ class TBEngine:
                 out.append(c)
                 i += 1
         return "".join(out)
+
+    def _require_local_database_refs(self, scrubbed: str) -> None:
+        """Refuse syntax that can leave the selected database connection.
+
+        Read-only is not the same as source-local: Oracle DB links and SQL
+        Server remote rowsets/three-part names can cross a workspace boundary
+        from both execution and optimizer-plan paths.
+        """
+        if "@" in scrubbed or re.search(
+            r"(?i)\b(?:OPENQUERY|OPENROWSET|OPENDATASOURCE)\s*\(", scrubbed
+        ):
+            raise EngineError(
+                "Remote database links and external rowset functions are "
+                "not allowed; query only the selected database source."
+            )
+        # Oracle's remote boundary is @DBLINK, checked above. Three-token
+        # SCHEMA.PACKAGE.FUNCTION calls are legitimate within one Oracle
+        # database, so the SQL Server multipart-name rules below must not
+        # reject them.
+        if self.db.dialect == "oracle":
+            return
+        # SQL Server accepts DATABASE..OBJECT and SERVER...OBJECT shorthands.
+        # Their empty identifiers mean the normal three/four-part-name regex
+        # does not see them; bracketed forms can also evade the ordinary
+        # table-reference extractor entirely.
+        identifier = (
+            r'(?:\[(?:[^\]]|\]\])*\]|"(?:[^"]|"")*"|'
+            + self._UNQUOTED_SQL_IDENTIFIER + r')'
+        )
+        remote_default_schema = re.search(
+            rf"(?i){identifier}\s*(?:\.\s*){{2,3}}{identifier}",
+            scrubbed,
+        )
+        if remote_default_schema:
+            raise EngineError(
+                "Consecutive-dot remote object names are not allowed; query "
+                "only the selected database source."
+            )
+        # Match everywhere in SQL code, not only immediately after FROM or
+        # JOIN. SQL Server accepts remote objects after comma/APPLY and as
+        # three-part scalar UDF calls in the SELECT list. Literals/comments
+        # have already been blanked by _scrub_sql, so a global token check is
+        # the smaller and safer boundary. Ordinary two-part OWNER.OBJECT and
+        # alias.column names remain valid.
+        remote_name = re.search(
+            rf"(?i)(?:{identifier}\s*\.\s*){{2}}{identifier}",
+            scrubbed,
+        )
+        if remote_name:
+            raise EngineError(
+                "Three- or four-part remote object names are not allowed; "
+                "query only the selected database source. For a local "
+                "schema.object, give the table an alias and use alias.column "
+                "in expressions."
+            )
 
     @classmethod
     def _neutralize_func_from(cls, t: str) -> str:
@@ -3281,7 +3344,12 @@ class TBEngine:
             raise DbError("No extra sources are configured; add them under "
                           "'sources:' in config.yaml.")
         if name not in self._source_engines:
-            eng = TBEngine(self.registry.get(name), self.cfg)
+            source_db = self.registry.get(name)
+            # Database owns the fully resolved Config for this source.  Using
+            # the primary engine's Config here makes Oracle catalog checks ask
+            # ALL_OBJECTS for the PeopleSoft owner even while queries execute
+            # through (for example) the P2Go connection and schema.
+            eng = TBEngine(source_db, source_db.cfg)
             self._source_engines[name] = eng
         return self._source_engines[name]
 
@@ -3364,6 +3432,7 @@ class TBEngine:
         m = _SQL_DENY.search(scrubbed)
         if m:
             raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
+        self._require_local_database_refs(scrubbed)
         refs = sorted(self._table_refs(scrubbed))
         unqualified = [r for r in refs if "." not in r]
         if self.db.prefix:
@@ -3651,6 +3720,13 @@ class TBEngine:
         m = _SQL_DENY.search(scrubbed)
         if m:
             raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
+        # A selected source is a database boundary, not merely the connection
+        # used to parse the query. Oracle database links and SQL Server remote
+        # rowset/three-part names can leave that connection while still being
+        # read-only SELECT syntax. Two-part OWNER.TABLE remains supported for
+        # approved same-database schemas; remote database/server addressing is
+        # refused before catalog validation or execution.
+        self._require_local_database_refs(scrubbed)
         # Validate every referenced table against the live catalog BEFORE
         # executing. A model-invented name (PS_JRNL_LINE for PS_JRNL_LN) should
         # come back instantly with a correction, not as an opaque ORA-00942 —

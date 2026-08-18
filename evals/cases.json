@@ -1051,8 +1051,10 @@
     },
     {
       "id": "metadata-ambiguous-source-schema",
-      "question": "Find VENDOR across every configured database. If it exists in more than one source or schema, do not choose one silently; show each candidate and tell me which source/schema I must specify.",
-      "scope": {},
+      "question": "In P2Go, find VENDOR. Stay in P2Go, show every matching P2Go schema candidate, and do not return a Finance object or query transaction rows.",
+      "scope": {
+        "source": "p2go"
+      },
       "expect": {
         "any_tool": [
           "get_metadata_context"
@@ -1063,8 +1065,11 @@
           "compare_records",
           "run_sql"
         ],
+        "tool_args_contain": {
+          "source": "p2go"
+        },
         "not_refused": true,
-        "_why": "Exact context is responsible for exposing source/schema ambiguity. A structural question must not choose by sort order or read live rows."
+        "_why": "Exact context is responsible for exposing schema ambiguity inside the route-bound P2Go artifact. A structural question must not merge databases, choose by sort order, or read live rows."
       }
     },
     {

@@ -15,6 +15,8 @@ import datetime as dt
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -282,6 +284,9 @@ class EndpointTests(unittest.TestCase):
             self.assertIn("text/csv", r.headers["content-type"])
             self.assertIn("attachment; filename=",
                           r.headers["content-disposition"])
+            self.assertIn("finance_run_sql_",
+                          r.headers["content-disposition"])
+            self.assertEqual(r.headers["X-Export-Source"], "finance")
             self.assertEqual(r.headers["X-Export-Rerun"], "1")
             self.assertGreater(int(r.headers["X-Export-Rows"]), 0)
             self.assertIn("a,amt", r.text)
@@ -309,6 +314,155 @@ class EndpointTests(unittest.TestCase):
                 "tool": "coupa_health", "result": {"ok": True}})
             self.assertEqual(r.status_code, 400)
             self.assertIn("not a row set", r.json()["detail"])
+
+    def test_p2go_sql_export_reruns_only_on_the_bound_child_engine(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        class Registry:
+            @staticmethod
+            def resolve_command(command):
+                return "p2go" if command == "p2go" else "default"
+
+            @staticmethod
+            def resolve_name(source):
+                return str(source or "default")
+
+            @staticmethod
+            def describe():
+                return [
+                    {"source": "default", "command": "finance"},
+                    {"source": "p2go", "command": "p2go"},
+                ]
+
+        class ChildEngine:
+            def __init__(self):
+                self.calls = []
+
+            def run_sql(self, sql, max_rows=100, row_ceiling=0):
+                self.calls.append(sql)
+                return {"rows": [{"database": "p2go"}]}
+
+        child = ChildEngine()
+        with (patch.object(gapp.engine, "registry", Registry()),
+              patch.object(gapp.engine, "for_source", return_value=child)
+              as bound,
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/p2go/export", json={
+                "tool": "run_sql",
+                "args": {"source": "p2go", "sql": "SELECT 1 AS x"},
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("p2go", response.text)
+        self.assertIn("p2go_run_sql_",
+                      response.headers["content-disposition"])
+        self.assertEqual(response.headers["X-Export-Source"], "p2go")
+        bound.assert_called_once_with("p2go")
+        self.assertEqual(child.calls, ["SELECT 1 AS x"])
+
+    def test_finance_export_never_resolves_a_secondary_engine(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        with (patch.object(gapp.engine, "for_source") as child,
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/finance/export", json={
+                "tool": "run_sql",
+                "args": {"source": "default", "sql": "SELECT 1 AS x"},
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("finance_run_sql_",
+                      response.headers["content-disposition"])
+        self.assertEqual(response.headers["X-Export-Source"], "finance")
+        child.assert_not_called()
+
+    def test_export_route_rejects_conflicting_source_aliases(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        class Registry:
+            @staticmethod
+            def resolve_command(command):
+                return "p2go"
+
+            @staticmethod
+            def resolve_name(source):
+                return str(source or "default")
+
+            @staticmethod
+            def describe():
+                return [
+                    {"source": "default", "command": "finance"},
+                    {"source": "p2go", "command": "p2go"},
+                ]
+
+        with (patch.object(gapp.engine, "registry", Registry()),
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/p2go/export", json={
+                "tool": "run_sql",
+                "args": {"source": "p2go", "db": "default",
+                         "sql": "SELECT 1"},
+            })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("args.db", response.json()["detail"])
+
+    def test_restricted_user_cannot_bypass_raw_sql_policy_via_export(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        access = SimpleNamespace(
+            all_units=False, units={"US001"}, oprid="RESTRICTED",
+            allows=lambda unit: unit == "US001")
+        with (patch.object(gapp, "access_for_request", return_value=access),
+              patch.object(gapp.engine, "for_source") as child,
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/finance/export", json={
+                "tool": "run_sql",
+                "args": {"source": "default", "sql": "SELECT 1"},
+            })
+        self.assertEqual(response.status_code, 403)
+        child.assert_not_called()
+
+    def test_no_finance_units_cannot_enable_p2go_raw_sql_via_export(self):
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        class Registry:
+            @staticmethod
+            def resolve_command(command):
+                return "p2go" if command == "p2go" else "default"
+
+            @staticmethod
+            def resolve_name(source):
+                return str(source or "default")
+
+            @staticmethod
+            def describe():
+                return [
+                    {"source": "default", "command": "finance"},
+                    {"source": "p2go", "command": "p2go"},
+                ]
+
+        access = SimpleNamespace(
+            all_units=False, units=frozenset(), oprid="P2GO_ONLY",
+            allows=lambda _unit: False,
+        )
+        with (patch.object(gapp.engine, "registry", Registry()),
+              patch.object(gapp, "access_for_request", return_value=access),
+              patch.object(gapp.engine, "for_source") as child,
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/p2go/export", json={
+                "tool": "run_sql",
+                "args": {"source": "p2go", "sql": "SELECT 1"},
+            })
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIn("arbitrary SQL", response.json()["detail"])
+        child.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -35,9 +35,14 @@ db:
   use_views: false        # set true once sql/oracle/XX_TB_*.sql views are deployed
   query_timeout_seconds: 120   # abort a query rather than hanging the UI        # set true once sql/oracle/XX_TB_*.sql views are deployed
 
-# Additional runtime database contexts for guarded ad-hoc discovery and SQL.
-# Uncomment to make P2Go available in Ask; building its metadata catalog alone
-# does not register a live source. Keep its Oracle credentials in .env as
+# Additional isolated Ask workspaces for generic semantic/relationship
+# discovery and guarded read-only SQL. Uncomment to expose `/p2go`; no
+# PeopleSoft/Coupa/wiki/curated tools are offered inside that workspace.
+# Building a metadata artifact alone does not register a live source. After
+# first enabling a second source, run build_metadata_catalog.py with no
+# --source so both Finance and P2Go move to their isolated multi-source paths.
+# Later, refresh only P2Go with --source p2go --peopletools-source none.
+# Keep its Oracle credentials in .env as
 # PSTB_SRC_P2GO_DSN, PSTB_SRC_P2GO_USER and PSTB_SRC_P2GO_PASSWORD.
 # sources:
 #   p2go:
@@ -196,10 +201,15 @@ process_graph:
   memory_budget_mb: 512
   write_batch_size: 2000
 
-# Offline catalog of logical PeopleTools records and every configured
-# database's physical objects/columns/indexes. It stores STRUCTURE only -- no
-# transaction rows or balances -- and is rebuilt atomically by:
+# Offline structural knowledge for each configured database: semantic-search
+# nodes plus native key/view relationship edges in one SQLite file per source.
+# A multi-source install uses metadata_catalogs/<safe-name>-<hash>.db; a
+# primary-only install keeps metadata_catalog.db for upgrade compatibility.
+# Artifacts store no transaction rows, balances, or credentials, and are
+# rebuilt independently/atomically by:
 #     .venv/bin/python scripts/build_metadata_catalog.py
+# Rebuild a source after changing its connection locator or schema: the runtime
+# verifies a secret-free endpoint fingerprint and fails closed on a mismatch.
 metadata_catalog:
   max_objects: 100000
   max_fields: 500000

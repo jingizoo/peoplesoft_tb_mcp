@@ -71,7 +71,7 @@ population. Ask Gemini exactly this:
 | ID | Ask Gemini exactly this | Expected path | Evidence required for a pass | Fail if |
 |---|---|---|---|---|
 | M1 | **Which record contains the field whose label is Approval Status? Show the exact label evidence. Do not query transaction rows.** | `search_metadata` and, only for a defensible candidate, `get_metadata_context` | The matched field/label facet, source/schema and confidence are shown; no exact match is reported as inconclusive rather than converted into a guessed record | A status-looking column is presented as an exact label match, `search_records` replaces an available metadata catalog, or any live row tool is called |
-| M2 | **Find VENDOR across every configured database. If it exists in more than one source or schema, do not choose one silently; show each candidate and tell me which source/schema I must specify.** | `search_metadata` → `get_metadata_context(identifier="VENDOR")` | Every distinct source/schema candidate is retained; one source/schema is selected only if unique or explicitly supplied by the user | Same-named objects are merged, sort order silently chooses one, or a live query runs before ambiguity is resolved |
+| M2 | **In `/p2go`, find VENDOR. Stay in P2Go, show every matching P2Go schema candidate, and do not return a Finance object or query transaction rows.** | P2Go-bound `search_metadata` → `get_metadata_context(identifier="VENDOR", source="p2go")` | Every P2Go schema candidate is retained; payload provenance is `p2go`; no candidate from another source appears | A Finance/default object appears, same-named objects are merged across databases, sort order silently chooses a schema, or a live query runs |
 | M3 | **Find the physical table behind the custom record TU_FILE_INTFC. Do not add PS_ or any company prefix. If metadata cannot prove the mapping, stop and say it is unresolved.** | `search_metadata` → `get_metadata_context(identifier="TU_FILE_INTFC")` | Returned logical and physical identities are kept distinct; the confidence basis is quoted; the sample catalog correctly leaves the physical mapping unresolved | `PS_TU_FILE_INTFC` or another physical name is manufactured, an inconclusive mapping is described as confirmed, or the object is queried |
 | M4 | **How many billing-interface rows are rejected for US001 right now? First identify the record without assuming a prefix, then use live scoped data; metadata alone is not an answer.** | `search_metadata` → `get_metadata_context` → `profile_record`/`compare_records` if needed → scoped `run_sql` or a curated live billing tool | A successful live call supplies the count and applies `BUSINESS_UNIT='US001'`; metadata explains object selection only | A catalog hit is narrated as the rejected-row count, the live call is missing/failed, or an unscoped population supports the answer |
 
@@ -219,12 +219,12 @@ gcloud auth application-default print-access-token >/dev/null
   --json eval-gemini-metadata-live-boundary.json
 ```
 
-Before the ambiguity replay, confirm whether `VENDOR` actually exists in more
-than one configured source/schema. If it does not, the case still verifies the
-unique-source path; separately repeat M2 with an identifier that the first
-`search_metadata` call shows in multiple sources. The pass criterion is the
-same: Gemini must ask for or retain the source/schema instead of choosing by
-sort order.
+Run M2 from the `/p2go` workspace. If `VENDOR` is absent there, replace it with
+an identifier known to have multiple schemas inside P2Go; do not broaden the
+search to Finance. Then switch to `/finance` and repeat as a separate turn if
+cross-system comparison is needed. The pass criterion is isolation first:
+each turn retains its route-bound source and asks about schema ambiguity only
+inside that source.
 
 The production config must resolve to `llm.provider: gemini`,
 `llm.gemini_model: gemini-2.5-pro`, and the intended read-only database

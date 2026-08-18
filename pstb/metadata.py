@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +32,11 @@ from typing import Iterable, Optional
 
 SCHEMA_VERSION = 2
 DEFAULT_FILENAME = "metadata_catalog.db"
+SOURCE_CATALOG_DIR = "metadata_catalogs"
 MAX_RESULT_CAP = 100
+MAX_RELATION_HOPS = 4
+MAX_RELATION_VISITED = 500
+MAX_RELATIONS_PER_NODE = 200
 
 HARD_MAX_OBJECTS = 1_000_000
 HARD_MAX_FIELDS = 5_000_000
@@ -79,8 +84,180 @@ def _stable_id(kind: str, source: str, schema: str, name: str,
     return f"{kind}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
 
 
-def catalog_path(cfg) -> Path:
-    return Path(getattr(cfg, "root", ".") or ".") / DEFAULT_FILENAME
+def _source_artifact_filename(source: str) -> str:
+    """Filesystem-safe, collision-resistant name for one source artifact.
+
+    Source names are configuration values, not paths.  Keeping only a short
+    readable slug and hashing the exact canonical name prevents ``../`` and
+    path separators from escaping the deployment directory, while ensuring
+    names that slug the same way still receive different files.
+    """
+    canonical = _s(source) or "default"
+    slug = re.sub(r"[^a-z0-9]+", "-", canonical.casefold()).strip("-")
+    slug = (slug or "source")[:40]
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}-{digest}.db"
+
+
+def source_catalog_path(cfg, source: str = "default") -> Path:
+    """Artifact path for exactly one configured database source.
+
+    A deployment with only the primary database keeps the historical
+    ``metadata_catalog.db`` path.  That compatibility matters on upgrade: a
+    working single-source catalog must not appear to vanish merely because
+    source isolation was added.  Once additional sources are configured,
+    every source -- including ``default`` -- receives its own hashed file.
+    """
+    root = Path(getattr(cfg, "root", ".") or ".")
+    canonical = _s(source) or "default"
+    configured = getattr(cfg, "sources", None) or {}
+    if canonical == "default" and not configured:
+        return root / DEFAULT_FILENAME
+    return root / SOURCE_CATALOG_DIR / _source_artifact_filename(canonical)
+
+
+def catalog_path(cfg, source: str = "default") -> Path:
+    """Backward-compatible public name for :func:`source_catalog_path`."""
+    return source_catalog_path(cfg, source)
+
+
+def _db_config_fingerprint(root: Path, db_cfg) -> str:
+    """Secret-free identity of the database endpoint whose shape was built.
+
+    The digest excludes passwords, wallet secrets, tokens, timeouts and pool
+    sizing. When no schema is configured it includes the configured login
+    identity because USER_OBJECTS/default-schema visibility is part of the
+    namespace being fingerprinted. Only the final digest is persisted.
+    """
+    backend = _s(getattr(db_cfg, "backend", "sqlite")).casefold()
+    schema = _u(getattr(db_cfg, "schema", ""))
+    namespace_identity: object = ""
+    locator: object
+    if backend == "sqlite":
+        raw = Path(_s(getattr(db_cfg, "sqlite_path", "")) or ".")
+        locator = str((raw if raw.is_absolute() else root / raw).resolve())
+    elif backend == "oracle":
+        # A TNS alias is resolved relative to the configured network/wallet
+        # directories, so the alias alone does not identify the endpoint.
+        def resolved_dir(field: str) -> str:
+            value = _s(getattr(db_cfg, field, ""))
+            if not value:
+                return ""
+            raw = Path(value)
+            return str((raw if raw.is_absolute() else root / raw).resolve())
+
+        dsn = " ".join(
+            _s(getattr(db_cfg, "oracle_dsn", "")).split()).casefold()
+        config_dir = resolved_dir("oracle_config_dir")
+        wallet_dir = resolved_dir("oracle_wallet_dir")
+        tns_files = []
+        for directory in dict.fromkeys((config_dir, wallet_dir)):
+            if not directory:
+                continue
+            candidate = Path(directory) / "tnsnames.ora"
+            if candidate.is_file():
+                try:
+                    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                except OSError as exc:
+                    raise MetadataError(
+                        f"Cannot read Oracle locator file {candidate}; "
+                        "metadata source binding must fail closed.") from exc
+                tns_files.append({
+                    "path": str(candidate.resolve()),
+                    "sha256": digest,
+                })
+        # Easy Connect strings and full connect descriptors identify their
+        # target directly. A bare TNS alias is indirection: hashing only the
+        # alias/path would miss an administrator repointing that alias to a
+        # different database while the process is stopped.
+        indirect_alias = bool(
+            dsn and not any(token in dsn for token in (":", "/", "(", "="))
+        )
+        if indirect_alias and not tns_files:
+            raise MetadataError(
+                "Oracle metadata source uses a TNS alias, but no readable "
+                "tnsnames.ora was found in oracle_config_dir or "
+                "oracle_wallet_dir. Configure that directory or use a direct "
+                "Easy Connect locator before building the source artifact."
+            )
+        locator = {
+            "dsn": dsn,
+            "config_dir": config_dir,
+            "wallet_dir": wallet_dir,
+            "tnsnames": tns_files,
+        }
+        if not schema:
+            namespace_identity = _u(getattr(db_cfg, "oracle_user", ""))
+    elif backend == "sqlserver":
+        # ODBC strings mix locator, driver, credentials, and preferences.
+        # Retain only keys which locate the database. Unknown keys are omitted
+        # rather than risking a vendor-specific password/token field.
+        locator_keys = {
+            "server", "address", "addr", "network address", "data source",
+            "database", "initial catalog", "port", "instance", "dsn",
+        }
+        login_keys = {"uid", "user id", "user", "username"}
+        parts: dict[str, str] = {}
+        logins: dict[str, str] = {}
+        seen_keys: set[str] = set()
+        for fragment in _s(getattr(db_cfg, "mssql_conn_str", "")).split(";"):
+            if "=" not in fragment:
+                continue
+            key, value = fragment.split("=", 1)
+            normalized = " ".join(key.strip().casefold().split())
+            seen_keys.add(normalized)
+            if normalized in locator_keys:
+                parts[normalized] = " ".join(value.strip().split()).casefold()
+            elif normalized in login_keys:
+                logins[normalized] = " ".join(
+                    value.strip().split()).casefold()
+        locator = sorted(parts.items())
+        has_server = any(key in parts for key in {
+            "server", "address", "addr", "network address", "data source",
+        })
+        has_database = any(key in parts for key in {
+            "database", "initial catalog",
+        })
+        if not (has_server and has_database):
+            indirect = sorted(seen_keys & {
+                "dsn", "filedsn", "attachdbfilename", "attach db filename",
+            })
+            reason = (
+                f" (indirect locator keys: {', '.join(indirect)})"
+                if indirect else ""
+            )
+            raise MetadataError(
+                "SQL Server metadata source must use a connection string "
+                "with explicit Server/Address and Database/Initial Catalog "
+                f"values{reason}. DSN/FILEDSN files, attached database files, "
+                "and a login's mutable default database cannot safely bind a "
+                "semantic artifact to one endpoint."
+            )
+        if not schema:
+            namespace_identity = sorted(logins.items())
+    else:
+        locator = ""
+    raw_identity = json.dumps(
+        {"version": 3, "backend": backend, "schema": schema,
+         "locator": locator, "namespace_identity": namespace_identity},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(
+        raw_identity.encode("utf-8")).hexdigest()
+
+
+def source_fingerprint(cfg, source: str = "default") -> str:
+    """Expected secret-free endpoint fingerprint for one configured source."""
+    canonical = _s(source) or "default"
+    if canonical == "default":
+        db_cfg = cfg.db
+    else:
+        configured = getattr(cfg, "sources", None) or {}
+        if canonical not in configured:
+            raise MetadataError(
+                f"Unknown metadata source {canonical!r}; cannot fingerprint it")
+        db_cfg = configured[canonical]
+    return _db_config_fingerprint(
+        Path(getattr(cfg, "root", ".") or "."), db_cfg)
 
 
 @dataclass(frozen=True)
@@ -925,11 +1102,12 @@ def _collect_constraints(
                 state.edge(
                     cid, target["id"], "foreign_key_references_object",
                     confidence=("confirmed" if ref_status == "resolved"
-                                else "inconclusive"),
+                                and rowset_complete else "inconclusive"),
                     evidence=evidence, collector="db_catalog",
                     authority="observed",
                     attrs={"resolution_status": ref_status,
-                           "column_pairs": pairs})
+                           "column_pairs": pairs,
+                           "rowset_complete": bool(rowset_complete)})
                 state.term(cid, "referenced object",
                            " ".join(filter(None, [referenced_schema,
                                                   referenced_object])))
@@ -2001,6 +2179,11 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
             [built_at, node_count, edge_count,
              [name for name, _db in source_list]],
             separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        source_fingerprints = {
+            name: _db_config_fingerprint(
+                Path(getattr(db.cfg, "root", ".") or "."), db.cfg.db)
+            for name, db in source_list
+        }
         info = {
             "schema_version": str(SCHEMA_VERSION),
             "snapshot_id": fingerprint,
@@ -2013,7 +2196,12 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
             "limit_hits": json.dumps(state.limit_hits, sort_keys=True),
             "fts": "yes" if fts else "no",
             "stale_after_hours": str(limits.stale_after_hours),
+            "source_fingerprints": json.dumps(
+                source_fingerprints, sort_keys=True, separators=(",", ":")),
         }
+        if len(source_fingerprints) == 1:
+            info["source_fingerprint"] = next(
+                iter(source_fingerprints.values()))
         con.executemany("INSERT INTO meta VALUES (?,?)", info.items())
         con.commit()
         con.close()
@@ -2059,16 +2247,30 @@ def _json(value: str) -> dict:
 
 
 class MetadataCatalog:
-    """Read-only question-time interface to ``metadata_catalog.db``."""
+    """Read-only question-time interface to one metadata artifact.
 
-    def __init__(self, path, stale_after_hours: int = 168):
+    ``source`` binds a runtime reader to one canonical database namespace.
+    Older callers may omit it to inspect a legacy multi-source artifact, but
+    the server always supplies it.  The binding is verified from the SQLite
+    ``sources`` table on every open; a copied, stale, or misrouted artifact
+    therefore fails closed before search can return another database's names.
+    """
+
+    def __init__(self, path, stale_after_hours: int = 168,
+                 source: str = "", expected_fingerprint: str = "",
+                 binding_error: str = ""):
         self.path = Path(path)
         self.stale_after_hours = max(int(stale_after_hours or 168), 1)
+        self.source = _s(source)
+        self.expected_fingerprint = _s(expected_fingerprint)
+        self.binding_error = _s(binding_error)
 
     def available(self) -> bool:
         return self.path.exists()
 
     def _open(self) -> sqlite3.Connection:
+        if self.binding_error:
+            raise MetadataError(self.binding_error)
         if not self.available():
             raise MetadataError(
                 f"No metadata catalog at {self.path.name}. Build it with: "
@@ -2089,6 +2291,33 @@ class MetadataCatalog:
                     f"Metadata catalog schema is {found}; this build expects "
                     f"{SCHEMA_VERSION}. Rebuild it with: "
                     "python scripts/build_metadata_catalog.py")
+            if self.source:
+                found_sources = [str(row[0]) for row in con.execute(
+                    "SELECT name FROM sources ORDER BY name")]
+                if found_sources != [self.source]:
+                    con.close()
+                    found = ", ".join(found_sources) or "none"
+                    raise MetadataError(
+                        f"Metadata catalog source mismatch: this runtime is "
+                        f"bound to {self.source!r}, but {self.path.name} "
+                        f"contains {found}. Rebuild only {self.source!r} with: "
+                        "python scripts/build_metadata_catalog.py "
+                        f"--source {self.source}")
+            if self.expected_fingerprint:
+                actual = con.execute(
+                    "SELECT value FROM meta WHERE key='source_fingerprint'"
+                ).fetchone()
+                if (not actual
+                        or str(actual[0]) != self.expected_fingerprint):
+                    con.close()
+                    raise MetadataError(
+                        f"Metadata catalog source fingerprint mismatch for "
+                        f"{self.source or 'the selected source'!r}. Its "
+                        "connection locator or schema changed, or this is a "
+                        "legacy artifact without endpoint binding. Rebuild it "
+                        "before querying: python "
+                        "scripts/build_metadata_catalog.py"
+                        + (f" --source {self.source}" if self.source else ""))
             return con
         except MetadataError:
             raise
@@ -2145,14 +2374,22 @@ class MetadataCatalog:
         }
 
     def describe(self) -> dict:
+        if self.binding_error:
+            return {"available": False,
+                    "source_database": self.source or None,
+                    "detail": self.binding_error,
+                    "how_to_build": "python scripts/build_metadata_catalog.py"}
         if not self.available():
             return {"available": False,
+                    "source_database": self.source or None,
                     "detail": f"No metadata catalog at {self.path.name}.",
                     "how_to_build": "python scripts/build_metadata_catalog.py"}
         try:
             con = self._open()
         except MetadataError as exc:
-            return {"available": False, "detail": str(exc),
+            return {"available": False,
+                    "source_database": self.source or None,
+                    "detail": str(exc),
                     "how_to_build": "python scripts/build_metadata_catalog.py"}
         try:
             meta = self._meta(con)
@@ -2175,8 +2412,11 @@ class MetadataCatalog:
                 hits = []
             return {
                 "available": True,
+                "source_database": self.source or (
+                    sources[0]["name"] if len(sources) == 1 else None),
                 "path": self.path.name,
                 "schema_version": meta.get("schema_version", ""),
+                "source_fingerprint": meta.get("source_fingerprint", ""),
                 "snapshot": self._snapshot(con),
                 "sources": sources,
                 "node_kinds": kinds,
@@ -2250,6 +2490,12 @@ class MetadataCatalog:
 
     def _validate_source(self, con, source: str) -> str:
         name = _s(source)
+        if self.source:
+            if name and name != self.source:
+                raise MetadataError(
+                    f"Metadata catalog is bound to source {self.source!r}; "
+                    f"it cannot answer for {name!r}.")
+            name = self.source
         if not name:
             return ""
         if not con.execute("SELECT 1 FROM sources WHERE name=?", (name,)).fetchone():
@@ -2535,11 +2781,12 @@ class MetadataCatalog:
                 out.append(row)
         return out
 
-    @staticmethod
-    def _unavailable(path: Path) -> dict:
+    def _unavailable(self, path: Path, detail: str = "") -> dict:
         return {
             "available": False,
-            "detail": f"No readable metadata catalog at {path.name}.",
+            "source_database": self.source or None,
+            "detail": (detail or
+                       f"No readable metadata catalog at {path.name}."),
             "how_to_build": "python scripts/build_metadata_catalog.py",
         }
 
@@ -2581,6 +2828,311 @@ class MetadataCatalog:
             code.pop("_id", None)
         return codes, len(rows) > limit
 
+    def _relationship_object(self, con, identifier: str,
+                             source: str) -> sqlite3.Row:
+        """Resolve one physical object inside the already-bound source."""
+        asked = _u(identifier)
+        if not asked:
+            raise MetadataError(
+                "relationship_path needs both from_object and to_object")
+        params: list = [source]
+        if "." in asked:
+            schema, name = asked.rsplit(".", 1)
+            sql = (
+                "SELECT * FROM nodes WHERE source=? AND "
+                "kind IN ('table','view') AND UPPER(schema_name)=? "
+                "AND UPPER(name)=? ORDER BY id LIMIT 3")
+            params.extend([schema, name])
+        else:
+            sql = (
+                "SELECT * FROM nodes WHERE source=? AND "
+                "kind IN ('table','view') AND UPPER(name)=? "
+                "ORDER BY schema_name,id LIMIT 3")
+            params.append(asked)
+        rows = con.execute(sql, params).fetchall()
+        if not rows:
+            # A physical/qualified alias may differ from the display name,
+            # especially where a database folds identifier case.
+            rows = con.execute(
+                "SELECT DISTINCT N.* FROM aliases A JOIN nodes N "
+                "ON N.id=A.node_id WHERE A.source=? AND A.alias_upper=? "
+                "AND N.kind IN ('table','view') "
+                "ORDER BY N.schema_name,N.name,N.id LIMIT 3",
+                (source, asked)).fetchall()
+        if not rows:
+            raise MetadataError(
+                f"No physical table/view {identifier!r} exists in metadata "
+                f"source {source!r}. Use search_metadata first.")
+        identities = {(row["schema_name"], row["name"]) for row in rows}
+        if len(identities) != 1:
+            choices = ", ".join(
+                f"{row['schema_name']}.{row['name']}" for row in rows)
+            raise MetadataError(
+                f"Object {identifier!r} is ambiguous in source {source!r}: "
+                f"{choices}. Pass schema.object explicitly.")
+        return rows[0]
+
+    @staticmethod
+    def _relation_node(row, prefix: str = "next_") -> dict:
+        return {
+            "id": row[f"{prefix}id"],
+            "source": row[f"{prefix}source"],
+            "schema": row[f"{prefix}schema"],
+            "kind": row[f"{prefix}kind"],
+            "object": row[f"{prefix}name"],
+        }
+
+    def _relationship_neighbours(self, con, node: sqlite3.Row,
+                                 source: str) -> tuple[list, bool]:
+        """One bounded ring of native FK and view-lineage neighbours."""
+        limit = MAX_RELATIONS_PER_NODE + 1
+        found: list[dict] = []
+
+        # Referencing object -> referenced object.
+        outgoing = con.execute(
+            "SELECT C.name AS constraint_name,C.attrs AS constraint_attrs,"
+            "F.confidence AS edge_confidence,F.evidence AS edge_evidence,"
+            "F.collector AS edge_collector,F.authority AS edge_authority,"
+            "F.attrs AS edge_attrs,N.id AS next_id,N.source AS next_source,"
+            "N.schema_name AS next_schema,N.kind AS next_kind,"
+            "N.name AS next_name FROM edges O JOIN nodes C ON C.id=O.dst "
+            "JOIN edges F ON F.src=C.id JOIN nodes N ON N.id=F.dst "
+            "WHERE O.src=? AND O.kind='object_has_constraint' "
+            "AND C.kind='constraint' "
+            "AND F.kind='foreign_key_references_object' "
+            "AND N.source=? AND N.kind IN ('table','view') "
+            "ORDER BY C.name,N.schema_name,N.name LIMIT ?",
+            (node["id"], source, limit)).fetchall()
+        for row in outgoing:
+            attrs = _json(row["edge_attrs"])
+            pairs = [{
+                "left_column": pair.get("column"),
+                "right_column": pair.get("referenced_column"),
+                "ordinal": pair.get("ordinal"),
+            } for pair in (attrs.get("column_pairs") or [])]
+            found.append({
+                "next": self._relation_node(row),
+                "relationship": "foreign_key",
+                "direction": "references",
+                "constraint": row["constraint_name"],
+                "column_pairs": pairs,
+                "column_pairs_complete": bool(
+                    attrs.get("rowset_complete", False)),
+                "confidence": row["edge_confidence"],
+                "evidence": row["edge_evidence"],
+                "provenance": {"collector": row["edge_collector"],
+                               "authority": row["edge_authority"]},
+            })
+
+        # Referenced object -> referencing object. Orient every pair to the
+        # direction the path is walking so generated ON clauses stay literal.
+        incoming = con.execute(
+            "SELECT C.name AS constraint_name,C.attrs AS constraint_attrs,"
+            "F.confidence AS edge_confidence,F.evidence AS edge_evidence,"
+            "F.collector AS edge_collector,F.authority AS edge_authority,"
+            "F.attrs AS edge_attrs,N.id AS next_id,N.source AS next_source,"
+            "N.schema_name AS next_schema,N.kind AS next_kind,"
+            "N.name AS next_name FROM edges F JOIN nodes C ON C.id=F.src "
+            "JOIN edges O ON O.dst=C.id JOIN nodes N ON N.id=O.src "
+            "WHERE F.dst=? AND F.kind='foreign_key_references_object' "
+            "AND O.kind='object_has_constraint' AND C.kind='constraint' "
+            "AND N.source=? AND N.kind IN ('table','view') "
+            "ORDER BY C.name,N.schema_name,N.name LIMIT ?",
+            (node["id"], source, limit)).fetchall()
+        for row in incoming:
+            attrs = _json(row["edge_attrs"])
+            pairs = [{
+                "left_column": pair.get("referenced_column"),
+                "right_column": pair.get("column"),
+                "ordinal": pair.get("ordinal"),
+            } for pair in (attrs.get("column_pairs") or [])]
+            found.append({
+                "next": self._relation_node(row),
+                "relationship": "foreign_key",
+                "direction": "referenced_by",
+                "constraint": row["constraint_name"],
+                "column_pairs": pairs,
+                "column_pairs_complete": bool(
+                    attrs.get("rowset_complete", False)),
+                "confidence": row["edge_confidence"],
+                "evidence": row["edge_evidence"],
+                "provenance": {"collector": row["edge_collector"],
+                               "authority": row["edge_authority"]},
+            })
+
+        for direction, join, where in (
+                ("depends_on", "N.id=E.dst", "E.src=?"),
+                ("used_by_view", "N.id=E.src", "E.dst=?")):
+            rows = con.execute(
+                "SELECT E.confidence AS edge_confidence,"
+                "E.evidence AS edge_evidence,E.collector AS edge_collector,"
+                "E.authority AS edge_authority,E.attrs AS edge_attrs,"
+                "N.id AS next_id,N.source AS next_source,"
+                "N.schema_name AS next_schema,N.kind AS next_kind,"
+                f"N.name AS next_name FROM edges E JOIN nodes N ON {join} "
+                f"WHERE {where} AND E.kind='view_depends_on' "
+                "AND N.source=? AND N.kind IN ('table','view') "
+                "ORDER BY N.schema_name,N.name LIMIT ?",
+                (node["id"], source, limit)).fetchall()
+            for row in rows:
+                found.append({
+                    "next": self._relation_node(row),
+                    "relationship": "view_dependency",
+                    "direction": direction,
+                    "constraint": None,
+                    "column_pairs": [],
+                    "column_pairs_complete": False,
+                    "confidence": row["edge_confidence"],
+                    "evidence": row["edge_evidence"],
+                    "provenance": {"collector": row["edge_collector"],
+                                   "authority": row["edge_authority"]},
+                })
+
+        truncated = len(found) > MAX_RELATIONS_PER_NODE
+        # Native FKs precede view lineage; then deterministic object order.
+        found.sort(key=lambda item: (
+            item["relationship"] != "foreign_key",
+            item["next"]["schema"] or "", item["next"]["object"]))
+        return found[:MAX_RELATIONS_PER_NODE], truncated
+
+    @staticmethod
+    def _relationship_sql(start: sqlite3.Row, hops: list[dict]) -> tuple[str, bool]:
+        """A literal join skeleton only when every hop supplies FK columns."""
+        qualified = lambda n: ".".join(filter(None, [
+            str(n.get("schema") or ""), str(n.get("object") or "")]))
+        first = {"schema": start["schema_name"], "object": start["name"]}
+        lines = [f"FROM {qualified(first)} T0"]
+        for position, hop in enumerate(hops, 1):
+            pairs = hop.get("column_pairs") or []
+            if (hop.get("relationship") != "foreign_key" or not pairs
+                    or hop.get("column_pairs_complete") is not True
+                    or any(not pair.get("left_column")
+                           or not pair.get("right_column") for pair in pairs)):
+                return "", False
+            on = " AND ".join(
+                f"T{position - 1}.{pair['left_column']} = "
+                f"T{position}.{pair['right_column']}"
+                for pair in sorted(
+                    pairs, key=lambda pair: int(pair.get("ordinal") or 0)))
+            lines.append(
+                f"  JOIN {qualified(hop['to'])} T{position} ON {on}")
+        return "\n".join(lines), True
+
+    def relationship_path(self, from_object: str, to_object: str,
+                          source: str = "", max_hops: int = 4) -> dict:
+        """Shortest proven FK/view-dependency path inside one source graph."""
+        try:
+            hops_cap = min(max(int(max_hops or MAX_RELATION_HOPS), 1),
+                           MAX_RELATION_HOPS)
+        except (TypeError, ValueError) as exc:
+            raise MetadataError("max_hops must be a whole number") from exc
+        if not self.available():
+            return self._unavailable(self.path)
+        try:
+            con = self._open()
+        except MetadataError as exc:
+            return self._unavailable(self.path, str(exc))
+        try:
+            src = self._validate_source(con, source)
+            if not src:
+                available = [row[0] for row in con.execute(
+                    "SELECT name FROM sources ORDER BY name")]
+                if len(available) != 1:
+                    raise MetadataError(
+                        "relationship_path needs source= for a legacy "
+                        "multi-source artifact")
+                src = str(available[0])
+            start = self._relationship_object(con, from_object, src)
+            goal = self._relationship_object(con, to_object, src)
+            snapshot = self._snapshot(con)
+            if start["id"] == goal["id"]:
+                sql, _ = self._relationship_sql(start, [])
+                return {
+                    "available": True, "found": True,
+                    "source": src, "source_database": src,
+                    "from": self._node(start), "to": self._node(goal),
+                    "hops": [], "hop_count": 0, "sql": sql,
+                    "queryable_join": True, "snapshot": snapshot,
+                }
+
+            queue = deque([(start, [])])
+            visited = {start["id"]}
+            graph_truncated = False
+            found_path: list[dict] | None = None
+            while queue and found_path is None:
+                node, path = queue.popleft()
+                if len(path) >= hops_cap:
+                    continue
+                neighbours, truncated = self._relationship_neighbours(
+                    con, node, src)
+                graph_truncated = graph_truncated or truncated
+                for edge in neighbours:
+                    nxt = edge["next"]
+                    if nxt["id"] in visited:
+                        continue
+                    visited.add(nxt["id"])
+                    hop = {
+                        "from": {"source": src,
+                                 "schema": node["schema_name"],
+                                 "kind": node["kind"],
+                                 "object": node["name"]},
+                        "to": {key: value for key, value in nxt.items()
+                               if key != "id"},
+                        **{key: value for key, value in edge.items()
+                           if key != "next"},
+                    }
+                    candidate = [*path, hop]
+                    if nxt["id"] == goal["id"]:
+                        found_path = candidate
+                        break
+                    if len(visited) >= MAX_RELATION_VISITED:
+                        graph_truncated = True
+                        queue.clear()
+                        break
+                    # Convert the compact node mapping back to the row-like
+                    # keys the neighbour reader consumes.
+                    node_row = con.execute(
+                        "SELECT * FROM nodes WHERE id=?", (nxt["id"],)
+                    ).fetchone()
+                    if node_row is not None:
+                        queue.append((node_row, candidate))
+
+            if found_path is None:
+                return {
+                    "available": True, "found": False,
+                    "source": src, "source_database": src,
+                    "from": self._node(start), "to": self._node(goal),
+                    "hops": [], "hop_count": None,
+                    "searched_hops": hops_cap,
+                    "visited_objects": len(visited),
+                    "graph_truncated": graph_truncated,
+                    "snapshot": snapshot,
+                    "detail": (
+                        "No path of native foreign keys or view dependencies "
+                        f"was found within {hops_cap} hops. Matching column "
+                        "names alone are not promoted to relationships."
+                        + (" The bounded traversal was truncated; absence is "
+                           "inconclusive." if graph_truncated else "")),
+                }
+            sql, queryable = self._relationship_sql(start, found_path)
+            return {
+                "available": True, "found": True,
+                "source": src, "source_database": src,
+                "from": self._node(start), "to": self._node(goal),
+                "hops": found_path, "hop_count": len(found_path),
+                "sql": sql, "queryable_join": queryable,
+                "visited_objects": len(visited),
+                "graph_truncated": graph_truncated,
+                "snapshot": snapshot,
+                "basis": (
+                    "Only database-native foreign keys and view-dependency "
+                    "edges from this source artifact were traversed. "
+                    "Foreign-key column pairs are literal catalog evidence; "
+                    "view lineage does not claim join columns."),
+            }
+        finally:
+            con.close()
+
     def search(self, query: str, source: str = "", kinds: str = "",
                limit: int = 20) -> dict:
         text = _s(query)
@@ -2595,15 +3147,19 @@ class MetadataCatalog:
         if not self.available():
             return self._unavailable(self.path)
         terms = _terms(text)
-        if not terms:
-            return {"available": self.available(), "query": text, "matches": [],
-                    "detail": "No meaningful metadata terms were supplied."}
         try:
             con = self._open()
-        except MetadataError:
-            return self._unavailable(self.path)
+        except MetadataError as exc:
+            return self._unavailable(self.path, str(exc))
         try:
             src = self._validate_source(con, source)
+            if not terms:
+                return {
+                    "available": True, "query": text, "matches": [],
+                    "source_database": src or None,
+                    "snapshot": self._snapshot(con),
+                    "detail": "No meaningful metadata terms were supplied.",
+                }
             wanted = {_u(k) for k in re.split(r"[\s,]+", kinds or "") if k}
             if wanted:
                 available_kinds = {str(row[0]).upper() for row in con.execute(
@@ -2657,6 +3213,7 @@ class MetadataCatalog:
                 entry["texts"].append(_u(hit["text"]))
             if not by_node:
                 return {"available": True, "query": text, "terms": terms,
+                        "source_database": src or None,
                         "matches": [], "count": 0, "truncated": False,
                         "snapshot": self._snapshot(con),
                         "detail": "No indexed metadata matched those terms."}
@@ -2726,6 +3283,7 @@ class MetadataCatalog:
             snapshot = self._snapshot(con)
             return {
                 "available": True, "query": text, "terms": terms,
+                "source_database": src or None,
                 "source_filter": src or None,
                 "kind_filter": sorted(wanted),
                 "matches": ranked[:cap], "count": len(ranked[:cap]),
@@ -2763,8 +3321,8 @@ class MetadataCatalog:
             return self._unavailable(self.path)
         try:
             con = self._open()
-        except MetadataError:
-            return self._unavailable(self.path)
+        except MetadataError as exc:
+            return self._unavailable(self.path, str(exc))
         try:
             src = self._validate_source(con, source)
             params: list = [asked]
@@ -2789,6 +3347,7 @@ class MetadataCatalog:
                 candidates = con.execute(sql, params).fetchall()
             if not candidates:
                 return {"available": True, "identifier": identifier,
+                        "source_database": src or None,
                         "found": False, "snapshot": self._snapshot(con),
                         "detail": "No exact logical name, physical name or alias "
                                   "matched. Use search_metadata first."}
@@ -2800,6 +3359,7 @@ class MetadataCatalog:
             if not src and len(source_names) > 1:
                 return {
                     "available": True, "identifier": identifier,
+                    "source_database": src or None,
                     "found": False, "ambiguous": True,
                     "candidates": [self._node(row) for row in candidates[:cap]],
                     "truncated": len(candidates) > cap,
@@ -2824,6 +3384,7 @@ class MetadataCatalog:
                 choices = list(unresolved_records.values())
                 return {
                     "available": True, "identifier": identifier,
+                    "source_database": src or None,
                     "found": False, "ambiguous": True,
                     "candidates": [self._object_summary(
                         con, row, unresolved_record=row)
@@ -2840,6 +3401,7 @@ class MetadataCatalog:
                 choices = list(physical_candidates.values())
                 return {
                     "available": True, "identifier": identifier,
+                    "source_database": src or None,
                     "found": False, "ambiguous": True,
                     "candidates": [self._object_summary(con, row) for row in
                                    choices[:cap]],
@@ -3097,6 +3659,7 @@ class MetadataCatalog:
                 (chosen["source"],))]
             return {
                 "available": True, "identifier": identifier, "found": True,
+                "source_database": src or subject["source"],
                 "matched_alias": matched_alias,
                 "subject": subject,
                 "object": subject,

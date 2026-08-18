@@ -127,8 +127,19 @@ _SOURCE_SCOPED_TOOLS = (
     # These read the offline multi-source catalog rather than a live DB, but
     # source is the same namespace boundary. A P2Go chat must not discover a
     # default-database object and then present it as P2Go context.
-    "search_metadata", "get_metadata_context",
+    "describe_metadata_catalog", "search_metadata", "get_metadata_context",
 )
+
+# A named secondary database is its own chat silo.  These are the complete
+# capabilities offered inside that silo: generic structural discovery,
+# relationship inspection, and guarded read-only querying.  PeopleSoft,
+# Coupa, wiki/policy, and every curated finance tool are intentionally absent.
+# Keep this allowlist small and positive so a newly registered primary tool
+# cannot silently become reachable from a secondary database conversation.
+SOURCE_SILO_TOOLS = frozenset({
+    "describe_metadata_catalog", "search_metadata", "get_metadata_context",
+    "list_tables", "describe_table", "join_path", "explain_query", "run_sql",
+})
 
 # These names look like generic database discovery, but their implementations
 # are deliberately tied to the primary PeopleSoft engine or to a global
@@ -1682,19 +1693,30 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
     # canonical source is exactly ``default``. This prevents a configured
     # secondary named ``finance`` from being collapsed back to the primary.
     selected_source = str(scope.get("source") or "default").strip().lower()
-    # Secondary database contexts are closed by default. The only data tools
-    # allowed there are the ones whose contract accepts and is hard-pinned to
-    # ``source``; global policy/wiki lookup is source-neutral. A denylist here
-    # would let every newly added primary tool silently reopen this boundary.
+    # Secondary database contexts are closed by default. The only tools
+    # allowed there are the generic contracts accepted by the silo. A
+    # denylist would let every newly added primary/global tool silently reopen
+    # this boundary.
     if (selected_source != "default"
-            and tool_name not in _SOURCE_SCOPED_TOOLS
-            and tool_name not in POLICY_TOOLS):
+            and tool_name not in SOURCE_SILO_TOOLS):
         raise ScopeConflict(
             f"{tool_name} is not source-aware and "
             f"cannot run while source {selected_source!r} is selected; use "
-            "a source-aware metadata/discovery tool or switch Database to "
-            "Finance"
+            "that database's semantic/relationship query path or switch to "
+            "the Finance workspace"
         )
+    if selected_source != "default" and tool_name == "run_sql":
+        if out.get("policy_binds"):
+            raise ScopeConflict(
+                "run_sql.policy_binds would import policy/wiki evidence into "
+                f"source {selected_source!r}; secondary database workspaces "
+                "are database-only"
+            )
+        if str(out.get("business_unit") or "").strip():
+            raise ScopeConflict(
+                "run_sql.business_unit is a PeopleSoft scope disclosure and "
+                f"cannot be applied to source {selected_source!r}"
+            )
     if (scope.get("source") == "default"
             and (not scope.get("business_unit") or not scope.get("ledger"))
             and tool_name in _FINANCE_SCOPE_REQUIRED_TOOLS):
@@ -1775,6 +1797,54 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
                 f"request scope {field}={requested!r}"
             )
     return out
+
+
+def source_result_status(
+    tool_name: str, content: str, request_scope: object
+) -> tuple[bool, str]:
+    """Verify that a generic source-silo result came from its selected DB.
+
+    Argument injection prevents a model from *requesting* another source;
+    this check prevents a stale worker, a mislabeled metadata artifact, or a
+    future wrapper regression from returning another database's payload under
+    the selected workspace.  Secondary results are structured-only because
+    provenance cannot be established from plain text.
+    """
+    scope = request_scope if isinstance(request_scope, Mapping) else {}
+    expected = str(scope.get("source") or scope.get("db") or "").strip()
+    if (not expected or expected.casefold() == "default"
+            or tool_name not in SOURCE_SILO_TOOLS):
+        return True, ""
+    if str(content or "").startswith("TOOL ERROR"):
+        # The ordinary result validator preserves the useful transport/tool
+        # failure.  No successful facts can cross the boundary in an error.
+        return True, ""
+    try:
+        payload = json.loads(content or "")
+    except (json.JSONDecodeError, TypeError):
+        return False, (
+            f"{tool_name} returned non-JSON data, so its database source "
+            f"could not be verified as {expected!r}"
+        )[:240]
+    if not isinstance(payload, Mapping):
+        return False, (
+            f"{tool_name} returned an unexpected result shape, so its "
+            f"database source could not be verified as {expected!r}"
+        )[:240]
+    if payload.get("error"):
+        return True, ""
+    actual = str(payload.get("source_database") or "").strip()
+    if not actual:
+        return False, (
+            f"{tool_name} did not identify the database that produced its "
+            "result"
+        )[:240]
+    if actual != expected:
+        return False, (
+            f"{tool_name} returned source_database={actual!r}, which "
+            f"conflicts with selected database {expected!r}"
+        )[:240]
+    return True, ""
 
 
 def tool_result_status(tool_name: str, content: str) -> tuple[bool, str]:
@@ -2726,6 +2796,21 @@ def source_of_tool(tool_name: str) -> str:
     return _TOOL_SOURCE.get((tool_name or "").strip(), "")
 
 
+def source_of_payload(tool_name: str, payload: object) -> str:
+    """Return result provenance, honoring a generic tool's actual source.
+
+    ``run_sql`` historically meant the primary PeopleSoft connection.  Once
+    the same guarded executor can be bound to P2Go (or any later source), the
+    payload's server-issued ``source_database`` is the authority; continuing
+    to label it PeopleSoft would let a P2Go number masquerade as a GL fact.
+    """
+    if tool_name in SOURCE_SILO_TOOLS and isinstance(payload, Mapping):
+        source = str(payload.get("source_database") or "").strip()
+        if source and source.casefold() != "default":
+            return f"database:{source}"
+    return source_of_tool(tool_name)
+
+
 def untag_payload(raw) -> tuple:
     """Split a turn payload into (tool_name, payload).
 
@@ -2855,17 +2940,19 @@ def tagged_payload_numbers(payloads) -> dict:
 
     for raw in payloads or []:
         tool, raw = untag_payload(raw)
-        label = source_of_tool(tool)
         if isinstance(raw, str):
             try:
                 parsed = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
+                label = source_of_tool(tool)
                 for match in re.findall(r"-?\d[\d,]*(?:\.\d+)?", raw):
                     add(_numeric_key(match), label)
             else:
+                label = source_of_payload(tool, parsed)
                 walk(parsed, label)
                 walk_sums(parsed, label)
         else:
+            label = source_of_payload(tool, raw)
             walk(raw, label)
             walk_sums(raw, label)
     # Ground unit-scaled RESTATEMENTS of payload figures. "$4.55M" for a
@@ -3070,8 +3157,14 @@ def attribution_caveat(findings) -> str:
     if not findings:
         return ""
 
+    def source_label(label: str) -> str:
+        if label.startswith("database:"):
+            name = label.split(":", 1)[1]
+            return f"the {name} database"
+        return SOURCE_LABELS.get(label, label)
+
     def phrase(labels) -> str:
-        named = [SOURCE_LABELS.get(l, l) for l in labels]
+        named = [source_label(l) for l in labels]
         if len(named) == 1:
             return named[0]
         return ", ".join(named[:-1]) + " and " + named[-1]
@@ -3100,7 +3193,7 @@ def attribution_caveat(findings) -> str:
         more = f" and {len(figures) - 3} more" if len(figures) > 3 else ""
         parts.append(
             f"{listed}{more} came from {phrase(actual)}, not from "
-            f"{SOURCE_LABELS.get(claimed, claimed)}.")
+            f"{source_label(claimed)}.")
     return "[Attribution: " + " ".join(parts) + "]"
 
 

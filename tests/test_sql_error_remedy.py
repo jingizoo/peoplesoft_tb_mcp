@@ -14,6 +14,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -71,6 +72,108 @@ class RemedyTests(unittest.TestCase):
         out = self.engine.run_sql(
             "SELECT COUNT(*) AS n FROM PS_BI_HDR WHERE BILL_STATUS = 'INV'")
         self.assertEqual(len(out["rows"]), 1)
+
+    def test_remote_database_links_are_refused_before_execution(self) -> None:
+        for sql in (
+            "SELECT * FROM PS_LEDGER@OTHER_DB",
+            "SELECT * FROM OPENQUERY(REMOTE, 'SELECT 1')",
+            "SELECT * FROM REMOTE_DB.SYSADM.PS_LEDGER",
+            "SELECT * FROM SERVER.REMOTE_DB.SYSADM.PS_LEDGER",
+            "SELECT * FROM FINANCE_DB..PS_LEDGER",
+            "SELECT * FROM [FINANCE_DB]..[PS_LEDGER]",
+            "SELECT * FROM FINANCE_SERVER...PS_LEDGER",
+            "SELECT * FROM [FINANCE_SERVER]...[PS_LEDGER]",
+            "SELECT * FROM FINANCE_DB . dbo . SECRET",
+            "SELECT * FROM [FINANCE_DB]. /* boundary */ [dbo].[SECRET]",
+            "SELECT * FROM [FIN]]ANCE].[dbo].[SECRET]",
+            "SELECT * FROM PS_LEDGER L, FINANCE_DB.dbo.SECRET S",
+            "SELECT * FROM PS_LEDGER L CROSS APPLY "
+            "FINANCE_DB.dbo.GET_ROWS() S",
+            "SELECT * FROM PS_LEDGER L OUTER APPLY "
+            "[FIN]]ANCE].[dbo].[GET_ROWS]() S",
+            "SELECT FINANCE_DB.dbo.GET_SECRET()",
+            "SELECT L.ACCOUNT, FINANCE_DB.dbo.GET_BALANCE(L.ACCOUNT) "
+            "FROM PS_LEDGER L",
+        ):
+            with self.subTest(sql=sql), self.assertRaises(EngineError) as caught:
+                self.engine.run_sql(sql)
+            self.assertIn("selected database source", str(caught.exception))
+
+    def test_remote_database_links_are_refused_before_explain(self) -> None:
+        for sql in (
+            "SELECT * FROM P2GO_ORDER@FINANCE_LINK",
+            "SELECT * FROM OPENQUERY(REMOTE, 'SELECT 1')",
+            "SELECT * FROM FINANCE_DB.SYSADM.PS_LEDGER",
+            "SELECT * FROM SERVER.FINANCE_DB.SYSADM.PS_LEDGER",
+            "SELECT * FROM FINANCE_DB..PS_LEDGER",
+            "SELECT * FROM [FINANCE_DB]..[PS_LEDGER]",
+            "SELECT * FROM FINANCE_SERVER...PS_LEDGER",
+            "SELECT * FROM [FINANCE_SERVER]...[PS_LEDGER]",
+            "SELECT * FROM FINANCE_DB . dbo . SECRET",
+            "SELECT * FROM [FINANCE_DB]. /* boundary */ [dbo].[SECRET]",
+            'SELECT * FROM "FIN""ANCE"."dbo"."SECRET"',
+            "SELECT * FROM PS_LEDGER L, FINANCE_DB.dbo.SECRET S",
+            "SELECT * FROM PS_LEDGER L CROSS APPLY "
+            "FINANCE_DB.dbo.GET_ROWS() S",
+            "SELECT * FROM PS_LEDGER L OUTER APPLY "
+            "[FIN]]ANCE].[dbo].[GET_ROWS]() S",
+            "SELECT FINANCE_DB.dbo.GET_SECRET()",
+            "SELECT L.ACCOUNT, FINANCE_DB.dbo.GET_BALANCE(L.ACCOUNT) "
+            "FROM PS_LEDGER L",
+        ):
+            with self.subTest(sql=sql), self.assertRaises(EngineError) as caught:
+                self.engine.explain_query(sql)
+            self.assertIn("selected database source", str(caught.exception))
+
+    def test_same_database_owner_qualification_remains_supported(self) -> None:
+        # Two-part OWNER.TABLE is intentionally distinct from a SQL Server
+        # database.schema.table or an Oracle @DBLINK.
+        refs = self.engine._table_refs("SELECT * FROM SYSADM.PS_LEDGER")
+        self.assertEqual(refs, {"SYSADM.PS_LEDGER"})
+        self.assertEqual(next(iter(refs)).count("."), 1)
+
+    def test_oracle_local_package_call_is_not_a_remote_reference(self) -> None:
+        sql = self.engine._scrub_sql(
+            "SELECT SYS.DBMS_LOB.SUBSTR(CLOB_COL, 10) FROM LOCAL_TABLE")
+        with patch.object(self.engine.db, "dialect", "oracle"):
+            self.engine._require_local_database_refs(sql)
+
+    def test_sqlserver_unicode_remote_identifiers_fail_closed(self) -> None:
+        statements = (
+            "SELECT * FROM Σ.Δ.Γ.Ω",
+            "SELECT dbo.fn(Σ.Δ.Γ) FROM PS_LEDGER",
+        )
+        with patch.object(self.engine.db, "dialect", "sqlserver"):
+            for sql in statements:
+                with self.subTest(path="run", sql=sql), self.assertRaises(
+                        EngineError) as run_error:
+                    self.engine.run_sql(sql)
+                self.assertIn(
+                    "selected database source", str(run_error.exception))
+                with self.subTest(path="explain", sql=sql), self.assertRaises(
+                        EngineError) as explain_error:
+                    self.engine.explain_query(sql)
+                self.assertIn(
+                    "selected database source", str(explain_error.exception))
+
+        self.assertEqual(
+            self.engine._table_refs("SELECT * FROM Σ.Δ"), {"Σ.Δ"})
+
+    def test_select_into_is_refused_for_execution_and_explain(self) -> None:
+        statements = (
+            "SELECT * INTO P2GO_COPY FROM PS_LEDGER",
+            "WITH X AS (SELECT * FROM PS_LEDGER) "
+            "SELECT * INTO P2GO_COPY FROM X",
+        )
+        for sql in statements:
+            with self.subTest(path="run", sql=sql), self.assertRaises(
+                    EngineError) as run_error:
+                self.engine.run_sql(sql)
+            self.assertIn("INTO", str(run_error.exception))
+            with self.subTest(path="explain", sql=sql), self.assertRaises(
+                    EngineError) as explain_error:
+                self.engine.explain_query(sql)
+            self.assertIn("INTO", str(explain_error.exception))
 
 
 class EvalMatcherTests(unittest.TestCase):

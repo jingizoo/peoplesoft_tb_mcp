@@ -20,16 +20,16 @@ From the project root:
 
 The default build reads the primary `db:` connection as source `default`, plus
 every database configured under `sources:`. It applies the PeopleTools overlay
-to `default` unless told otherwise. Useful scoped builds are:
+to `default` unless told otherwise. Each source is published to its own atomic
+SQLite artifact. The file holds both semantic-search nodes and relationship
+edges; there is no second process graph or shared cross-database catalog.
 
-`--source` REPLACES the whole artifact — it is not an incremental refresh.
-A build naming one source produces a catalog containing only that source, and
-because the write is atomic the result looks complete. Name every source you
-want indexed, or omit the flag entirely (the normal case, and what cron uses).
+`--source` chooses which independent artifacts to refresh. It never patches or
+replaces an unmentioned source's file. Omit it in the normal scheduled job to
+refresh every configured database.
 
 ```bash
-# Only the PeopleSoft primary and a named warehouse — anything else
-# configured is DROPPED from the rebuilt catalog
+# Refresh only these two source artifacts; every other source is unchanged
 .venv/bin/python scripts/build_metadata_catalog.py --source default,warehouse
 
 # PeopleTools is on a different selected source
@@ -39,15 +39,41 @@ want indexed, or omit the flag entirely (the normal case, and what cron uses).
 # Build native database structure only
 .venv/bin/python scripts/build_metadata_catalog.py --peopletools-source none
 
-# Put the artifact in a separately protected location
-.venv/bin/python scripts/build_metadata_catalog.py --out /secure/path/metadata_catalog.db
+# Put one selected source's artifact in a separately protected location
+.venv/bin/python scripts/build_metadata_catalog.py --source warehouse \
+  --peopletools-source none --out /secure/path/warehouse_metadata.db
 ```
 
-Without `--out`, the artifact is `metadata_catalog.db` beside the active
-configuration. It is git-ignored and written with owner-only permissions
-(`0600`). The builder writes `metadata_catalog.db.building` first and atomically
-replaces the readable artifact only after a usable snapshot commits. A failed
-or empty rebuild does not destroy the last good catalog.
+For a primary-only deployment, `default` retains the legacy
+`metadata_catalog.db` path beside the active configuration. In a multi-source
+deployment, every source including `default` is stored under
+`metadata_catalogs/<safe-slug>-<source-hash>.db`. The source name is hashed
+before it enters a filename, so a configured name cannot escape that directory
+or collide after sanitization. `--out` is accepted only when exactly one source
+is selected.
+
+Artifacts are git-ignored and written with owner-only permissions (`0600`).
+The builder writes a `.building` sibling first and atomically replaces only the
+selected source after a usable snapshot commits. A failed or empty rebuild
+does not destroy that source's last good catalog, and cannot affect another
+database's artifact.
+
+Each artifact stores a one-way, secret-free fingerprint of its backend,
+configured schema, and non-secret database locator. Passwords, wallet secrets,
+access tokens, timeout settings, and pool sizing are excluded. When schema is
+blank, the configured login identity is included only inside the one-way hash
+because it determines `USER_*`/default-schema visibility; the username itself
+is not stored in the artifact. A bare Oracle TNS alias is also bound to the
+hashed contents of the readable `tnsnames.ora` in its configured network or
+wallet directory. SQL Server metadata sources must expose explicit
+`Server`/`Address` and `Database`/`Initial Catalog` values. DSN-only and
+FILEDSN locators, attached database files without an explicit database, and
+connection strings that rely on the login's mutable default database are
+refused because those targets can change without changing `config.yaml`.
+In a multi-source deployment the runtime compares the configured fingerprint
+before every read. Repointing `p2go` (or changing its schema) therefore makes
+the old graph unavailable until `--source p2go` rebuilds it; it cannot silently
+answer with stale semantics from the former endpoint.
 
 Build once during deployment and after a PeopleSoft customization, schema,
 key/constraint, index, view, field-label, translate-value or saved-query
@@ -60,10 +86,18 @@ frequent as that target.
 
 ## Source and schema scope
 
-Source names are a hard namespace boundary. The same table name in `default`
-and `warehouse` remains two different objects, and an ambiguous lookup asks for
-`source=` instead of choosing one. Add intended secondary databases under
-`sources:` in `config.yaml`, for example:
+Source names are a hard namespace and file boundary. The same table name in
+`default` and `warehouse` is stored in two different SQLite files. At runtime,
+`describe_metadata_catalog`, `search_metadata`, and `get_metadata_context`
+resolve one canonical `source=` and open only its bound file. The reader checks
+the file's `sources` table on every open; a copied or misrouted artifact fails
+closed with a rebuild instruction instead of searching the wrong database.
+It also verifies the endpoint fingerprint, so the same source name cannot be
+reused for another locator/schema while retaining the old artifact. The source
+exact match, build time, snapshot age, and fingerprint are visible through
+`describe_metadata_catalog(source="...")`.
+Add intended secondary databases under `sources:` in `config.yaml`, for
+example:
 
 ```yaml
 db:
@@ -125,7 +159,7 @@ relationships are skipped so private query names cannot leak.
 
 ## What the catalog indexes
 
-For every selected database source, the catalog stores:
+For its one database source, each catalog stores:
 
 - tables and views, with source and schema;
 - columns with ordinal, data type, length and nullability;
@@ -135,6 +169,14 @@ For every selected database source, the catalog stores:
   referenced columns, enable/trust or validation status when the database
   exposes it, and delete/update rules when available;
 - native view-to-table/view dependencies on Oracle and SQL Server.
+
+The same file is both the semantic catalog and the relationship graph.
+Secondary-source `join_path` performs a bounded shortest-path traversal in
+that file using only native foreign keys and view dependencies. Foreign-key
+steps include the literal ordered local/referenced column pairs. A composite
+key whose collection was truncated remains visible as inconclusive structure,
+but never emits a partial `ON` clause or a queryable join skeleton. Matching
+column names alone are never promoted to a relationship.
 
 Foreign-key and view targets are resolved only when the exact source/schema
 object was observed in the same build. A catalog reference to an object outside
@@ -165,36 +207,48 @@ Search uses local SQLite FTS5 when available and a deterministic substring
 fallback otherwise. There are no embeddings, vector database, external
 semantic-index service, or bulk metadata call to Gemini.
 
+For a non-PeopleSoft source, the initial semantic vocabulary comes from native
+object/column names and structural keys/view lineage. Oracle table/column
+comments and SQL Server `MS_Description` values are not harvested in this
+slice. The catalog does not ask a model to invent missing business meanings;
+use reviewed site vocabulary when names alone are insufficient.
+
 ## Gemini 2.5 Pro workflow
 
 For an unfamiliar delivered or custom concept, the intended sequence is:
 
 ```text
-search_metadata(query="Phoenix interface")
+search_metadata(query="Phoenix interface", source="p2go")
     -> ranked structural candidates with source, confidence and provenance
 
-get_metadata_context(identifier="ACME_TXN_HDR", source="default")
+get_metadata_context(identifier="ACME_TXN_HDR", source="p2go")
     -> logical/physical mapping, columns, declared keys, foreign-key targets,
        native view dependencies, ordered indexes, labels and codes
 
-profile_record(table="ACME_TXN_HDR", source="default")
-    or describe_table / compare_records / explain_query / join_path
-    -> live shape, population and query-plan evidence
+join_path(from_record="ACME_TXN_HDR", to_record="ACME_TXN_LINE", source="p2go")
+    -> shortest native-FK/view-dependency path from P2Go's own artifact
 
-curated financial tool or guarded run_sql
-    -> the scoped, dated business answer
+describe_table / explain_query
+    -> live shape and query-plan evidence from exactly P2Go
+
+guarded run_sql
+    -> the bounded live P2Go answer
 ```
 
 Gemini 2.5 Pro is prompted to use this discovery chain before querying an
 unfamiliar object. It receives only the bounded search/context results, not the
-whole artifact. If the catalog is unavailable it can fall back to
-`search_records`; when several live candidates remain plausible it should use
-`compare_records` rather than guess.
+whole artifact. A secondary source workspace intentionally has no PeopleSoft
+`search_records`, row profiler, comparison sampler, wiki, memory or curated
+financial tools; if its catalog is missing or several candidates remain
+plausible, it reports that limitation rather than borrowing another source or
+sampling rows to guess. The `/finance` workspace retains its PeopleTools and
+curated-tool discovery behavior.
 
-The final live call must still apply the caller's authorized business-unit
-scope and the question's date, status, ledger and currency basis. The metadata
-tools are classified as structural tools and cannot satisfy the financial
-evidence gate.
+The final live call must still apply every scope/filter the selected source
+can actually prove. Finance includes the caller's authorized business unit,
+date, status, ledger and currency basis; a generic source must not invent those
+PeopleSoft dimensions. Metadata tools are structural only and cannot satisfy
+a row/count/amount or financial-evidence claim.
 
 ## Confidence, relevance and provenance
 
@@ -213,8 +267,10 @@ confidence says how strongly the metadata connects the logical concept to the
 physical object. Neither proves that a future financial query is correct.
 
 `get_metadata_context` returns bounded candidates instead of silently choosing
-when a name exists in multiple sources or schemas. Pass the returned source and
-qualified physical object to live tools exactly as reported.
+when a name exists in multiple schemas within the selected source. Pass the
+returned source and qualified physical object to live tools exactly as
+reported. Every metadata tool result also carries top-level
+`source_database`; a source-silo chat rejects a missing or different value.
 
 ## Configuration and limits
 
@@ -264,8 +320,8 @@ Search results default to 20 and context to 40. Both are bounded to at most
 
 ## Partial, stale and unavailable snapshots
 
-Run `describe_metadata_catalog` before relying on an absence. It reports the
-snapshot time and age, selected sources, source/layer status, configured limit
+Run `describe_metadata_catalog(source="...")` before relying on an absence. It
+reports that source's snapshot time and age, layer status, configured limit
 hits, collector notes, search mode and schema version.
 
 - **Partial:** a source or layer failed, or a configured harvest limit was
@@ -274,8 +330,9 @@ hits, collector notes, search mode and schema version.
 - **Stale:** the artifact is older than `stale_after_hours`. It remains
   readable and every result discloses the age; rebuild it before treating it
   as a picture of the current customization.
-- **Unavailable or incompatible:** search/context return the exact rebuild
-  command. Source databases are not queried as an implicit fallback.
+- **Unavailable, incompatible, or mismatched:** search/context return the exact
+  source-specific rebuild command. Source databases are not queried as an
+  implicit fallback, and an artifact built for another source is never opened.
 - **Layer unavailable:** `notes[].status` says `unavailable` when a platform
   has no structured layer (notably SQLite view dependencies) or an optional
   privacy-safe PeopleTools shape is absent. Other complete layers remain
@@ -306,8 +363,10 @@ the selected schemas, and build only from intended sources.
 
 - Native primary/unique/foreign keys are collected, but database check/default
   expressions, triggers, grants and full definitions are intentionally not.
-  PeopleTools logical index/key definitions are a later layer. Use `join_path`
-  and `explain_query` for live, bounded join-plan verification.
+  Native Oracle comments and SQL Server extended descriptions, plus
+  PeopleTools logical index/key definitions, are later layers. Secondary
+  `join_path` uses the isolated native-edge graph; use `explain_query` for
+  live, bounded plan verification.
 - Oracle and SQL Server expose native view dependency catalogs. SQLite does
   not, so SQLite view lineage is explicitly unavailable rather than inferred
   from stored SQL. Dynamic SQL and dependencies the database itself cannot

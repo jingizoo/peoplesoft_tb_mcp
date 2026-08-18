@@ -112,7 +112,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .badge.dim{background:var(--bg);color:var(--muted)}
 
 /* chat */
-.chatwrap{display:grid;grid-template-rows:1fr auto auto auto;height:100vh}
+.chatwrap{display:grid;grid-template-rows:auto 1fr auto auto auto;height:100vh}
 .msgs{overflow:auto;padding:18px;display:flex;flex-direction:column;gap:14px}
 .msg{max-width:min(760px,92%);padding:11px 14px;border-radius:12px;white-space:pre-wrap;line-height:1.6}
 .msg.me{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
@@ -130,10 +130,27 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .composer input:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .chat-context{display:flex;align-items:center;gap:8px;padding:8px 18px 0;background:var(--panel);
   color:var(--muted);font-size:11.5px;border-top:1px solid var(--line);flex-wrap:wrap}
-.chat-source{display:flex;align-items:center;gap:5px;color:var(--muted)}
-.chat-source select{padding:4px 8px;border:1px solid var(--line);border-radius:6px;
-  background:var(--bg);color:var(--ink);font-weight:600}
-.chat-source select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.chat-workspaces{display:flex;align-items:center;gap:6px;padding:10px 18px 0;background:var(--panel);
+  border-top:1px solid var(--line);overflow-x:auto}
+.workspace-button{position:relative;border:1px solid var(--line);border-radius:8px;background:var(--bg);
+  color:var(--muted);font:600 12px ui-monospace,Menlo,monospace;padding:6px 10px;cursor:pointer;
+  white-space:nowrap}
+.workspace-button.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.workspace-button .workspace-count{display:inline-flex;align-items:center;justify-content:center;
+  min-width:16px;height:16px;margin-left:5px;padding:0 4px;border-radius:10px;background:var(--accent);
+  color:#fff;font:700 10px system-ui,sans-serif}
+.source-badge{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);
+  border-radius:20px;padding:2px 8px;background:var(--bg);color:var(--muted);
+  font:650 11px ui-monospace,Menlo,monospace;white-space:nowrap}
+.source-badge.secondary{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.msg.me .source-badge{border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.14);
+  color:#fff;margin-bottom:5px}
+.source-command-menu{margin:0 18px 8px;padding:8px;border:1px solid var(--line);border-radius:9px;
+  background:var(--panel);display:flex;gap:7px;flex-wrap:wrap;box-shadow:var(--shadow)}
+.source-command-menu button{border:1px solid var(--line);border-radius:7px;background:var(--bg);
+  color:var(--ink);padding:6px 9px;cursor:pointer;text-align:left}
+.source-command-menu small{display:block;color:var(--muted);margin-top:2px}
+.command-error{margin:0 18px 8px;color:var(--bad);font-size:12px}
 .build-tag{margin-left:auto;color:var(--muted);font-size:11px;font-family:ui-monospace,monospace;cursor:help}
 .scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .tool-card{margin:6px 0}
@@ -410,6 +427,72 @@ const makeSessionId=()=>{
 // themselves disappear from the page.
 let CHAT_SESSION_ID=makeSessionId();
 let CHAT_RESETTING=false;
+// One database means one conversation.  These source workspaces intentionally
+// live only for this page lifetime: a reload still starts fresh visible and
+// provider histories, while switching between /finance and /p2go no longer
+// destroys either one's context or leaves both systems in one transcript.
+let ACTIVE_CHAT_SOURCE='default';
+const CHAT_SILOS=new Map();
+
+function chatSourceDescriptors(){
+  const configured=(META&&META.sources)||[];
+  const list=configured.length?configured:[{source:'default'}];
+  return list.map(item=>{
+    const source=String(item.source||'default');
+    const primary=source==='default';
+    return {...item,source,
+      command:String(item.command||(primary?'finance':source)).toLowerCase(),
+      aliases:Array.isArray(item.aliases)?item.aliases.map(x=>String(x).toLowerCase()):
+        (primary?['ps','peoplesoft']:[]),
+      label:String(item.label||(primary?'Finance':source)),
+      mode:String(item.mode||(primary?'finance':'semantic_read_only')),
+      curated_tools:item.curated_tools===undefined?primary:Boolean(item.curated_tools)};
+  });
+}
+function descriptorForSource(source){
+  return chatSourceDescriptors().find(s=>s.source===String(source||'default'))||null;
+}
+function sourceForCommand(command){
+  const token=String(command||'').toLowerCase();
+  const found=chatSourceDescriptors().find(s=>
+    s.command===token||s.aliases.includes(token));
+  return found?found.source:null;
+}
+function sourceCommand(source){
+  const d=descriptorForSource(source);
+  return '/'+(d?d.command:String(source||'finance'));
+}
+function sourceBadgeHtml(source){
+  const d=descriptorForSource(source)||{label:String(source),mode:'semantic_read_only'};
+  const cls=d.source==='default'?'source-badge':'source-badge secondary';
+  return '<span class="'+cls+'">'+esc(sourceCommand(d.source))+' · '+esc(d.label)+'</span>';
+}
+function ensureChatSilos(){
+  chatSourceDescriptors().forEach(d=>{
+    if(CHAT_SILOS.has(d.source)) return;
+    CHAT_SILOS.set(d.source,{
+      source:d.source,descriptor:d,sessionId:makeSessionId(),generation:0,
+      scope:d.source==='default'?null:{source:d.source},messagesNode:null,
+      resetting:false,running:0,unread:0,draft:''
+    });
+  });
+  if(!CHAT_SILOS.has(ACTIVE_CHAT_SOURCE)) ACTIVE_CHAT_SOURCE='default';
+  const active=CHAT_SILOS.get(ACTIVE_CHAT_SOURCE);
+  if(active){
+    CHAT_SCOPE=active.scope;
+    CHAT_SESSION_ID=active.sessionId;
+    CHAT_RESETTING=active.resetting;
+  }
+  return active;
+}
+function activeChatSilo(){ return ensureChatSilos(); }
+function activeMessages(){
+  const silo=activeChatSilo();
+  return silo&&silo.messagesNode?silo.messagesNode:$('#msgs');
+}
+function isLiveSiloTurn(silo,sessionId,generation){
+  return Boolean(silo&&silo.sessionId===sessionId&&silo.generation===generation);
+}
 
 const REQ_TIMEOUT_MS=180000;
 async function api(path,opts){
@@ -541,7 +624,7 @@ function canonicalScope(value){
 function scopeLabel(value){
   if(!value) return 'Choose financial scope';
   if(value.source&&value.source!=='default')
-    return 'database '+value.source+' — ad-hoc only';
+    return 'database '+value.source+' — read-only semantic & relationship queries';
   if(value.source==='default'&&(!value.business_unit||!value.ledger))
     return 'Finance database — choose financial scope';
   const fy=value.fiscal_year?('FY'+value.fiscal_year):'any year';
@@ -550,40 +633,52 @@ function scopeLabel(value){
   const unit=value.business_unit+(name?(' '+name):'');
   return unit+' · '+value.ledger+' · '+fy+' · '+per;
 }
-// The Ask view is the visible product surface, so its database control is
-// constructed in the always-visible context bar. The older #f-source lives
-// in the hidden browse toolbar and is deliberately not relied upon here.
-function buildChatSourceSelect(){
-  const list=(META&&META.sources)||[];
-  if(list.length<2) return null;
-  const label=el('label','chat-source');
-  label.id='chat-source-label';
-  label.append(el('span',null,'Database'));
-  const sel=el('select');
-  sel.id='chat-source';
-  sel.setAttribute('aria-label','Database context');
-  list.forEach(s=>sel.append(new Option(
-    s.source==='default'?'Finance':s.source, s.source)));
-  sel.value=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
-  sel.onchange=()=>setChatSource(sel.value);
-  label.append(sel);
-  return label;
+function updateWorkspaceButtons(){
+  document.querySelectorAll('.workspace-button').forEach(button=>{
+    const silo=CHAT_SILOS.get(button.dataset.source);
+    button.classList.toggle('on',button.dataset.source===ACTIVE_CHAT_SOURCE);
+    button.setAttribute('aria-current',
+      button.dataset.source===ACTIVE_CHAT_SOURCE?'page':'false');
+    const count=button.querySelector('.workspace-count');
+    const n=silo?(silo.running+silo.unread):0;
+    if(count){ count.textContent=n?String(n):''; count.hidden=!n; }
+  });
 }
-// Database is a hard boundary, unlike year and period defaults. Changing
-// this select always goes through setChatScope, which is the same path used
-// by the financial scope chooser and therefore the same scope sent to chat.
-function setChatSource(source){
-  const name=String(source||'default');
-  const current=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
-  if(name===current) return;
-  if(name==='default'){
-    setChatScope(LAST_FINANCE_SCOPE||{source:'default'},true);
-    return;
+function buildChatWorkspaceBar(){
+  ensureChatSilos();
+  const bar=el('div','chat-workspaces');
+  bar.setAttribute('aria-label','Database workspaces');
+  chatSourceDescriptors().forEach(d=>{
+    const button=el('button','workspace-button',esc('/'+d.command)+
+      '<span class="workspace-count" hidden></span>');
+    button.type='button';button.dataset.source=d.source;
+    button.title=d.role||d.label;
+    button.onclick=()=>activateChatSource(d.source,true);
+    bar.append(button);
+  });
+  return bar;
+}
+function activateChatSource(source,focusComposer){
+  ensureChatSilos();
+  const next=CHAT_SILOS.get(String(source));
+  if(!next) return false;
+  const prior=CHAT_SILOS.get(ACTIVE_CHAT_SOURCE);
+  const oldInput=$('#q');
+  if(prior){
+    prior.scope=CHAT_SCOPE;
+    if(oldInput) prior.draft=oldInput.value;
   }
-  if(CHAT_SCOPE&&(!CHAT_SCOPE.source||CHAT_SCOPE.source==='default'))
-    LAST_FINANCE_SCOPE={...CHAT_SCOPE};
-  setChatScope({source:name},true);
-  dismissScopeChoosers();
+  ACTIVE_CHAT_SOURCE=next.source;
+  next.unread=0;
+  CHAT_SCOPE=next.scope;
+  CHAT_SESSION_ID=next.sessionId;
+  CHAT_RESETTING=next.resetting;
+  if(CHAT_SCOPE) syncScopeControls(CHAT_SCOPE);
+  else syncSourceControl({source:next.source});
+  if(VIEW==='chat') viewChat();
+  updateWorkspaceButtons();
+  if(focusComposer!==false){ const q=$('#q'); if(q)q.focus(); }
+  return true;
 }
 // Populate the database chooser and hide it when there is nothing to
 // choose. A one-item dropdown is a question with one answer — it teaches
@@ -598,8 +693,6 @@ function syncSourceControl(value){
       s.source==='default'?'Finance (all business units)':s.source, s.source)));
   const selected=(value&&value.source)||'default';
   if(sel) sel.value=selected;
-  const chatSel=$('#chat-source');
-  if(chatSel) chatSel.value=selected;
   // BU / ledger / year / period are finance-system concepts. On another
   // database they have no meaning and no honest value to show, so they are
   // hidden rather than left displaying a stale selection that reads as if
@@ -650,6 +743,7 @@ function renderBuildTag(node){
   tag.title=Object.entries(b).map(([k,v])=>k+': '+v).join('\n');
 }
 function applyScopeCatalog(){
+  ensureChatSilos();
   // Learn unit names HERE, because this is the one function both routes into
   // the catalog call. The background loader is skipped entirely when the
   // server's scope cache is already warm — /api/meta then carries the whole
@@ -708,7 +802,8 @@ function updateScopeChip(){
   chip.textContent=scopeLabel(CHAT_SCOPE);
 }
 function setChatScope(value,announce){
-  const previousSource=(CHAT_SCOPE&&CHAT_SCOPE.source)||'default';
+  ensureChatSilos();
+  const previousSource=ACTIVE_CHAT_SOURCE;
   let next=canonicalScope(value);
   // Switching back to Finance before a BU has ever been selected removes
   // the secondary source pin and returns to the honest "choose" state. It
@@ -716,14 +811,16 @@ function setChatScope(value,announce){
   if(!next){
     if(!value||String(value.source||'')!=='default') return;
     const changed=Boolean(CHAT_SCOPE);
-    if(previousSource!=='default') CHAT_SESSION_ID=makeSessionId();
-    CHAT_SCOPE=null; syncSourceControl({source:'default'}); updateScopeChip();
+    if(previousSource!=='default') activateChatSource('default',false);
+    CHAT_SCOPE=null;
+    const finance=CHAT_SILOS.get('default'); if(finance)finance.scope=null;
+    syncSourceControl({source:'default'}); updateScopeChip();
     if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
-    if(announce&&changed&&$('#msgs')){
-      $('#msgs').append(el('div','msg bot',
-        '<div class="who">New database context</div>'+esc(scopeLabel(null))+
-        '<br><span style="color:var(--muted)">Conversation history is isolated from every other scope.</span>'));
-      $('#msgs').scrollTop=$('#msgs').scrollHeight;
+    const msgs=activeMessages();
+    if(announce&&changed&&msgs){
+      msgs.append(el('div','msg bot',
+        '<div class="who">Finance scope changed</div>'+esc(scopeLabel(null))));
+      msgs.scrollTop=msgs.scrollHeight;
     }
     return;
   }
@@ -732,23 +829,22 @@ function setChatScope(value,announce){
     next=canonicalScope({...next,...PENDING_TIME});
   const changed=!CHAT_SCOPE||scopeLabel(CHAT_SCOPE)!==scopeLabel(next);
   const nextSource=(next&&next.source)||'default';
-  // send() captures the session id and drops a response when it no longer
-  // matches. Rotating here (not only in the select handler) also covers a
-  // user who leaves a secondary database through the finance scope chooser.
-  if(previousSource!==nextSource) CHAT_SESSION_ID=makeSessionId();
+  if(previousSource!==nextSource) activateChatSource(nextSource,false);
   if(!next.source||next.source==='default') LAST_FINANCE_SCOPE={...next};
-  CHAT_SCOPE=next; syncScopeControls(next); updateScopeChip();
+  CHAT_SCOPE=next;
+  const silo=CHAT_SILOS.get(nextSource); if(silo)silo.scope=next;
+  syncScopeControls(next); updateScopeChip();
   if(SYNC_TIME_SELECTS) SYNC_TIME_SELECTS();
   // The fiscal-year list costs MIN/MAX aggregates over PS_LEDGER — heavy on
   // a real instance — and at page load nobody has opened the year picker
   // yet. Fetch it LAZILY on first interaction with the selects instead of
   // eagerly on every scope set: page load issues zero PS_LEDGER aggregates.
   SCOPE_YEARS_STALE=true;
-  if(announce&&changed&&$('#msgs')){
-    $('#msgs').append(el('div','msg bot',
-      '<div class="who">New database context</div>'+esc(scopeLabel(next))+
-      '<br><span style="color:var(--muted)">Conversation history is isolated from every other scope.</span>'));
-    $('#msgs').scrollTop=$('#msgs').scrollHeight;
+  const msgs=activeMessages();
+  if(announce&&changed&&msgs&&nextSource==='default'){
+    msgs.append(el('div','msg bot',
+      '<div class="who">Finance scope changed</div>'+esc(scopeLabel(next))));
+    msgs.scrollTop=msgs.scrollHeight;
   }
 }
 document.addEventListener('focusin',e=>{
@@ -857,10 +953,12 @@ function renderScopeChooser(options,onChoose,title){
   return c;
 }
 function dismissScopeChoosers(){
-  document.querySelectorAll('#msgs .scope-chooser').forEach(h=>h.remove());
+  const msgs=activeMessages();
+  if(msgs) msgs.querySelectorAll('.scope-chooser').forEach(h=>h.remove());
 }
 function showScopeChooser(){
-  const msgs=$('#msgs'); if(!msgs) return;
+  if(ACTIVE_CHAT_SOURCE!=='default') return;
+  const msgs=activeMessages(); if(!msgs) return;
   // At most ONE chooser card: clicking the chip repeatedly was stacking
   // identical cards, and a card picked in one copy left the others live.
   dismissScopeChoosers();
@@ -971,11 +1069,13 @@ function hasTable(r){
   return Object.values(r).some(v=>Array.isArray(v)&&v.length>0&&
     v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)));
 }
-async function downloadExport(tool,args,result,btn){
+async function downloadExport(tool,args,result,btn,source){
   const label=btn.textContent;
   btn.textContent='exporting…'; btn.disabled=true;
   try{
-    const r=await fetch('/api/export',{method:'POST',
+    const descriptor=descriptorForSource(source)||descriptorForSource('default');
+    const route='/api/source/'+encodeURIComponent(descriptor.command)+'/export';
+    const r=await fetch(route,{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({tool:tool,args:args||{},result:result})});
     if(!r.ok){
@@ -1092,14 +1192,14 @@ function copyTableButton(table,label){
   return b;
 }
 
-function csvButton(tool,args,result,label,exportView){
+function csvButton(tool,args,result,label,exportView,source){
   const b=el('button','csvbtn',label||'CSV');
   b.type='button'; b.title=CSV_HINT;
   b.setAttribute('aria-label','Download full '+tool+' result as CSV');
   b.onclick=ev=>{ ev.preventDefault(); ev.stopPropagation();
     const exportArgs=Object.assign({},args||{});
     if(exportView) exportArgs._export_view=exportView;
-    downloadExport(tool,exportArgs,result,b); };
+    downloadExport(tool,exportArgs,result,b,source||'default'); };
   return b;
 }
 
@@ -4228,119 +4328,241 @@ async function openAccount(account,descr,ctx){
 }
 
 /* ---------- chat ---------- */
-function viewChat(){
-  const w=$('#wrap'); w.style.padding='0'; w.innerHTML='';
-  const wrap=el('div','chatwrap');
-  const msgs=el('div','msgs'); msgs.id='msgs';
-  msgs.setAttribute('role','log');
-  msgs.setAttribute('aria-live','polite');
-  msgs.setAttribute('aria-relevant','additions');
+function populateSiloIntro(silo,status){
+  const msgs=silo.messagesNode; if(!msgs)return;
+  msgs.innerHTML='';
+  const d=silo.descriptor;
   const hero=el('div','hero');
-  hero.innerHTML='<h1>Ask your finance data anything</h1>'+
-    '<p>Ask in plain language. The agent queries each configured system of record and dynamically builds the relevant '+
-    'tables, controls, statements, customer views, and approved wiki evidence inside this conversation.</p>';
+  if(silo.source==='default'){
+    hero.innerHTML='<h1>Ask Finance</h1>'+sourceBadgeHtml(silo.source)+
+      '<p>This workspace uses primary finance-system scopes, curated controls, '+
+      'and source-grounded finance evidence. Other databases never enter this conversation.</p>';
+  }else{
+    hero.innerHTML='<h1>Ask '+esc(d.label)+'</h1>'+sourceBadgeHtml(silo.source)+
+      '<p>This workspace answers only from '+esc(d.label)+
+      ' using read-only semantic and relationship discovery plus guarded queries. '+
+      'Finance scopes and curated controls are not available here.</p>';
+  }
   msgs.append(hero);
-  if(!CHAT_SCOPE){
+  if(silo.source==='default'&&!silo.scope){
     const holder=el('div','inline scope-chooser');
     holder.append(renderScopeChooser(
       flattenScopes(META.financial_scopes||[]),()=>dismissScopeChoosers(),
-      'Choose a scope for financial questions'
-    ));
+      'Choose a scope for financial questions'));
     msgs.append(holder);
   }
-  const chips=el('div','starter-groups');
-  chips.id='chat-starters';
-  chips.hidden=Boolean(CHAT_SCOPE&&CHAT_SCOPE.source&&
-    CHAT_SCOPE.source!=='default');
-  const starterGroups=["Billing & AR","Accounts payable","GL & close"].map(label=>{
-    const box=el('div','starter-group');
-    box.append(el('div','starter-label',esc(label)));
-    const row=el('div','chips');box.append(row);chips.append(box);return row;
-  });
-  const coupaAuthority='coupa';
-  // Every chip below is PINNED to an eval case with the same question
-  // text (smoke enforces it), so a suggestion on this page is a promise
-  // the suite keeps — never an untested guess.
-  const accrualQuestion=(META.procurement&&META.procurement.authority===coupaAuthority)?
-    'Which current Coupa PO lines have net receipt activity above eligible invoice coverage?':
-    'Which current PO-linked received-not-invoiced items in the configured ERP should we review today?';
-  ['Give me total finalized invoice amount',
-   'Show AR aging and reconcile it to the GL control account',
-   'Which customers are overdue or in dispute?',
-   'Where is billing stuck before AR?',
-   'Find the custom billing-interface record for rejected rows; do not assume it starts with PS_.',
-   'How much did we owe vendors at the selected period end?',
-   'Any confirmed duplicate vendor payments?',
-   accrualQuestion,
-   'Is AP complete for month-end?',
-   'Does the trial balance balance?',
-   'Which journals still need action before close?',
-   'Are we ready to close GL?',
-   'What needs my attention today?'].forEach((q,i)=>{
-    const c=el('button','chip',esc(q)); c.type='button';
-    c.onclick=()=>{$('#q').value=q;send();};
-    starterGroups[i<5?0:i<9?1:2].append(c);
-  });
+  if(status) msgs.append(el('div','empty',esc(status)));
+}
+function ensureSiloMessages(silo){
+  if(silo.messagesNode) return silo.messagesNode;
+  const msgs=el('div','msgs');
+  msgs.dataset.source=silo.source;
+  msgs.setAttribute('role','log');
+  msgs.setAttribute('aria-live','polite');
+  msgs.setAttribute('aria-relevant','additions');
+  silo.messagesNode=msgs;
+  populateSiloIntro(silo);
+  return msgs;
+}
+function refreshFinanceScopeChooser(silo){
+  if(!silo||silo.source!=='default'||silo.scope||
+     !flattenScopes(META.financial_scopes||[]).length)return;
+  const existing=silo.messagesNode&&silo.messagesNode.querySelector('.scope-chooser');
+  if(!existing)return;
+  const holder=el('div','inline scope-chooser');
+  holder.append(renderScopeChooser(
+    flattenScopes(META.financial_scopes||[]),()=>dismissScopeChoosers(),
+    'Choose a scope for financial questions'));
+  existing.replaceWith(holder);
+}
+function parseSourceCommand(input){
+  const text=String(input||'').trim();
+  if(text==='/') return {kind:'menu'};
+  if(!text.startsWith('/')) return {kind:'question',question:text};
+  const match=text.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
+  if(!match) return {kind:'unknown',token:text.slice(1).split(/\s/,1)[0]};
+  const token=match[1].toLowerCase();
+  const source=sourceForCommand(token);
+  if(!source) return {kind:'unknown',token};
+  const question=String(match[2]||'').trim();
+  return question?{kind:'question',source,question,command:token}:
+    {kind:'switch',source,command:token};
+}
+function removeSourceCommandMenu(){
+  const menu=$('#source-command-menu');if(menu)menu.remove();
+  const error=$('#source-command-error');if(error)error.remove();
+}
+function showSourceCommandMenu(filter){
+  removeSourceCommandMenu();
+  const comp=$('#chat-composer');if(!comp)return;
+  const wanted=String(filter||'').replace(/^\//,'').toLowerCase();
+  const menu=el('div','source-command-menu');menu.id='source-command-menu';
+  menu.setAttribute('role','listbox');
+  chatSourceDescriptors().filter(d=>!wanted||d.command.startsWith(wanted)||
+    d.aliases.some(a=>a.startsWith(wanted))).forEach(d=>{
+      const button=el('button',null,'<b>'+esc('/'+d.command)+'</b><small>'+esc(d.label)+
+        (d.source==='default'?' · curated finance':' · semantic/relationship, read-only')+
+        '</small>');
+      button.type='button';button.onclick=()=>{
+        const q=$('#q');if(q)q.value='';
+        removeSourceCommandMenu();activateChatSource(d.source,true);
+      };
+      menu.append(button);
+    });
+  if(!menu.children.length) menu.append(el('div','empty','No matching data workspace.'));
+  comp.before(menu);
+}
+function showUnknownSourceCommand(token){
+  removeSourceCommandMenu();
+  const comp=$('#chat-composer');if(!comp)return;
+  const available=chatSourceDescriptors().map(d=>'/'+d.command).join(', ');
+  const box=el('div','command-error',esc(
+    'Unknown data workspace /'+token+'. Available: '+available+'.'));
+  box.id='source-command-error';box.setAttribute('role','alert');
+  comp.before(box);
+}
+async function clearActiveSilo(){
+  const silo=activeChatSilo();
+  if(!silo||silo.resetting)return;
+  silo.resetting=true;
+  if(silo.source===ACTIVE_CHAT_SOURCE)CHAT_RESETTING=true;
+  const oldSessionId=silo.sessionId;
+  silo.sessionId=makeSessionId();silo.generation+=1;silo.running=0;silo.unread=0;
+  if(silo.source===ACTIVE_CHAT_SOURCE)CHAT_SESSION_ID=silo.sessionId;
+  populateSiloIntro(silo,'Clearing '+sourceCommand(silo.source)+' history…');
+  const q=$('#q'),sendButton=$('#send'),clearButton=$('#clr');
+  if(silo.source===ACTIVE_CHAT_SOURCE){
+    if(q)q.disabled=true;if(sendButton)sendButton.disabled=true;
+    if(clearButton)clearButton.disabled=true;
+  }
+  updateWorkspaceButtons();
+  try{
+    await api('/api/chat/reset',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:oldSessionId})});
+    populateSiloIntro(silo,'History cleared. Ask a new question.');
+  }catch(e){
+    populateSiloIntro(silo);
+    silo.messagesNode.append(el('div','msg err',esc(
+      'A new '+sourceCommand(silo.source)+' chat was started, but old history cleanup failed: '+e.message)));
+  }finally{
+    silo.resetting=false;
+    if(silo.source===ACTIVE_CHAT_SOURCE){
+      CHAT_RESETTING=false;
+      const q2=$('#q'),send2=$('#send'),clear2=$('#clr');
+      if(q2){q2.disabled=false;q2.focus();}if(send2)send2.disabled=false;
+      if(clear2)clear2.disabled=false;
+    }
+    updateWorkspaceButtons();
+  }
+}
+function viewChat(){
+  const silo=activeChatSilo();
+  const w=$('#wrap'); w.style.padding='0'; w.innerHTML='';
+  const wrap=el('div','chatwrap');
+  const workspaceBar=buildChatWorkspaceBar();
+  const msgs=ensureSiloMessages(silo);msgs.id='msgs';
+  refreshFinanceScopeChooser(silo);
+  let chips=null;
+  if(silo.source==='default'){
+    chips=el('div','starter-groups');chips.id='chat-starters';
+    const starterGroups=["Billing & AR","Accounts payable","GL & close"].map(label=>{
+      const box=el('div','starter-group');
+      box.append(el('div','starter-label',esc(label)));
+      const row=el('div','chips');box.append(row);chips.append(box);return row;
+    });
+    const coupaAuthority='coupa';
+    // Every chip below is PINNED to an eval case with the same question
+    // text. Secondary workspaces do not borrow these primary-system promises.
+    const accrualQuestion=(META.procurement&&META.procurement.authority===coupaAuthority)?
+      'Which current Coupa PO lines have net receipt activity above eligible invoice coverage?':
+      'Which current PO-linked received-not-invoiced items in the configured ERP should we review today?';
+    ['Give me total finalized invoice amount',
+     'Show AR aging and reconcile it to the GL control account',
+     'Which customers are overdue or in dispute?',
+     'Where is billing stuck before AR?',
+     'Find the custom billing-interface record for rejected rows; do not assume it starts with PS_.',
+     'How much did we owe vendors at the selected period end?',
+     'Any confirmed duplicate vendor payments?',accrualQuestion,
+     'Is AP complete for month-end?','Does the trial balance balance?',
+     'Which journals still need action before close?','Are we ready to close GL?',
+     'What needs my attention today?'].forEach((q,i)=>{
+      const c=el('button','chip',esc(q));c.type='button';
+      c.onclick=()=>{$('#q').value=q;send();};
+      starterGroups[i<5?0:i<9?1:2].append(c);
+    });
+  }
   const context=el('div','chat-context','<span>Active data context</span>');
-  const sourceControl=buildChatSourceSelect();
-  if(sourceControl) context.append(sourceControl);
-  const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
-  contextButton.id='active-scope';
-  contextButton.onclick=()=>{
-    if(SCOPE_LOAD_ERROR){SCOPE_LOAD_ERROR='';loadScopesInBackground();return;}
-    showScopeChooser();
-  };context.append(contextButton);
-  buildTimeSelects().forEach(sel=>context.append(sel));
+  context.insertAdjacentHTML('beforeend',sourceBadgeHtml(silo.source));
+  if(silo.source==='default'){
+    const contextButton=el('button','scope-chip',esc(scopeLabel(CHAT_SCOPE)));
+    contextButton.id='active-scope';
+    contextButton.onclick=()=>{
+      if(SCOPE_LOAD_ERROR){SCOPE_LOAD_ERROR='';loadScopesInBackground();return;}
+      showScopeChooser();
+    };context.append(contextButton);
+    buildTimeSelects().forEach(sel=>context.append(sel));
+  }else{
+    context.append(el('span','sub','Read-only semantic and relationship queries only'));
+  }
   const build=el('span','build-tag');
   build.id='build-tag';
   context.append(build);
   renderBuildTag(build);
-  const comp=el('div','composer');
-  comp.innerHTML='<input id="q" aria-label="Ask a question about your finance data" '+
-    'placeholder="Ask a question…" autocomplete="off">'+
+  const comp=el('div','composer');comp.id='chat-composer';
+  const label='Ask a question in '+silo.descriptor.label;
+  comp.innerHTML='<input id="q" aria-label="'+esc(label)+'" '+
+    'placeholder="Ask '+esc(sourceCommand(silo.source))+'…" autocomplete="off">'+
     '<button class="btn" id="send">Send</button><button class="btn ghost" id="clr">Clear</button>';
-  wrap.append(msgs,chips,context,comp);
+  wrap.append(workspaceBar,msgs);
+  if(chips)wrap.append(chips);
+  wrap.append(context,comp);
   w.append(wrap);
-  $('#send').onclick=send; $('#clr').onclick=async()=>{
-    if(CHAT_RESETTING) return;
-    CHAT_RESETTING=true;
-    const oldSessionId=CHAT_SESSION_ID;
-    // Detach the browser from the old provider history immediately. Disabling
-    // the composer prevents a new turn from becoming invisible while the
-    // server waits for any in-flight old turn to finish resetting.
-    CHAT_SESSION_ID=makeSessionId();
-    const q=$('#q'), sendButton=$('#send'), clearButton=$('#clr');
-    q.disabled=true;sendButton.disabled=true;clearButton.disabled=true;
-    msgs.innerHTML='';msgs.append(el('div','empty','Clearing history…'));
-    try{
-      await api('/api/chat/reset',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:oldSessionId})
-      });
-      msgs.innerHTML='';msgs.append(el('div','empty','History cleared. Ask a new question.'));
-    }catch(e){
-      msgs.innerHTML='';msgs.append(el('div','msg err',
-        esc('A new chat was started, but old history cleanup failed: '+e.message)));
-    }finally{
-      CHAT_RESETTING=false;
-      q.disabled=false;sendButton.disabled=false;clearButton.disabled=false;q.focus();
-    }
-  };
+  const input=$('#q');input.value=silo.draft||'';input.disabled=silo.resetting;
+  $('#send').disabled=silo.resetting;$('#clr').disabled=silo.resetting;
+  $('#send').onclick=send;$('#clr').onclick=clearActiveSilo;
   $('#q').onkeydown=e=>{if(e.key==='Enter')send()};
+  $('#q').oninput=e=>{
+    silo.draft=e.target.value;
+    if(e.target.value.startsWith('/'))showSourceCommandMenu(e.target.value);
+    else removeSourceCommandMenu();
+  };
+  updateWorkspaceButtons();
   $('#q').focus();
 }
 async function send(messageOverride,appendUser){
-  const sendSession=CHAT_SESSION_ID; // stale-answer guard after Clear
-  if(CHAT_RESETTING) return;
-  const i=$('#q');
+  let i=$('#q');
   const supplied=typeof messageOverride==='string';
-  const m=supplied?messageOverride.trim():i.value.trim();
-  if(!m) return;
+  const raw=supplied?messageOverride.trim():i.value.trim();
+  if(!raw)return;
+  const parsed=parseSourceCommand(raw);
+  if(parsed.kind==='menu'){showSourceCommandMenu('/');return;}
+  if(parsed.kind==='unknown'){showUnknownSourceCommand(parsed.token);return;}
+  if(parsed.source){
+    // Clear the old workspace draft before switching, so `/p2go question`
+    // does not reappear in Finance when the user comes back.
+    if(i)i.value='';
+    const prior=CHAT_SILOS.get(ACTIVE_CHAT_SOURCE);if(prior)prior.draft='';
+    removeSourceCommandMenu();activateChatSource(parsed.source,false);
+    if(parsed.kind==='switch'){const q=$('#q');if(q)q.focus();return;}
+    i=$('#q');
+  }
+  const m=parsed.question;
+  if(!m)return;
+  const silo=activeChatSilo();
+  if(!silo||silo.resetting)return;
+  const sendSession=silo.sessionId;
+  const sendGeneration=silo.generation;
+  const sendScope=silo.scope?{...silo.scope}:{};
   if(appendUser===undefined) appendUser=true;
-  const msgs=$('#msgs'); if(msgs.querySelector('.empty')) msgs.innerHTML='';
-  i.value=''; if(appendUser) msgs.append(el('div','msg me',esc(m)));
-  const think=el('div','msg bot','<span class="spin"></span> Working…');
+  const msgs=ensureSiloMessages(silo);
+  msgs.querySelectorAll(':scope > .empty').forEach(node=>node.remove());
+  i.value='';silo.draft='';
+  if(appendUser) msgs.append(el('div','msg me',
+    '<div class="who">'+sourceBadgeHtml(silo.source)+'</div>'+esc(m)));
+  const think=el('div','msg bot','<div class="who">'+sourceBadgeHtml(silo.source)+
+    '</div><span class="spin"></span> Working…');
   msgs.append(think); msgs.scrollTop=msgs.scrollHeight;
+  silo.running+=1;updateWorkspaceButtons();
   // While the one-shot request runs, poll what the turn is DOING so a
   // 40-second query reads as "running get_trial_balance — 38s", not a
   // spinner asking for faith.
@@ -4352,12 +4574,12 @@ async function send(messageOverride,appendUser){
   // answers stale:true for a token that no longer owns the slot.
   const turnToken=makeSessionId();
   const poll=setInterval(async()=>{
-    if(sendSession!==CHAT_SESSION_ID){ clearInterval(poll); return; }
+    if(!isLiveSiloTurn(silo,sendSession,sendGeneration)){ clearInterval(poll); return; }
     try{
       const a=await (await fetch('/api/activity?session_id='+
         encodeURIComponent(sendSession)+'&turn='+
         encodeURIComponent(turnToken))).json();
-      if(sendSession!==CHAT_SESSION_ID){ clearInterval(poll); return; }
+      if(!isLiveSiloTurn(silo,sendSession,sendGeneration)){ clearInterval(poll); return; }
       const secs=Math.round((Date.now()-tStart)/1000);
       const ev=(a.stale?[]:(a.events||[]));
       const running=[...ev].reverse().find(e=>e.status==='running');
@@ -4370,7 +4592,8 @@ async function send(messageOverride,appendUser){
       // validation, a queued turn, spawning an engine — and naming it is
       // the difference between a slow answer and an apparently dead one.
       else if(!a.stale&&a.phase) line=esc(a.phase)+'… '+secs+'s';
-      think.innerHTML='<span class="spin"></span> '+line;
+      think.innerHTML='<div class="who">'+sourceBadgeHtml(silo.source)+
+        '</div><span class="spin"></span> '+line;
     }catch(e){}
   },700);
   try{
@@ -4378,25 +4601,29 @@ async function send(messageOverride,appendUser){
     const timer=setTimeout(()=>ctl.abort(),REQ_TIMEOUT_MS);
     let r;
     try{
-      r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      const route='/api/source/'+encodeURIComponent(silo.descriptor.command)+'/chat';
+      r=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
-          message:m,session_id:sendSession,scope:CHAT_SCOPE||{},
+          message:m,session_id:sendSession,scope:sendScope,
           turn_token:turnToken
         }),signal:ctl.signal});
     } finally { clearTimeout(timer); }
     const j=await r.json();
     clearInterval(poll);
     think.remove();
-    if(sendSession!==CHAT_SESSION_ID) return; // cleared mid-flight — stale answer
+    if(!isLiveSiloTurn(silo,sendSession,sendGeneration)) return;
     if(j.scope_required){
       const holder=el('div','inline scope-chooser');
       holder.append(renderScopeChooser(j.scope_options||[],()=>{
-        dismissScopeChoosers();send(m,false);
+        activateChatSource(silo.source,false);dismissScopeChoosers();send(m,false);
       },j.answer||'Choose a scope'));
       msgs.append(holder);msgs.scrollTop=msgs.scrollHeight;
       return;
     }
-    if(j.scope) setChatScope(j.scope,false);
+    if(j.scope){
+      silo.scope=canonicalScope(j.scope);
+      if(silo.source===ACTIVE_CHAT_SOURCE)setChatScope(j.scope,false);
+    }
     const wantChart=/\b(chart|graph|plot|trend|visuali[sz]e)/i.test(m);
     const turnCards=[], turnCardMeta=[];
     (j.tool_calls||[]).forEach(c=>{
@@ -4407,18 +4634,19 @@ async function send(messageOverride,appendUser){
       const summary=document.createElement('summary');
       summary.innerHTML='<span class="chev">\u25B6</span>'+
         '<span class="dot '+(c.ok===false?'bad':'ok')+'"></span><b>'+esc(c.tool)+'</b>'+
+        sourceBadgeHtml(silo.source)+
         '<span class="args" title="'+esc(JSON.stringify(c.args||{}))+'">'+esc(compactArgs(c.args))+'</span>'+
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       const rb=resultBadge(c.result);
       if(rb) summary.append(el('span','badge '+rb.cls,esc(rb.text)));
       if(c.ok!==false&&c.tool==='get_coupa_rni'){
         if(Array.isArray((c.result||{}).lines)&&(c.result||{}).lines.length)
-          summary.append(csvButton(c.tool,c.args||{},c.result,'Candidate CSV'));
+          summary.append(csvButton(c.tool,c.args||{},c.result,'Candidate CSV',null,silo.source));
         const exportRows=(((c.result||{}).export_evidence||{}).receipt_transactions)||[];
         if(Array.isArray(exportRows)&&exportRows.length)
-          summary.append(csvButton(c.tool,c.args||{},c.result,'Export flags CSV','receipt_export_state'));
+          summary.append(csvButton(c.tool,c.args||{},c.result,'Export flags CSV','receipt_export_state',silo.source));
       }else if(c.ok!==false&&hasTable(c.result))
-        summary.append(csvButton(c.tool,c.args||{},c.result));
+        summary.append(csvButton(c.tool,c.args||{},c.result,null,null,silo.source));
       // CSV downloads a file; Copy puts it on the clipboard. Different
       // jobs — one goes into a folder, the other into the email someone
       // is already writing.
@@ -4453,7 +4681,8 @@ async function send(messageOverride,appendUser){
       const cc=turnCards.find(cd=>cd.querySelector('.viz'));
       if(cc) cc.open=true;
     }
-    if(!r.ok||j.error) msgs.append(el('div','msg err',esc(j.error||j.detail||'Request failed')));
+    if(!r.ok||j.error) msgs.append(el('div','msg err',
+      sourceBadgeHtml(silo.source)+'<br>'+esc(j.error||j.detail||'Request failed')));
     else if(j.answer){
       const b=el('div','msg bot');
       const totalMs=(j.tool_calls||[]).reduce((a,c)=>a+(c.ms||0),0);
@@ -4462,7 +4691,8 @@ async function send(messageOverride,appendUser){
           (turnCardMeta.length===1?'':'s')+
           (totalMs?' in '+(totalMs>=1000?(totalMs/1000).toFixed(1)+'s':totalMs+' ms'):'')+
           ' \u2014 underlined figures open their source.</div>' : '';
-      b.innerHTML='<div class="who">Assistant commentary — cards above are verified source results</div>'+trail+
+      b.innerHTML='<div class="who">'+sourceBadgeHtml(silo.source)+
+        ' · assistant commentary — cards above are verified source results</div>'+trail+
         linkFigures(mdLite(esc(j.answer)),buildFigureIndex(turnCardMeta))+
         (j.turn_id?'<button class="fb" type="button" data-turn="'+esc(j.turn_id)+
           '" aria-label="Flag this answer as wrong or unhelpful">&#128078;</button>':'');
@@ -4487,7 +4717,7 @@ async function send(messageOverride,appendUser){
         both.type='button';
         both.setAttribute('aria-label',
           'Copy this answer together with the source results it cites');
-        both.onclick=()=>copyText(answerWithSources(m,j),both);
+        both.onclick=()=>copyText(answerWithSources(m,j,silo),both);
         acts.append(both);
       }
       b.append(acts);
@@ -4497,12 +4727,19 @@ async function send(messageOverride,appendUser){
   }catch(e){
     clearInterval(poll);
     think.remove();
-    if(sendSession!==CHAT_SESSION_ID) return;
+    if(!isLiveSiloTurn(silo,sendSession,sendGeneration)) return;
     const m2=e.name==='AbortError'
       ? 'Timed out after '+(REQ_TIMEOUT_MS/1000)+'s. The tool call is still running against the '+
         'database — narrow the scope, or raise db.query_timeout_seconds.'
       : e.message;
-    msgs.append(el('div','msg err',esc(m2)));
+    msgs.append(el('div','msg err',sourceBadgeHtml(silo.source)+'<br>'+esc(m2)));
+  }finally{
+    clearInterval(poll);
+    if(isLiveSiloTurn(silo,sendSession,sendGeneration)){
+      silo.running=Math.max(0,silo.running-1);
+      if(silo.source!==ACTIVE_CHAT_SOURCE)silo.unread+=1;
+    }
+    updateWorkspaceButtons();
   }
   msgs.scrollTop=msgs.scrollHeight;
 }
@@ -4530,8 +4767,9 @@ function renderFollowUps(msgs,list){
 // Question, answer, and the tool results behind it — as text, so it can be
 // pasted into a ticket or a review thread by someone who does not have this
 // page open. Tables become TSV for the same reason the table copy does.
-function answerWithSources(question, j){
+function answerWithSources(question, j, silo){
   const parts=['Q: '+question,'','A: '+(j.answer||''),''];
+  if(silo)parts.splice(1,0,'Database: '+sourceCommand(silo.source)+' · '+silo.descriptor.label);
   const scope=j.scope||{};
   const bits=[scope.business_unit,scope.ledger,
               scope.fiscal_year?'FY'+scope.fiscal_year:''].filter(Boolean);

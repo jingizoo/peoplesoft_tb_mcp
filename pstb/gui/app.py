@@ -318,6 +318,19 @@ def _needs_unit_check(path: str) -> bool:
         return False
     if path.startswith("/api/console"):
         return False
+    if path.startswith("/api/source/"):
+        # A named secondary database has no PeopleSoft business-unit
+        # dimension.  It still passes through the signed-in-session branch
+        # below, and the source-bound chat/export handlers apply their own
+        # exact source and raw-SQL policy.  Finance keeps the ordinary BU
+        # middleware because /finance is the primary PeopleSoft workspace.
+        command = path[len("/api/source/"):].split("/", 1)[0]
+        try:
+            return engine.registry.resolve_command(command) == "default"
+        except (AttributeError, DbError):
+            # Let the source route return its precise 404 after sign-in; an
+            # unknown command must not be turned into a misleading BU error.
+            return False
     return not path.startswith(_UNIT_FREE_PREFIXES)
 
 
@@ -1058,19 +1071,34 @@ def _validated_scope(requested: object, catalog: Optional[dict] = None) -> dict:
     # means the person deliberately selected Finance, so an ad-hoc attempt to
     # reach another source must conflict rather than silently widen.
     source_supplied = "source" in raw or "db" in raw
-    source = str(raw.get("source") or raw.get("db") or "").strip()
+    source = ""
     if source_supplied:
         known = (engine.registry.names()
                  if engine.registry is not None else ["default"])
-        resolved = (engine.registry.resolve_name(source)
-                    if engine.registry is not None else "default")
-        if resolved not in known:
+        claims = {}
+        for key in ("source", "db"):
+            if key not in raw:
+                continue
+            claimed = str(raw.get(key) or "").strip()
+            resolved = (engine.registry.resolve_name(claimed)
+                        if engine.registry is not None
+                        else ("default" if claimed in ("", "default")
+                              else claimed))
+            if resolved not in known:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"Unknown database source {claimed!r}. "
+                            f"Configured: {', '.join(known)}."),
+                )
+            claims[key] = resolved
+        distinct = set(claims.values())
+        if len(distinct) > 1:
             raise HTTPException(
                 status_code=400,
-                detail=(f"Unknown database source {source!r}. Configured: "
-                        f"{', '.join(known)}."),
+                detail=("scope.source and scope.db name different database "
+                        "workspaces; choose exactly one."),
             )
-        source = resolved
+        source = next(iter(distinct), "default")
         if source != "default":
             return {"source": source}
         if not any(
@@ -1252,6 +1280,22 @@ def _provider_key(
         scope.get("fiscal_year") or 0,
         scope.get("period") or 0,
     )
+
+
+def _provider_tools_for_scope(tools: list, scope: Optional[dict]) -> list:
+    """Closed tool profile for the selected database workspace.
+
+    The runtime scope guard is the final enforcement layer.  Filtering the
+    provider schema as well keeps the model from wasting rounds attempting
+    PeopleSoft, Coupa, wiki, memory, or future tools that can never be legal
+    inside a generic source silo.
+    """
+    source = str((scope or {}).get("source") or "").strip()
+    if not source or source == "default":
+        return list(tools)
+    from ..guards import SOURCE_SILO_TOOLS
+    return [tool for tool in tools
+            if getattr(tool, "name", "") in SOURCE_SILO_TOOLS]
 
 
 def _session_id(payload: dict) -> str:
@@ -1653,8 +1697,8 @@ def question_report():
     return r
 
 
-@app.post("/api/export")
-def export_csv(payload: dict, request: Request = None):
+def _export_csv_for_source(canonical: str, payload: dict,
+                           request: Request = None):
     """Full-population CSV for one result card.
 
     The browser holds a display-capped preview; this re-runs the same tool
@@ -1682,38 +1726,121 @@ def export_csv(payload: dict, request: Request = None):
     tool = str(body.get("tool") or "")
     if not tool:
         raise HTTPException(status_code=400, detail="tool is required")
+    raw_args = body.get("args") or {}
+    if not isinstance(raw_args, dict):
+        raise HTTPException(status_code=400, detail="args must be an object")
+    args = dict(raw_args)
+
+    # The URL is the export database authority, exactly as it is for chat.
+    # Validate both compatibility aliases independently before normalizing.
+    for scope_key in ("source", "db"):
+        if scope_key not in args:
+            continue
+        claimed = engine.registry.resolve_name(
+            str(args.get(scope_key) or "").strip())
+        if claimed != canonical:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Export workspace is bound to {canonical!r}; "
+                        f"args.{scope_key} requested {claimed!r}."),
+            )
+    args.pop("db", None)
+
+    from ..guards import (SOURCE_SILO_TOOLS, ScopeConflict,
+                          apply_request_scope, source_result_status,
+                          unit_access_block)
+    if canonical != "default":
+        if tool not in SOURCE_SILO_TOOLS:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{tool} is not available in database workspace "
+                        f"{canonical!r}."),
+            )
+        try:
+            args = apply_request_scope(
+                tool, args, {"source": canonical})
+        except ScopeConflict as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        captured = body.get("result")
+        if captured is not None:
+            source_ok, problem = source_result_status(
+                tool, json.dumps(captured, default=str),
+                {"source": canonical},
+            )
+            if not source_ok:
+                raise HTTPException(status_code=400, detail=problem)
+    elif "source" in args:
+        args["source"] = "default"
+
     # The unit rides in the BODY here, where the query-string gate cannot
     # see it — and export re-runs the tool at the full population ceiling,
     # so an unchecked one hands over more rows than the screen ever showed.
     access = access_for_request(request)
-    if access is not None and not access.all_units:
-        args = body.get("args") or {}
+    if canonical == "default" and access is not None and not access.all_units:
         named = str(args.get("business_unit") or "").strip()
         if named and named.upper() not in {"ALL", "*"} and not access.allows(named):
             raise HTTPException(status_code=403, detail=access.refusal(named))
         if not named:
-            args = dict(args)
             args["business_unit"] = _default_unit_for(access)
-            body = dict(body, args=args)
-    registry = _export.build_registry(
-        engine=engine, ar=ar, modules=ModulePacks(engine),
-        report_runner=report_runner, coupa=_coupa_mod.from_env(cfg=cfg),
-        qas=_qas_from_config())
-    out = _guard(_export.export, tool=tool, args=body.get("args") or {},
+    denied = unit_access_block(
+        tool, args, access,
+        allow_raw_sql=bool(
+            getattr(cfg.security, "raw_sql_for_restricted", False)),
+    )
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
+
+    if canonical == "default":
+        registry = _export.build_registry(
+            engine=engine, ar=ar, modules=ModulePacks(engine),
+            report_runner=report_runner, coupa=_coupa_mod.from_env(cfg=cfg),
+            qas=_qas_from_config())
+    else:
+        try:
+            bound_engine = engine.for_source(canonical)
+        except (EngineError, DbError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        # Only run_sql is re-runnable from the generic export registry. The
+        # structural tools export their already source-verified card payload.
+        registry = _export.build_registry(engine=bound_engine)
+    out = _guard(_export.export, tool=tool, args=args,
                  registry=registry, payload=body.get("result"))
+    source_command = next(
+        (str(item["command"]) for item in engine.registry.describe()
+         if item.get("source") == canonical),
+        "finance" if canonical == "default" else "source",
+    )
+    download_name = f"{source_command}_{out['filename']}"
     return Response(
         content=out["csv"], media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition":
-                f'attachment; filename="{out["filename"]}"',
+                f'attachment; filename="{download_name}"',
+            "X-Export-Source": source_command,
             "X-Export-Rows": str(out["rows"]),
             "X-Export-Truncated": "1" if out["truncated"] else "0",
             "X-Export-Rerun": "1" if out["rerun"] else "0",
             "X-Export-Note": out["note"],
             "Access-Control-Expose-Headers":
-                "X-Export-Rows, X-Export-Truncated, X-Export-Rerun, "
-                "X-Export-Note, Content-Disposition",
+                "X-Export-Source, X-Export-Rows, X-Export-Truncated, "
+                "X-Export-Rerun, X-Export-Note, Content-Disposition",
         })
+
+
+@app.post("/api/export")
+def export_csv(payload: dict, request: Request = None):
+    """Backward-compatible Finance export route."""
+    return _export_csv_for_source("default", payload, request)
+
+
+@app.post("/api/source/{command}/export")
+def source_export_csv(command: str, payload: dict, request: Request = None):
+    """CSV export hard-bound to the database workspace in the URL."""
+    try:
+        canonical = engine.registry.resolve_command(command)
+    except DbError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return _export_csv_for_source(canonical, payload, request)
 
 
 @app.get("/api/rollup")
@@ -2054,7 +2181,7 @@ async def chat(payload: dict, request: Request = None):
                                 "Checking the database context")
 
     from ..client.chat import agent_turn, tool_result_limit
-    from ..client.prompt import system_prompt
+    from ..client.prompt import source_silo_prompt, system_prompt
 
     calls: list = []
     # The turn id comes back in THIS dict, not off the function object: a
@@ -2218,29 +2345,21 @@ async def chat(payload: dict, request: Request = None):
             await session.initialize()
             tools = tool_specs(await session.list_tools())
 
+        secondary_source = (
+            str((active_scope or {}).get("source") or "").strip()
+            if (active_scope or {}).get("source") not in (None, "", "default")
+            else ""
+        )
+        provider_tools = _provider_tools_for_scope(tools, active_scope)
+
         def make_provider():
-            prompt = system_prompt(cfg, surface="gui",
-                                   memory=_site_memory(),
-                                   provider=provider_name)
-            if (active_scope
-                    and active_scope.get("source") not in
-                    (None, "", "default")):
-                source = active_scope["source"]
-                prompt += (
-                    "\n\n## Active database context selected by the user\n"
-                    f"- Database source: {source}\n"
-                    "This is a hard database boundary. Only guarded ad-hoc "
-                    "discovery and read-only SQL tools that accept source= "
-                    f"may query {source}, and they must use source={source}. "
-                    "Do not attach PeopleSoft business-unit, ledger, fiscal "
-                    "year, or accounting-period claims to this context. "
-                    "Curated financial tools remain bound to the PeopleSoft "
-                    "primary database; do not use one to claim it answered "
-                    f"from {source}. If the requested fact needs a curated "
-                    "PeopleSoft control, tell the user to switch Database "
-                    "back to Finance."
-                )
-            elif (active_scope
+            if secondary_source:
+                prompt = source_silo_prompt(secondary_source, surface="gui")
+            else:
+                prompt = system_prompt(cfg, surface="gui",
+                                       memory=_site_memory(),
+                                       provider=provider_name)
+            if (not secondary_source and active_scope
                   and not active_scope.get("business_unit")):
                 prompt += (
                     "\n\n## Active Finance database context selected by the user\n"
@@ -2251,7 +2370,7 @@ async def chat(payload: dict, request: Request = None):
                     "transaction total, party amount, or control conclusion "
                     "until the user chooses a financial scope."
                 )
-            elif active_scope:
+            elif not secondary_source and active_scope:
                 prompt += (
                     "\n\n## Active scope selected by the user and verified "
                     "against PS_LEDGER\n"
@@ -2271,7 +2390,7 @@ async def chat(payload: dict, request: Request = None):
                     "fact first and then retrieve the wiki passage; never "
                     "let wiki text replace database evidence."
                 )
-            else:
+            elif not secondary_source:
                 prompt += (
                     "\n\n## Knowledge-only conversation\n"
                     "No financial database scope is selected. You may "
@@ -2287,7 +2406,7 @@ async def chat(payload: dict, request: Request = None):
                 from ..client.llm_claude import ClaudeProvider as P
             else:
                 from ..client.llm_ollama import OllamaProvider as P
-            return P(cfg, prompt, tools)
+            return P(cfg, prompt, provider_tools)
 
         # The user is part of the key: provider entries hold conversation
         # history including prior tool payloads, and reusing one across
@@ -2468,6 +2587,74 @@ async def chat(payload: dict, request: Request = None):
     return {"answer": answer, "tool_calls": calls, "provider": provider_name,
             "scope": active_scope, "suggestions": follow_ups,
             "turn_id": turn_meta.get("turn_id")}
+
+
+@app.post("/api/source/{command}/chat")
+async def source_chat(command: str, payload: dict, request: Request = None):
+    """Run a turn in the database workspace named by the URL.
+
+    The route is the authority.  A browser-side selector or a model-supplied
+    argument must never be able to turn ``/p2go`` into a primary-database
+    request (or vice versa).  The ordinary ``/api/chat`` endpoint remains for
+    older clients; the slash-workspace UI uses this bound endpoint.
+    """
+    if engine.registry is None:
+        raise HTTPException(status_code=404, detail="No data workspaces configured")
+    try:
+        canonical = engine.registry.resolve_command(command)
+    except DbError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    body = dict(payload or {})
+    raw_scope = body.get("scope")
+    if raw_scope is not None and not isinstance(raw_scope, dict):
+        raise HTTPException(status_code=400, detail="scope must be an object")
+    raw_scope = dict(raw_scope or {})
+
+    # Validate both compatibility aliases independently.  Checking only the
+    # first truthy one would let a contradictory second alias survive the
+    # request boundary (for example source=default, db=p2go on /finance).
+    for scope_key in ("source", "db"):
+        if scope_key not in raw_scope:
+            continue
+        claimed = str(raw_scope.get(scope_key) or "").strip()
+        # The browser posts the exact canonical key returned by /api/meta.
+        # Do not case-fold configured keys here: a site-defined source named
+        # ``finance`` is distinct from the primary alias and resolves through
+        # its own collision-safe slash command.
+        claimed_canonical = engine.registry.resolve_name(claimed)
+        if claimed_canonical != canonical:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Database workspace /{command} is bound to "
+                        f"{canonical!r}; body scope {scope_key} requested "
+                        f"{claimed_canonical!r}."),
+            )
+
+    if canonical == "default":
+        # Finance retains its independently validated BU/ledger/time scope.
+        # The explicit sentinel also prevents an ad-hoc P2Go call before the
+        # user has selected a Finance business unit.
+        raw_scope.pop("db", None)
+        raw_scope["source"] = "default"
+        body["scope"] = raw_scope
+    else:
+        finance_fields = {
+            "business_unit", "bu", "ledger", "fiscal_year", "fy",
+            "period", "per", "as_of_date",
+        }
+        stale = sorted(
+            key for key in finance_fields
+            if raw_scope.get(key) not in (None, "", 0, "0")
+        )
+        if stale:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Database workspace /{command} has no PeopleSoft "
+                        f"financial scope; remove: {', '.join(stale)}."),
+            )
+        body["scope"] = {"source": canonical}
+    return await chat(body, request)
 
 
 def _console_reload() -> dict:

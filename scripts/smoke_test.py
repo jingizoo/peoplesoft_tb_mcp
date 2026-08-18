@@ -1498,7 +1498,8 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     # RE-RUNS the tool at the export ceiling rather than serializing the
     # capped preview the browser holds.
     check("result cards offer a full-data CSV download",
-          "csvButton(" in _script and "/api/export" in _script
+          "csvButton(" in _script
+          and "'/api/source/'" in _script and "+'/export'" in _script
           and "hasTable(" in _script,
           "the CSV download button is gone from result cards")
     check("the CSV button does not toggle the card it sits in",

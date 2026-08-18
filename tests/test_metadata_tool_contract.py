@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,11 +38,35 @@ class MetadataToolContractTests(unittest.TestCase):
             {"query", "source", "kinds", "limit"},
         )
         self.assertEqual(
-            set(inspect.signature(describe_catalog).parameters), set())
+            set(inspect.signature(describe_catalog).parameters), {"source"})
         self.assertEqual(
             set(inspect.signature(context).parameters),
             {"identifier", "source", "limit"},
         )
+
+    def test_relationship_graph_is_registered_when_raw_sql_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "db:\n"
+                "  backend: sqlite\n"
+                f"  sqlite_path: {ROOT / 'sample_data' / 'ps_sample.db'}\n"
+                "tools:\n"
+                "  allow_raw_sql: false\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["PSTB_CONFIG"] = str(config)
+            probe = subprocess.run(
+                [sys.executable, "-c", (
+                    "from pstb import server; "
+                    "assert server.cfg.tools.allow_raw_sql is False; "
+                    "assert callable(server.join_path); "
+                    "assert not hasattr(server, 'run_sql')"
+                )],
+                cwd=ROOT, env=env, text=True, capture_output=True,
+            )
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
 
     def test_metadata_is_structural_and_never_financial_evidence(self) -> None:
         from pstb.guards import (FINANCIAL_EVIDENCE_TOOLS, STRUCTURAL_TOOLS,
@@ -82,12 +109,18 @@ class MetadataToolContractTests(unittest.TestCase):
             "search_metadata", "get_metadata_context", "run_sql"])
         self.assertIn("metadata alone is not an answer",
                       live["question"].lower())
+        isolated = cases["metadata-ambiguous-source-schema"]
+        self.assertEqual(isolated["scope"], {"source": "p2go"})
+        self.assertEqual(
+            isolated["expect"]["tool_args_contain"]["source"], "p2go")
+        self.assertNotIn("every configured database",
+                         isolated["question"].lower())
 
     def test_metadata_tools_receive_no_business_unit_scope_argument(self) -> None:
         from pstb.guards import _TOOL_SCOPE_ARGS
 
-        self.assertNotIn("describe_metadata_catalog", _TOOL_SCOPE_ARGS)
-        for tool in ("search_metadata", "get_metadata_context"):
+        for tool in ("describe_metadata_catalog", "search_metadata",
+                     "get_metadata_context"):
             self.assertEqual(
                 _TOOL_SCOPE_ARGS.get(tool), {"source": "source"},
                 "metadata discovery follows the selected database namespace "
