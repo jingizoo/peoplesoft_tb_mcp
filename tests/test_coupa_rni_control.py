@@ -12,14 +12,28 @@ import os
 import urllib.parse
 import unittest
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 from pstb.connectors.coupa import CoupaConnector, from_env
 
 
-TODAY = dt.date(2026, 8, 17)
 COUPA_BU = "US_CORP"
 COUPA_TZ = "America/New_York"
+# The RNI evidence gate compares a payload's as_of_date against the REAL
+# current date in the connector's zone, because a current-only control must
+# not accept a stale cut-off. A frozen literal here therefore expires: these
+# tests passed until the world moved past it, then failed every day after.
+# Track the clock the gate will judge against.
+TODAY = dt.datetime.now(ZoneInfo(COUPA_TZ)).date()
+# The instant that is midnight in the company calendar on the day AFTER
+# TODAY, written in UTC. Computed rather than spelled, because New York
+# midnight is 04:00Z in summer and 05:00Z in winter and a literal is wrong
+# for half the year.
+TOMORROW_MIDNIGHT_UTC = (
+    dt.datetime.combine(TODAY + dt.timedelta(days=1), dt.time(0, 0),
+                        ZoneInfo(COUPA_TZ))
+    .astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
 def receipt(
@@ -868,9 +882,10 @@ class AccountingArithmeticTests(unittest.TestCase):
         boundary = receipt(1, amount="40", line_id=1)
         future = receipt(
             2, amount="60", line_id=2,
-            # Midnight in the configured America/New_York company calendar.
-            # A UTC-midnight event is still on August 17 for this tenant.
-            event_date="2026-08-18T04:00:00Z")
+            # Midnight in the configured America/New_York company calendar
+            # on the following day, so it is genuinely future for this
+            # tenant however the host clock is set.
+            event_date=TOMORROW_MIDNIGHT_UTC)
         control, _ = connector([boundary, future])
         out = run(control)
         self.assertTrue(out["evaluated"])
