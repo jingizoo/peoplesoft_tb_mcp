@@ -144,11 +144,13 @@ either failure mode.
 ### Metadata discovery contract
 
 `scripts/build_metadata_catalog.py` reads catalog structure with SELECT/PRAGMA
-only and publishes `metadata_catalog.db` atomically at mode `0600`. Source and
-schema are part of every identity; never collapse same-named objects across
-databases, never infer a `PS_` prefix, and never treat lexical relevance as
-mapping confidence. The four mapping tiers are `confirmed`, `corroborated`,
-`candidate` and `inconclusive`, each with an evidence basis.
+only and publishes one atomic mode-`0600` artifact per configured database.
+Single-source installs keep `metadata_catalog.db`; multi-source installs use
+`metadata_catalogs/<safe-source>-<hash>.db`. Source selection chooses one whole
+artifact, so same-named objects from different databases are never combined.
+Never infer a `PS_` prefix or treat lexical relevance as mapping confidence.
+The four mapping tiers are `confirmed`, `corroborated`, `candidate` and
+`inconclusive`, each with an evidence basis.
 
 The MCP sequence is intentionally split:
 
@@ -162,9 +164,11 @@ The MCP sequence is intentionally split:
 
 Partial and stale artifacts remain readable with disclosure. Tests and callers
 must treat absence from a partial layer as inconclusive and must expect
-ambiguity responses rather than sort-order selection. The first schema version
-does not collect PK/FK/constraint/dependency lineage, use embeddings, or
-support quoted identifiers that differ only by case. See
+ambiguity responses rather than sort-order selection. Schema version 2 records
+native PK/FK constraints and view dependencies; relationship paths use only
+that declared evidence and never infer a join from matching column names.
+Composite keys collected incompletely remain inconclusive. The catalog does
+not use embeddings or support quoted identifiers that differ only by case. See
 [METADATA_CATALOG.md](METADATA_CATALOG.md) for exact build limits, grants and
 source/dialect rules.
 

@@ -1,9 +1,11 @@
 # Choosing the right record
 
-`search_metadata` is the preferred first step for an unfamiliar delivered,
-custom or cross-database concept. It searches an offline snapshot of physical
-objects, PeopleTools logical records, fields, labels, translate values, page
-use and public saved-query use, while preserving source and schema identity.
+`search_metadata` is the preferred first step for an unfamiliar delivered or
+custom concept inside the active database workspace. Each workspace opens only
+its own offline artifact. `/finance` adds PeopleTools logical records, fields,
+labels, translate values, page use and public saved-query use; a generic
+workspace such as `/p2go` contains that database's native objects, columns,
+keys, indexes and view dependencies.
 
 `search_records` remains the live PeopleTools fallback when that artifact has
 not been built, and it includes approved site-memory facts. A name or
@@ -19,24 +21,32 @@ Names cannot separate those. Contents can.
 
 ## The sequence
 
+In `/finance` the full discrimination sequence is:
+
 ```
-search_metadata(query="open invoice")
-    -> candidates across configured sources
+search_metadata(query="open invoice", source="default")
 get_metadata_context(identifier="ACME_ITEM", source="default")
-    -> mapping, columns, indexes, labels/codes
 profile_record(table="ACME_ITEM", source="default")
-    -> live shape and population
 compare_records(tables=[...], source="default")
-    -> choose if several remain plausible
 curated tool or run_sql(...)
-    -> the scoped business question
+```
+
+In a generic source silo the sequence remains inside that source:
+
+```
+search_metadata(query="failed interface", source="p2go")
+get_metadata_context(identifier="JOB_HDR", source="p2go")
+join_path(from_record="JOB_HDR", to_record="JOB_LINE", source="p2go")
+describe_table(table="JOB_HDR", source="p2go")
+explain_query(...) / run_sql(...)                 # when raw SQL is enabled
 ```
 
 On Gemini 2.5 Pro this sequence is part of the tool-routing prompt. The model
-must use the physical object and source returned by the catalog; it must not add
-`PS_` or guess a company prefix. If an identifier is ambiguous across sources
-or schemas, `get_metadata_context` returns candidates rather than choosing by
-sort order.
+must use the physical object and source returned by the active artifact; it
+must not add `PS_` or guess a company prefix. If an identifier is ambiguous
+across schemas within that source, `get_metadata_context` returns candidates
+rather than choosing by sort order. To inspect another database, switch
+workspaces and run a separate search; one turn never merges source catalogs.
 
 Catalog confidence is separate from search relevance:
 
@@ -76,8 +86,10 @@ An empty record is rarely what a question means, however well its name matches.
 ## Masking
 
 The offline metadata catalog stores and returns structure only, so its search
-and context calls contain no sampled source rows. The first row-bearing step is
-`profile_record` or `compare_records`.
+and context calls contain no sampled source rows. In `/finance`, the first
+row-bearing step may be `profile_record` or `compare_records`; those tools are
+not exposed in a generic source silo, whose first row-bearing step is a guarded
+`run_sql` when raw SQL is enabled.
 
 Sample rows leave this process and reach whichever model is configured. On the
 Gemini provider that means they leave your network.
@@ -168,8 +180,9 @@ and `describe_table` returns the live catalog; both keep columns IN ORDER,
 because order is the whole game: the optimizer can only use an index whose
 leading columns appear in your predicates. A table with no readable index says
 so plainly — every query there is a full scan and no rewrite changes that.
-The first metadata-catalog schema does not collect PK/FK or dependency edges,
-so an ordered index must not be presented as a declared relationship.
+Metadata schema version 2 collects native PK/FK and view-dependency edges.
+`join_path` may present those declared relationships with their exact columns;
+an ordered index or a same-named column alone is still not a declared join.
 
 **`explain_query`.** Asks the optimizer how it WOULD run a SELECT, without
 executing it. Returns the plan, each referenced table's rows and indexes, and

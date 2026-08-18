@@ -41,6 +41,7 @@ from ..guards import (
     units_named_in,
     question_financial_domains,
     filter_scope_payload,
+    source_result_status,
     tool_result_status,
     unit_access_block,
     unsupported_domain_reason,
@@ -369,21 +370,30 @@ def _blocked_result(reason: str, next_step: str) -> str:
 
 def _evidence_nudge(intent: str, db_ok: bool, relevant_financial_db_ok: bool,
                     policy_ok: bool, policy_attempted: bool = False,
-                    db_problem: str = "", user_question: str = "") -> str:
+                    db_problem: str = "", user_question: str = "",
+                    database_source: str = "") -> str:
     """Return the next required evidence phase, or an empty string."""
+    named_database = (
+        f"the {database_source} database" if database_source else "PeopleSoft"
+    )
     if intent == "data" and not db_ok:
         detail = f" The previous database result failed: {db_problem}" if db_problem else ""
         return (
-            "Evidence gate: answer this data question from PeopleSoft, not the "
-            f"wiki. Call the most specific database tool now.{detail}"
+            f"Evidence gate: answer this data question from {named_database}. "
+            f"Call the most specific available database tool now.{detail}"
         )
     if intent == "mixed" and not relevant_financial_db_ok:
         detail = f" The previous database result failed: {db_problem}" if db_problem else ""
         return (
             "Evidence gate: this question combines a financial fact with a "
-            "policy decision. Call the relevant PeopleSoft financial tool now. "
-            f"Do not call the wiki until that result succeeds.{detail}"
+            f"policy decision. Retrieve the database fact from {named_database} "
+            f"first.{detail}"
         )
+    if database_source and intent in ("policy", "mixed"):
+        # A secondary source silo deliberately has no wiki/policy capability.
+        # Let the deterministic final gate explain that boundary instead of
+        # nudging the model toward a tool it was never offered.
+        return ""
     if intent in ("policy", "mixed") and not policy_ok and not policy_attempted:
         return (
             "Evidence gate: retrieve the actual policy passage with wiki_lookup "
@@ -413,6 +423,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     constrained, so ``list_financial_scopes`` can still answer "all BUs".
     """
     request_scope = normalize_request_scope(scope)
+    source_silo = str(request_scope.get("source") or "").strip()
+    if source_silo.casefold() == "default":
+        source_silo = ""
     intent = evidence_intent(user_text)
     # A question that NAMES two units crosses them just as surely as one
     # that says "across all business units" — and that shape was invisible
@@ -554,6 +567,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 policy_attempted,
                 last_db_problem,
                 user_text,
+                source_silo,
             )
             if nudges < MAX_NUDGES and needed:
                 nudges += 1
@@ -702,6 +716,17 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             # The catalog comes back from a server that does not know who
             # asked; narrow it here, where we do.
             out = filter_scope_payload(call.name, out, access)
+            if not blocked:
+                source_ok, source_problem = source_result_status(
+                    call.name, out, request_scope
+                )
+                if not source_ok:
+                    blocked = f"SOURCE_BOUNDARY: {source_problem}"
+                    out = _blocked_result(
+                        blocked,
+                        "Stay in the selected database workspace and retry "
+                        "with a result that identifies that exact source.",
+                    )
             return (index, call, effective_args, blocked, out, elapsed_ms,
                     was_scope_block)
 
@@ -820,20 +845,30 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
         gate_replaced_answer = True
     elif intent == "mixed" and not relevant_financial_db_ok:
         answer = (
-            "I could not obtain successful PeopleSoft financial evidence, so "
+            "I could not obtain successful "
+            + (f"{source_silo} database evidence" if source_silo
+               else "PeopleSoft financial evidence")
+            + ", so "
             "I cannot decide this question. The wiki was not used as a "
             "substitute for the missing financial result."
             + (f" Database detail: {last_db_problem}" if last_db_problem else "")
         )
         gate_replaced_answer = True
     elif intent == "mixed" and not policy_ok:
-        answer = (
-            "The PeopleSoft data was retrieved, but no verified wiki passage "
-            "was available, so I cannot decide whether the result satisfies "
-            "the requested rule."
-            + (f" Wiki detail: {last_policy_problem}"
-               if last_policy_problem else "")
-        )
+        if source_silo:
+            answer = (
+                f"The {source_silo} database fact was retrieved, but this "
+                "database workspace has no policy or wiki source. I cannot "
+                "decide whether it satisfies the requested rule here."
+            )
+        else:
+            answer = (
+                "The PeopleSoft data was retrieved, but no verified wiki passage "
+                "was available, so I cannot decide whether the result satisfies "
+                "the requested rule."
+                + (f" Wiki detail: {last_policy_problem}"
+                   if last_policy_problem else "")
+            )
         gate_replaced_answer = True
     elif intent == "data" and not (
         relevant_financial_db_ok if financial_fact_required else db_ok
@@ -883,19 +918,29 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             )
         else:
             answer = (
-                "I could not obtain a successful PeopleSoft or other governed "
-                "financial result complete for this question. No wiki content "
-                "was used in its place."
+                (f"I could not obtain a successful result from the "
+                 f"{source_silo} database complete for this question."
+                 if source_silo else
+                 "I could not obtain a successful PeopleSoft or other governed "
+                 "financial result complete for this question. No wiki content "
+                 "was used in its place.")
                 + (f" Detail: {last_db_problem}" if last_db_problem else "")
             )
         gate_replaced_answer = True
     elif intent == "policy" and not policy_ok:
-        answer = (
-            "I could not retrieve a verified policy passage from the wiki, so "
-            "I cannot answer this policy question from memory."
-            + (f" Wiki detail: {last_policy_problem}"
-               if last_policy_problem else "")
-        )
+        if source_silo:
+            answer = (
+                f"The {source_silo} workspace contains database semantics, "
+                "relationships, and guarded read-only queries—not policy or "
+                "wiki evidence. I cannot answer this policy question here."
+            )
+        else:
+            answer = (
+                "I could not retrieve a verified policy passage from the wiki, so "
+                "I cannot answer this policy question from memory."
+                + (f" Wiki detail: {last_policy_problem}"
+                   if last_policy_problem else "")
+            )
         gate_replaced_answer = True
 
     # MECHANICAL number grounding. The prompt forbids inventing figures and
@@ -983,7 +1028,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
         turn_id = qlog.log_turn(surface=surface, provider=provider.name,
                                 question=user_text, calls=logged_calls,
                                 rounds=rounds, answer=answer,
-                                hit_round_limit=hit_limit)
+                                hit_round_limit=hit_limit, scope=scope)
         # Per CALL, not on the function. Stashing it on agent_turn made the
         # id a process global that every concurrent turn overwrote: two
         # colleagues asking at once, and a thumbs-down on one answer logged

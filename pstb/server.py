@@ -26,7 +26,8 @@ from .grni import GRNIControl
 from .ar import ARBilling, ARError
 from .anomalies import AnomalyDetector, AnomalyError
 from .metadata import (MetadataCatalog, MetadataError,
-                       catalog_path as _metadata_path)
+                       source_catalog_path as _metadata_path,
+                       source_fingerprint as _metadata_fingerprint)
 from .memory import MemoryError_, SiteMemory
 from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
@@ -40,6 +41,8 @@ from .wiki import WikiError, make_wiki
 cfg = load_config(os.environ.get("PSTB_CONFIG"))
 db = Database(cfg)
 engine = TBEngine(db, cfg)
+from .sources import SourceRegistry
+engine.registry = SourceRegistry(cfg, db)
 journal_status = JournalStatusControl(engine)
 anomaly_detector = AnomalyDetector(db, cfg)
 report_runner = ReportRunner(engine)
@@ -63,13 +66,34 @@ from .procgraph import ProcessGraph, graph_path
 # this process started is picked up without a restart — the build script is
 # run by an administrator, not by the server.
 process_graph = ProcessGraph(graph_path(cfg))
+_default_metadata_fingerprint = ""
+_default_metadata_binding_error = ""
+if cfg.sources:
+    try:
+        _default_metadata_fingerprint = _metadata_fingerprint(cfg, "default")
+    except MetadataError as exc:
+        # Endpoint indirection that cannot be bound safely (for example a
+        # missing tnsnames.ora or a DSN without an explicit server/database)
+        # disables this derived artifact.  It must not stop unrelated MCP
+        # tools or other independently-bound source artifacts from starting.
+        _default_metadata_binding_error = str(exc)
 metadata_catalog = MetadataCatalog(
-    _metadata_path(cfg),
-    stale_after_hours=getattr(cfg.metadata_catalog, "stale_after_hours", 168))
+    _metadata_path(cfg, "default"),
+    stale_after_hours=getattr(cfg.metadata_catalog, "stale_after_hours", 168),
+    source="default",
+    # A historical one-database deployment may already have a v2 catalog
+    # without an endpoint binding. Keep it readable until the next rebuild.
+    # Multi-source deployments fail closed because alias reuse can cross a
+    # real data boundary.
+    expected_fingerprint=_default_metadata_fingerprint,
+    binding_error=_default_metadata_binding_error)
+# Additional readers are tiny immutable bindings over local paths and open a
+# read-only SQLite connection per call. Keep the long-standing singular name
+# above as the primary alias for compatibility with extensions/tests, while
+# every secondary source gets a physically distinct artifact.
+_metadata_catalogs: dict[str, MetadataCatalog] = {}
 metadata_reranker = HybridReranker.from_config(cfg)
 from .psquery import QueryCatalog
-from .sources import SourceRegistry
-engine.registry = SourceRegistry(cfg, db)
 query_catalog = QueryCatalog(engine)
 from .connectors import psquery_api as _qas_mod
 
@@ -135,6 +159,47 @@ def _safe(fn, /, **kw) -> dict:
         return {"error": str(e)}
     except Exception as e:  # keep the agent loop alive on unexpected failures
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _metadata_for_source(source: str = "") -> tuple[str, MetadataCatalog]:
+    """Canonical source name and its source-bound knowledge artifact.
+
+    Resolution happens before opening SQLite, and the reader independently
+    verifies the file contains exactly that source.  These are two separate
+    boundaries on purpose: a bad tool argument gets a useful configured-name
+    error, while a copied or stale file cannot leak a different database's
+    catalog even if routing selected the right name.
+    """
+    name = engine.registry.resolve_name(source)
+    known = engine.registry.names()
+    if name not in known:
+        raise MetadataError(
+            f"Unknown metadata source {source!r}. Available sources: "
+            f"{', '.join(known)}")
+    if name == "default":
+        # Read the public alias each time so controlled test/extension
+        # replacement of the primary reader continues to work.
+        return name, metadata_catalog
+    catalog = _metadata_catalogs.get(name)
+    if catalog is None:
+        fingerprint = ""
+        binding_error = ""
+        try:
+            fingerprint = _metadata_fingerprint(cfg, name)
+        except MetadataError as exc:
+            # Keep source-independent tools available while this one source's
+            # endpoint binding is incomplete.  Every catalog operation will
+            # return the precise fail-closed remedy through binding_error.
+            binding_error = str(exc)
+        catalog = MetadataCatalog(
+            _metadata_path(cfg, name),
+            stale_after_hours=getattr(
+                cfg.metadata_catalog, "stale_after_hours", 168),
+            source=name,
+            expected_fingerprint=fingerprint,
+            binding_error=binding_error)
+        _metadata_catalogs[name] = catalog
+    return name, catalog
 
 
 def _sourced(source: str, method: str, /, **kw) -> dict:
@@ -473,31 +538,40 @@ def get_record_map() -> dict:
 
 
 @mcp.tool()
-def describe_metadata_catalog() -> dict:
+def describe_metadata_catalog(source: str = "") -> dict:
     """Coverage and freshness of the offline metadata intelligence catalog.
-    It reports which database sources and PeopleTools layers were harvested,
-    any build limits/errors, and whether the snapshot is stale or partial.
+    source chooses one configured database (default: the PeopleSoft primary).
+    Each database has a physically separate artifact; this reports that one
+    source's harvested layers, build limits/errors, and snapshot freshness.
     This is STRUCTURE only: it contains no transaction rows or balances and
     cannot support a financial conclusion. If unavailable, return the exact
     offline build command to the user."""
-    return _safe(metadata_catalog.describe)
+    def _describe() -> dict:
+        name, catalog = _metadata_for_source(source)
+        result = catalog.describe()
+        result["source_database"] = name
+        return result
+
+    return _safe(_describe)
 
 
 @mcp.tool()
 def search_metadata(query: str, source: str = "", kinds: str = "",
                     limit: int = 20) -> dict:
     """Find the database object behind natural business/custom terminology.
-    Searches logical PeopleTools records, physical tables/views, fields,
-    labels, translate values, pages and public saved-query use across the
-    offline catalog. It preserves company prefixes and SQLTABLENAME mappings;
-    NEVER add PS_ or another prefix yourself. Results aggregate to a physical
-    object when proven and explain relevance, confidence and provenance.
-    source narrows to one configured database; kinds is an optional comma list
-    such as table,view,record,field. Call get_metadata_context before querying
-    an unfamiliar result. Metadata is not financial evidence."""
+    Searches the selected source's physical tables/views, fields, native keys
+    and view relationships. The default Finance artifact may additionally
+    contain logical PeopleTools records, labels, translate values, pages and
+    public saved-query use. NEVER add PS_ or another prefix yourself. Results
+    explain relevance, confidence and provenance. source selects exactly one
+    physical artifact; kinds is an optional comma list such as
+    table,view,record,field. Call get_metadata_context before querying an
+    unfamiliar result. Metadata is structural, not row/financial evidence."""
     def _search() -> dict:
-        result = metadata_catalog.search(
-            query=query, source=source, kinds=kinds, limit=limit)
+        name, catalog = _metadata_for_source(source)
+        result = catalog.search(
+            query=query, source=name, kinds=kinds, limit=limit)
+        result["source_database"] = name
         matches = result.get("matches") if isinstance(result, dict) else None
         if not isinstance(matches, list) or not metadata_reranker.enabled:
             return result
@@ -512,15 +586,21 @@ def search_metadata(query: str, source: str = "", kinds: str = "",
 @mcp.tool()
 def get_metadata_context(identifier: str, source: str = "",
                          limit: int = 40) -> dict:
-    """Explain one logical record, physical object, field or qualified column
-    from the offline metadata catalog. Returns the proven logical-to-physical
-    mapping, real columns, ordered indexes, field labels and effective-dated
-    translate codes, with confidence/provenance. Ambiguous names return
-    bounded candidates instead of guessing. Use the returned physical_object
-    exactly; then use live/profile/financial tools with caller scope. This
-    structural snapshot contains no transaction values."""
-    return _safe(metadata_catalog.context, identifier=identifier,
-                 source=source, limit=limit)
+    """Explain one object/field from exactly one source's offline catalog.
+    Returns observed columns, ordered indexes, native constraints and view
+    relationships with confidence/provenance. Finance may also return proven
+    PeopleTools logical mappings, labels and translate codes. Ambiguous names
+    return bounded candidates instead of guessing. Use the returned qualified
+    physical object exactly, then obtain live evidence from a tool available in
+    the same workspace. This snapshot contains no transaction values."""
+    def _context() -> dict:
+        name, catalog = _metadata_for_source(source)
+        result = catalog.context(
+            identifier=identifier, source=name, limit=limit)
+        result["source_database"] = name
+        return result
+
+    return _safe(_context)
 
 
 @mcp.tool()
@@ -1096,11 +1176,36 @@ def run_playbook(playbook: str = "", business_unit: str = "", ledger: str = "",
 
 @mcp.tool()
 def list_sources() -> dict:
-    """Databases this agent can query. 'default' is the PeopleSoft primary —
-    every curated tool answers from it. Extra sources are reachable from
-    run_sql / list_tables / describe_table / search_records via source=<name>;
-    use them when the user names a non-PeopleSoft system."""
+    """Configured database workspaces. 'default' is the Finance/PeopleSoft
+    primary with curated controls. Each extra source is an isolated semantic,
+    native-relationship and guarded read-only query workspace; it does not
+    inherit PeopleSoft, Coupa, wiki, memory or curated business tools."""
     return _safe(lambda: {"sources": engine.registry.describe()})
+
+
+@mcp.tool()
+def join_path(from_record: str, to_record: str, source: str = "") -> dict:
+    """How to JOIN two records in exactly one configured database.
+
+    The default PeopleSoft source uses its live curated/index-aware
+    relationship service. A secondary source uses only native foreign-key and
+    view-dependency evidence from that source's physically isolated metadata
+    artifact. Secondary results never infer relationships from matching column
+    names; when native evidence is absent, they say no path was found. This
+    structural tool remains available when live raw SQL is disabled.
+    """
+    def _join() -> dict:
+        name, catalog = _metadata_for_source(source)
+        if name == "default":
+            return _sourced(
+                name, "join_path", from_record=from_record,
+                to_record=to_record)
+        result = catalog.relationship_path(
+            from_object=from_record, to_object=to_record, source=name)
+        result["source_database"] = name
+        return result
+
+    return _safe(_join)
 
 
 if cfg.tools.allow_raw_sql:
@@ -1111,14 +1216,16 @@ if cfg.tools.allow_raw_sql:
                 pivot: Optional[dict] = None,
                 list_binds: Optional[dict] = None,
                 partition: Optional[dict] = None) -> dict:
-        """Run a read-only SQL SELECT against the PeopleSoft database — including
-                CUSTOM and site-specific records. Guarded: one SELECT/WITH statement, no
+        """Run a read-only SQL SELECT against exactly the selected database.
+                source is a hard boundary. Guarded: one SELECT/WITH statement, no
                 DML/DDL, rows capped at 500, every table validated against the catalog
                 and unqualified names schema-qualified automatically (write
-                OTHER_OWNER.TBL to reach another schema). NEVER invent a table name.
-                PS_ tables use signed amounts (credits negative).
+                OTHER_OWNER.TBL only for an approved same-database schema). Database
+                links, external rowsets and three/four-part remote names are refused.
+                NEVER invent a table or column. On Finance only, PS_ accounting tables
+                use signed amounts (credits negative).
                 business_unit: reported back as scope_filtered / scope_note — the SQL is
-                never rewritten. Relay scope_note when it says NOT restricted.
+                never rewritten. Finance only; forbidden in a secondary workspace.
                 policy_binds: when the question refers to a POLICY figure ("above the
                 capitalization threshold", "over the approval limit"), do NOT type the
                 number. Write the bind in the SQL and name the policy here — e.g.
@@ -1126,7 +1233,8 @@ if cfg.tools.allow_raw_sql:
                 "capitalization_threshold"}. The value is looked up in the wiki and
                 bound server-side, and the result carries policy_basis with the exact
                 sentence and page it came from — quote that when you answer. Call
-                list_policy_terms for the available names.
+                list_policy_terms for the available names. Finance only; policy/wiki
+                evidence is forbidden in a secondary database workspace.
                 pivot: USE THIS for any "trend", "by month", "over the last N periods",
                 "compare X across Y" question. Return three columns — row label, column
                 label, value — grouped by the first two, and name them:
@@ -1154,25 +1262,11 @@ if cfg.tools.allow_raw_sql:
     @mcp.tool()
     def explain_query(sql: str, source: str = "") -> dict:
         """Ask the optimizer how it WOULD run a SELECT — WITHOUT running it.
-                USE THIS BEFORE any join or aggregate over large tables (PS_LEDGER,
-                PS_JRNL_LN, PS_ITEM, custom transaction tables), and IMMEDIATELY after
-                a query times out. Returns row counts, each table's INDEXES with their
-                column order, which full scans are planned, and the leading columns
-                your WHERE/JOIN must include."""
+                source selects exactly one configured database. USE THIS before any
+                join or aggregate over large/custom transaction tables, and immediately
+                after a timeout. Returns row estimates, indexes/column order, planned
+                full scans and leading columns the WHERE/JOIN should include."""
         return _sourced(source, "explain_query", sql=sql)
-
-    @mcp.tool()
-    def join_path(from_record: str, to_record: str, source: str = "") -> dict:
-        """How to JOIN two PeopleSoft records here — the ON columns, and
-                whether this database's indexes can actually serve them.
-                USE THIS BEFORE writing any multi-table run_sql. It returns a
-                FROM/JOIN skeleton, which columns to pin as constants to turn a
-                scan into a range scan (usually SETID or BUSINESS_UNIT, which the
-                selected scope already fixes), and a confidence. Guessing a join
-                against PS_LEDGER or PS_ITEM does not fail fast — it consumes the
-                whole query timeout."""
-        return _sourced(source, "join_path",
-                     from_record=from_record, to_record=to_record)
 
     @mcp.tool()
     def search_records(query: str = "", limit: int = 25, source: str = "") -> dict:
@@ -1228,7 +1322,7 @@ if cfg.tools.allow_raw_sql:
 
     @mcp.tool()
     def describe_table(table_name: str, source: str = "") -> dict:
-        """Column names and types for one table/view (e.g. PS_JRNL_HEADER)."""
+        """Live column names/types for one table/view in the selected source."""
         return _sourced(source, "describe_table", table_name=table_name)
 
 

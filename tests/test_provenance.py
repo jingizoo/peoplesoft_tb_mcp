@@ -33,7 +33,8 @@ from pstb.client.chat import agent_turn  # noqa: E402
 from pstb.client.llm_base import LLMResponse, ToolCall  # noqa: E402
 from pstb.guards import (  # noqa: E402
     attribution_caveat, misattributed_figures, payload_numbers,
-    source_of_tool, tagged_payload_numbers, untag_payload)
+    source_of_payload, source_of_tool, source_result_status,
+    tagged_payload_numbers, untag_payload)
 
 WIKI = ("wiki_get_page", json.dumps({
     "page": "Close Policy",
@@ -117,6 +118,55 @@ class SourceTaggingTests(unittest.TestCase):
         # it, or the caveat loses the figure it was written about.
         tagged = tagged_payload_numbers([COUPA])
         self.assertEqual(tagged["1.3"], {"coupa"})
+
+    def test_generic_query_uses_the_server_issued_database_source(self) -> None:
+        payload = {"source_database": "p2go", "rows": [{"amount": 81.25}]}
+        self.assertEqual(source_of_payload("run_sql", payload),
+                         "database:p2go")
+        tagged = tagged_payload_numbers([
+            ("run_sql", json.dumps(payload)),
+        ])
+        self.assertEqual(tagged["81.25"], {"database:p2go"})
+        self.assertNotIn("peoplesoft_gl", tagged["81.25"])
+
+    def test_default_generic_query_remains_peoplesoft(self) -> None:
+        payload = {"source_database": "default", "rows": [{"amount": 81.25}]}
+        self.assertEqual(source_of_payload("run_sql", payload),
+                         "peoplesoft_gl")
+
+
+class SourceBoundaryResultTests(unittest.TestCase):
+    def test_secondary_result_requires_the_exact_source(self) -> None:
+        scope = {"source": "p2go"}
+        self.assertEqual(
+            source_result_status(
+                "run_sql", json.dumps({"source_database": "p2go"}), scope),
+            (True, ""),
+        )
+        for payload in (
+            {"source_database": "default"},
+            {"source_database": "warehouse"},
+            {"rows": []},
+        ):
+            with self.subTest(payload=payload):
+                ok, detail = source_result_status(
+                    "run_sql", json.dumps(payload), scope)
+                self.assertFalse(ok)
+                self.assertTrue(detail)
+
+    def test_secondary_result_must_be_structured(self) -> None:
+        ok, detail = source_result_status(
+            "search_metadata", "plain text", {"source": "p2go"})
+        self.assertFalse(ok)
+        self.assertIn("non-JSON", detail)
+
+    def test_failed_result_keeps_its_original_failure_path(self) -> None:
+        self.assertEqual(
+            source_result_status(
+                "run_sql", json.dumps({"error": "query failed"}),
+                {"source": "p2go"}),
+            (True, ""),
+        )
 
 
 class CrossSourceTests(unittest.TestCase):

@@ -138,16 +138,22 @@ class LockTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ScopeConflict):
                 apply_request_scope(name, {}, {"source": "p2go"})
 
-    def test_secondary_context_allows_only_source_aware_data_or_policy(self):
+    def test_secondary_sql_cannot_import_finance_policy_or_scope(self) -> None:
+        for args in (
+            {"sql": "SELECT 1", "policy_binds": {"limit": "close_limit"}},
+            {"sql": "SELECT 1", "business_unit": "US001"},
+        ):
+            with self.subTest(args=args), self.assertRaises(ScopeConflict):
+                apply_request_scope("run_sql", args, {"source": "p2go"})
+
+    def test_secondary_context_allows_only_source_aware_data(self):
         self.assertEqual(
             apply_request_scope("list_tables", {}, {"source": "p2go"}),
             {"source": "p2go"},
         )
-        self.assertEqual(
+        with self.assertRaises(ScopeConflict):
             apply_request_scope("wiki_lookup", {"question": "policy"},
-                                {"source": "p2go"}),
-            {"question": "policy"},
-        )
+                                {"source": "p2go"})
 
     def test_finance_database_without_bu_cannot_run_a_curated_control(self):
         # This is deliberately a direct tool-call probe: even a technical
@@ -217,29 +223,27 @@ if(!scope||scope.source!=='default'||Object.keys(scope).length!==1)
         subprocess.run([shutil.which("node"), "-e", script], check=True,
                        capture_output=True, text=True)
 
-    def test_chat_has_an_accessible_database_selector(self) -> None:
+    def test_chat_has_accessible_database_workspaces(self) -> None:
         builder = self._function(
-            "buildChatSourceSelect", "// Database is a hard boundary")
+            "buildChatWorkspaceBar", "function activateChatSource")
         chat = self._function("viewChat", "async function send(")
-        self.assertIn("label.append(el('span',null,'Database'))", builder)
-        self.assertIn("sel.setAttribute('aria-label','Database context')",
+        self.assertIn("setAttribute('aria-label','Database workspaces')",
                       builder)
-        self.assertIn("s.source==='default'?'Finance':s.source", builder)
-        self.assertIn("const sourceControl=buildChatSourceSelect()", chat)
-        self.assertIn("if(sourceControl) context.append(sourceControl)", chat)
+        self.assertIn("button.dataset.source=d.source", builder)
+        self.assertIn("activateChatSource(d.source,true)", builder)
+        self.assertIn("const workspaceBar=buildChatWorkspaceBar()", chat)
 
-    def test_chat_selector_is_absent_for_one_database(self) -> None:
-        builder = self._function(
-            "buildChatSourceSelect", "// Database is a hard boundary")
-        self.assertIn("if(list.length<2) return null;", builder)
+    def test_finance_workspace_exists_even_with_one_database(self) -> None:
+        descriptors = self._function(
+            "chatSourceDescriptors", "function descriptorForSource")
+        self.assertIn("[{source:'default'}]", descriptors)
+        self.assertIn("primary?'finance':source", descriptors)
 
-    def test_chat_selector_uses_the_hard_scope_path(self) -> None:
-        builder = self._function(
-            "buildChatSourceSelect", "// Database is a hard boundary")
-        switcher = self._function(
-            "setChatSource", "// Populate the database chooser")
-        self.assertIn("sel.onchange=()=>setChatSource(sel.value)", builder)
-        self.assertIn("setChatScope({source:name},true)", switcher)
+    def test_chat_posts_to_source_derived_route(self) -> None:
+        send = self._function("send", "function renderFollowUps")
+        self.assertIn("'/api/source/'+encodeURIComponent(", send)
+        self.assertIn("silo.descriptor.command", send)
+        self.assertIn("scope:sendScope", send)
 
     def test_initial_finance_selection_is_also_a_hard_scope(self) -> None:
         catalog = self._function(
@@ -250,87 +254,24 @@ if(!scope||scope.source!=='default'||Object.keys(scope).length!==1)
 
     def test_inflight_turn_stays_bound_to_its_original_session(self) -> None:
         send = self._function("send", "function renderFollowUps")
-        self.assertIn("const sendSession=CHAT_SESSION_ID", send)
+        self.assertIn("const sendSession=silo.sessionId", send)
+        self.assertIn("const sendGeneration=silo.generation", send)
+        self.assertIn("const sendScope=silo.scope?{...silo.scope}:{}", send)
         self.assertIn("encodeURIComponent(sendSession)+'&turn='", send)
-        self.assertIn("message:m,session_id:sendSession,scope:CHAT_SCOPE||{}",
+        self.assertIn("message:m,session_id:sendSession,scope:sendScope",
                       send)
         self.assertGreaterEqual(
-            send.count("if(sendSession!==CHAT_SESSION_ID)"), 3,
+            send.count("isLiveSiloTurn(silo,sendSession,sendGeneration)"), 4,
             "success, error, and activity outcomes must all be stale-safe",
         )
-        self.assertIn(
-            "if(sendSession!==CHAT_SESSION_ID){ clearInterval(poll); return; }",
-            send,
-        )
 
-    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
-    def test_switching_round_trip_restores_the_finance_scope(self) -> None:
-        """Execute the real switcher, not a Python copy of its behavior."""
-        canonical = self._function("canonicalScope", "function scopeLabel")
+    def test_source_switch_keeps_each_silos_session_and_transcript(self) -> None:
         switcher = self._function(
-            "setChatSource", "// Populate the database chooser")
-        script = """
-const META={sources:[{source:'default'},{source:'p2go'}]};
-let CHAT_SCOPE={business_unit:'US001',ledger:'ACTUALS',
-  fiscal_year:2026,period:7};
-let LAST_FINANCE_SCOPE=null;
-const calls=[];
-""" + canonical + """
-function setChatScope(value,announce){
-  const next=canonicalScope(value);
-  calls.push({value:{...value},next,announce});
-  CHAT_SCOPE=next;
-}
-function dismissScopeChoosers(){}
-""" + switcher + """
-setChatSource('p2go');
-if(calls.length!==1||calls[0].value.source!=='p2go'||!calls[0].announce)
-  throw new Error('secondary source did not use setChatScope');
-if(!CHAT_SCOPE||CHAT_SCOPE.source!=='p2go'||Object.keys(CHAT_SCOPE).length!==1)
-  throw new Error('secondary source was not the complete hard scope');
-if(!LAST_FINANCE_SCOPE||LAST_FINANCE_SCOPE.business_unit!=='US001'||
-   LAST_FINANCE_SCOPE.ledger!=='ACTUALS'||
-   LAST_FINANCE_SCOPE.fiscal_year!==2026||LAST_FINANCE_SCOPE.period!==7)
-  throw new Error('finance scope was not retained');
-setChatSource('default');
-const restored=calls[1].value;
-if(restored.business_unit!=='US001'||restored.ledger!=='ACTUALS'||
-   restored.fiscal_year!==2026||restored.period!==7)
-  throw new Error('finance scope was not restored');
-"""
-        subprocess.run([shutil.which("node"), "-e", script], check=True,
-                       capture_output=True, text=True)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
-    def test_any_database_scope_change_isolates_late_answers(self) -> None:
-        setter = self._function(
-            "setChatScope", "document.addEventListener('focusin'")
-        script = """
-let CHAT_SCOPE={source:'default',business_unit:'US001',ledger:'ACTUALS'};
-let LAST_FINANCE_SCOPE={...CHAT_SCOPE};
-let CHAT_SESSION_ID='session-1', sequence=1;
-let PENDING_TIME={}, SYNC_TIME_SELECTS=null, SCOPE_YEARS_STALE=false;
-function makeSessionId(){ return 'session-'+(++sequence); }
-function canonicalScope(value){
-  return value&&value.source==='p2go'?{source:'p2go'}:(value?{...value}:null);
-}
-function scopeLabel(value){ return JSON.stringify(value); }
-function syncScopeControls(){}
-function syncSourceControl(){}
-function updateScopeChip(){}
-function esc(value){ return String(value); }
-function el(){ return {}; }
-const $=()=>null;
-""" + setter + """
-setChatScope({source:'p2go'},false);
-if(CHAT_SESSION_ID!=='session-2'||CHAT_SCOPE.source!=='p2go')
-  throw new Error('entering the secondary source kept the old generation');
-setChatScope({source:'default',business_unit:'US001',ledger:'ACTUALS'},false);
-if(CHAT_SESSION_ID!=='session-3'||CHAT_SCOPE.source!=='default')
-  throw new Error('leaving through a finance scope kept the old generation');
-"""
-        subprocess.run([shutil.which("node"), "-e", script], check=True,
-                       capture_output=True, text=True)
+            "activateChatSource", "// Populate the database chooser")
+        self.assertNotIn("makeSessionId", switcher)
+        self.assertIn("prior.scope=CHAT_SCOPE", switcher)
+        self.assertIn("CHAT_SESSION_ID=next.sessionId", switcher)
+        self.assertIn("CHAT_SCOPE=next.scope", switcher)
 
     def test_finance_only_chips_hide_on_another_database(self) -> None:
         self.assertIn("const psOnly = selected==='default';", self.html)
@@ -338,32 +279,16 @@ if(CHAT_SESSION_ID!=='session-3'||CHAT_SCOPE.source!=='default')
         self.assertIn("if(el2) el2.hidden=!psOnly", self.html)
         self.assertIn("if(starters) starters.hidden=!psOnly", self.html)
         self.assertIn("chips.id='chat-starters'", self.html)
-        self.assertIn("curated financial tools", self.html)
-        self.assertIn("database '+value.source+' — ad-hoc only", self.html)
+        self.assertIn("Finance scopes and curated controls are not available", self.html)
+        self.assertIn("read-only semantic & relationship queries", self.html)
 
-    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
-    def test_chat_control_does_not_depend_on_hidden_browse_toolbar(self) -> None:
-        syncer = self._function("syncSourceControl", "function syncScopeControls")
-        script = """
-const META={sources:[{source:'default'},{source:'p2go'}]};
-const nodes={
-  '#chat-source':{value:'default'},
-  '#scope-fy':{hidden:false},
-  '#scope-per':{hidden:false}
-};
-const $=selector=>nodes[selector]||null;
-""" + syncer + """
-syncSourceControl({source:'p2go'});
-if(nodes['#chat-source'].value!=='p2go'||
-   !nodes['#scope-fy'].hidden||!nodes['#scope-per'].hidden)
-  throw new Error('secondary chat context was not applied');
-syncSourceControl({source:'default'});
-if(nodes['#chat-source'].value!=='default'||
-   nodes['#scope-fy'].hidden||nodes['#scope-per'].hidden)
-  throw new Error('finance chat controls were not restored');
-"""
-        subprocess.run([shutil.which("node"), "-e", script], check=True,
-                       capture_output=True, text=True)
+    def test_chat_workspaces_do_not_depend_on_hidden_browse_toolbar(self) -> None:
+        builder = self._function(
+            "buildChatWorkspaceBar", "function activateChatSource")
+        self.assertIn("chatSourceDescriptors().forEach", builder)
+        self.assertIn("button.dataset.source=d.source", builder)
+        self.assertNotIn("#f-source", builder)
+        self.assertNotIn("#chat-source", self.html)
 
 
 if __name__ == "__main__":

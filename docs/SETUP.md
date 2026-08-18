@@ -607,10 +607,10 @@ authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.
    .venv/bin/python -m pstb.client.chat --ask "List the business units and ledgers."
    ```
 
-### Add P2Go as an Ask database context
+### Add P2Go as an isolated Ask workspace
 
-The Ask database selector is populated from configured runtime sources, not
-from the offline metadata artifact. Add P2Go under `sources:` in `config.yaml`:
+Ask workspaces are populated from configured runtime sources, not from the
+offline metadata artifact. Add P2Go under `sources:` in `config.yaml`:
 
 ```yaml
 db:
@@ -634,15 +634,45 @@ PSTB_SRC_P2GO_PASSWORD=...
 Restart the GUI process after changing either file. Then open `/api/meta` on
 that process (for the default port,
 `http://127.0.0.1:8016/api/meta`) and confirm that `sources` contains both
-`default` and `p2go`. The **Database** selector appears in Ask only when at
-least two runtime sources are present.
+`default` and `p2go`, with commands `finance` and `p2go`.
 
-Choosing **Finance** keeps the context on the primary PeopleSoft connection;
-curated financial tools are available there. Choosing **p2go** hard-locks the
-context to guarded, source-aware discovery, read-only SQL, and metadata tools
-on P2Go. Source-unaware and curated financial tools are refused; switch the
-selector back to **Finance** to use them. A P2Go context has no PeopleSoft
-business unit, ledger, fiscal year, or period scope.
+Ask now shows separate `/finance` and `/p2go` workspaces. Type `/` to open the
+workspace menu, `/p2go` to switch, or `/p2go show failed interface jobs` to
+switch and ask in one step. Each workspace keeps its own visible transcript,
+draft, in-flight work, activity and model session. **Clear** resets only the
+active workspace.
+
+`/finance` stays on the primary PeopleSoft connection and retains its curated
+financial controls and business-unit/ledger/time scope. `/p2go` is hard-bound
+to the P2Go connection and exposes no PeopleSoft, Coupa, wiki, memory or
+P2Go-specific business tools. It can use only generic source-bound metadata
+search, relationship paths, live table shape, query explanation, and guarded
+read-only SQL. A P2Go workspace therefore has no PeopleSoft business unit,
+ledger, fiscal year or period controls. An unknown slash command is rejected
+in the browser without sending a model or database request.
+
+Build every configured source once after enabling multi-source mode. This
+migrates Finance from the single-source legacy path and creates P2Go's separate
+semantic catalog and relationship graph:
+
+```bash
+.venv/bin/python scripts/build_metadata_catalog.py
+```
+
+After that initial build, a P2Go-only refresh leaves Finance untouched:
+
+```bash
+.venv/bin/python scripts/build_metadata_catalog.py \
+  --source p2go --peopletools-source none
+```
+
+This publishes only P2Go's atomic knowledge SQLite file under
+`metadata_catalogs/`; it does not rebuild or replace Finance. The artifact
+contains structural names, keys, foreign-key column pairs and view dependency
+edges—not transaction rows. Missing or partial native relationships remain
+inconclusive, and matching column names alone are never promoted to a join.
+If `tools.allow_raw_sql: false`, `/p2go` remains useful for structural semantic
+and relationship questions but cannot answer row/count/amount questions.
 
 Optionally have a DBA deploy the views in [`sql/oracle/`](../sql/oracle) and set
 `db.use_views: true` — see [VIEWS.md](VIEWS.md). The agent works without them.
@@ -992,8 +1022,12 @@ metadata_catalog:
 Use `--max-objects`, `--max-fields`, `--max-indexes`, `--max-constraints`,
 `--max-constraint-columns`, `--max-dependencies`,
 `--max-peopletools-rows` or `--page-size` for a one-build override. The
-builder writes a mode-`0600` `.building` file and atomically publishes
-`metadata_catalog.db`; a failed or empty build preserves the prior artifact.
+builder writes a mode-`0600` `.building` file and atomically publishes one
+artifact per selected source. A primary-only installation keeps the legacy
+`metadata_catalog.db`; a multi-source installation uses
+`metadata_catalogs/<safe-source>-<source-hash>.db` for every source, including
+`default`. A failed or empty build preserves that source's prior artifact, and
+refreshing `p2go` cannot replace `default`, `warehouse`, or any other source.
 A layer that reaches a configured limit remains usable but is marked partial.
 `describe_metadata_catalog` reports every limit hit, source/layer error,
 snapshot age and search mode. Stale snapshots remain readable with a warning;
@@ -1001,9 +1035,20 @@ absence in a partial or stale layer is never evidence that an object does not
 exist.
 
 Rebuild after customizations, DDL/index changes, field-label/translate changes
-or saved-query changes. Weekly matches the default seven-day freshness target
-for a stable PeopleSoft environment; schedule nightly if custom integration or
-warehouse metadata changes frequently.
+or saved-query changes. Rebuild a source immediately after changing its
+connection locator, configured schema, or (when schema is blank) configured
+login identity. Each artifact carries a one-way fingerprint of that namespace;
+passwords and tokens are excluded, and a multi-source runtime fails closed
+instead of reusing an artifact whose fingerprint no longer matches. For an
+Oracle TNS alias, configure a readable `oracle_config_dir` or
+`oracle_wallet_dir`; the `tnsnames.ora` content is part of the hash. For SQL
+Server, use explicit `Server`/`Address` plus `Database`/`Initial Catalog`
+values in the connection string. DSN-only/FILEDSN sources, attached database
+files without an explicit database, and login-default databases are refused
+because their targets are mutable external indirection. Weekly
+matches the default seven-day freshness target for a stable
+PeopleSoft environment; schedule nightly if custom integration or warehouse
+metadata changes frequently.
 
 ### 7b.1 Keep the offline refreshes in one schedule
 

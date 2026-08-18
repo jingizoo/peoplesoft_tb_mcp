@@ -191,6 +191,24 @@ Full walkthrough in [docs/SETUP.md](docs/SETUP.md#4b-restrict-data-by-business-u
 The agent works without the views (its inline SQL encodes the same effective
 dating / setid / tree logic), so you can pilot first and deploy views later.
 
+## Isolated database workspaces
+
+Ask treats each configured database as a separate product context. `/finance`
+is the PeopleSoft workspace with curated controls and financial scope;
+`/<source>` (for example `/p2go`) has its own transcript/session and is limited
+to that database's semantic catalog and native relationship graph. When raw
+SQL is enabled, its source-bound live shape, query plan and guarded read-only
+SQL tools are available too. Type `/` in Ask to switch workspaces or `/p2go
+<question>` to route a question directly. Results, history and in-flight work
+never move between workspaces.
+
+Each database also has its own atomic offline knowledge SQLite file. Build all
+configured sources with `scripts/build_metadata_catalog.py`, or refresh just
+one with `--source p2go --peopletools-source none`. See
+[docs/SETUP.md](docs/SETUP.md#add-p2go-as-an-isolated-ask-workspace) for runtime
+configuration and [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) for the
+physical source/graph boundary.
+
 ## Offline metadata intelligence
 
 Build the structural catalog after connecting the intended databases:
@@ -199,16 +217,19 @@ Build the structural catalog after connecting the intended databases:
 .venv/bin/python scripts/build_metadata_catalog.py
 ```
 
-It indexes names, columns, ordered indexes, declared primary/unique/foreign-key
-constraints, native view dependencies, PeopleTools logical records, labels,
-translate values, page use and public saved-query use across `default` and
-every configured `sources:` database. It keeps source/schema identities
-separate and resolves custom physical names from evidence — it never assumes
-`PS_` or another company prefix.
+Every configured database gets its own native names, columns, ordered indexes,
+declared primary/unique/foreign-key constraints and view dependencies. The
+`default` Finance artifact additionally receives the PeopleTools overlay:
+logical records, labels, translate values, page use and public saved-query
+use. Secondary artifacts such as P2Go remain native to that database. Source
+and schema identities never share a file, and custom physical names are
+resolved from evidence rather than an assumed `PS_` or company prefix.
 
-For Gemini 2.5 Pro, unfamiliar-record discovery follows
-`search_metadata` → `get_metadata_context` → a live scoped tool such as
-`profile_record`, `compare_records`, a curated financial tool or guarded
+For Gemini 2.5 Pro, the Finance workspace can proceed from metadata discovery
+to its curated controls, profiles or comparisons. A secondary workspace stays
+on the narrower source-bound path: `search_metadata` →
+`get_metadata_context` → `join_path`. When raw SQL is enabled, it may continue
+through `list_tables`/`describe_table`, `explain_query` and guarded read-only
 `run_sql`. The catalog is structure only: it contains no source rows or
 balances and cannot satisfy the financial-evidence gate. See
 [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md) for source/schema scope,

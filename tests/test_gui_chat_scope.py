@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
@@ -62,6 +63,15 @@ class DummyRegistry:
     def resolve_name(self, source):
         value = str(source or "").strip()
         return "default" if value in ("", "default", "finance") else value
+
+    def resolve_command(self, command):
+        value = str(command or "").strip().lower().lstrip("/")
+        if value in ("finance", "ps", "peoplesoft"):
+            return "default"
+        if value == "p2go":
+            return "p2go"
+        from pstb.db import DbError
+        raise DbError(f"Unknown data workspace /{value}")
 
 
 class ScopeValidationTests(unittest.TestCase):
@@ -180,7 +190,95 @@ class ScopeValidationTests(unittest.TestCase):
         self.assertEqual(result["period"], 13)
 
 
+class SourceRouteTests(unittest.TestCase):
+    def test_secondary_route_is_the_database_authority(self):
+        inner = AsyncMock(return_value={"answer": "ok"})
+        payload = {
+            "message": "show invoice relationships",
+            "session_id": "session-p2go-123",
+            "scope": {"source": "p2go"},
+        }
+        with (patch.object(gui.engine, "registry", DummyRegistry()),
+              patch.object(gui, "chat", inner)):
+            result = asyncio.run(gui.source_chat("p2go", payload))
+        self.assertEqual(result, {"answer": "ok"})
+        forwarded = inner.await_args.args[0]
+        self.assertEqual(forwarded["scope"], {"source": "p2go"})
+
+    def test_secondary_route_rejects_a_conflicting_body_source(self):
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(gui.source_chat("p2go", {
+                    "message": "x", "session_id": "session-p2go-123",
+                    "scope": {"source": "default"},
+                }))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bound to", caught.exception.detail)
+
+    def test_route_rejects_each_conflicting_scope_alias(self):
+        cases = (
+            ("finance", {"source": "default", "db": "p2go"}),
+            ("p2go", {"source": "p2go", "db": "default"}),
+        )
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            for command, scope in cases:
+                with self.subTest(command=command, scope=scope):
+                    with self.assertRaises(HTTPException) as caught:
+                        asyncio.run(gui.source_chat(command, {
+                            "message": "x",
+                            "session_id": f"session-{command}-123",
+                            "scope": scope,
+                        }))
+                    self.assertEqual(caught.exception.status_code, 400)
+                    self.assertIn("body scope db", caught.exception.detail)
+
+    def test_secondary_route_rejects_stale_finance_dimensions(self):
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(gui.source_chat("p2go", {
+                    "message": "x", "session_id": "session-p2go-123",
+                    "scope": {"source": "p2go", "ledger": "ACTUALS"},
+                }))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("no PeopleSoft financial scope", caught.exception.detail)
+
+    def test_finance_alias_preserves_financial_scope_and_pins_default(self):
+        inner = AsyncMock(return_value={"answer": "ok"})
+        payload = {
+            "message": "trial balance", "session_id": "session-fin-123",
+            "scope": {"business_unit": "US001", "ledger": "ACTUALS"},
+        }
+        with (patch.object(gui.engine, "registry", DummyRegistry()),
+              patch.object(gui, "chat", inner)):
+            asyncio.run(gui.source_chat("ps", payload))
+        scope = inner.await_args.args[0]["scope"]
+        self.assertEqual(scope["source"], "default")
+        self.assertEqual(scope["business_unit"], "US001")
+
+    def test_unknown_workspace_is_a_404(self):
+        with patch.object(gui.engine, "registry", DummyRegistry()):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(gui.source_chat("sap", {
+                    "message": "x", "session_id": "session-sap-123",
+                }))
+        self.assertEqual(caught.exception.status_code, 404)
+
+
 class ProviderSessionStoreTests(unittest.TestCase):
+    def test_secondary_provider_receives_only_the_closed_generic_profile(self):
+        from pstb.guards import SOURCE_SILO_TOOLS
+
+        offered = [SimpleNamespace(name=name) for name in (
+            sorted(SOURCE_SILO_TOOLS)
+            + ["get_trial_balance", "wiki_lookup", "remember_record_fact",
+               "a_future_tool"]
+        )]
+        p2go = gui._provider_tools_for_scope(offered, {"source": "p2go"})
+        self.assertEqual({tool.name for tool in p2go}, SOURCE_SILO_TOOLS)
+        finance = gui._provider_tools_for_scope(
+            offered, {"source": "default", "business_unit": "US001"})
+        self.assertEqual(finance, offered)
+
     def test_history_is_isolated_by_database_source(self):
         finance = gui._provider_key(
             "session-one", "gemini",

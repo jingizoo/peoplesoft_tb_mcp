@@ -16,10 +16,11 @@ Review the backlog:  python -m pstb.qlog [logs/questions.jsonl]
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import re
 import sys
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +38,7 @@ _GAVE_UP = re.compile(
 class QuestionLog:
     def __init__(self, path: Optional[str], root: Path):
         self.path: Optional[Path] = None
+        self._lock = threading.Lock()
         if path:
             p = Path(path)
             self.path = p if p.is_absolute() else root / p
@@ -45,17 +47,36 @@ class QuestionLog:
         if not self.path:
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a") as f:
-                f.write(json.dumps(rec, default=str) + "\n")
+            # One QuestionLog instance serves concurrent GUI turns. Keep each
+            # JSON record as one serialized append so two silo completions
+            # cannot interleave into a torn line.
+            line = json.dumps(rec, default=str) + "\n"
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(line)
         except OSError:
             pass  # logging must never break the answer
 
     def log_turn(self, *, surface: str, provider: str, question: str,
                  calls: list[dict], rounds: int, answer: str,
-                 hit_round_limit: bool = False) -> str:
+                 hit_round_limit: bool = False,
+                 scope: Optional[dict] = None) -> str:
         ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-        turn_id = hashlib.sha256(f"{ts}|{question}".encode()).hexdigest()[:12]
+        # Timestamp+question collided whenever two silos asked the same thing
+        # in one second, making feedback attach to both/the wrong answer.
+        # A random 128-bit ID is independent of wording, clock resolution and
+        # process concurrency.
+        turn_id = uuid.uuid4().hex
+        active_scope = dict(scope or {})
+        source_database = str(
+            active_scope.get("source") or active_scope.get("db") or "default"
+        ).strip() or "default"
+        logged_scope = {"source": source_database}
+        for key in ("business_unit", "ledger", "fiscal_year", "period"):
+            value = active_scope.get(key)
+            if value not in (None, ""):
+                logged_scope[key] = value
         flags = []
         if any(not c.get("ok", True) for c in calls):
             flags.append("tool_error")
@@ -68,6 +89,8 @@ class QuestionLog:
         self._append({
             "type": "turn", "turn_id": turn_id, "ts": ts,
             "surface": surface, "provider": provider,
+            "source_database": source_database,
+            "scope": logged_scope,
             "question": question,
             "tools": [{"tool": c.get("tool"), "ok": c.get("ok", True),
                        "ms": c.get("ms"),
