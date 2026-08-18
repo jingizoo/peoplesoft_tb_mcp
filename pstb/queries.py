@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from .db import Database
+from .db import Database, DbError
 
 # Chartfields allowed as extra group-by / detail columns on PS_LEDGER.
 GROUPABLE_CHARTFIELDS = {
@@ -29,7 +29,12 @@ GROUPABLE_CHARTFIELDS = {
     "CURRENCY_CD",
 }
 
-IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#.]{0,63}$")
+_IDENT = (
+    r'(?:[A-Za-z][A-Za-z0-9_$#]{0,127}|'
+    r'"[A-Za-z][A-Za-z0-9_$#]{0,127}"|'
+    r'\[[A-Za-z][A-Za-z0-9_$#]{0,127}\])'
+)
+IDENT_RE = re.compile(rf"^\s*{_IDENT}(?:\s*\.\s*{_IDENT})?\s*$")
 
 
 def opt(db: Database, table: str, column: str, alias: str,
@@ -758,28 +763,58 @@ def table_list(db: Database, params: dict) -> str:
         return """SELECT name AS table_name, type AS object_type FROM sqlite_master
  WHERE type IN ('table', 'view') AND name LIKE :pat ORDER BY name"""
     if db.dialect == "oracle":
-        owner = db.cfg.db.schema.strip().rstrip(".").upper()
-        if owner:
-            params["owner"] = owner
-            return """SELECT OBJECT_NAME AS table_name, OBJECT_TYPE AS object_type
+        schemas = db.allowed_schemas
+        if len(schemas) == 1:
+            params["owner"] = schemas[0]
+            return """SELECT OWNER AS schema_name, OBJECT_NAME AS table_name,
+       OBJECT_TYPE AS object_type
   FROM ALL_OBJECTS WHERE OWNER = :owner AND OBJECT_TYPE IN ('TABLE', 'VIEW')
-   AND OBJECT_NAME LIKE :pat ORDER BY OBJECT_NAME"""
-        return """SELECT OBJECT_NAME AS table_name, OBJECT_TYPE AS object_type
+   AND OBJECT_NAME LIKE :pat ORDER BY OWNER, OBJECT_NAME"""
+        if schemas:
+            binds = []
+            for i, owner in enumerate(schemas):
+                key = f"owner{i}"
+                params[key] = owner
+                binds.append(f":{key}")
+            return f"""SELECT OWNER AS schema_name, OBJECT_NAME AS table_name,
+       OBJECT_TYPE AS object_type
+  FROM ALL_OBJECTS WHERE OWNER IN ({', '.join(binds)})
+   AND OBJECT_TYPE IN ('TABLE', 'VIEW')
+   AND OBJECT_NAME LIKE :pat ORDER BY OWNER, OBJECT_NAME"""
+        return """SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS schema_name,
+       OBJECT_NAME AS table_name, OBJECT_TYPE AS object_type
   FROM USER_OBJECTS WHERE OBJECT_TYPE IN ('TABLE', 'VIEW')
    AND OBJECT_NAME LIKE :pat ORDER BY OBJECT_NAME"""
-    return """SELECT TABLE_NAME AS table_name, TABLE_TYPE AS object_type
-  FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE :pat ORDER BY TABLE_NAME"""
+    schemas = db.allowed_schemas
+    where = "TABLE_NAME LIKE :pat"
+    if len(schemas) == 1:
+        params["owner"] = schemas[0]
+        where += " AND UPPER(TABLE_SCHEMA) = :owner"
+    elif schemas:
+        binds = []
+        for i, owner in enumerate(schemas):
+            key = f"owner{i}"
+            params[key] = owner
+            binds.append(f":{key}")
+        where += f" AND UPPER(TABLE_SCHEMA) IN ({', '.join(binds)})"
+    return f"""SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name,
+       TABLE_TYPE AS object_type
+  FROM INFORMATION_SCHEMA.TABLES WHERE {where}
+ ORDER BY TABLE_SCHEMA, TABLE_NAME"""
 
 
 def table_describe(db: Database, table: str, params: dict) -> str:
     if not IDENT_RE.match(table):
         raise ValueError(f"Invalid table name: {table!r}")
+    try:
+        owner, name = db.table_scope(table)
+    except DbError as exc:
+        raise ValueError(str(exc)) from exc
     if db.dialect == "sqlite":
         # PRAGMA cannot take binds; the identifier is regex-validated above.
-        return f"PRAGMA table_info({table})"
+        return f"PRAGMA table_info({name})"
     if db.dialect == "oracle":
-        params["tname"] = table.upper()
-        owner = db.cfg.db.schema.strip().rstrip(".").upper()
+        params["tname"] = name
         if owner:
             params["owner"] = owner
             return """SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
@@ -789,8 +824,12 @@ def table_describe(db: Database, table: str, params: dict) -> str:
         return """SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
        DATA_LENGTH AS data_length, NULLABLE AS nullable
   FROM USER_TAB_COLUMNS WHERE TABLE_NAME = :tname ORDER BY COLUMN_ID"""
-    params["tname"] = table
-    return """SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
+    params["tname"] = name
+    where = "UPPER(TABLE_NAME) = :tname"
+    if owner:
+        params["owner"] = owner
+        where += " AND UPPER(TABLE_SCHEMA) = :owner"
+    return f"""SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
        CHARACTER_MAXIMUM_LENGTH AS data_length, IS_NULLABLE AS nullable
-  FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = :tname
+  FROM INFORMATION_SCHEMA.COLUMNS WHERE {where}
  ORDER BY ORDINAL_POSITION"""

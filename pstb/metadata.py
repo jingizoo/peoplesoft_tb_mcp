@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .config import normalize_db_schemas
+
 
 SCHEMA_VERSION = 2
 DEFAULT_FILENAME = "metadata_catalog.db"
@@ -59,6 +61,37 @@ _STOP = frozenset({
 
 class MetadataError(RuntimeError):
     """A catalog build/read that cannot honestly continue."""
+
+
+def _configured_schemas(db) -> tuple[str, ...]:
+    """The normalized schema boundary for one database connection."""
+    try:
+        schemas = tuple(normalize_db_schemas(
+            db.cfg.db, section="database"))
+    except RuntimeError as exc:
+        raise MetadataError(str(exc)) from exc
+    if len(schemas) > 1 and str(getattr(db, "dialect", "")).lower() != "oracle":
+        raise MetadataError(
+            "Explicit multi-schema metadata allowlists are supported only "
+            "for Oracle in this release; configure other databases as "
+            "separate sources instead"
+        )
+    return schemas
+
+
+def _owner_scope(column: str, owners: tuple[str, ...], params: dict) -> str:
+    """Return a safely bound equality/IN predicate for catalog owners."""
+    if not owners:
+        return ""
+    if len(owners) == 1:
+        params["owner"] = owners[0]
+        return f"{column}=:owner"
+    binds = []
+    for pos, owner in enumerate(owners):
+        key = f"owner{pos}"
+        params[key] = owner
+        binds.append(f":{key}")
+    return f"{column} IN ({','.join(binds)})"
 
 
 def _utcnow() -> datetime:
@@ -130,6 +163,11 @@ def _db_config_fingerprint(root: Path, db_cfg) -> str:
     namespace being fingerprinted. Only the final digest is persisted.
     """
     backend = _s(getattr(db_cfg, "backend", "sqlite")).casefold()
+    try:
+        allowed_schemas = normalize_db_schemas(
+            db_cfg, section="database")
+    except RuntimeError as exc:
+        raise MetadataError(str(exc)) from exc
     schema = _u(getattr(db_cfg, "schema", ""))
     namespace_identity: object = ""
     locator: object
@@ -237,9 +275,18 @@ def _db_config_fingerprint(root: Path, db_cfg) -> str:
             namespace_identity = sorted(logins.items())
     else:
         locator = ""
+    # Preserve the established scalar-only identity so deploying this feature
+    # does not invalidate every existing single-schema Finance artifact.  The
+    # multi-schema shape gets a new identity version and the complete set.
+    identity = {
+        "version": 3, "backend": backend, "schema": schema,
+        "locator": locator, "namespace_identity": namespace_identity,
+    }
+    if len(allowed_schemas) > 1:
+        identity["version"] = 4
+        identity["schemas"] = sorted(allowed_schemas)
     raw_identity = json.dumps(
-        {"version": 3, "backend": backend, "schema": schema,
-         "locator": locator, "namespace_identity": namespace_identity},
+        identity,
         sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return "sha256:" + hashlib.sha256(
         raw_identity.encode("utf-8")).hexdigest()
@@ -506,7 +553,8 @@ class _Writer:
 
 def _object_page(db, after: tuple | None, cap: int) -> tuple[list[dict], bool]:
     dialect = db.dialect
-    configured = _u(getattr(db.cfg.db, "schema", ""))
+    owners = _configured_schemas(db)
+    configured = owners[0] if owners else ""
     if dialect == "sqlite":
         name = after[1] if after else ""
         return db.query(
@@ -520,14 +568,19 @@ def _object_page(db, after: tuple | None, cap: int) -> tuple[list[dict], bool]:
         cursor = ""
         if after is not None:
             params["n"] = after[1]
-            cursor = " AND OBJECT_NAME > :n"
-        if configured:
-            params["owner"] = configured
+            if len(owners) > 1:
+                params["s"] = after[0]
+                cursor = (
+                    " AND (OWNER>:s OR (OWNER=:s AND OBJECT_NAME>:n))")
+            else:
+                cursor = " AND OBJECT_NAME > :n"
+        if owners:
+            owner_scope = _owner_scope("OWNER", owners, params)
             return db.query(
                 "SELECT OWNER AS schema_name, OBJECT_NAME AS object_name, "
                 "OBJECT_TYPE AS object_type FROM ALL_OBJECTS "
-                "WHERE OWNER=:owner AND OBJECT_TYPE IN ('TABLE','VIEW') "
-                f"{cursor} ORDER BY OBJECT_NAME",
+                f"WHERE {owner_scope} AND OBJECT_TYPE IN ('TABLE','VIEW') "
+                f"{cursor} ORDER BY OWNER,OBJECT_NAME",
                 params, max_rows=cap)
         return db.query(
             "SELECT USER AS schema_name, OBJECT_NAME AS object_name, "
@@ -554,26 +607,35 @@ def _object_page(db, after: tuple | None, cap: int) -> tuple[list[dict], bool]:
 
 def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     dialect = db.dialect
-    configured = _u(getattr(db.cfg.db, "schema", ""))
+    owners = _configured_schemas(db)
+    configured = owners[0] if owners else ""
     after: tuple | None = None
     while True:
         if dialect == "oracle":
             params = {}
             cursor = ""
             if after is not None:
-                table, pos = after
-                params.update({"t": table, "p": pos})
-                cursor = (
-                    " AND (TABLE_NAME>:t OR "
-                    "(TABLE_NAME=:t AND COLUMN_ID>:p))")
-            if configured:
+                if len(owners) > 1:
+                    schema, table, pos = after
+                    params.update({"s": schema, "t": table, "p": pos})
+                    cursor = (
+                        " AND (OWNER>:s OR (OWNER=:s AND "
+                        "(TABLE_NAME>:t OR (TABLE_NAME=:t AND "
+                        "COLUMN_ID>:p))))")
+                else:
+                    table, pos = after
+                    params.update({"t": table, "p": pos})
+                    cursor = (
+                        " AND (TABLE_NAME>:t OR "
+                        "(TABLE_NAME=:t AND COLUMN_ID>:p))")
+            if owners:
+                owner_scope = _owner_scope("OWNER", owners, params)
                 sql = (
                     "SELECT OWNER AS schema_name,TABLE_NAME AS object_name,"
                     "COLUMN_NAME AS column_name,COLUMN_ID AS ordinal_position,"
                     "DATA_TYPE AS data_type,DATA_LENGTH AS data_length,"
-                    "NULLABLE AS nullable FROM ALL_TAB_COLUMNS WHERE OWNER=:owner "
-                    f"{cursor} ORDER BY TABLE_NAME,COLUMN_ID")
-                params["owner"] = configured
+                    "NULLABLE AS nullable FROM ALL_TAB_COLUMNS WHERE "
+                    f"{owner_scope}{cursor} ORDER BY OWNER,TABLE_NAME,COLUMN_ID")
             else:
                 sql = (
                     "SELECT USER AS schema_name,TABLE_NAME AS object_name,"
@@ -611,8 +673,13 @@ def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             return
         last = page[-1]
         if dialect == "oracle":
-            nxt = (_u(last.get("object_name")),
-                   int(last.get("ordinal_position") or 0))
+            if len(owners) > 1:
+                nxt = (_u(last.get("schema_name")),
+                       _u(last.get("object_name")),
+                       int(last.get("ordinal_position") or 0))
+            else:
+                nxt = (_u(last.get("object_name")),
+                       int(last.get("ordinal_position") or 0))
         else:
             nxt = (_u(last.get("schema_name")), _u(last.get("object_name")),
                    int(last.get("ordinal_position") or 0))
@@ -623,7 +690,8 @@ def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
 
 def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     dialect = db.dialect
-    configured = _u(getattr(db.cfg.db, "schema", ""))
+    owners = _configured_schemas(db)
+    configured = owners[0] if owners else ""
     if dialect == "sqlite":
         return
     after: tuple | None = None
@@ -632,14 +700,24 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             params = {}
             cursor = ""
             if after is not None:
-                table, index, pos = after
-                params.update({"t": table, "i": index, "p": pos})
-                cursor = (
-                    " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
-                    "(C.INDEX_NAME>:i OR (C.INDEX_NAME=:i AND "
-                    "C.COLUMN_POSITION>:p))))")
-            if configured:
-                params["owner"] = configured
+                if len(owners) > 1:
+                    schema, table, index, pos = after
+                    params.update({"s": schema, "t": table,
+                                   "i": index, "p": pos})
+                    cursor = (
+                        " AND (C.TABLE_OWNER>:s OR (C.TABLE_OWNER=:s AND "
+                        "(C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                        "(C.INDEX_NAME>:i OR (C.INDEX_NAME=:i AND "
+                        "C.COLUMN_POSITION>:p))))))")
+                else:
+                    table, index, pos = after
+                    params.update({"t": table, "i": index, "p": pos})
+                    cursor = (
+                        " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                        "(C.INDEX_NAME>:i OR (C.INDEX_NAME=:i AND "
+                        "C.COLUMN_POSITION>:p))))")
+            if owners:
+                owner_scope = _owner_scope("C.TABLE_OWNER", owners, params)
                 sql = (
                     "SELECT C.TABLE_OWNER AS schema_name,C.TABLE_NAME AS object_name,"
                     "C.INDEX_NAME AS index_name,C.COLUMN_NAME AS column_name,"
@@ -648,8 +726,8 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "FROM ALL_IND_COLUMNS C "
                     "JOIN ALL_INDEXES I ON I.OWNER=C.INDEX_OWNER "
                     "AND I.INDEX_NAME=C.INDEX_NAME WHERE "
-                    f"C.TABLE_OWNER=:owner{cursor} ORDER BY C.TABLE_NAME,"
-                    "C.INDEX_NAME,C.COLUMN_POSITION")
+                    f"{owner_scope}{cursor} ORDER BY C.TABLE_OWNER,"
+                    "C.TABLE_NAME,C.INDEX_NAME,C.COLUMN_POSITION")
             else:
                 # USER_* is both faster and semantically correct here.  An
                 # unqualified primary connection means the current schema,
@@ -700,8 +778,15 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             return
         last = page[-1]
         if dialect == "oracle":
-            nxt = (_u(last.get("object_name")), _u(last.get("index_name")),
-                   int(last.get("ordinal_position") or 0))
+            if len(owners) > 1:
+                nxt = (_u(last.get("schema_name")),
+                       _u(last.get("object_name")),
+                       _u(last.get("index_name")),
+                       int(last.get("ordinal_position") or 0))
+            else:
+                nxt = (_u(last.get("object_name")),
+                       _u(last.get("index_name")),
+                       int(last.get("ordinal_position") or 0))
         else:
             nxt = (_u(last.get("schema_name")), _u(last.get("object_name")),
                    _u(last.get("index_name")),
@@ -714,7 +799,8 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
 def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     """Yield ordered key/foreign-key columns without reading application rows."""
     dialect = db.dialect
-    configured = _u(getattr(db.cfg.db, "schema", ""))
+    owners = _configured_schemas(db)
+    configured = owners[0] if owners else ""
     if dialect == "sqlite":
         return
     after: tuple | None = None
@@ -723,14 +809,24 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             params = {}
             cursor = ""
             if after is not None:
-                table, constraint, pos = after
-                params.update({"t": table, "c": constraint, "p": pos})
-                cursor = (
-                    " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
-                    "(C.CONSTRAINT_NAME>:c OR (C.CONSTRAINT_NAME=:c AND "
-                    "CC.POSITION>:p))))")
-            if configured:
-                params["owner"] = configured
+                if len(owners) > 1:
+                    schema, table, constraint, pos = after
+                    params.update({"s": schema, "t": table,
+                                   "c": constraint, "p": pos})
+                    cursor = (
+                        " AND (C.OWNER>:s OR (C.OWNER=:s AND "
+                        "(C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                        "(C.CONSTRAINT_NAME>:c OR "
+                        "(C.CONSTRAINT_NAME=:c AND CC.POSITION>:p))))))")
+                else:
+                    table, constraint, pos = after
+                    params.update({"t": table, "c": constraint, "p": pos})
+                    cursor = (
+                        " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                        "(C.CONSTRAINT_NAME>:c OR (C.CONSTRAINT_NAME=:c AND "
+                        "CC.POSITION>:p))))")
+            if owners:
+                owner_scope = _owner_scope("C.OWNER", owners, params)
                 sql = (
                     "SELECT C.OWNER AS schema_name,C.TABLE_NAME AS object_name,"
                     "C.CONSTRAINT_NAME AS constraint_name,"
@@ -747,9 +843,10 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "RC.CONSTRAINT_NAME=C.R_CONSTRAINT_NAME "
                     "LEFT JOIN ALL_CONS_COLUMNS RCC ON RCC.OWNER=RC.OWNER AND "
                     "RCC.CONSTRAINT_NAME=RC.CONSTRAINT_NAME AND "
-                    "RCC.POSITION=CC.POSITION WHERE C.OWNER=:owner AND "
+                    f"RCC.POSITION=CC.POSITION WHERE {owner_scope} AND "
                     f"C.CONSTRAINT_TYPE IN ('P','U','R'){cursor} "
-                    "ORDER BY C.TABLE_NAME,C.CONSTRAINT_NAME,CC.POSITION")
+                    "ORDER BY C.OWNER,C.TABLE_NAME,C.CONSTRAINT_NAME,"
+                    "CC.POSITION")
             else:
                 # USER_* keeps an unqualified connection in its current
                 # schema. A cross-schema FK whose target is not visible still
@@ -844,9 +941,15 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             return
         last = page[-1]
         if dialect == "oracle":
-            nxt = (_u(last.get("object_name")),
-                   _u(last.get("constraint_name")),
-                   int(last.get("ordinal_position") or 0))
+            if len(owners) > 1:
+                nxt = (_u(last.get("schema_name")),
+                       _u(last.get("object_name")),
+                       _u(last.get("constraint_name")),
+                       int(last.get("ordinal_position") or 0))
+            else:
+                nxt = (_u(last.get("object_name")),
+                       _u(last.get("constraint_name")),
+                       int(last.get("ordinal_position") or 0))
         else:
             nxt = (_u(last.get("schema_name")),
                    _u(last.get("object_name")),
@@ -861,7 +964,8 @@ def _view_dependency_pages(
         db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     """Yield catalog-native view dependencies; never fetch view definitions."""
     dialect = db.dialect
-    configured = _u(getattr(db.cfg.db, "schema", ""))
+    owners = _configured_schemas(db)
+    configured = owners[0] if owners else ""
     if dialect == "sqlite":
         return
     after: tuple | None = None
@@ -870,29 +974,45 @@ def _view_dependency_pages(
             params = {}
             cursor = ""
             if after is not None:
-                view, ref_schema, ref_object, ref_link = after
-                params.update({"v": view, "rs": ref_schema,
-                               "ro": ref_object, "rl": ref_link})
-                cursor = (
-                    " AND (NAME>:v OR (NAME=:v AND "
-                    "(NVL(REFERENCED_OWNER,CHR(0))>NVL(:rs,CHR(0)) OR "
-                    "(NVL(REFERENCED_OWNER,CHR(0))=NVL(:rs,CHR(0)) AND "
-                    "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
-                    "NVL(REFERENCED_LINK_NAME,CHR(0))>"
-                    "NVL(:rl,CHR(0))))))))")
-            if configured:
-                params["owner"] = configured
+                if len(owners) > 1:
+                    (schema, view, ref_schema,
+                     ref_object, ref_link) = after
+                    params.update({"s": schema, "v": view,
+                                   "rs": ref_schema, "ro": ref_object,
+                                   "rl": ref_link})
+                    cursor = (
+                        " AND (OWNER>:s OR (OWNER=:s AND "
+                        "(NAME>:v OR (NAME=:v AND "
+                        "(NVL(REFERENCED_OWNER,CHR(0))>NVL(:rs,CHR(0)) OR "
+                        "(NVL(REFERENCED_OWNER,CHR(0))=NVL(:rs,CHR(0)) AND "
+                        "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
+                        "NVL(REFERENCED_LINK_NAME,CHR(0))>"
+                        "NVL(:rl,CHR(0))))))))))")
+                else:
+                    view, ref_schema, ref_object, ref_link = after
+                    params.update({"v": view, "rs": ref_schema,
+                                   "ro": ref_object, "rl": ref_link})
+                    cursor = (
+                        " AND (NAME>:v OR (NAME=:v AND "
+                        "(NVL(REFERENCED_OWNER,CHR(0))>NVL(:rs,CHR(0)) OR "
+                        "(NVL(REFERENCED_OWNER,CHR(0))=NVL(:rs,CHR(0)) AND "
+                        "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
+                        "NVL(REFERENCED_LINK_NAME,CHR(0))>"
+                        "NVL(:rl,CHR(0))))))))")
+            if owners:
+                owner_scope = _owner_scope("OWNER", owners, params)
                 sql = (
                     "SELECT OWNER AS schema_name,NAME AS view_name,"
                     "REFERENCED_OWNER AS referenced_schema,"
                     "REFERENCED_NAME AS referenced_object,"
                     "REFERENCED_TYPE AS referenced_type,"
                     "REFERENCED_LINK_NAME AS referenced_link FROM "
-                    "ALL_DEPENDENCIES WHERE OWNER=:owner AND TYPE='VIEW' AND "
+                    f"ALL_DEPENDENCIES WHERE {owner_scope} AND TYPE='VIEW' AND "
                     "REFERENCED_TYPE IN ('TABLE','VIEW','MATERIALIZED VIEW') AND "
                     "1=1"
-                    f"{cursor} ORDER BY NAME,NVL(REFERENCED_OWNER,CHR(0)),"
-                    "REFERENCED_NAME,NVL(REFERENCED_LINK_NAME,CHR(0))")
+                    f"{cursor} ORDER BY OWNER,NAME,"
+                    "NVL(REFERENCED_OWNER,CHR(0)),REFERENCED_NAME,"
+                    "NVL(REFERENCED_LINK_NAME,CHR(0))")
             else:
                 sql = (
                     "SELECT USER AS schema_name,NAME AS view_name,"
@@ -964,10 +1084,17 @@ def _view_dependency_pages(
             return
         last = page[-1]
         if dialect == "oracle":
-            nxt = (_u(last.get("view_name")),
-                   _u(last.get("referenced_schema")),
-                   _u(last.get("referenced_object")),
-                   _u(last.get("referenced_link")))
+            if len(owners) > 1:
+                nxt = (_u(last.get("schema_name")),
+                       _u(last.get("view_name")),
+                       _u(last.get("referenced_schema")),
+                       _u(last.get("referenced_object")),
+                       _u(last.get("referenced_link")))
+            else:
+                nxt = (_u(last.get("view_name")),
+                       _u(last.get("referenced_schema")),
+                       _u(last.get("referenced_object")),
+                       _u(last.get("referenced_link")))
         else:
             nxt = (_u(last.get("schema_name")), _u(last.get("view_name")),
                    _u(last.get("referenced_schema")),
@@ -2189,9 +2316,21 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
 
         node_count = con.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         if not node_count:
+            boundaries = []
+            for name, source_db in source_list:
+                schemas = _configured_schemas(source_db)
+                if schemas:
+                    rendered = ", ".join(
+                        f"{schema} (default)" if pos == 0 else schema
+                        for pos, schema in enumerate(schemas))
+                    boundaries.append(f"{name}: {rendered}")
+            boundary_note = (
+                " Requested schema boundaries: " + "; ".join(boundaries) + "."
+                if boundaries else "")
             raise MetadataError(
                 "No metadata could be harvested. The existing catalog was not "
-                "replaced; check read-only catalog grants and source settings.")
+                "replaced; check read-only catalog grants and source settings."
+                + boundary_note)
         edge_count = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
         fts = _try_fts(con)
         built_at = _stamp()

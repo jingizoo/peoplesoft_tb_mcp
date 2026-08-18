@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 import threading
 
-from .config import Config
+from .config import Config, normalize_db_schemas
 from .db import Database, DbError
 
 
@@ -28,6 +28,10 @@ _PRIMARY_ALIASES = {"peoplesoft", "people soft", "ps", "psft", "primary",
 
 class SourceRegistry:
     def __init__(self, cfg: Config, primary: Database):
+        normalize_db_schemas(cfg.db, section="db")
+        for source_name, source_cfg in (cfg.sources or {}).items():
+            normalize_db_schemas(
+                source_cfg, section=f"sources.{source_name}")
         # Every later boundary comparison is case-insensitive.  Accepting
         # both ``P2Go`` and ``p2go`` here would therefore make two credentials
         # collapse to one guard identity even though dict lookup still treated
@@ -149,6 +153,7 @@ class SourceRegistry:
             "label": "Finance",
             "backend": self.cfg.db.backend,
             "schema": self.cfg.db.schema or None,
+            "schemas": list(self.cfg.db.schemas),
             "mode": "finance",
             "curated_tools": True,
             "role": "primary finance system — all curated tools answer from here",
@@ -173,6 +178,7 @@ class SourceRegistry:
                 "label": str(name),
                 "backend": src.backend,
                 "schema": src.schema or None,
+                "schemas": list(src.schemas),
                 "mode": "semantic_read_only",
                 "curated_tools": False,
                 "role": "read-only semantic and relationship discovery "

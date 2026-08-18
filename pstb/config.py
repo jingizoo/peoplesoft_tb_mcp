@@ -39,7 +39,13 @@ class Defaults:
 class DbCfg:
     backend: str = "sqlite"  # sqlite | oracle | sqlserver
     sqlite_path: str = "sample_data/ps_sample.db"
+    # ``schema`` is the default namespace used for unqualified object names.
+    # ``schemas`` is the complete read boundary for a source that deliberately
+    # combines more than one namespace in one semantic catalog/graph.  The
+    # loader also accepts ``schema: [DEFAULT, EXTRA]`` as a shorthand, but
+    # normalizes it immediately so downstream code always sees a scalar here.
     schema: str = ""
+    schemas: list = field(default_factory=list)
     use_views: bool = False
     oracle_dsn: str = ""
     oracle_user: str = ""
@@ -383,6 +389,110 @@ def _apply_section(obj: Any, data: Optional[dict]) -> None:
             setattr(obj, k, v)
 
 
+_SCHEMA_IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]{0,127}$")
+
+
+def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
+    """Canonicalize one database's default schema and schema allowlist.
+
+    ``schema`` remains backward-compatible and scalar after this function.
+    The explicit ``schemas`` list augments it; a list supplied in ``schema``
+    is accepted as a user-friendly shorthand whose first entry is the
+    default.  Values are ordinary unquoted database identifiers because the
+    same allowlist is later used as a hard query/catalog boundary.  Blank or
+    quoted/dotted values therefore fail closed instead of broadening access.
+
+    The returned list is ordered with the default first and otherwise keeps
+    configuration order.  Case-insensitive duplicates are removed.
+    """
+    raw_default = getattr(cfg, "schema", "")
+    raw_allowed = getattr(cfg, "schemas", [])
+    if isinstance(raw_default, (list, tuple)):
+        default_values = list(raw_default)
+        if not default_values:
+            raise RuntimeError(
+                f"{section}.schema list must contain at least one schema name")
+        if raw_allowed not in (None, [], ()):
+            if not isinstance(raw_allowed, (list, tuple)):
+                raise RuntimeError(f"{section}.schemas must be a list of schema names")
+            default_values.extend(raw_allowed)
+        raw_values = default_values
+        raw_default = default_values[0] if default_values else ""
+    else:
+        if raw_default is None:
+            raw_default = ""
+        if not isinstance(raw_default, str):
+            raise RuntimeError(
+                f"{section}.schema must be a schema name or a list of names")
+        if raw_allowed is None:
+            raw_allowed = []
+        if not isinstance(raw_allowed, (list, tuple)):
+            raise RuntimeError(f"{section}.schemas must be a list of schema names")
+        raw_values = ([raw_default] if raw_default.strip() else []) + list(raw_allowed)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        if not isinstance(raw, str):
+            raise RuntimeError(f"{section}.schemas must contain only schema names")
+        value = raw.strip().upper()
+        if not value:
+            raise RuntimeError(f"{section}.schemas cannot contain blank schema names")
+        if not _SCHEMA_IDENT.fullmatch(value):
+            raise RuntimeError(
+                f"{section}.schemas contains unsafe schema name {raw!r}; "
+                "use an unquoted database identifier without dots")
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+
+    default = str(raw_default).strip().upper()
+    if default:
+        if not _SCHEMA_IDENT.fullmatch(default):
+            raise RuntimeError(
+                f"{section}.schema contains unsafe schema name {raw_default!r}; "
+                "use an unquoted database identifier without dots")
+        if default in normalized:
+            normalized.remove(default)
+        normalized.insert(0, default)
+    elif normalized:
+        default = normalized[0]
+
+    cfg.schema = default
+    cfg.schemas = normalized
+    return list(normalized)
+
+
+def _validate_multi_schema_backend(block: Any, *, section: str) -> None:
+    """Reject an explicitly multi-schema non-Oracle YAML source.
+
+    Validation uses the unmodified input block. Runtime/fingerprint helpers
+    normalize programmatically constructed configs more than once, so they
+    cannot distinguish a user allowlist from the single default they derived
+    on an earlier pass.
+    """
+    if not isinstance(block, dict):
+        return
+    raw_schema = block.get("schema", "")
+    raw_schemas = block.get("schemas", [])
+    values = list(raw_schema) if isinstance(raw_schema, (list, tuple)) else (
+        [raw_schema] if isinstance(raw_schema, str) and raw_schema.strip()
+        else [])
+    if isinstance(raw_schemas, (list, tuple)):
+        values.extend(raw_schemas)
+    distinct = {
+        value.strip().casefold() for value in values
+        if isinstance(value, str) and value.strip()
+    }
+    backend = str(block.get("backend", "sqlite") or "").strip().casefold()
+    if len(distinct) > 1 and backend != "oracle":
+        raise RuntimeError(
+            f"{section}.schemas supports multiple schema names only for "
+            "Oracle in this release; configure other databases as separate "
+            "sources instead"
+        )
+
+
 def _validate_coupa(cfg: CoupaCfg) -> None:
     """Fail closed on malformed procurement-authority configuration.
 
@@ -628,6 +738,7 @@ def load_config(path: Optional[str] = None) -> Config:
                     data[section] = {**data[section], **block}
                 elif isinstance(block, dict):
                     data[section] = block
+        _validate_multi_schema_backend(data.get("db"), section="db")
         _apply_section(cfg.defaults, data.get("defaults"))
         _apply_section(cfg.db, data.get("db"))
         _apply_section(cfg.llm, data.get("llm"))
@@ -644,6 +755,8 @@ def load_config(path: Optional[str] = None) -> Config:
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]
         for name, block in (data.get("sources") or {}).items():
+            _validate_multi_schema_backend(
+                block, section=f"sources.{name}")
             src = DbCfg()
             _apply_section(src, block)
             # Per-source credentials come from env vars named after the
@@ -655,6 +768,13 @@ def load_config(path: Optional[str] = None) -> Config:
             src.oracle_password = _env(f"PSTB_SRC_{key}_PASSWORD",
                                        src.oracle_password)
             cfg.sources[str(name)] = src
+
+    # Do this after both YAML layers have been applied.  It turns the accepted
+    # list shorthand back into the scalar contract every database consumer
+    # historically expects, while retaining the full hard allowlist.
+    normalize_db_schemas(cfg.db, section="db")
+    for name, src in cfg.sources.items():
+        normalize_db_schemas(src, section=f"sources.{name}")
 
     d, l, w = cfg.db, cfg.llm, cfg.wiki
     cfg.ps_api.user = _env("PSFT_QAS_USER", cfg.ps_api.user)

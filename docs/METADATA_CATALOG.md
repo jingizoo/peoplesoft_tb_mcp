@@ -108,6 +108,10 @@ sources:
   warehouse:
     backend: oracle
     schema: FIN_DW
+  p2go:
+    backend: oracle
+    schema: P2GO
+    schemas: [P2GO, TUSINVC]
 ```
 
 Keep passwords in `.env`; they are not copied into the catalog. Per-source
@@ -116,12 +120,16 @@ Oracle credentials use `PSTB_SRC_<SOURCE>_DSN`,
 
 Schema behavior is intentionally bounded:
 
-- **Oracle:** when `db.schema` is set, the collector uses owner-filtered
-  `ALL_*` catalog views. When it is blank, it uses `USER_*`. It never performs
-  an unowned crawl of everything visible to the account.
+- **Oracle:** when `schema`/`schemas` are set, the collector uses safely bound
+  owner filters on `ALL_*` catalog views. `schema` is the default for
+  unqualified live names; `schemas` is the complete allowlist stored in that
+  source's one artifact. When both are blank, it uses `USER_*`. It never
+  performs an unowned crawl of everything visible to the account.
 - **SQL Server:** objects are joined to `sys.schemas`. A configured schema is
   matched case-insensitively; with no configured schema, every schema visible
-  in that configured database is collected and kept distinct.
+  in that configured database is collected and kept distinct. Explicit
+  multi-schema allowlists are Oracle-only in this release; use separate
+  sources for other governed database boundaries.
 - **SQLite:** the collector reads the selected database's `sqlite_master` and
   PRAGMA metadata under schema `MAIN`.
 
@@ -135,8 +143,9 @@ for the narrowest metadata visibility that covers the intended database and
 schema:
 
 - Oracle: visibility of objects, columns, indexes, constraints and dependencies
-  through `USER_*`, or `ALL_*` for the single configured owner. Object
-  visibility still follows the privileges of the build account.
+  through `USER_*`, or `ALL_*` for every explicitly configured owner. Object
+  visibility still follows the privileges of the build account; privileges do
+  not add an owner to the artifact or live-query allowlist.
 - SQL Server: `CONNECT` plus `VIEW DEFINITION` on the intended database or
   schema. Do not grant server-wide metadata visibility merely for this build.
 - SQLite: read access to the selected database file.
@@ -184,6 +193,9 @@ that scope remains an `external_object` with `resolution_status: unresolved`;
 it is never silently dropped or promoted to a live table. Cross-database,
 SQL Server linked-server and Oracle database-link names remain structural
 reference attributes, not a guessed mapping to another configured source.
+Two allowed schemas in one source can therefore produce a confirmed
+cross-schema edge, while the same reference to Finance or any unlisted owner
+cannot become a traversable relationship.
 
 SQLite exposes primary, unique and foreign keys through structured PRAGMAs but
 has no structured dependency catalog. The build therefore records SQLite view
