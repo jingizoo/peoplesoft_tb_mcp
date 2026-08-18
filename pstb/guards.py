@@ -130,6 +130,12 @@ _SOURCE_SCOPED_TOOLS = (
     "describe_metadata_catalog", "search_metadata", "get_metadata_context",
 )
 
+# Every source-accepting generic tool must prove the database that produced
+# its result.  This is deliberately broader than ``SOURCE_SILO_TOOLS``:
+# Finance can also call record search/profile/compare, while those tools are
+# intentionally not offered inside a secondary workspace.
+SOURCE_PROVENANCE_TOOLS = frozenset(_SOURCE_SCOPED_TOOLS)
+
 # A named secondary database is its own chat silo.  These are the complete
 # capabilities offered inside that silo: generic structural discovery,
 # relationship inspection, and guarded read-only querying.  PeopleSoft,
@@ -1812,8 +1818,7 @@ def source_result_status(
     """
     scope = request_scope if isinstance(request_scope, Mapping) else {}
     expected = str(scope.get("source") or scope.get("db") or "").strip()
-    if (not expected or expected.casefold() == "default"
-            or tool_name not in SOURCE_SILO_TOOLS):
+    if not expected or tool_name not in SOURCE_PROVENANCE_TOOLS:
         return True, ""
     if str(content or "").startswith("TOOL ERROR"):
         # The ordinary result validator preserves the useful transport/tool
@@ -1831,9 +1836,27 @@ def source_result_status(
             f"{tool_name} returned an unexpected result shape, so its "
             f"database source could not be verified as {expected!r}"
         )[:240]
-    if payload.get("error"):
-        return True, ""
     actual = str(payload.get("source_database") or "").strip()
+    if payload.get("error"):
+        # Pure errors carry no usable facts and may retain the ordinary tool
+        # failure path. A payload that mixes an error with rows/results is
+        # neither a trustworthy success nor a safe partial result: refuse it
+        # before it reaches the selected workspace's model transcript.
+        if actual and actual != expected:
+            return False, (
+                f"{tool_name} returned source_database={actual!r}, which "
+                f"conflicts with selected database {expected!r}"
+            )[:240]
+        error_only = {
+            "error", "code", "status", "reason", "message", "detail",
+            "hint", "remedy", "next_step", "retryable", "source_database",
+        }
+        if set(payload) - error_only:
+            return False, (
+                f"{tool_name} returned result-bearing fields together with "
+                "an error, so the partial payload was withheld"
+            )[:240]
+        return True, ""
     if not actual:
         return False, (
             f"{tool_name} did not identify the database that produced its "
@@ -2643,10 +2666,10 @@ def _numeric_key(text: str) -> str:
 # dismiss — not a blanked answer.
 
 # Which system's authority a tool's numbers carry. This mapping is a
-# JUDGEMENT and belongs in code review, not in inference: run_sql and
-# run_playbook are peoplesoft_gl because they read the PeopleSoft database
-# THIS deployment points at, and that stops being true the day sources.py
-# aims a named source at some other system. Revisit it then.
+# JUDGEMENT and belongs in code review, not in inference. Curated Finance tools
+# are physically bound to PeopleSoft. Generic source-silo tools such as
+# run_sql use the server-issued payload source instead (see source_of_payload),
+# so a P2Go result never inherits this primary fallback label.
 _SOURCE_OF_TOOL = {
     "peoplesoft_gl": {
         "get_trial_balance", "get_account_balance", "compare_trial_balance",
@@ -2804,7 +2827,7 @@ def source_of_payload(tool_name: str, payload: object) -> str:
     payload's server-issued ``source_database`` is the authority; continuing
     to label it PeopleSoft would let a P2Go number masquerade as a GL fact.
     """
-    if tool_name in SOURCE_SILO_TOOLS and isinstance(payload, Mapping):
+    if tool_name in SOURCE_PROVENANCE_TOOLS and isinstance(payload, Mapping):
         source = str(payload.get("source_database") or "").strip()
         if source and source.casefold() != "default":
             return f"database:{source}"

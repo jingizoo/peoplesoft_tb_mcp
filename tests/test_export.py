@@ -378,6 +378,25 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Export-Source"], "finance")
         child.assert_not_called()
 
+    def test_finance_export_rejects_a_captured_p2go_card(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        with TestClient(
+                gapp.app, base_url="http://127.0.0.1:8000",
+                client=("127.0.0.1", 50000)) as client:
+            response = client.post("/api/source/finance/export", json={
+                "tool": "list_tables",
+                "args": {"source": "default"},
+                "result": {
+                    "source_database": "p2go",
+                    "tables": [{"schema": "P2GO",
+                                "name": "PRIVATE_P2GO"}],
+                },
+            })
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("selected database", response.json()["detail"])
+
     def test_export_route_rejects_conflicting_source_aliases(self) -> None:
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp

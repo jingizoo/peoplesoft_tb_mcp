@@ -136,6 +136,21 @@ class SourceTaggingTests(unittest.TestCase):
 
 
 class SourceBoundaryResultTests(unittest.TestCase):
+    def test_explicit_finance_result_requires_exact_default_source(self):
+        scope = {"source": "default"}
+        self.assertEqual(
+            source_result_status(
+                "run_sql", json.dumps({"source_database": "default"}),
+                scope),
+            (True, ""),
+        )
+        for payload in ({"source_database": "p2go"}, {"rows": []}):
+            with self.subTest(payload=payload):
+                ok, detail = source_result_status(
+                    "run_sql", json.dumps(payload), scope)
+                self.assertFalse(ok)
+                self.assertTrue(detail)
+
     def test_secondary_result_requires_the_exact_source(self) -> None:
         scope = {"source": "p2go"}
         self.assertEqual(
@@ -167,6 +182,28 @@ class SourceBoundaryResultTests(unittest.TestCase):
                 {"source": "p2go"}),
             (True, ""),
         )
+
+    def test_mixed_error_payload_cannot_cross_or_bypass_source_boundary(self):
+        for payload in (
+            {"error": "partial backend error", "source_database": "p2go",
+             "rows": [{"salary": 999999}]},
+            {"error": "partial backend error", "source_database": "default",
+             "rows": [{"salary": 999999}]},
+        ):
+            with self.subTest(payload=payload):
+                ok, detail = source_result_status(
+                    "run_sql", json.dumps(payload), {"source": "default"})
+                self.assertFalse(ok)
+                self.assertTrue(detail)
+
+    def test_all_source_accepting_tools_verify_result_provenance(self):
+        ok, detail = source_result_status(
+            "search_records",
+            json.dumps({"source_database": "p2go", "matches": []}),
+            {"source": "default"},
+        )
+        self.assertFalse(ok)
+        self.assertIn("selected database", detail)
 
 
 class CrossSourceTests(unittest.TestCase):

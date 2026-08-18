@@ -4175,6 +4175,33 @@ function renderQlogReport(r){
     (r.turns?r.turns+' turns, '+r.failed+' failed or thumbed down':'no turns logged yet')+'</span>'));
   if(r.error){ c.append(el('div','pad',esc(r.error))); return c; }
   if(r.note){ c.append(el('div','pad',esc(r.note))); return c; }
+  const sourceRows=Object.values(r.sources||{});
+  if(sourceRows.length){
+    const t=el('table');
+    t.innerHTML='<thead><tr><th>Source</th><th>Boundary / scope</th><th class="num">Turns</th><th class="num">Failed</th><th>Catalog</th></tr></thead><tbody>'+sourceRows.map(s=>{
+      const cx=s.source_context||{},schemas=cx.schema_allowlist||[];
+      const schemaBoundary=schemas.length
+        ? ((cx.default_schema?cx.default_schema+' default; ':'')+schemas.join(', '))
+        : '';
+      const financeScopes=(s.scopes||[]).slice(0,3).map(x=>[x.business_unit,x.ledger,
+          x.fiscal_year?'FY'+x.fiscal_year:'',x.period?'P'+x.period:''].filter(Boolean).join(' / ')).join('; ');
+      const boundary=[schemaBoundary,financeScopes].filter(Boolean).join(' · ');
+      const cat=s.catalog||{},coverage=cat.schema_coverage||{},counts=coverage.object_counts||{},latest=cat.latest_build||{};
+      const coverageText=Object.keys(counts).length
+        ? ' · '+Object.entries(counts).map(([k,v])=>k+' '+v).join(', ')
+        : '';
+      const refreshText=latest.status
+        ? ' · refresh '+latest.status+(latest.published?' published':' not published')
+        : '';
+      const catalog=cat.status
+        ? cat.status+(cat.fingerprint?' · '+cat.fingerprint.slice(0,12):'')+coverageText+refreshText
+        : 'not observed';
+      return '<tr><td><b>'+esc(s.source_database||'default')+'</b></td><td>'+esc(boundary||'none')+'</td>'+
+        '<td class="num">'+Number(s.turns||0).toLocaleString()+'</td><td class="num">'+Number(s.failed||0).toLocaleString()+'</td>'+
+        '<td>'+esc(catalog)+'</td></tr>';
+    }).join('')+'</tbody>';
+    c.append(t);
+  }
   if(r.suggestions&&r.suggestions.length){
     c.append(el('div','pad','<b>What to do next, in order</b><br>'+
       r.suggestions.map((s2,i)=>(i+1)+'. '+esc(s2)).join('<br>')));
@@ -4183,8 +4210,9 @@ function renderQlogReport(r){
   }
   if(r.recent_failed&&r.recent_failed.length){
     const t=el('table');
-    t.innerHTML='<thead><tr><th>When</th><th>Question</th><th>Flags</th></tr></thead><tbody>'+
-      r.recent_failed.map(f=>'<tr><td>'+esc(f.ts)+'</td><td>'+esc(f.question)+'</td>'+
+    t.innerHTML='<thead><tr><th>When</th><th>Source</th><th>Local turn</th><th>Flags</th></tr></thead><tbody>'+
+      r.recent_failed.map(f=>'<tr><td>'+esc(f.ts)+'</td><td>'+esc(f.source_database||'default')+'</td>'+
+        '<td><code>'+esc(f.turn_id||'')+'</code></td>'+
         '<td>'+f.flags.map(x=>'<span class="badge warn">'+esc(x)+'</span>').join(' ')+'</td></tr>').join('')+
       '</tbody>';
     const sc=el('div'); sc.style.maxHeight='260px'; sc.style.overflow='auto'; sc.append(t);

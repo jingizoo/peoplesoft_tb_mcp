@@ -77,6 +77,40 @@ try:
 except WikiError:
     wiki = None
 
+
+def _source_log_context(source: str) -> dict:
+    """Connection-free schema boundary for the structural question log.
+
+    The registry description is derived from active configuration only.  Do
+    not open the metadata artifact or source database merely to emit telemetry:
+    catalog build identity is captured when a metadata tool actually observes
+    it, and a chat turn must not become slower or less available because its
+    logger wanted another probe.
+    """
+    canonical = str(source or "default").strip() or "default"
+    try:
+        canonical = engine.registry.resolve_name(canonical)
+        item = next(
+            (row for row in engine.registry.describe()
+             if row.get("source") == canonical),
+            {},
+        )
+    except Exception:
+        # Telemetry is subordinate to the request.  Focused integrations and
+        # a partially initialised registry may expose routing without the
+        # connection-free descriptor; that must never change a 400/answer
+        # into a logging-shaped 500.
+        item = {}
+    schemas = list(item.get("schemas") or [])
+    default = str(item.get("schema") or "")
+    if default and default not in schemas:
+        schemas.insert(0, default)
+    return {
+        "canonical_source": canonical,
+        "default_schema": default,
+        "schema_allowlist": schemas,
+    }
+
 # ---------------------------------------------------------------- MCP session
 # One server subprocess for the LIFETIME OF THE PROCESS, not one per chat turn.
 # Spawning per turn cost a fresh Python start, MCP handshake, Oracle logon and
@@ -1684,11 +1718,19 @@ def diagnostics(include_timings: int = 0):
 
 
 @app.get("/api/question-report")
-def question_report():
+def question_report(request: Request):
     """Deterministic what-to-optimize-next report over the question log."""
+    if row_security.enabled:
+        access = access_for_request(request)
+        if access is None or not getattr(access, "privileged", False):
+            raise HTTPException(
+                status_code=403,
+                detail="Question-log diagnostics are restricted to "
+                       "configured privileged operators.")
     from pstb import qlog_report as _qr
     if not qlog.path:
         return {"turns": 0, "failed": 0, "flags": {}, "tools": [],
+                "sources": {},
                 "repeat_failures": [], "recent_failed": [], "suggestions": [],
                 "note": "question logging is not configured"}
     r = _guard(_qr.analyze, path=qlog.path)
@@ -1761,16 +1803,21 @@ def _export_csv_for_source(canonical: str, payload: dict,
                 tool, args, {"source": canonical})
         except ScopeConflict as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        captured = body.get("result")
-        if captured is not None:
-            source_ok, problem = source_result_status(
-                tool, json.dumps(captured, default=str),
-                {"source": canonical},
-            )
-            if not source_ok:
-                raise HTTPException(status_code=400, detail=problem)
     elif "source" in args:
         args["source"] = "default"
+
+    # Captured structural cards are used when a tool has no safe export
+    # re-run. Verify them for Finance as well as secondary workspaces: a stale
+    # P2Go card must never become a file labelled ``finance`` merely because
+    # the default route was selected.
+    captured = body.get("result")
+    if captured is not None:
+        source_ok, problem = source_result_status(
+            tool, json.dumps(captured, default=str),
+            {"source": canonical},
+        )
+        if not source_ok:
+            raise HTTPException(status_code=400, detail=problem)
 
     # The unit rides in the BODY here, where the query-string gate cannot
     # see it — and export re-runs the tool at the full population ceiling,
@@ -2214,6 +2261,7 @@ async def chat(payload: dict, request: Request = None):
             engine.registry.resolve_name(raw_source)
             if engine.registry is not None else "default"
         )
+        source_log_context = _source_log_context(resolved_source)
         secondary_requested = bool(
             raw_source and resolved_source != "default"
         )
@@ -2531,6 +2579,7 @@ async def chat(payload: dict, request: Request = None):
                     qlog=qlog,
                     surface="gui",
                     scope=active_scope,
+                    source_context=source_log_context,
                     tool_observer=_observe_and_record,
                     tool_started=_on_started,
                     prior_payloads=prior_payloads,
@@ -2729,6 +2778,8 @@ def feedback(payload: dict):
     turn_id = (payload or {}).get("turn_id", "")
     if not turn_id:
         raise HTTPException(status_code=400, detail="turn_id required")
+    if not qlog.has_turn(turn_id):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
     qlog.log_feedback(turn_id, (payload or {}).get("verdict", "bad"),
                       (payload or {}).get("note", ""))
     return {"ok": True}

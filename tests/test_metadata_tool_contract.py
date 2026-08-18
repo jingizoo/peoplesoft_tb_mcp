@@ -112,7 +112,8 @@ class MetadataToolContractTests(unittest.TestCase):
         isolated = cases["metadata-ambiguous-source-schema"]
         self.assertEqual(isolated["scope"], {"source": "p2go"})
         self.assertEqual(
-            isolated["expect"]["tool_args_contain"]["source"], "p2go")
+            isolated["expect"]["tool_args_by_tool"]
+            ["get_metadata_context"]["source"], "p2go")
         self.assertNotIn("every configured database",
                          isolated["question"].lower())
 

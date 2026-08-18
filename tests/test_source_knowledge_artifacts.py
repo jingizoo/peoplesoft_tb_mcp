@@ -20,9 +20,12 @@ from pstb.metadata import (
     MetadataCatalog,
     MetadataBuildLimits,
     MetadataError,
+    build_status_path,
     build_catalog,
+    read_build_status,
     source_catalog_path,
     source_fingerprint,
+    write_build_status,
 )
 
 
@@ -110,6 +113,79 @@ class SourceKnowledgeArtifactTests(unittest.TestCase):
         self.assertNotIn("/", hostile.name)
         self.assertRegex(p2go.name, r"^p2go-[0-9a-f]{12}\.db$")
 
+    def test_latest_build_status_is_private_bounded_and_source_bound(self):
+        artifact = self._build("p2go")
+        write_build_status(artifact, {
+            "source_database": "p2go",
+            "build_run_id": "a" * 32,
+            "attempted_at": "2026-08-18T12:00:00Z",
+            "published": False,
+            "status": "failed",
+            "previous_snapshot_id": "b" * 20,
+            "failure_category": "metadata_unavailable",
+            "schema_coverage": {
+                "default": "P2GO",
+                "configured": ["P2GO", "TUSINVC"],
+                "object_counts": {"P2GO": 0, "TUSINVC": 0},
+                "missing": ["P2GO", "TUSINVC"],
+                "complete": False,
+            },
+            # Persistence reselects fields and cannot retain diagnostics.
+            "error": "password=secret; SELECT * FROM PRIVATE_TABLE",
+        })
+        status_file = build_status_path(artifact)
+        self.assertEqual(status_file.stat().st_mode & 0o777, 0o600)
+        text = status_file.read_text(encoding="utf-8")
+        self.assertNotIn("secret", text)
+        self.assertNotIn("PRIVATE_TABLE", text)
+        status = read_build_status(artifact, "p2go")
+        self.assertFalse(status["published"])
+        self.assertEqual(status["previous_snapshot_id"], "b" * 20)
+        self.assertEqual(status["schema_coverage"]["missing"],
+                         ["P2GO", "TUSINVC"])
+        self.assertEqual(read_build_status(artifact, "finance"), {})
+        described = MetadataCatalog(artifact, source="p2go").describe()
+        self.assertEqual(described["latest_build"], status)
+        self.assertEqual(described["snapshot"]["latest_build"], status)
+
+    def test_status_writer_does_not_follow_predictable_temp_symlink(self):
+        artifact = self._build("p2go")
+        target = build_status_path(artifact)
+        victim = self.root / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        old_temp = target.with_name(target.name + ".building")
+        old_temp.symlink_to(victim)
+
+        write_build_status(artifact, {
+            "source_database": "p2go",
+            "build_run_id": "c" * 32,
+            "attempted_at": "2026-08-18T12:00:00Z",
+            "published": False,
+            "status": "building",
+        })
+
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(read_build_status(artifact, "p2go")["status"],
+                         "building")
+
+    def test_success_status_must_match_the_served_snapshot(self):
+        artifact = self._build("p2go")
+        write_build_status(artifact, {
+            "source_database": "p2go",
+            "build_run_id": "d" * 32,
+            "attempted_at": "2026-08-18T12:00:00Z",
+            "published": True,
+            "status": "complete",
+            "snapshot_id": "e" * 20,
+        })
+
+        latest = MetadataCatalog(
+            artifact, source="p2go").describe()["latest_build"]
+        self.assertFalse(latest["published"])
+        self.assertEqual(latest["status"], "failed")
+        self.assertFalse(latest["snapshot_matches"])
+        self.assertEqual(latest["failure_category"], "snapshot_mismatch")
+
     def test_one_file_contains_semantic_nodes_and_relationship_edges(self) -> None:
         path = self._build("p2go")
         with sqlite3.connect(path) as con:
@@ -195,6 +271,10 @@ class SourceKnowledgeArtifactTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertTrue(result["found"])
         self.assertEqual(result["source_database"], "p2go")
+        self.assertEqual(
+            result["snapshot"]["source_fingerprint"],
+            source_fingerprint(self.cfg, "p2go"),
+        )
         self.assertEqual(result["hop_count"], 1)
         hop = result["hops"][0]
         self.assertEqual(hop["relationship"], "foreign_key")
@@ -473,7 +553,12 @@ class SourceKnowledgeArtifactTests(unittest.TestCase):
         loaded_cfg = __import__("pstb.config", fromlist=["load_config"]
                             ).load_config(str(config_path))
         finance_artifact = source_catalog_path(loaded_cfg, "default")
+        p2go_artifact = source_catalog_path(loaded_cfg, "p2go")
         finance_before = finance_artifact.read_bytes()
+        finance_status_before = build_status_path(finance_artifact).read_bytes()
+        first_p2go_status = read_build_status(p2go_artifact, "p2go")
+        self.assertTrue(first_p2go_status["published"])
+        self.assertEqual(first_p2go_status["status"], "complete")
 
         with sqlite3.connect(self.p2go_path) as con:
             con.execute("CREATE TABLE P2GO_SECOND_REFRESH (ID INTEGER)")
@@ -482,6 +567,103 @@ class SourceKnowledgeArtifactTests(unittest.TestCase):
                 "--config", str(config_path), "--source", "p2go",
                 "--peopletools-source", "none", "--quiet"]), 0)
         self.assertEqual(finance_artifact.read_bytes(), finance_before)
+        self.assertEqual(build_status_path(finance_artifact).read_bytes(),
+                         finance_status_before)
+        refreshed = read_build_status(p2go_artifact, "p2go")
+        self.assertTrue(refreshed["published"])
+        self.assertNotEqual(refreshed["build_run_id"],
+                            first_p2go_status["build_run_id"])
+        self.assertEqual(refreshed["previous_snapshot_id"],
+                         first_p2go_status["snapshot_id"])
+
+    def test_failed_refresh_is_observable_while_prior_snapshot_survives(self):
+        from scripts import build_metadata_catalog as builder
+
+        config_path = self.root / "config.yaml"
+        config_path.write_text(
+            "db:\n  backend: sqlite\n"
+            f"  sqlite_path: {self.finance_path}\n"
+            "sources:\n  p2go:\n    backend: sqlite\n"
+            f"    sqlite_path: {self.p2go_path}\n",
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(builder.main([
+                "--config", str(config_path), "--source", "p2go",
+                "--peopletools-source", "none", "--quiet"]), 0)
+        loaded_cfg = __import__("pstb.config", fromlist=["load_config"]
+                            ).load_config(str(config_path))
+        artifact = source_catalog_path(loaded_cfg, "p2go")
+        before = artifact.read_bytes()
+        prior = read_build_status(artifact, "p2go")
+
+        empty = self.root / "empty-p2go.db"
+        sqlite3.connect(empty).close()
+        config_path.write_text(
+            "db:\n  backend: sqlite\n"
+            f"  sqlite_path: {self.finance_path}\n"
+            "sources:\n  p2go:\n    backend: sqlite\n"
+            f"    sqlite_path: {empty}\n",
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(builder.main([
+                "--config", str(config_path), "--source", "p2go",
+                "--peopletools-source", "none", "--quiet"]), 1)
+        self.assertEqual(artifact.read_bytes(), before)
+        failed = read_build_status(artifact, "p2go")
+        self.assertFalse(failed["published"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["previous_snapshot_id"],
+                         prior["snapshot_id"])
+        self.assertEqual(failed["failure_category"],
+                         "metadata_unavailable")
+        self.assertIn("prior p2go artifact", output.getvalue())
+        self.assertEqual(
+            MetadataCatalog(artifact, source="p2go").describe()[
+                "latest_build"],
+            failed,
+        )
+
+    def test_status_write_failure_cannot_leave_prior_success_looking_current(self):
+        from scripts import build_metadata_catalog as builder
+
+        config_path = self.root / "config.yaml"
+        config_path.write_text(
+            "db:\n  backend: sqlite\n"
+            f"  sqlite_path: {self.finance_path}\n"
+            "sources:\n  p2go:\n    backend: sqlite\n"
+            f"    sqlite_path: {self.p2go_path}\n",
+            encoding="utf-8",
+        )
+        real_write = builder.write_build_status
+        calls = 0
+
+        def fail_completion(path, record):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_write(path, record)
+            raise OSError("simulated status filesystem failure")
+
+        output = io.StringIO()
+        with patch.object(builder, "write_build_status",
+                          side_effect=fail_completion), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(builder.main([
+                "--config", str(config_path), "--source", "p2go",
+                "--peopletools-source", "none", "--quiet"]), 1)
+
+        loaded_cfg = __import__(
+            "pstb.config", fromlist=["load_config"]).load_config(
+                str(config_path))
+        artifact = source_catalog_path(loaded_cfg, "p2go")
+        self.assertTrue(artifact.exists(), "the usable artifact was published")
+        latest = read_build_status(artifact, "p2go")
+        self.assertEqual(latest["status"], "building")
+        self.assertFalse(latest["published"])
+        self.assertIn("STATUS INCOMPLETE", output.getvalue())
 
 
 class SourceMetadataToolResultTests(unittest.TestCase):

@@ -150,8 +150,20 @@ and retry tuning built in — `gemini-2.5-flash` is the cheaper/faster option;
 Whichever you pick, measure it rather than assuming:
 
 ```bash
-.venv/bin/python scripts/eval.py --provider claude
+.venv/bin/python scripts/eval.py --suite finance --provider claude
+.venv/bin/python scripts/eval.py --suite p2go --provider claude
+.venv/bin/python scripts/eval.py --suite all --provider claude --json eval-all.json
 ```
+
+Finance and P2Go are scored separately even with `--suite all`; one workspace
+cannot hide a regression in the other. The runner uses the same Finance prompt
+and full tool profile as Ask for Finance cases, and the same source-silo prompt
+and closed structural/query tool profile as `/p2go` for P2Go cases. P2Go cases
+also verify the configured `P2GO` + `TUSINVC` schema boundary from that source's
+own catalog. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#source-aware-evals--pinning-model-behavior)
+for the acceptance gates and privacy-safe local observability contract. JSON
+eval evidence is written atomically with owner-only permissions and standard
+output names are git-ignored.
 
 ## Restricting data by business unit
 

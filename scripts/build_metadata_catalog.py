@@ -14,8 +14,12 @@ prior file after a usable snapshot is complete.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import json
+import sqlite3
 import sys
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,13 +28,43 @@ sys.path.insert(0, str(ROOT))
 from pstb.config import load_config                            # noqa: E402
 from pstb.db import Database                                   # noqa: E402
 from pstb.metadata import (MetadataBuildLimits, MetadataError, # noqa: E402
-                           build_catalog, catalog_path)
+                           build_catalog, catalog_path,
+                           write_build_status)
 from pstb.sources import SourceRegistry                        # noqa: E402
 
 
 def _say(message: str, quiet: bool = False) -> None:
     if not quiet:
         print(message, flush=True)
+
+
+def _prior_snapshot_id(path: Path) -> str:
+    """Read only the prior artifact identity; an unreadable file is none."""
+    if not path.is_file():
+        return ""
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT value FROM meta WHERE key='snapshot_id'"
+            ).fetchone()
+            value = str(row[0] if row else "")
+            return value if len(value) <= 128 else ""
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return ""
+
+
+def _record_build_status(path: Path, record: dict) -> bool:
+    """Persist the acceptance state without ever modifying the artifact."""
+    try:
+        write_build_status(path, record)
+    except (MetadataError, OSError) as exc:
+        print("WARNING: metadata build status could not be recorded "
+              f"for {record.get('source_database')}: {type(exc).__name__}")
+        return False
+    return True
 
 
 def main(argv=None) -> int:
@@ -147,6 +181,32 @@ def main(argv=None) -> int:
                 _say(f"{name} schemas: {', '.join(rendered)}", args.quiet)
             if all(id(database) != id(opened) for opened in opened_dbs):
                 opened_dbs.append(database)
+            build_run_id = uuid.uuid4().hex
+            attempted_at = dt.datetime.now(dt.timezone.utc).replace(
+                microsecond=0).isoformat().replace("+00:00", "Z")
+            previous_snapshot_id = _prior_snapshot_id(out)
+            pending_status = {
+                "source_database": name,
+                "build_run_id": build_run_id,
+                "attempted_at": attempted_at,
+                "published": False,
+                "status": "building",
+                "previous_snapshot_id": previous_snapshot_id,
+                "schema_coverage": {
+                    "default": schemas[0] if schemas else "",
+                    "configured": schemas,
+                    "object_counts": {schema: 0 for schema in schemas},
+                    "missing": schemas,
+                    "complete": False,
+                },
+            }
+            if not _record_build_status(out, pending_status):
+                exc = MetadataError(
+                    "The refresh attempt could not be durably recorded; "
+                    "the prior artifact was not touched")
+                failures.append((name, exc))
+                print(f"Metadata catalog for {name} was NOT rebuilt: {exc}")
+                continue
             started = time.perf_counter()
             try:
                 info = build_catalog(
@@ -155,6 +215,24 @@ def main(argv=None) -> int:
                         name if args.peopletools_source == name else "none"))
                 elapsed = time.perf_counter() - started
             except Exception as exc:  # atomic builder preserves this source
+                _record_build_status(out, {
+                    "source_database": name,
+                    "build_run_id": build_run_id,
+                    "attempted_at": attempted_at,
+                    "published": False,
+                    "status": "failed",
+                    "previous_snapshot_id": previous_snapshot_id,
+                    "failure_category": (
+                        "metadata_unavailable"
+                        if isinstance(exc, MetadataError) else "build_error"),
+                    "schema_coverage": {
+                        "default": schemas[0] if schemas else "",
+                        "configured": schemas,
+                        "object_counts": {schema: 0 for schema in schemas},
+                        "missing": schemas,
+                        "complete": False,
+                    },
+                })
                 failures.append((name, exc))
                 print(f"Metadata catalog for {name} was NOT replaced: {exc}")
                 print(f"The prior {name} artifact, if any, remains readable.")
@@ -169,6 +247,36 @@ def main(argv=None) -> int:
                 print(f"PARTIAL {name}: a configured layer limit or read "
                       "error was recorded. Run describe_metadata_catalog "
                       f"with source={name!r} for exact coverage.")
+            try:
+                coverage = json.loads(info.get("schema_coverage") or "{}") \
+                    .get(name, {})
+            except (TypeError, ValueError):
+                coverage = {}
+            status_recorded = _record_build_status(out, {
+                "source_database": name,
+                "build_run_id": build_run_id,
+                "attempted_at": attempted_at,
+                "published": True,
+                "status": ("partial" if info.get("partial") == "yes"
+                           else "complete"),
+                "snapshot_id": info.get("snapshot_id", ""),
+                "previous_snapshot_id": previous_snapshot_id,
+                "schema_coverage": coverage,
+            })
+            if not status_recorded:
+                exc = MetadataError(
+                    "The artifact was published, but its matching build "
+                    "status could not be recorded; deployment acceptance "
+                    "must remain failed until a clean refresh")
+                failures.append((name, exc))
+                print(f"STATUS INCOMPLETE {name}: {exc}")
+            if coverage.get("missing"):
+                print(
+                    f"MISSING SCHEMAS {name}: "
+                    + ", ".join(coverage["missing"])
+                    + ". Verify the service/PDB, exact owner names, and "
+                    "normal-session catalog grants."
+                )
             if info.get("degraded"):
                 print("DEGRADED sources: " + info["degraded"])
     finally:

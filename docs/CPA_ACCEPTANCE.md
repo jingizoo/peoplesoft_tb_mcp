@@ -208,7 +208,7 @@ gcloud auth application-default print-access-token >/dev/null
 .venv/bin/python scripts/eval.py --provider gemini \
   --case metadata-field-label-discovery \
   --json eval-gemini-metadata-field-label.json
-.venv/bin/python scripts/eval.py --provider gemini \
+.venv/bin/python scripts/eval.py --suite p2go --provider gemini \
   --case metadata-ambiguous-source-schema \
   --json eval-gemini-metadata-ambiguity.json
 .venv/bin/python scripts/eval.py --provider gemini \

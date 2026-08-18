@@ -191,10 +191,12 @@ class EvalMatcherTests(unittest.TestCase):
         return self.ev._grade({"expect": expect}, "fine answer", calls)
 
     def test_dict_arg_matches_by_key(self) -> None:
-        calls = [{"tool": "run_sql", "ok": True, "args": {
-            "sql": "SELECT ...", "pivot": {"row_field": "customer",
-                                           "column_field": "period",
-                                           "value_field": "amt"}}}]
+        calls = [{"tool": "run_sql", "ok": True,
+                  "_result": {"source_database": "default"}, "args": {
+                      "sql": "SELECT ...",
+                      "pivot": {"row_field": "customer",
+                                "column_field": "period",
+                                "value_field": "amt"}}}]
         problems = self._grade(
             {"any_tool": ["run_sql"], "tool_args_contain": {"pivot": "row_field"}},
             calls)
@@ -208,10 +210,13 @@ class EvalMatcherTests(unittest.TestCase):
 
     def test_ordered_tools_requires_successful_subsequence(self) -> None:
         calls = [
-            {"tool": "search_metadata", "ok": True, "args": {}},
+            {"tool": "search_metadata", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
             {"tool": "wiki_search", "ok": True, "args": {}},
-            {"tool": "get_metadata_context", "ok": True, "args": {}},
-            {"tool": "run_sql", "ok": True, "args": {}},
+            {"tool": "get_metadata_context", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
+            {"tool": "run_sql", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
         ]
         problems = self._grade({
             "all_tools": ["search_metadata", "get_metadata_context", "run_sql"],
@@ -222,17 +227,22 @@ class EvalMatcherTests(unittest.TestCase):
 
     def test_ordered_tools_rejects_reversed_or_failed_context(self) -> None:
         reversed_calls = [
-            {"tool": "get_metadata_context", "ok": True, "args": {}},
-            {"tool": "search_metadata", "ok": True, "args": {}},
-            {"tool": "run_sql", "ok": True, "args": {}},
+            {"tool": "get_metadata_context", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
+            {"tool": "search_metadata", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
+            {"tool": "run_sql", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
         ]
         self.assertTrue(self._grade({"ordered_tools": [
             "search_metadata", "get_metadata_context", "run_sql"]},
             reversed_calls))
         failed = [
-            {"tool": "search_metadata", "ok": True, "args": {}},
+            {"tool": "search_metadata", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
             {"tool": "get_metadata_context", "ok": False, "args": {}},
-            {"tool": "run_sql", "ok": True, "args": {}},
+            {"tool": "run_sql", "ok": True, "args": {},
+             "_result": {"source_database": "default"}},
         ]
         self.assertTrue(self._grade({"all_tools": [
             "search_metadata", "get_metadata_context", "run_sql"]}, failed))

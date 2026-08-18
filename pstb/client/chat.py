@@ -50,7 +50,7 @@ from ..guards import (
     ungrounded_figures,
     unevidenced_verdict,
 )
-from ..qlog import QuestionLog
+from ..qlog import QuestionLog, observe_tool_call
 from .llm_base import (
     PROVIDERS,
     LLMProvider,
@@ -408,6 +408,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                      user_text: str, qlog=None, surface: str = "terminal",
                      turn_meta: Optional[dict] = None,
                      scope: dict | None = None,
+                     source_context: dict | None = None,
                      tool_observer: Callable | None = None,
                      tool_started: Callable | None = None,
                      prior_payloads: list | None = None,
@@ -424,6 +425,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     """
     request_scope = normalize_request_scope(scope)
     source_silo = str(request_scope.get("source") or "").strip()
+    expected_result_source = str(
+        (source_context or {}).get("canonical_source")
+        or request_scope.get("source") or "default"
+    ).strip() or "default"
     if source_silo.casefold() == "default":
         source_silo = ""
     intent = evidence_intent(user_text)
@@ -790,12 +795,16 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                                 and "has columns:" in
                                 str(problem or blocked or out or "")):
                             sql_remedy_pending = True
-                logged_calls.append({
-                    "tool": call.name,
-                    "ok": ok,
-                    **({"error": (problem or blocked or out)[:240]}
-                       if not ok else {}),
-                })
+                logged_calls.append(observe_tool_call(
+                    tool=call.name,
+                    output=out,
+                    ms=elapsed_ms,
+                    ok=ok,
+                    problem=(problem or blocked),
+                    expected_source=expected_result_source,
+                    allowed_schemas=(source_context or {}).get(
+                        "schema_allowlist") or (),
+                ))
                 if ok:
                     # Successful results get an id (r1, r2, ...) the model
                     # can REFERENCE in later rounds instead of retyping the
@@ -970,8 +979,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             )
             gate_replaced_answer = True
             logged_calls.append({"tool": "_number_guard", "ok": False,
-                                 "error": "ungrounded figures: "
-                                          + ", ".join(invented[:5])})
+                                 "refusal_category": "tool_error",
+                                 "result_completeness": {
+                                     "status": "refused"}})
 
     # A compliance verdict needs a rule AND a figure. If one side is missing,
     # say so rather than letting a half-grounded judgement stand.
@@ -985,7 +995,9 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 "again for both the rule and the balance.]"
             )
             logged_calls.append({"tool": "_verdict_guard", "ok": False,
-                                 "error": f"verdict without {missing}"})
+                                 "refusal_category": "tool_error",
+                                 "result_completeness": {
+                                     "status": "refused"}})
 
     # Rates get a caveat, never a withhold. A percentage passes the figure
     # guard untouched (see guards._FIGURE_EXEMPT), so "the standard rate is
@@ -1025,17 +1037,28 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
             answer += "\n\n" + attribution
 
     if qlog is not None:
-        turn_id = qlog.log_turn(surface=surface, provider=provider.name,
-                                question=user_text, calls=logged_calls,
-                                rounds=rounds, answer=answer,
-                                hit_round_limit=hit_limit, scope=scope)
+        try:
+            turn_id = qlog.log_turn(
+                surface=surface, provider=provider.name,
+                question=user_text, calls=logged_calls,
+                rounds=rounds, answer=answer,
+                hit_round_limit=hit_limit, scope=scope,
+                source_context=source_context)
+        except Exception:
+            # Observability is downstream of the answer. A malformed
+            # untrusted payload, full disk, or exporter failure must never
+            # turn a completed user request into an application error.
+            turn_id = ""
         # Per CALL, not on the function. Stashing it on agent_turn made the
         # id a process global that every concurrent turn overwrote: two
         # colleagues asking at once, and a thumbs-down on one answer logged
         # against the other one's turn. The caller's own dict cannot race
         # with anybody else's.
         if turn_meta is not None:
-            turn_meta["turn_id"] = turn_id
+            if turn_id:
+                turn_meta["turn_id"] = turn_id
+            else:
+                turn_meta.pop("turn_id", None)
         agent_turn.last_turn_id = turn_id   # terminal client, single turn
     return answer
 

@@ -133,6 +133,38 @@ Schema behavior is intentionally bounded:
 - **SQLite:** the collector reads the selected database's `sqlite_master` and
   PRAGMA metadata under schema `MAIN`.
 
+Each multi-schema Oracle build records `schema_coverage` in the source's
+snapshot: the configured default, the complete configured owner list, a
+TABLE/VIEW object count per owner, the owners with a zero count, and a
+`complete` boolean. Thus a P2Go source configured as `schema: P2GO` with
+`schemas: [P2GO, TUSINVC]` has one catalog and relationship graph, but the
+operator can still prove that both owners contributed objects. Declared native
+relationships may cross those two owners; they never cross into Finance or a
+different source artifact.
+
+A configured owner returning zero TABLE/VIEW metadata marks the source and
+snapshot **partial**, and the build prints `MISSING SCHEMAS <source>: ...`.
+It does not prove that the owner is empty. Verify the Oracle service/PDB, exact
+owner spelling, and the build account's normal-session `ALL_*` visibility. Do
+not treat absence from that owner as evidence until a fresh build reports
+nonzero coverage for it.
+
+Each CLI refresh also writes an adjacent owner-only (`0600`), git-ignored
+`*.db.status.json`. Before collection starts, the builder durably records a
+`building` attempt; if that marker cannot be written, the build stops before
+touching the catalog. The status records a random build-run ID, attempt time,
+canonical source, building/published/failed/partial state, current and previous
+snapshot IDs, and the bounded schema coverage above. It stores only a
+categorized failure reason, never the Oracle error, SQL, credentials, login,
+DSN or object names.
+`describe_metadata_catalog` exposes this as `latest_build`. A failed refresh
+still preserves the prior readable artifact atomically, but
+`latest_build.published: false` makes that failure visible and prevents a model
+eval from mistaking the older snapshot for a successful current refresh. A
+successful status is accepted only when its snapshot ID matches the catalog
+being served; a mismatch is disclosed as a failed/unknown refresh rather than
+borrowed as health evidence.
+
 Select sources deliberately. Catalog structure can itself reveal custom object
 and field names even though it contains no business rows.
 
@@ -336,9 +368,10 @@ Run `describe_metadata_catalog(source="...")` before relying on an absence. It
 reports that source's snapshot time and age, layer status, configured limit
 hits, collector notes, search mode and schema version.
 
-- **Partial:** a source or layer failed, or a configured harvest limit was
-  reached. Available facts remain searchable, but a missing object or
-  relationship is inconclusive.
+- **Partial:** a source or layer failed, a configured harvest limit was
+  reached, or a configured schema returned zero TABLE/VIEW objects. Available
+  facts remain searchable, but a missing object or relationship is
+  inconclusive. Inspect `schema_coverage.missing` as well as collector notes.
 - **Stale:** the artifact is older than `stale_after_hours`. It remains
   readable and every result discloses the age; rebuild it before treating it
   as a picture of the current customization.
@@ -349,9 +382,11 @@ hits, collector notes, search mode and schema version.
   has no structured layer (notably SQLite view dependencies) or an optional
   privacy-safe PeopleTools shape is absent. Other complete layers remain
   usable and the unsupported layer alone does not make them partial.
-- **Failed rebuild:** the `.building` file is removed and the prior artifact,
-  if any, remains readable. A successful partial rebuild can replace it because
-  its coverage gaps are explicit; a completely empty harvest cannot.
+- **Failed rebuild:** the catalog's temporary `.building` file is removed and
+  the prior artifact, if any, remains readable. The adjacent status remains
+  non-published (`failed`, or `building` if the final status update itself could
+  not be persisted). A successful partial rebuild can replace the catalog
+  because its coverage gaps are explicit; a completely empty harvest cannot.
 
 This behavior is intentional: an older, labelled snapshot is safer than
 destroying known-good discovery data during a transient grant or connection

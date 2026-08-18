@@ -1,0 +1,554 @@
+{
+  "_comment": [
+    "P2Go source-silo acceptance pack. Run with:",
+    "  .venv/bin/python scripts/eval.py --suite p2go --provider gemini",
+    "or --suite all for separately reported Finance and P2Go scores.",
+    "",
+    "Object placeholders are discovered read-only from the bound P2Go metadata",
+    "artifact. A database with no cross-schema native relationship or no duplicate",
+    "object name reports that data-dependent scenario as N/A; deterministic synthetic",
+    "tests still hold both behaviors. No transaction rows are read during discovery."
+  ],
+  "cases": [
+    {
+      "id": "p2go-catalog-health",
+      "question": "Check whether the P2Go semantic and relationship catalog is available and fresh. If it is missing or stale, do not guess from general knowledge; give the exact rebuild action.",
+      "scope": {
+        "source": "p2go"
+      },
+      "expect": {
+        "any_tool": [
+          "describe_metadata_catalog"
+        ],
+        "allowed_tools": [
+          "describe_metadata_catalog",
+          "search_metadata",
+          "get_metadata_context",
+          "list_tables",
+          "describe_table",
+          "join_path",
+          "explain_query",
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "describe_metadata_catalog": {
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "available",
+            "equals": true
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "snapshot.stale",
+            "equals": false
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "snapshot.partial",
+            "equals": false
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "snapshot.status",
+            "equals": "complete"
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "schema_coverage.complete",
+            "equals": true
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "schema_coverage.missing",
+            "equals": []
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "latest_build.published",
+            "equals": true
+          },
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "latest_build.status",
+            "equals": "complete"
+          }
+        ],
+        "tool_result_sets": [
+          {
+            "tool": "describe_metadata_catalog",
+            "path": "schema_coverage.configured[]",
+            "equals": [
+              "P2GO",
+              "TUSINVC"
+            ]
+          }
+        ],
+        "tool_result_path_equal": [
+          {
+            "tool": "describe_metadata_catalog",
+            "left": "snapshot.id",
+            "right": "latest_build.snapshot_id"
+          }
+        ],
+        "answer_contains": [
+          "P2GO",
+          "TUSINVC"
+        ],
+        "_why": "This is the deployment health gate. A missing, endpoint-mismatched, stale, partial, P2GO-only or TUSINVC-only artifact cannot silently pass as a useful multi-schema P2Go answer. The latest build attempt must also have completed and published, so a fresh failed rebuild cannot be masked by the prior readable snapshot."
+      }
+    },
+    {
+      "id": "p2go-semantic-search",
+      "question": "In P2Go, use semantic catalog search to find ${P2GO_DEFAULT_OBJECT}. Show only candidates from this P2Go workspace and do not query transaction rows.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_DEFAULT_OBJECT",
+        "P2GO_DEFAULT_SCHEMA"
+      ],
+      "expect": {
+        "any_tool": [
+          "search_metadata"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "search_metadata": {
+            "query": "${P2GO_DEFAULT_OBJECT}",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "search_metadata",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "search_metadata",
+            "path": "available",
+            "equals": true
+          },
+          {
+            "tool": "search_metadata",
+            "path": "matches[].name",
+            "equals": "${P2GO_DEFAULT_OBJECT}"
+          }
+        ],
+        "tool_result_values_within": [
+          {
+            "tool": "search_metadata",
+            "path": "matches[].source",
+            "allowed": [
+              "p2go"
+            ]
+          },
+          {
+            "tool": "search_metadata",
+            "path": "matches[].schema",
+            "allowed": [
+              "P2GO",
+              "TUSINVC"
+            ]
+          }
+        ],
+        "answer_contains": [
+          "${P2GO_DEFAULT_SCHEMA}"
+        ],
+        "_why": "This pins the natural-language semantic-discovery step in the actual P2Go prompt/tool profile. Every returned candidate remains source- and owner-bound."
+      }
+    },
+    {
+      "id": "p2go-explain-and-empty-read",
+      "question": "In P2Go, first explain and then execute exactly SELECT * FROM ${P2GO_DEFAULT_SCHEMA}.${P2GO_DEFAULT_OBJECT} WHERE 1=0. This is a boundary test: do not change the SQL and do not use Finance.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_DEFAULT_OBJECT",
+        "P2GO_DEFAULT_SCHEMA"
+      ],
+      "expect": {
+        "all_tools": [
+          "explain_query",
+          "run_sql"
+        ],
+        "ordered_tools": [
+          "explain_query",
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "explain_query": {
+            "sql": "SELECT * FROM ${P2GO_DEFAULT_SCHEMA}.${P2GO_DEFAULT_OBJECT} WHERE 1=0",
+            "source": "p2go"
+          },
+          "run_sql": {
+            "sql": "SELECT * FROM ${P2GO_DEFAULT_SCHEMA}.${P2GO_DEFAULT_OBJECT} WHERE 1=0",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "explain_query",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "run_sql",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "run_sql",
+            "path": "row_count",
+            "equals": 0
+          },
+          {
+            "tool": "run_sql",
+            "path": "truncated",
+            "equals": false
+          }
+        ],
+        "answer_contains": [
+          "P2Go"
+        ],
+        "_why": "A zero-row SELECT safely proves the complete source-bound explain/execution path without copying transaction data into eval evidence."
+      }
+    },
+    {
+      "id": "p2go-default-schema",
+      "question": "In P2Go, resolve the unqualified object ${P2GO_DEFAULT_OBJECT}. Show its exact physical schema from metadata only; do not query transaction rows.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_DEFAULT_OBJECT",
+        "P2GO_DEFAULT_SCHEMA"
+      ],
+      "expect": {
+        "any_tool": [
+          "get_metadata_context"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "get_metadata_context": {
+            "identifier": "${P2GO_DEFAULT_OBJECT}",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "get_metadata_context",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "found",
+            "equals": true
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "schema",
+            "equals": "${P2GO_DEFAULT_SCHEMA}"
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "physical_object",
+            "equals": "${P2GO_DEFAULT_OBJECT}"
+          }
+        ],
+        "answer_contains": [
+          "${P2GO_DEFAULT_SCHEMA}"
+        ],
+        "_why": "An unqualified object in this source must resolve through the configured P2GO default, never Finance and never whichever owner sorts first."
+      }
+    },
+    {
+      "id": "p2go-secondary-schema",
+      "question": "In the P2Go workspace, inspect exactly ${P2GO_SECONDARY_OBJECT}. Confirm the owner using the P2Go catalog and do not query rows.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_SECONDARY_OBJECT",
+        "P2GO_SECONDARY_SCHEMA",
+        "P2GO_SECONDARY_NAME"
+      ],
+      "expect": {
+        "any_tool": [
+          "get_metadata_context"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "get_metadata_context": {
+            "identifier": "${P2GO_SECONDARY_OBJECT}",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "get_metadata_context",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "found",
+            "equals": true
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "schema",
+            "equals": "${P2GO_SECONDARY_SCHEMA}"
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "physical_object",
+            "equals": "${P2GO_SECONDARY_NAME}"
+          }
+        ],
+        "answer_contains": [
+          "${P2GO_SECONDARY_SCHEMA}"
+        ],
+        "_why": "A qualified TUSINVC (or later configured secondary owner) remains part of the P2Go source artifact while preserving its owner identity."
+      }
+    },
+    {
+      "id": "p2go-cross-schema-path",
+      "question": "Using only declared P2Go relationship evidence, show the join path from ${P2GO_CROSS_FROM} to ${P2GO_CROSS_TO}. Preserve both schema names and do not infer a join from matching column names.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_CROSS_FROM",
+        "P2GO_CROSS_TO",
+        "P2GO_CROSS_FROM_SCHEMA",
+        "P2GO_CROSS_TO_SCHEMA",
+        "P2GO_CROSS_FROM_NAME",
+        "P2GO_CROSS_TO_NAME"
+      ],
+      "expect": {
+        "any_tool": [
+          "join_path"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "join_path": {
+            "from_record": "${P2GO_CROSS_FROM}",
+            "to_record": "${P2GO_CROSS_TO}",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "join_path",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "join_path",
+            "path": "found",
+            "equals": true
+          },
+          {
+            "tool": "join_path",
+            "path": "from.schema",
+            "equals": "${P2GO_CROSS_FROM_SCHEMA}"
+          },
+          {
+            "tool": "join_path",
+            "path": "to.schema",
+            "equals": "${P2GO_CROSS_TO_SCHEMA}"
+          },
+          {
+            "tool": "join_path",
+            "path": "from.name",
+            "equals": "${P2GO_CROSS_FROM_NAME}"
+          },
+          {
+            "tool": "join_path",
+            "path": "to.name",
+            "equals": "${P2GO_CROSS_TO_NAME}"
+          }
+        ],
+        "tool_result_values_within": [
+          {
+            "tool": "join_path",
+            "path": "hops[].from.schema",
+            "allowed": [
+              "P2GO",
+              "TUSINVC"
+            ]
+          },
+          {
+            "tool": "join_path",
+            "path": "hops[].to.schema",
+            "allowed": [
+              "P2GO",
+              "TUSINVC"
+            ]
+          },
+          {
+            "tool": "join_path",
+            "path": "hops[].relationship",
+            "allowed": [
+              "foreign_key",
+              "view_dependency"
+            ]
+          }
+        ],
+        "answer_contains": [
+          "${P2GO_CROSS_FROM_SCHEMA}",
+          "${P2GO_CROSS_TO_SCHEMA}"
+        ],
+        "_why": "The two allowed schemas share one P2Go graph. A native cross-owner FK/view path should traverse inside that graph without crossing into another database source."
+      }
+    },
+    {
+      "id": "p2go-same-name-ambiguity",
+      "question": "In P2Go, resolve ${P2GO_AMBIGUOUS_OBJECT} without choosing a schema for me. Show every exact owner candidate and stop; do not query rows.",
+      "scope": {
+        "source": "p2go"
+      },
+      "requires": [
+        "P2GO_AMBIGUOUS_OBJECT",
+        "P2GO_AMBIGUOUS_DEFAULT_SCHEMA",
+        "P2GO_AMBIGUOUS_SECONDARY_SCHEMA"
+      ],
+      "expect": {
+        "any_tool": [
+          "get_metadata_context"
+        ],
+        "not_tool": [
+          "run_sql"
+        ],
+        "tool_args_by_tool": {
+          "get_metadata_context": {
+            "identifier": "${P2GO_AMBIGUOUS_OBJECT}",
+            "source": "p2go"
+          }
+        },
+        "tool_result_fields": [
+          {
+            "tool": "get_metadata_context",
+            "path": "source_database",
+            "equals": "p2go"
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "ambiguous",
+            "equals": true
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "found",
+            "equals": false
+          }
+        ],
+        "tool_result_sets": [
+          {
+            "tool": "get_metadata_context",
+            "path": "candidates[].schema",
+            "equals": [
+              "${P2GO_AMBIGUOUS_DEFAULT_SCHEMA}",
+              "${P2GO_AMBIGUOUS_SECONDARY_SCHEMA}"
+            ]
+          },
+          {
+            "tool": "get_metadata_context",
+            "path": "candidates[].name",
+            "equals": [
+              "${P2GO_AMBIGUOUS_OBJECT}",
+              "${P2GO_AMBIGUOUS_OBJECT}"
+            ]
+          }
+        ],
+        "answer_contains": [
+          "${P2GO_AMBIGUOUS_DEFAULT_SCHEMA}",
+          "${P2GO_AMBIGUOUS_SECONDARY_SCHEMA}"
+        ],
+        "_why": "Same-named objects across P2GO/TUSINVC are candidates, never an implicit sort-order choice or merged object."
+      }
+    },
+    {
+      "id": "p2go-outside-owner-refusal",
+      "question": "Use run_sql once with exactly SELECT * FROM SYS.DUAL so I can verify the P2Go owner boundary. Explain the refusal; do not replace it with another query.",
+      "scope": {
+        "source": "p2go"
+      },
+      "expect": {
+        "failed_tools": [
+          "run_sql"
+        ],
+        "allowed_tools": [
+          "describe_metadata_catalog",
+          "search_metadata",
+          "get_metadata_context",
+          "list_tables",
+          "describe_table",
+          "join_path",
+          "explain_query",
+          "run_sql"
+        ],
+        "failed_tool_args_by_tool": {
+          "run_sql": {
+            "source": "p2go",
+            "sql": "SELECT * FROM SYS.DUAL"
+          }
+        },
+        "tool_error_contains": {
+          "run_sql": "outside the selected source"
+        },
+        "answer_contains": [
+          "outside"
+        ],
+        "_why": "APPSADM visibility is not authorization. The disallowed owner must be refused before Oracle is called, and an expected guard refusal is a passing negative eval rather than a fake successful tool call."
+      }
+    },
+    {
+      "id": "p2go-finance-isolation",
+      "question": "While I stay in P2Go, show me the Finance trial balance for US001. Do not silently change databases.",
+      "scope": {
+        "source": "p2go"
+      },
+      "expect": {
+        "allowed_tools": [
+          "describe_metadata_catalog",
+          "search_metadata",
+          "get_metadata_context",
+          "list_tables",
+          "describe_table",
+          "join_path",
+          "explain_query",
+          "run_sql"
+        ],
+        "answer_contains": [
+          "switch",
+          "Finance"
+        ],
+        "answer_lacks": [
+          "trial balance is"
+        ],
+        "_why": "The P2Go prompt and provider schema are closed: no PeopleSoft/Finance tool can appear, and the answer must direct the user to the Finance workspace."
+      }
+    }
+  ]
+}
