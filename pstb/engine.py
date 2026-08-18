@@ -2222,8 +2222,7 @@ class TBEngine:
                 options = str(step.get("options") or "").upper()
                 if "FULL" not in options and step.get("operation") != "SCAN":
                     continue
-                obj = str(step.get("object") or "").split(".")[-1].upper()
-                obj = aliases.get(obj, obj)
+                obj = self._plan_object(step, aliases)
                 rows = self._approx_rows(obj) if obj else None
                 if rows and rows >= self._SCAN_ROW_FLOOR:
                     idx = self.db.indexes(obj)
@@ -2952,21 +2951,22 @@ class TBEngine:
         (ALL_TABLES.NUM_ROWS); exact COUNT only on SQLite (sample-sized)."""
         try:
             if self.db.dialect == "oracle":
-                owner = self.cfg.db.schema.strip().rstrip(".").upper()
+                owner, name = self._table_target(table)
                 if owner:
                     rows, _ = self.db.query(
                         "SELECT NUM_ROWS AS n FROM ALL_TABLES "
                         "WHERE OWNER = :o AND TABLE_NAME = :t",
-                        {"o": owner, "t": table.upper()}, max_rows=1)
+                        {"o": owner, "t": name}, max_rows=1)
                 else:
                     rows, _ = self.db.query(
                         "SELECT NUM_ROWS AS n FROM USER_TABLES WHERE TABLE_NAME = :t",
-                        {"t": table.upper()}, max_rows=1)
+                        {"t": name}, max_rows=1)
                 return int(rows[0]["n"]) if rows and rows[0]["n"] is not None else None
             if self.db.dialect == "sqlite":
                 if not self._table_exists(table):
                     return None
-                rows, _ = self.db.query(f"SELECT COUNT(*) AS n FROM {table}",
+                _, name = self._table_target(table)
+                rows, _ = self.db.query(f"SELECT COUNT(*) AS n FROM {name}",
                                         {}, max_rows=1)
                 return int(rows[0]["n"])
         except Exception:
@@ -3115,9 +3115,31 @@ class TBEngine:
     # not refused and then no table is left for catalog validation. ``[^\W\d]``
     # is a Unicode word character other than a decimal digit.
     _UNQUOTED_SQL_IDENTIFIER = r"(?:[^\W\d]|[_#@])[\w$#@]*"
+    _QUOTED_SQL_IDENTIFIER = r'"(?:[^"]|"")*"'
+    _BRACKETED_SQL_IDENTIFIER = r"\[(?:[^\]]|\]\])*\]"
+    _SQL_IDENTIFIER = (
+        rf"(?:{_UNQUOTED_SQL_IDENTIFIER}|{_QUOTED_SQL_IDENTIFIER}|"
+        rf"{_BRACKETED_SQL_IDENTIFIER})"
+    )
+    _SCOPED_SQL_IDENTIFIER = (
+        rf"{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER})?"
+    )
     _TABLE_REF_RE = re.compile(
-        rf"(?is)\b(?:FROM|JOIN)\s+({_UNQUOTED_SQL_IDENTIFIER}"
-        rf"(?:\.{_UNQUOTED_SQL_IDENTIFIER})?)"
+        rf"(?is)\b(?:FROM|JOIN|APPLY)\s+({_SCOPED_SQL_IDENTIFIER})"
+    )
+    _PAREN_TABLE_REF_RE = re.compile(
+        rf"(?is)\b(?:FROM|JOIN|APPLY)"
+        rf"(?:\s*\(\s*)+({_SCOPED_SQL_IDENTIFIER})"
+    )
+    _TABLE_TOKEN_RE = re.compile(
+        rf"(?is)\s*({_SCOPED_SQL_IDENTIFIER})"
+    )
+    _PAREN_TABLE_TOKEN_RE = re.compile(
+        rf"(?is)\s*(?:\(\s*)+({_SCOPED_SQL_IDENTIFIER})"
+    )
+    _SCOPED_SQL_IDENTIFIER_RE = re.compile(
+        rf"(?is)^\s*({_SQL_IDENTIFIER})"
+        rf"(?:\s*\.\s*({_SQL_IDENTIFIER}))?\s*$"
     )
     _CTE_RE = re.compile(r"(?is)\b([A-Za-z_]\w*)\s+AS\s*\(")
     _FUNC_FROM_HEAD = re.compile(r"(?is)\b(EXTRACT|TRIM|SUBSTRING)\s*\(")
@@ -3260,29 +3282,172 @@ class TBEngine:
                 self._neutralize_func_from(scrubbed)):
             table, alias = m.group(1), m.group(2)
             base = table.split(".")[-1].upper()
-            alias_map[base] = base
+            target = table.upper()
+            alias_map[base] = target
             if alias and alias.upper() not in {"ON", "WHERE", "JOIN", "LEFT",
                                                "RIGHT", "INNER", "OUTER",
                                                "CROSS", "GROUP", "ORDER",
                                                "USING"}:
-                alias_map[alias.upper()] = base
+                alias_map[alias.upper()] = target
         return alias_map
+
+    @staticmethod
+    def _plan_object(step: dict, aliases: Optional[dict] = None) -> str:
+        """Schema-qualified catalog object named by an optimizer plan step.
+
+        Oracle PLAN_TABLE separates OBJECT_OWNER from OBJECT_NAME. Dropping
+        the former silently checked P2GO statistics and indexes for a
+        TUSINVC scan, which could turn a large unfiltered scan into an
+        apparent small-table pass. Alias-only SQLite/fabricated plans retain
+        the established alias resolution fallback.
+        """
+        obj = str(step.get("object") or "").strip()
+        if not obj:
+            return ""
+        owner = str(step.get("object_owner") or "").strip()
+        if owner and "." not in obj:
+            return f"{owner}.{obj}"
+        if aliases:
+            return aliases.get(obj.split(".")[-1].upper(), obj)
+        return obj
 
     def _table_refs(self, scrubbed: str) -> set:
         """Names referenced as tables by FROM/JOIN (input must already be
         comment- and literal-scrubbed via _scrub_sql)."""
-        return set(self._TABLE_REF_RE.findall(
-            self._neutralize_func_from(scrubbed)))
+        return {name for name, _ in self._table_ref_matches(scrubbed)}
+
+    def _table_ref_matches(self, scrubbed: str) -> list[tuple[str, int]]:
+        """Table names and offsets across Oracle table-source forms.
+
+        Oracle applications still contain plenty of ``FROM A, B`` syntax.
+        Looking only after FROM/JOIN let ``OTHER.SECRET`` hide in the second
+        position, bypassing both the source allowlist and catalog validation.
+        APPLY targets and the first table inside ``FROM (A JOIN B)`` have the
+        same problem. Commas are collected only inside a FROM clause and at
+        its own parenthesis depth, so SELECT-list/function commas are not
+        tables.
+        """
+        masked = self._neutralize_func_from(scrubbed)
+        matches = [(m.group(1), m.start(1))
+                   for m in self._TABLE_REF_RE.finditer(masked)]
+        for match in self._PAREN_TABLE_REF_RE.finditer(masked):
+            name = match.group(1)
+            # A derived table starts ``FROM (SELECT ...`` or
+            # ``FROM (WITH ...``. Those heads are SQL grammar, not objects;
+            # their inner FROM clauses are scanned independently below.
+            if name.strip().upper() in {
+                    "SELECT", "WITH", "VALUES", "TABLE", "LATERAL"}:
+                continue
+            matches.append((name, match.start(1)))
+        stop = re.compile(
+            r"(?is)\b(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|MINUS|"
+            r"INTERSECT|CONNECT\s+BY|START\s+WITH|FETCH|OFFSET|FOR\s+UPDATE)\b"
+        )
+        for head in re.finditer(r"(?is)\bFROM\b", masked):
+            depth = 0
+            i = head.end()
+            while i < len(masked):
+                if depth == 0 and stop.match(masked, i):
+                    break
+                ch = masked[i]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    token = self._TABLE_TOKEN_RE.match(masked, i + 1)
+                    if token:
+                        matches.append((token.group(1), token.start(1)))
+                    else:
+                        token = self._PAREN_TABLE_TOKEN_RE.match(
+                            masked, i + 1)
+                        if (token and token.group(1).strip().upper() not in {
+                                "SELECT", "WITH", "VALUES", "TABLE",
+                                "LATERAL"}):
+                            matches.append((token.group(1), token.start(1)))
+                i += 1
+        # Nested FROM scans may encounter the same comma factor through more
+        # than one enclosing scan.  Offset identity removes those duplicates.
+        return [(name, pos) for pos, name in sorted(
+            {pos: name for name, pos in matches}.items()
+        )]
+
+    def _configured_schemas(self) -> tuple[str, ...]:
+        """Normalized source schema boundary, with the default first.
+
+        ``load_config`` performs the authoritative validation.  This local
+        normalization keeps directly-constructed test/integration configs
+        backward compatible while applying the same boundary at runtime.
+        """
+        raw_default = getattr(self.cfg.db, "schema", "") or ""
+        if isinstance(raw_default, (list, tuple)):
+            raw_default = raw_default[0] if raw_default else ""
+        default = str(raw_default).strip().rstrip(".").upper()
+        raw = getattr(self.cfg.db, "schemas", []) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        out: list[str] = []
+        for value in ([default] if default else []) + list(raw):
+            schema = str(value or "").strip().rstrip(".").upper()
+            if schema and schema not in out:
+                out.append(schema)
+        return tuple(out)
+
+    @staticmethod
+    def _decode_sql_identifier(token: str) -> tuple[str, bool]:
+        """Identifier value and whether SQL made it case-sensitive/quoted."""
+        value = str(token or "").strip()
+        if value.startswith('"') and value.endswith('"'):
+            return value[1:-1].replace('""', '"'), True
+        if value.startswith("[") and value.endswith("]"):
+            return value[1:-1].replace("]]", "]"), True
+        return value.upper(), False
+
+    def _table_target(self, name: str) -> tuple[str, str]:
+        """Resolve an object to its configured local owner and bare name."""
+        match = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(str(name or ""))
+        if not match:
+            raise EngineError(f"Invalid table name: {name!r}")
+        explicit = match.group(2) is not None
+        first, _ = self._decode_sql_identifier(match.group(1))
+        second, _ = self._decode_sql_identifier(match.group(2) or "")
+        raw_default = getattr(self.cfg.db, "schema", "") or ""
+        if isinstance(raw_default, (list, tuple)):
+            raw_default = raw_default[0] if raw_default else ""
+        default = str(raw_default).strip().rstrip(".").upper()
+        owner = first if explicit else default
+        table = second if explicit else first
+        allowed = self._configured_schemas()
+        if explicit and allowed and owner not in allowed:
+            raise EngineError(
+                f"Schema {owner} is outside the selected source. Allowed "
+                f"schemas: {', '.join(allowed)}. Choose an object from this "
+                "source's semantic catalog; the query was not sent to the "
+                "database."
+            )
+        # Configuration deliberately supports ordinary unquoted schema
+        # identifiers. Quoting the same uppercase name is harmless; quoting a
+        # differently-cased lookalike targets a distinct Oracle owner and was
+        # already rejected by the exact comparison above. Object case is kept
+        # for the ALL_* catalog bind when explicitly quoted.
+        return owner, table
+
+    def _require_allowed_schema_refs(self, scrubbed: str) -> None:
+        """Apply the same schema boundary to execution and EXPLAIN paths."""
+        for ref in self._table_refs(scrubbed):
+            if "." in ref:
+                self._table_target(ref)
 
     def _table_exists(self, name: str) -> bool:
-        n = name.upper()
+        owner, n = self._table_target(name)
         if self.db.dialect == "sqlite":
             rows, _ = self.db.query(
                 "SELECT 1 AS x FROM sqlite_master WHERE type IN ('table','view') "
                 "AND UPPER(name) = :n", {"n": n}, max_rows=1)
             return bool(rows)
         if self.db.dialect == "oracle":
-            owner = self.cfg.db.schema.strip().rstrip(".").upper()
             if owner:
                 rows, _ = self.db.query(
                     "SELECT 1 AS x FROM ALL_OBJECTS WHERE OWNER = :o "
@@ -3295,9 +3460,14 @@ class TBEngine:
                     "AND OBJECT_TYPE IN ('TABLE','VIEW','SYNONYM',"
                     "'MATERIALIZED VIEW')", {"n": n}, max_rows=1)
             return bool(rows)
+        where = "UPPER(TABLE_NAME) = :n"
+        params = {"n": n}
+        if owner:
+            where += " AND UPPER(TABLE_SCHEMA) = :o"
+            params["o"] = owner
         rows, _ = self.db.query(
-            "SELECT 1 AS x FROM INFORMATION_SCHEMA.TABLES WHERE UPPER(TABLE_NAME) = :n",
-            {"n": n}, max_rows=1)
+            f"SELECT 1 AS x FROM INFORMATION_SCHEMA.TABLES WHERE {where}",
+            params, max_rows=1)
         return bool(rows)
 
     def _suggest_tables(self, name: str) -> list[str]:
@@ -3306,7 +3476,10 @@ class TBEngine:
         than loading it (a real PS schema has tens of thousands of objects)."""
         import difflib
 
-        base = name.split(".")[-1].upper()
+        parsed = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(name)
+        _, target = self._table_target(name)
+        base = target.upper()
+        qualified_input = bool(parsed and parsed.group(2))
         for cut in (len(base), 12, 10, 8, 7, 6, 5, 4):
             pre = base[:cut].rstrip("_%")
             if len(pre) < 3:
@@ -3325,6 +3498,20 @@ class TBEngine:
                 # empty look-alike is rarely the record the question means.
                 counts = {n: (self._approx_rows(n) or 0) for n in ranked}
                 ranked.sort(key=lambda n: -counts.get(n, 0))
+                if len(self._configured_schemas()) > 1 or qualified_input:
+                    qualified = []
+                    for candidate in ranked:
+                        matches = [
+                            str(r.get("schema_name") or "").upper()
+                            for r in rows
+                            if str(r.get("table_name") or "").upper()
+                            == candidate
+                        ]
+                        qualified.extend(
+                            f"{schema}.{candidate}" if schema else candidate
+                            for schema in matches
+                        )
+                    return list(dict.fromkeys(qualified))[:5]
                 return ranked
         return []
 
@@ -3433,34 +3620,32 @@ class TBEngine:
         if m:
             raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
         self._require_local_database_refs(scrubbed)
+        self._require_allowed_schema_refs(scrubbed)
         refs = sorted(self._table_refs(scrubbed))
         unqualified = [r for r in refs if "." not in r]
         if self.db.prefix:
             s = self._qualify_tables(s, unqualified)
         plan = self.db.explain_plan(s)
-        tables = [r.split(".")[-1] for r in refs]
         alias_map = self._alias_map(scrubbed)
 
-        def _resolve(obj: str) -> str:
-            return alias_map.get(obj.split(".")[-1].upper(),
-                                 obj.split(".")[-1].upper())
         table_info = []
-        for t in tables:
+        for t in refs:
+            owner, name = self._table_target(t)
+            catalog_name = f"{owner}.{name}" if owner else name
             info = {"table": t, "approx_rows": self._approx_rows(t),
-                    "indexes": self.db.indexes(t)}
+                    "indexes": self.db.indexes(catalog_name)}
             table_info.append(info)
         out: dict = {"sql": s, "plan": plan, "tables": table_info}
         advice: list = []
         for step in (plan.get("steps") or []):
             options = str(step.get("options") or "").upper()
             operation = str(step.get("operation") or "").upper()
-            obj = str(step.get("object") or "").strip()
+            obj = self._plan_object(step, alias_map)
             is_full = ("FULL" in options
                        or (operation == "SCAN" and "INDEX" not in
                            str(step.get("detail") or "").upper()))
             if not is_full or not obj:
                 continue
-            obj = _resolve(obj)
             rows = self._approx_rows(obj)
             idx = self.db.indexes(obj)
             if idx:
@@ -3578,7 +3763,7 @@ class TBEngine:
                            str(step.get("detail") or "").upper()))
             if not is_scan:
                 continue
-            obj = str(step.get("object") or "").strip()
+            obj = self._plan_object(step)
             rows = self._approx_rows(obj) if obj else None
             scans.append({"object": obj, "approx_rows": rows,
                           "cost": step.get("cost")})
@@ -3673,8 +3858,9 @@ class TBEngine:
                          r"unknown column", msg):
             return msg
         parts, seen = [], set()
-        for t in re.findall(r"(?i)\b(?:from|join)\s+([A-Za-z_][\w.]*)", sql):
-            name = t.split(".")[-1].upper()
+        for raw in self._table_refs(self._scrub_sql(sql)):
+            owner, table = self._table_target(raw)
+            name = f"{owner}.{table}" if owner else table
             if name in seen or len(parts) >= 5:
                 continue
             seen.add(name)
@@ -3727,6 +3913,7 @@ class TBEngine:
         # approved same-database schemas; remote database/server addressing is
         # refused before catalog validation or execution.
         self._require_local_database_refs(scrubbed)
+        self._require_allowed_schema_refs(scrubbed)
         # Validate every referenced table against the live catalog BEFORE
         # executing. A model-invented name (PS_JRNL_LINE for PS_JRNL_LN) should
         # come back instantly with a correction, not as an opaque ORA-00942 —
@@ -3734,16 +3921,17 @@ class TBEngine:
         ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
         problems, unqualified = [], []
         for ref in self._table_refs(scrubbed):
-            bare = ref.split(".")[-1]
+            parsed = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(ref)
+            _, bare = self._table_target(ref)
             if bare.upper() in ctes or bare.upper() == "DUAL":
                 continue
-            if not self._table_exists(bare):
-                sugg = self._suggest_tables(bare)
+            if not self._table_exists(ref):
+                sugg = self._suggest_tables(ref)
                 problems.append(
-                    f"{bare} does not exist"
+                    f"{ref} does not exist"
                     + (f" — did you mean: {', '.join(sugg)}?" if sugg else "")
                 )
-            elif "." not in ref:
+            elif parsed and parsed.group(2) is None:
                 unqualified.append(ref)
         if problems:
             raise EngineError(
@@ -3923,11 +4111,10 @@ class TBEngine:
         wanted = {n.upper() for n in names}
         masked = self._neutralize_func_from(self._scrub_sql(sql))
         edits = []
-        for m in self._TABLE_REF_RE.finditer(masked):
-            name = m.group(1)
+        for name, pos in self._table_ref_matches(masked):
             if "." in name or name.upper() not in wanted:
                 continue
-            edits.append(m.start(1))
+            edits.append(pos)
         out = sql
         for pos in sorted(edits, reverse=True):
             out = out[:pos] + self.db.prefix + out[pos:]

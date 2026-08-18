@@ -141,6 +141,10 @@ def main(argv=None) -> int:
             out = (Path(args.out) if args.out else catalog_path(cfg, name))
             _say(f"{name} artifact: {out}", args.quiet)
             database = registry.get(name)
+            schemas = list(getattr(database, "allowed_schemas", ()) or ())
+            if schemas:
+                rendered = [f"{schemas[0]} (default)", *schemas[1:]]
+                _say(f"{name} schemas: {', '.join(rendered)}", args.quiet)
             if all(id(database) != id(opened) for opened in opened_dbs):
                 opened_dbs.append(database)
             started = time.perf_counter()

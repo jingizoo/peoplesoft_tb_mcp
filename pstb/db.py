@@ -18,6 +18,22 @@ class DbError(RuntimeError):
 
 
 _BIND_RE = re.compile(r"(?<![:\w]):(\w+)")
+_CATALOG_IDENTIFIER = (
+    r'(?:[A-Za-z][A-Za-z0-9_$#]*|"[A-Za-z][A-Za-z0-9_$#]*"|'
+    r'\[[A-Za-z][A-Za-z0-9_$#]*\])'
+)
+_CATALOG_OBJECT_RE = re.compile(
+    rf"^\s*({_CATALOG_IDENTIFIER})"
+    rf"(?:\s*\.\s*({_CATALOG_IDENTIFIER}))?\s*$"
+)
+
+
+def _catalog_identifier_value(token: str) -> str:
+    text = str(token or "").strip()
+    if ((text.startswith('"') and text.endswith('"'))
+            or (text.startswith("[") and text.endswith("]"))):
+        return text[1:-1]
+    return text.upper()
 
 
 def _to_qmark(sql: str, params: dict) -> tuple[str, list]:
@@ -185,8 +201,59 @@ class Database:
 
     # ---- dialect helpers -------------------------------------------------
     @property
+    def default_schema(self) -> str:
+        """Schema used for an unqualified object name.
+
+        Configuration loading normalizes this to one scalar.  Keeping the
+        small defensive conversion here also makes Database safe in focused
+        tests and integrations that construct ``DbCfg`` directly.
+        """
+        raw = getattr(self.cfg.db, "schema", "")
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else ""
+        return str(raw or "").strip().rstrip(".").upper()
+
+    @property
+    def allowed_schemas(self) -> tuple[str, ...]:
+        """Configured same-database schema boundary, default first."""
+        raw = getattr(self.cfg.db, "schemas", []) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        ordered: list[str] = []
+        configured = ([self.default_schema] if self.default_schema else []) \
+            + list(raw)
+        for value in configured:
+            schema = str(value or "").strip().rstrip(".").upper()
+            if schema and schema not in ordered:
+                ordered.append(schema)
+        return tuple(ordered)
+
+    def table_scope(self, table: str) -> tuple[str, str]:
+        """Return ``(owner, object)`` within this connection's allowlist.
+
+        An explicit owner is never trusted merely because the login can read
+        it.  In particular, a DBA-capable Oracle account remains restricted
+        to the schemas configured for the selected source.
+        """
+        match = _CATALOG_OBJECT_RE.fullmatch(str(table or ""))
+        if not match:
+            raise DbError(f"Invalid table name: {table!r}")
+        explicit = match.group(2) is not None
+        first = _catalog_identifier_value(match.group(1))
+        second = _catalog_identifier_value(match.group(2) or "")
+        owner = first if explicit else self.default_schema
+        name = second if explicit else first
+        allowed = self.allowed_schemas
+        if explicit and allowed and owner not in allowed:
+            raise DbError(
+                f"Schema {owner!r} is outside this source's configured "
+                f"boundary ({', '.join(allowed)})"
+            )
+        return owner, name
+
+    @property
     def prefix(self) -> str:
-        s = self.cfg.db.schema.strip().rstrip(".")
+        s = self.default_schema
         return f"{s}." if s else ""
 
     # ---- schema catalog --------------------------------------------------
@@ -202,7 +269,11 @@ class Database:
         Returns an empty set when the catalog cannot be read, which callers
         must treat as "assume the reference shape" — never as "no columns".
         """
-        key = table.upper()
+        try:
+            owner, name = self.table_scope(table)
+        except DbError:
+            return set()
+        key = f"{owner}.{name}" if owner else name
         with self._catalog_lock:
             if key in self._catalog:
                 return self._catalog[key]
@@ -242,16 +313,20 @@ class Database:
         exactly the information a query writer needs and never had. Returns
         [] when unreadable — callers treat that as "unknown", never "none".
         """
-        key = ("IDX", table.upper())
+        try:
+            owner, table_name = self.table_scope(table)
+        except DbError:
+            return []
+        scoped_name = f"{owner}.{table_name}" if owner else table_name
+        key = ("IDX", scoped_name)
         with self._catalog_lock:
             if key in self._catalog:
                 return self._catalog[key]
         out: list = []
         try:
             if self.dialect == "oracle":
-                owner = self.cfg.db.schema.strip().rstrip(".").upper()
                 where = "C.TABLE_NAME = :t"
-                params: dict = {"t": table.upper()}
+                params: dict = {"t": table_name}
                 if owner:
                     where += " AND C.TABLE_OWNER = :o"
                     params["o"] = owner
@@ -274,9 +349,9 @@ class Database:
                     entry["columns"].append(str(r["col"]))
                 out = list(by_name.values())
             elif self.dialect == "sqlite":
-                if not self.columns(table):
+                if not self.columns(scoped_name):
                     return []
-                rows, _ = self.query(f"PRAGMA index_list({table})",
+                rows, _ = self.query(f"PRAGMA index_list({table_name})",
                                      {}, max_rows=100)
                 for r in rows:
                     name = str(r.get("name") or "")
@@ -290,12 +365,11 @@ class Database:
                                         cols, key=lambda x: x.get("seqno", 0))],
                     })
             elif self.dialect == "sqlserver":
-                schema = self.cfg.db.schema.strip().rstrip(".").upper()
                 where = "UPPER(T.name) = :t"
-                params = {"t": table.upper()}
-                if schema:
+                params = {"t": table_name}
+                if owner:
                     where += " AND UPPER(S.name) = :o"
-                    params["o"] = schema
+                    params["o"] = owner
                 rows, _ = self.query(
                     "SELECT I.name AS name, C.name AS col, "
                     "IC.key_ordinal AS pos, I.is_unique AS uniq "
@@ -560,13 +634,14 @@ class Database:
                         cur.execute(
                             f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {sql}")
                         cur.execute(
-                            "SELECT OPERATION, OPTIONS, OBJECT_NAME, "
-                            "CARDINALITY, COST FROM PLAN_TABLE "
+                            "SELECT OPERATION, OPTIONS, OBJECT_OWNER, "
+                            "OBJECT_NAME, CARDINALITY, COST FROM PLAN_TABLE "
                             "WHERE STATEMENT_ID = :sid ORDER BY ID",
                             {"sid": stmt_id})
                         rows = [
                             {"operation": r[0], "options": r[1],
-                             "object": r[2], "rows": r[3], "cost": r[4]}
+                             "object_owner": r[2], "object": r[3],
+                             "rows": r[4], "cost": r[5]}
                             for r in cur.fetchall()
                         ]
                         cur.execute(
@@ -597,6 +672,7 @@ class Database:
                 steps.append({
                     "operation": "SCAN" if upper.startswith("SCAN") else "SEARCH",
                     "options": "FULL" if upper.startswith("SCAN") else "",
+                    "object_owner": "",
                     "object": detail.split()[1] if len(detail.split()) > 1 else "",
                     "rows": None, "cost": None, "detail": detail,
                 })

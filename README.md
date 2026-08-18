@@ -222,8 +222,17 @@ declared primary/unique/foreign-key constraints and view dependencies. The
 `default` Finance artifact additionally receives the PeopleTools overlay:
 logical records, labels, translate values, page use and public saved-query
 use. Secondary artifacts such as P2Go remain native to that database. Source
-and schema identities never share a file, and custom physical names are
-resolved from evidence rather than an assumed `PS_` or company prefix.
+identities never share a file; schema identities remain distinct inside their
+source file. Custom physical names are resolved from evidence rather than an
+assumed `PS_` or company prefix.
+
+One Oracle source may deliberately contain several related schemas on the same
+database. Configure its scalar default in `schema` and the complete boundary
+in `schemas`, for example `schema: P2GO` with `schemas: [P2GO, TUSINVC]`.
+Those owners share the one `/p2go` artifact while every node remains
+schema-qualified; Finance and every other configured source still have their
+own files and sessions. Other backends should remain separate sources in this
+release.
 
 For Gemini 2.5 Pro, the Finance workspace can proceed from metadata discovery
 to its curated controls, profiles or comparisons. A secondary workspace stays

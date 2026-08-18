@@ -342,6 +342,25 @@ class SourceKnowledgeArtifactTests(unittest.TestCase):
         cfg.sources["warehouse"].schema = "reporting"
         self.assertNotEqual(source_fingerprint(cfg, "warehouse"), first)
 
+    def test_fingerprint_tracks_full_schema_allowlist_not_its_order(self):
+        cfg = Config.sample(self.root)
+        cfg.sources = {"p2go": DbCfg(
+            backend="oracle", schema="P2GO",
+            schemas=["P2GO", "TUSINVC"],
+            oracle_dsn="db.example:1521/service",
+            oracle_user="APPSADM", oracle_password="secret")}
+        first = source_fingerprint(cfg, "p2go")
+        scalar_cfg = Config.sample(self.root)
+        scalar_cfg.sources = {"p2go": DbCfg(
+            backend="oracle", schema="P2GO",
+            oracle_dsn="db.example:1521/service",
+            oracle_user="APPSADM", oracle_password="another-secret")}
+        self.assertNotEqual(first, source_fingerprint(scalar_cfg, "p2go"))
+        cfg.sources["p2go"].schemas = ["TUSINVC", "P2GO"]
+        self.assertEqual(source_fingerprint(cfg, "p2go"), first)
+        cfg.sources["p2go"].schemas.append("ANOTHER")
+        self.assertNotEqual(source_fingerprint(cfg, "p2go"), first)
+
     def test_blank_oracle_schema_binds_login_and_tns_resolution(self) -> None:
         p2go_network = self.root / "network" / "p2go"
         finance_network = self.root / "network" / "finance"

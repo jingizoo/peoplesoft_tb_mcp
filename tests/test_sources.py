@@ -54,7 +54,12 @@ class SourceAliasTests(unittest.TestCase):
                          "a configured source was shadowed by the alias list")
 
     def test_describe_exposes_slash_workspace_contract(self) -> None:
-        self.cfg.sources = {"p2go": DbCfg(backend="sqlite")}
+        self.cfg.sources = {
+            "p2go": DbCfg(
+                backend="oracle", schema="p2go",
+                schemas=["p2go", "tusinvc"]),
+        }
+        self.registry = SourceRegistry(self.cfg, self.db)
         described = self.registry.describe()
         finance, p2go = described
         self.assertEqual(
@@ -67,6 +72,8 @@ class SourceAliasTests(unittest.TestCase):
         self.assertEqual(p2go["command"], "p2go")
         self.assertEqual(p2go["mode"], "semantic_read_only")
         self.assertFalse(p2go["curated_tools"])
+        self.assertEqual(p2go["schema"], "P2GO")
+        self.assertEqual(p2go["schemas"], ["P2GO", "TUSINVC"])
         self.assertIn("semantic and relationship", p2go["role"])
 
     def test_command_resolution_is_case_insensitive_and_exact(self) -> None:

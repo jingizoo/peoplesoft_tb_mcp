@@ -47,7 +47,14 @@ db:
 # sources:
 #   p2go:
 #     backend: oracle
-#     schema: P2GO_SCHEMA
+#     schema: P2GO              # default for unqualified table names
+#     schemas: [P2GO, TUSINVC]  # complete allowlist for this one /p2go silo
+#
+# `schema` remains the default namespace. `schemas` may add related owners on
+# the same database to the same semantic catalog and relationship graph. The
+# login's broader Oracle visibility is never an implicit allowlist. As a
+# shorthand, `schema: [P2GO, TUSINVC]` is accepted and uses the first item as
+# the default, but the explicit form above makes query resolution clearer.
 
 # Concept overrides: which codes define a named population at THIS site.
 # Approved site-memory facts outrank this; the built-in seed backstops both.
@@ -208,8 +215,9 @@ process_graph:
 # Artifacts store no transaction rows, balances, or credentials, and are
 # rebuilt independently/atomically by:
 #     .venv/bin/python scripts/build_metadata_catalog.py
-# Rebuild a source after changing its connection locator or schema: the runtime
-# verifies a secret-free endpoint fingerprint and fails closed on a mismatch.
+# Rebuild a source after changing its connection locator or schema allowlist:
+# the runtime verifies a secret-free endpoint fingerprint and fails closed on
+# a mismatch.
 metadata_catalog:
   max_objects: 100000
   max_fields: 500000

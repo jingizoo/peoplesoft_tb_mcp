@@ -620,8 +620,30 @@ db:
 sources:
   p2go:
     backend: oracle
-    schema: P2GO_SCHEMA
+    schema: P2GO
+    schemas: [P2GO, TUSINVC]
 ```
+
+`schema` is the default owner for an unqualified name such as `ORDERS`.
+`schemas` is the complete allowlist for this one workspace. In this example,
+`ORDERS` means `P2GO.ORDERS`, while `TUSINVC.INVOICE` is also allowed. Both
+owners are indexed into P2Go's one semantic catalog and native relationship
+graph, so a declared foreign key between them can form a proven path. Objects
+remain schema-qualified and a duplicate name in both owners must be qualified.
+Every explicit table reference to another owner is rejected before live SQL
+or query explanation even when the Oracle login has wider DBA/catalog
+visibility. Least-privilege credentials remain the final boundary for views,
+synonyms, and database code defined inside an allowed owner.
+
+Use a dedicated read-only login for normal operation. The application does
+not connect with Oracle `AS SYSDBA`; an account that is merely eligible for
+SYSDBA still runs here as its ordinary session identity. Broad APPSADM/DBA
+visibility can be useful for a one-time metadata build, but it is not a
+substitute for least-privilege live query credentials.
+
+The shorthand `schema: [P2GO, TUSINVC]` is also accepted and chooses the first
+entry as the default. The explicit `schema` + `schemas` form above is preferred
+because it makes unqualified-name behavior visible during review.
 
 Keep its read-only credentials in `.env`:
 
@@ -993,15 +1015,20 @@ default. Narrow or redirect that explicitly when required:
 .venv/bin/python scripts/build_metadata_catalog.py --peopletools-source none
 ```
 
-Oracle collection is owner-scoped: a configured `db.schema` uses filtered
-`ALL_*` views and a blank schema uses `USER_*`. SQL Server retains the
-`sys.schemas` owner and filters to a configured schema when present; SQLite
-uses `MAIN`. Same-named objects in different sources or schemas never merge.
+Oracle collection is owner-scoped: configured `schema`/`schemas` values use
+bound, allowlisted filters on `ALL_*` views and a blank schema uses `USER_*`.
+The default schema leads only unqualified live names; all configured Oracle
+owners are retained separately in the catalog and pagination cursor. Explicit
+multi-schema allowlists are Oracle-only in this release. SQL Server retains
+the `sys.schemas` owner and filters to its scalar configured schema when
+present; SQLite uses `MAIN`. Same-named objects in different sources or
+schemas never merge.
 
 The build account needs read-only metadata visibility for objects, columns and
 indexes in each selected source (`VIEW DEFINITION` on the intended SQL Server
-database/schema; the corresponding `USER_*` or owner-filtered `ALL_*`
-visibility on Oracle; file read access on SQLite). For the PeopleTools layer,
+database/schema allowlist; the corresponding `USER_*` or owner-filtered
+`ALL_*` visibility for every configured Oracle owner; file read access on
+SQLite). For the PeopleTools layer,
 grant `SELECT` on `PSRECDEFN` and `PSRECFIELD`, plus the optional
 `PSDBFIELD`, `PSDBFLDLABL`, `PSXLATITEM`, `PSPNLFIELD`, `PSQRYDEFN` and
 `PSQRYRECORD` layers you want indexed. Saved-query use is collected only when

@@ -118,6 +118,56 @@ class FallbackTests(unittest.TestCase):
                          "it; anything else reports the path asked for")
 
 
+class MultiSchemaConfigTests(unittest.TestCase):
+    def _load(self, source_block: str):
+        root = Path(tempfile.mkdtemp())
+        path = root / CONFIG_NAME
+        path.write_text(
+            "sources:\n  p2go:\n    backend: oracle\n" + source_block,
+            encoding="utf-8",
+        )
+        return load_config(str(path)).sources["p2go"]
+
+    def test_default_schema_and_allowlist_are_normalized_and_deduped(self):
+        source = self._load(
+            "    schema: p2go\n"
+            "    schemas: [P2GO, tusinvc, TUSINVC]\n")
+        self.assertEqual(source.schema, "P2GO")
+        self.assertEqual(source.schemas, ["P2GO", "TUSINVC"])
+
+    def test_schema_list_shorthand_keeps_first_as_scalar_default(self):
+        source = self._load("    schema: [p2go, tusinvc]\n")
+        self.assertEqual(source.schema, "P2GO")
+        self.assertEqual(source.schemas, ["P2GO", "TUSINVC"])
+
+    def test_scalar_schema_remains_backward_compatible(self):
+        source = self._load("    schema: p2go\n")
+        self.assertEqual(source.schema, "P2GO")
+        self.assertEqual(source.schemas, ["P2GO"])
+
+    def test_blank_or_unsafe_allowlist_values_fail_closed(self):
+        too_long = "A" * 129
+        for values in ('[P2GO, ""]', '[P2GO, "OTHER.SCHEMA"]', '[]',
+                       f'[P2GO, "{too_long}"]'):
+            with self.subTest(values=values), self.assertRaises(RuntimeError):
+                if values == '[]':
+                    self._load("    schema: []\n")
+                else:
+                    self._load(
+                        f"    schema: P2GO\n    schemas: {values}\n")
+
+    def test_multiple_schema_allowlist_is_oracle_only_for_now(self):
+        root = Path(tempfile.mkdtemp())
+        path = root / CONFIG_NAME
+        path.write_text(
+            "sources:\n  warehouse:\n    backend: sqlserver\n"
+            "    schema: dbo\n    schemas: [dbo, reporting]\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "only for Oracle"):
+            load_config(str(path))
+
+
 class ConsoleTests(unittest.TestCase):
     """The console validates against the base actually in use."""
 

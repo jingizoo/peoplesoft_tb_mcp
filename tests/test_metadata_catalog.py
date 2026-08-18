@@ -25,6 +25,7 @@ from pstb.db import Database  # noqa: E402
 from pstb.metadata import (  # noqa: E402
     MetadataBuildLimits,
     MetadataCatalog,
+    MetadataError,
     build_catalog,
 )
 
@@ -879,9 +880,11 @@ class CrossSourceTests(_FixtureCase):
 
 class NativeCatalogDialectTests(unittest.TestCase):
     class _Recorder:
-        def __init__(self, dialect: str, schema: str, responses: list):
+        def __init__(self, dialect: str, schema: str, responses: list,
+                     schemas=None):
             self.dialect = dialect
-            self.cfg = SimpleNamespace(db=SimpleNamespace(schema=schema))
+            self.cfg = SimpleNamespace(db=SimpleNamespace(
+                schema=schema, schemas=list(schemas or [])))
             self.responses = list(responses)
             self.calls: list[dict] = []
 
@@ -1026,6 +1029,285 @@ class NativeCatalogDialectTests(unittest.TestCase):
             {"v": "CORP_AR_QUEUE_V", "rs": "SYSADM",
              "ro": "CORP_AR_QUEUE", "rl": "", "owner": "SYSADM"},
         )
+
+    def test_multi_schema_oracle_binds_allowlist_and_paginates_by_owner(self):
+        from pstb.metadata import (_column_pages, _constraint_pages,
+                                   _index_pages, _object_page,
+                                   _view_dependency_pages)
+
+        allowed = ["p2go", "tusinvc"]
+        objects = self._Recorder(
+            "oracle", "p2go", [([], False)], schemas=allowed)
+        _object_page(objects, ("P2GO", "LAST_OBJECT"), 1)
+        call = objects.calls[0]
+        self.assertIn("OWNER IN (:owner0,:owner1)", call["sql"])
+        self.assertIn("OWNER>:s", call["sql"])
+        self.assertEqual(call["params"], {
+            "s": "P2GO", "n": "LAST_OBJECT",
+            "owner0": "P2GO", "owner1": "TUSINVC",
+        })
+
+        class PagingOracle:
+            dialect = "oracle"
+            cfg = SimpleNamespace(db=SimpleNamespace(
+                schema="P2GO", schemas=allowed))
+
+            def query(self, _sql, params=None, max_rows=None):
+                params = params or {}
+                after = (params.get("s", ""), params.get("n", ""))
+                rows = [
+                    {"schema_name": "P2GO", "object_name": "Z_LAST",
+                     "object_type": "TABLE"},
+                    {"schema_name": "TUSINVC", "object_name": "A_FIRST",
+                     "object_type": "TABLE"},
+                    {"schema_name": "TUSINVC", "object_name": "Z_LAST",
+                     "object_type": "TABLE"},
+                ]
+                remaining = [row for row in rows if (
+                    row["schema_name"], row["object_name"]) > after]
+                return remaining[:max_rows], len(remaining) > max_rows
+
+        page_db = PagingOracle()
+        seen = []
+        after = None
+        while True:
+            page, truncated = _object_page(page_db, after, 1)
+            seen.extend((row["schema_name"], row["object_name"])
+                        for row in page)
+            if not truncated:
+                break
+            after = (page[-1]["schema_name"], page[-1]["object_name"])
+        self.assertEqual(seen, [
+            ("P2GO", "Z_LAST"),
+            ("TUSINVC", "A_FIRST"),
+            ("TUSINVC", "Z_LAST"),
+        ])
+
+        first_column = {
+            "schema_name": "P2GO", "object_name": "Z_LAST",
+            "column_name": "ID", "ordinal_position": 1,
+        }
+        second_column = {
+            "schema_name": "TUSINVC", "object_name": "A_FIRST",
+            "column_name": "ID", "ordinal_position": 1,
+        }
+        columns = self._Recorder(
+            "oracle", "p2go",
+            [([first_column], True), ([second_column], True), ([], False)],
+            schemas=allowed)
+        self.assertEqual(
+            [page[0][0]["schema_name"]
+             for page in _column_pages(columns, page_size=1)],
+            ["P2GO", "TUSINVC"],
+        )
+        self.assertEqual(columns.calls[1]["params"], {
+            "s": "P2GO", "t": "Z_LAST", "p": 1,
+            "owner0": "P2GO", "owner1": "TUSINVC",
+        })
+        self.assertEqual(columns.calls[2]["params"]["s"], "TUSINVC")
+        self.assertIn("ORDER BY OWNER,TABLE_NAME,COLUMN_ID",
+                      columns.calls[0]["sql"])
+
+        index_row = {
+            "schema_name": "P2GO", "object_name": "ORDERS",
+            "index_name": "ORDERS_PK", "column_name": "ID",
+            "ordinal_position": 1,
+        }
+        indexes = self._Recorder(
+            "oracle", "p2go", [([index_row], True), ([], False)],
+            schemas=allowed)
+        list(_index_pages(indexes, page_size=1))
+        self.assertEqual(indexes.calls[1]["params"]["s"], "P2GO")
+        self.assertIn("C.TABLE_OWNER>:s", indexes.calls[1]["sql"])
+
+        constraint_row = {
+            "schema_name": "TUSINVC", "object_name": "INVOICE",
+            "constraint_name": "INVOICE_PK", "constraint_type": "P",
+            "column_name": "ID", "ordinal_position": 1,
+        }
+        constraints = self._Recorder(
+            "oracle", "p2go", [([constraint_row], True), ([], False)],
+            schemas=allowed)
+        list(_constraint_pages(constraints, page_size=1))
+        self.assertEqual(constraints.calls[1]["params"]["s"], "TUSINVC")
+        self.assertIn("C.OWNER>:s", constraints.calls[1]["sql"])
+
+        dependency_row = {
+            "schema_name": "P2GO", "view_name": "INVOICE_V",
+            "referenced_schema": "TUSINVC",
+            "referenced_object": "INVOICE", "referenced_type": "TABLE",
+            "referenced_link": "",
+        }
+        dependencies = self._Recorder(
+            "oracle", "p2go", [([dependency_row], True), ([], False)],
+            schemas=allowed)
+        list(_view_dependency_pages(dependencies, page_size=1))
+        self.assertEqual(dependencies.calls[1]["params"]["s"], "P2GO")
+        self.assertIn("OWNER>:s", dependencies.calls[1]["sql"])
+
+    def test_one_oracle_source_graph_resolves_only_allowed_cross_schema_edges(self):
+        class MultiSchemaOracle:
+            dialect = "oracle"
+            prefix = "P2GO."
+
+            def __init__(self, root):
+                self.cfg = Config(
+                    root=root,
+                    db=DbCfg(
+                        backend="oracle", schema="P2GO",
+                        schemas=["P2GO", "TUSINVC"],
+                        oracle_dsn="db.example:1521/service",
+                        oracle_user="APPSADM", oracle_password="secret"),
+                )
+                self.calls = []
+
+            def query(self, sql, params=None, max_rows=None):
+                params = dict(params or {})
+                self.calls.append((" ".join(sql.split()), params))
+                if "FROM ALL_OBJECTS" in sql:
+                    rows = [
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "object_type": "TABLE"},
+                        {"schema_name": "P2GO", "object_name": "ORDER_VIEW",
+                         "object_type": "VIEW"},
+                        {"schema_name": "P2GO", "object_name": "SHARED",
+                         "object_type": "TABLE"},
+                        {"schema_name": "TUSINVC", "object_name": "INVOICE",
+                         "object_type": "TABLE"},
+                        {"schema_name": "TUSINVC", "object_name": "SHARED",
+                         "object_type": "TABLE"},
+                    ]
+                elif "FROM ALL_TAB_COLUMNS" in sql:
+                    rows = [
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "column_name": "ID", "ordinal_position": 1},
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "column_name": "INVOICE_ID", "ordinal_position": 2},
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "column_name": "OUTSIDE_ID", "ordinal_position": 3},
+                        {"schema_name": "TUSINVC", "object_name": "INVOICE",
+                         "column_name": "ID", "ordinal_position": 1},
+                    ]
+                elif "FROM ALL_IND_COLUMNS" in sql:
+                    rows = []
+                elif "FROM ALL_CONSTRAINTS C" in sql:
+                    rows = [
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "constraint_name": "FK_INVOICE",
+                         "constraint_type": "R", "column_name": "INVOICE_ID",
+                         "ordinal_position": 1,
+                         "referenced_schema": "TUSINVC",
+                         "referenced_object": "INVOICE",
+                         "referenced_column": "ID",
+                         "referenced_constraint": "INVOICE_PK"},
+                        {"schema_name": "P2GO", "object_name": "ORDERS",
+                         "constraint_name": "FK_OUTSIDE",
+                         "constraint_type": "R", "column_name": "OUTSIDE_ID",
+                         "ordinal_position": 1,
+                         "referenced_schema": "OTHER",
+                         "referenced_object": "SECRET_TABLE",
+                         "referenced_column": "ID",
+                         "referenced_constraint": "SECRET_PK"},
+                    ]
+                elif "FROM ALL_DEPENDENCIES" in sql:
+                    rows = [
+                        {"schema_name": "P2GO", "view_name": "ORDER_VIEW",
+                         "referenced_schema": "TUSINVC",
+                         "referenced_object": "INVOICE",
+                         "referenced_type": "TABLE", "referenced_link": ""},
+                        {"schema_name": "P2GO", "view_name": "ORDER_VIEW",
+                         "referenced_schema": "OTHER",
+                         "referenced_object": "SECRET_TABLE",
+                         "referenced_type": "TABLE", "referenced_link": ""},
+                    ]
+                else:
+                    raise AssertionError(sql)
+                if "ALL_" in sql:
+                    assert params.get("owner0") == "P2GO", params
+                    assert params.get("owner1") == "TUSINVC", params
+                return rows[:int(max_rows)], False
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source = MultiSchemaOracle(root)
+        artifact = root / "p2go-multi-schema.db"
+        build_catalog(
+            artifact, [("p2go", source)], peopletools_source="none")
+
+        catalog = MetadataCatalog(artifact, source="p2go")
+        ambiguous = catalog.context("SHARED", source="p2go")
+        self.assertFalse(ambiguous["found"])
+        self.assertTrue(ambiguous["ambiguous"])
+        self.assertEqual(
+            {item["schema"] for item in ambiguous["candidates"]},
+            {"P2GO", "TUSINVC"})
+        self.assertEqual(
+            catalog.context("TUSINVC.SHARED", source="p2go")
+            ["object"]["schema"],
+            "TUSINVC")
+
+        with sqlite3.connect(artifact) as con:
+            con.row_factory = sqlite3.Row
+            resolved = con.execute(
+                "SELECT E.confidence,D.schema_name,D.name FROM edges E "
+                "JOIN nodes S ON S.id=E.src JOIN nodes D ON D.id=E.dst "
+                "WHERE E.kind='foreign_key_references_object' "
+                "AND S.name='FK_INVOICE'"
+            ).fetchone()
+            outside = con.execute(
+                "SELECT E.confidence,D.kind,D.schema_name,D.name FROM edges E "
+                "JOIN nodes S ON S.id=E.src JOIN nodes D ON D.id=E.dst "
+                "WHERE E.kind='foreign_key_references_object' "
+                "AND S.name='FK_OUTSIDE'"
+            ).fetchone()
+            view_edges = con.execute(
+                "SELECT E.confidence,D.kind,D.schema_name,D.name FROM edges E "
+                "JOIN nodes D ON D.id=E.dst "
+                "WHERE E.kind='view_depends_on' ORDER BY D.schema_name"
+            ).fetchall()
+            real_outside = con.execute(
+                "SELECT COUNT(*) FROM nodes WHERE schema_name='OTHER' "
+                "AND kind IN ('table','view')"
+            ).fetchone()[0]
+        self.assertEqual(tuple(resolved), ("confirmed", "TUSINVC", "INVOICE"))
+        self.assertEqual(tuple(outside),
+                         ("inconclusive", "external_object", "OTHER",
+                          "SECRET_TABLE"))
+        self.assertEqual(
+            {(row["confidence"], row["kind"], row["schema_name"])
+             for row in view_edges},
+            {("confirmed", "table", "TUSINVC"),
+             ("inconclusive", "external_object", "OTHER")})
+        self.assertEqual(real_outside, 0)
+
+    def test_empty_multi_schema_build_names_the_attempted_boundaries(self):
+        class EmptyOracle:
+            dialect = "oracle"
+            prefix = "P2GO."
+
+            def __init__(self, root):
+                self.cfg = Config(
+                    root=root,
+                    db=DbCfg(
+                        backend="oracle", schema="P2GO",
+                        schemas=["P2GO", "TUSINVC"],
+                        oracle_dsn="db.example:1521/service"),
+                )
+
+            def query(self, _sql, _params=None, max_rows=None):
+                return [], False
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        with self.assertRaises(MetadataError) as caught:
+            build_catalog(
+                root / "empty.db", [("p2go", EmptyOracle(root))],
+                peopletools_source="none")
+        message = str(caught.exception)
+        self.assertIn("p2go: P2GO (default), TUSINVC", message)
+        self.assertNotIn("db.example", message)
 
     def test_unconfigured_oracle_stays_in_current_user_catalogs(self):
         from pstb.metadata import (_column_pages, _constraint_pages,
