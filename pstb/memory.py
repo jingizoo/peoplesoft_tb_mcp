@@ -157,23 +157,18 @@ class SiteMemory:
                 if f.get("status") == "approved"]
 
     def record_facts(self, table: str = "") -> list:
-        """What someone here has taught about a record.
+        """Operator-approved facts about one record.
 
-        Both approved and pending facts are returned, each carrying its own
-        status. Approval still governs whether a fact enters PROMPT CONTEXT —
-        an unreviewed claim must not silently shape a conclusion. But record
-        facts do a different job: they help FIND a table, and whatever is
-        found is then read from the live catalog anyway. Making someone run a
-        CLI before the agent can act on "that table holds interface files" is
-        friction with nothing on the other side of it, so discovery uses them
-        immediately and labels where they came from.
+        Pending conversational claims never influence discovery.  They may be
+        reviewed with the memory CLI, but only an explicit approval makes a
+        fact available to ``search_records`` or ``describe_record``.
         """
         want = (table or "").strip().upper()
         if want.startswith("PS_"):
             want = want[3:]
         out = []
         for f in self._load()["facts"]:
-            if f.get("kind") != "record" or f.get("status") == "rejected":
+            if f.get("kind") != "record" or f.get("status") != "approved":
                 continue
             rec = str(f.get("record") or "")
             if want and rec != want and rec != f"PS_{want}" \

@@ -8,8 +8,9 @@ Auto flags per turn:
   max_rounds       — the agent loop hit its round limit
   gave_up          — the answer says it can't / data not available
 
-The user can also mark a turn bad from the web UI (thumbs-down), which appends
-a feedback record referencing the turn id.
+The user can also rate a turn and select bounded improvement reasons in the
+web UI. Feedback, runtime quality, and operator review state are separate
+append-only records referencing the turn id.
 
 Review the backlog:  python -m pstb.qlog [logs/questions.jsonl]
 """
@@ -25,6 +26,14 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Optional
+
+from .quality import (
+    GROUNDEDNESS_STATUSES,
+    QUALITY_COUNT_KEYS,
+    QUALITY_REASON_CODES,
+    RUNTIME_GROUNDING_BASIS,
+    safe_groundedness,
+)
 
 _DATAISH = re.compile(
     r"(?i)\b(balance|aging|invoice|customer|journal|ledger|budget|revenue|"
@@ -63,23 +72,45 @@ DEFAULT_LOG_BACKUPS = 3
 MAX_QUESTION_CHARS = 8_000
 MAX_FEEDBACK_CHARS = 4_000
 
-# NOT \b before the keyword. Underscore is a word character, so \b does not
-# exist between the "_" and the "A" of COUPA_API_KEY — and an env-var name is
-# the SHAPE these actually arrive in, pasted out of a .env or an error
-# message. \b matched "password=" in prose and missed COUPA_API_KEY=,
-# GOOGLE_API_KEY=, ANTHROPIC_API_KEY= and client_secret:, which is most of
-# what there is to leak. A non-alphanumeric lookbehind admits the "_" while
-# still refusing to fire inside a longer word.
+FEEDBACK_VERDICTS = frozenset({"good", "bad"})
+FEEDBACK_CATEGORIES = frozenset({
+    "not_relevant", "unsupported_claim", "wrong_number", "wrong_source",
+    "incomplete", "too_slow", "other",
+})
+REVIEW_STATUSES = frozenset({
+    "open", "triaged", "eval_added", "fix_in_progress", "fixed",
+    "verified", "dismissed",
+})
+MAX_FEEDBACK_CATEGORIES = 7
+
+
+class FeedbackAlreadyRecorded(ValueError):
+    """A turn accepts one immutable user rating."""
+
+
+_REVIEW_RANK = {
+    "open": 0,
+    "triaged": 1,
+    "eval_added": 2,
+    "fix_in_progress": 3,
+    "fixed": 4,
+    "verified": 5,
+}
+
+# Do not use ``\b`` before these keywords. Underscore is a word character,
+# so there is no boundary before the API_KEY part of an environment variable
+# such as COUPA_API_KEY. A non-alphanumeric lookbehind catches the deployed
+# shape without matching inside longer words.
 _KEY_START = r"(?<![A-Za-z0-9])"
 _ASSIGNED_VALUE = r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)" + _KEY_START +
-    r"(password|passwd|pwd|secret|token|api[_-]?key|authorization)"
+    r"(?i)" + _KEY_START
+    + r"(password|passwd|pwd|secret|token|api[_-]?key|authorization)"
     + _ASSIGNED_VALUE
 )
 _LOCATOR_ASSIGNMENT = re.compile(
-    r"(?i)" + _KEY_START +
-    r"(dsn|data\s+source|server|host|service(?:_name)?|uid|user\s+id)"
+    r"(?i)" + _KEY_START
+    + r"(dsn|data\s+source|server|host|service(?:_name)?|uid|user\s+id)"
     + _ASSIGNED_VALUE
 )
 # Oracle's thin-driver form carries the credential as user/password@host,
@@ -550,33 +581,111 @@ def _safe_tool_record(call: object, source_database: str,
     return out
 
 
+def _feedback_categories(values: object) -> list[str]:
+    """Validate user-selected feedback categories as a closed vocabulary."""
+    if values in (None, ""):
+        return []
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        raise ValueError("feedback categories must be a list")
+    if len(values) > MAX_FEEDBACK_CATEGORIES:
+        raise ValueError(
+            f"feedback accepts at most {MAX_FEEDBACK_CATEGORIES} categories")
+    categories = [str(value or "").strip() for value in values]
+    unknown = sorted({value for value in categories
+                      if value not in FEEDBACK_CATEGORIES})
+    if unknown:
+        raise ValueError(
+            "unknown feedback category: " + ", ".join(unknown))
+    return sorted(set(categories))[:MAX_FEEDBACK_CATEGORIES]
+
+
 class QuestionLog:
     def __init__(self, path: Optional[str], root: Path, *,
                  max_bytes: int = DEFAULT_MAX_LOG_BYTES,
                  backups: int = DEFAULT_LOG_BACKUPS):
         self.path: Optional[Path] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._known_turns: set[str] = set()
+        self._active_turns: set[str] = set()
+        self._turn_records: dict[str, dict] = {}
+        self._quality_records: dict[str, dict] = {}
+        self._feedback_records: dict[str, dict] = {}
+        self._review_records: dict[str, dict] = {}
+        self._feedback_turns: set[str] = set()
+        self._review_statuses: dict[str, str] = {}
+        self._parent_identity: tuple[int, int] | None = None
         self.max_bytes = max(int(max_bytes or 0), 1024)
         self.backups = min(max(int(backups or 0), 1), 20)
         if path:
             p = Path(path)
-            self.path = p if p.is_absolute() else root / p
+            if p.is_absolute():
+                self.path = p.parent.resolve(strict=False) / p.name
+            else:
+                safe_root = Path(root).resolve(strict=False)
+                candidate = safe_root / p
+                safe_parent = candidate.parent.resolve(strict=False)
+                try:
+                    safe_parent.relative_to(safe_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "relative question log must stay below the configured "
+                        "application root and cannot traverse linked parents"
+                    ) from exc
+                self.path = safe_parent / candidate.name
+
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            parent = self.path.parent.lstat()
+            if not stat.S_ISDIR(parent.st_mode):
+                raise ValueError(
+                    "question log parent must be a real directory, not a link")
+            self._parent_identity = (parent.st_dev, parent.st_ino)
 
         self._harden_existing_files()
         self._load_known_turns()
 
-    @staticmethod
-    def _open_regular(path: Path, flags: int = os.O_RDONLY) -> int:
+    def _open_parent(self) -> int:
+        if not self.path or not self._parent_identity:
+            raise OSError("question log is disabled")
+        flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(self.path.parent, flags)
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISDIR(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != self._parent_identity):
+                raise OSError("question log parent changed after startup")
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    def _open_regular(self, path: Path,
+                      flags: int = os.O_RDONLY) -> int:
         """Open an existing regular file without following a symlink."""
-        fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
+        if not self.path or path.parent != self.path.parent:
+            raise OSError("question log path escaped its configured parent")
+        parent_fd = self._open_parent()
+        try:
+            fd = os.open(
+                path.name, flags | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError(f"refusing non-regular question log {path}")
             # On platforms without O_NOFOLLOW, compare the opened inode to
             # the directory entry so a symlink cannot slip through fallback.
             if not getattr(os, "O_NOFOLLOW", 0):
-                before = path.lstat()
+                parent_fd = self._open_parent()
+                try:
+                    before = os.stat(
+                        path.name, dir_fd=parent_fd, follow_symlinks=False)
+                finally:
+                    os.close(parent_fd)
                 opened = os.fstat(fd)
                 if (before.st_dev, before.st_ino) != (
                         opened.st_dev, opened.st_ino):
@@ -607,7 +716,18 @@ class QuestionLog:
                 os.close(fd)
 
     def _load_known_turns(self) -> None:
-        for path in self._paths():
+        # Rotated files are older as their suffix grows. Read oldest to newest
+        # so the last append wins for review state while every turn id remains
+        # known for feedback/quality validation.
+        self._known_turns.clear()
+        self._active_turns.clear()
+        self._turn_records.clear()
+        self._quality_records.clear()
+        self._feedback_records.clear()
+        self._review_records.clear()
+        self._feedback_turns.clear()
+        self._review_statuses.clear()
+        for path in reversed(self._paths()):
             try:
                 fd = self._open_regular(path)
             except (FileNotFoundError, OSError):
@@ -627,59 +747,143 @@ class QuestionLog:
                                 and re.fullmatch(r"[A-Fa-f0-9]{12,64}",
                                                  turn_id)):
                             self._known_turns.add(turn_id)
+                            self._turn_records[turn_id] = rec
+                            if path == self.path:
+                                self._active_turns.add(turn_id)
+                        elif (rec.get("type") == "feedback"
+                              and re.fullmatch(r"[A-Fa-f0-9]{12,64}",
+                                               turn_id)):
+                            self._feedback_turns.add(turn_id)
+                            self._feedback_records[turn_id] = rec
+                        elif (rec.get("type") == "quality"
+                              and re.fullmatch(r"[A-Fa-f0-9]{12,64}",
+                                               turn_id)):
+                            self._quality_records[turn_id] = rec
+                        elif (rec.get("type") == "review"
+                              and re.fullmatch(r"[A-Fa-f0-9]{12,64}",
+                                               turn_id)):
+                            status = str(rec.get("status") or "")
+                            if status in REVIEW_STATUSES:
+                                self._review_statuses[turn_id] = status
+                                self._review_records[turn_id] = rec
             finally:
                 if fd >= 0:
                     os.close(fd)
 
-    def _rotate(self, incoming_bytes: int) -> None:
-        if not self.path or not self.path.exists():
-            return
-        try:
-            current = self.path.lstat()
-            if not stat.S_ISREG(current.st_mode):
-                return
-            if current.st_size + incoming_bytes <= self.max_bytes:
-                return
-        except OSError:
-            return
-        oldest = self.path.with_name(f"{self.path.name}.{self.backups}")
-        oldest.unlink(missing_ok=True)
-        for index in range(self.backups - 1, 0, -1):
-            prior = self.path.with_name(f"{self.path.name}.{index}")
-            if prior.exists():
-                try:
-                    if not stat.S_ISREG(prior.lstat().st_mode):
-                        prior.unlink()
-                        continue
-                except OSError:
-                    continue
-                prior.replace(self.path.with_name(
-                    f"{self.path.name}.{index + 1}"))
-        first = self.path.with_name(f"{self.path.name}.1")
-        self.path.replace(first)
-        try:
-            fd = self._open_regular(first)
-            try:
-                os.fchmod(fd, 0o600)
-            finally:
-                os.close(fd)
-        except OSError:
-            pass
+    def retained_records(self) -> list[dict]:
+        """Read retained records through the startup-pinned log directory.
 
-    def _append(self, rec: dict) -> bool:
+        The operator dashboard must not reopen ``self.path`` as an ordinary
+        pathname: an attacker who swaps the parent directory for a symlink
+        after startup could otherwise redirect a read even though writes
+        already fail closed.  Reuse the same directory identity and no-follow
+        checks as the writer, oldest generation first.
+        """
+        records: list[dict] = []
+        if not self.path:
+            return records
+        with self._lock:
+            for path in reversed(self._paths()):
+                fd = -1
+                try:
+                    fd = self._open_regular(path)
+                    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                        fd = -1
+                        for line in handle:
+                            try:
+                                rec = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(rec, dict):
+                                records.append(rec)
+                except (FileNotFoundError, OSError):
+                    continue
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+        return records
+
+    def _rotate(self, incoming_bytes: int) -> bool:
+        if not self.path:
+            return False
+        parent_fd = -1
+        try:
+            parent_fd = self._open_parent()
+            current = os.stat(
+                self.path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode):
+                os.close(parent_fd)
+                return False
+            if current.st_size + incoming_bytes <= self.max_bytes:
+                os.close(parent_fd)
+                return False
+        except (FileNotFoundError, OSError):
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            return False
+        try:
+            oldest = f"{self.path.name}.{self.backups}"
+            try:
+                os.unlink(oldest, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            for index in range(self.backups - 1, 0, -1):
+                prior = f"{self.path.name}.{index}"
+                try:
+                    prior_stat = os.stat(
+                        prior, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(prior_stat.st_mode):
+                    try:
+                        os.unlink(prior, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                    continue
+                os.replace(
+                    prior, f"{self.path.name}.{index + 1}",
+                    src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                )
+            os.replace(
+                self.path.name, f"{self.path.name}.1",
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+            try:
+                fd = os.open(
+                    f"{self.path.name}.1",
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+            return True
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+    def _append_records(self, records: list[dict]) -> bool:
         if not self.path:
             return False
         try:
             # One QuestionLog instance serves concurrent GUI turns. Keep each
             # JSON record as one serialized append so two silo completions
             # cannot interleave into a torn line.
-            line = json.dumps(rec, default=str) + "\n"
+            line = "".join(
+                json.dumps(rec, default=str) + "\n" for rec in records)
             with self._lock:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._rotate(len(line.encode("utf-8")))
+                rotated = self._rotate(len(line.encode("utf-8")))
                 flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
                          | getattr(os, "O_NOFOLLOW", 0))
-                fd = os.open(self.path, flags, 0o600)
+                parent_fd = self._open_parent()
+                try:
+                    fd = os.open(
+                        self.path.name, flags, 0o600, dir_fd=parent_fd)
+                finally:
+                    os.close(parent_fd)
                 try:
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
                         raise OSError("question log is not a regular file")
@@ -689,9 +893,59 @@ class QuestionLog:
                     raise
                 with os.fdopen(fd, "a", encoding="utf-8") as f:
                     f.write(line)
+                if rotated:
+                    # Rotation may evict the oldest turn. Rebuild the bounded
+                    # indexes from retained files so stale ids cannot accept
+                    # feedback/review writes forever.
+                    self._load_known_turns()
             return True
         except OSError:
             return False  # logging must never break the answer
+
+    def _append(self, rec: dict) -> bool:
+        return self._append_records([rec])
+
+    def _append_for_turn(self, turn_id: str, rec: dict) -> bool:
+        """Append a child event without letting rotation orphan its turn.
+
+        If the parent turn has already moved to a backup, copy its already
+        redacted record and latest quality/feedback/review siblings into the
+        active generation in the same append as the new event. Report readers
+        deduplicate by turn id, while the retained complaint and its complete
+        current assessment now age together.
+        """
+        with self._lock:
+            parent = self._turn_records.get(turn_id)
+            if not isinstance(parent, dict):
+                return False
+            refresh_parent = turn_id not in self._active_turns
+            records = [rec]
+            if refresh_parent:
+                records = [parent]
+                kind = str(rec.get("type") or "")
+                for sibling_kind, siblings in (
+                    ("quality", self._quality_records),
+                    ("feedback", self._feedback_records),
+                    ("review", self._review_records),
+                ):
+                    sibling = siblings.get(turn_id)
+                    if sibling_kind != kind and isinstance(sibling, dict):
+                        records.append(sibling)
+                records.append(rec)
+            recorded = self._append_records(records)
+            if recorded:
+                if refresh_parent:
+                    self._known_turns.add(turn_id)
+                    self._active_turns.add(turn_id)
+                    self._turn_records[turn_id] = parent
+                kind = str(rec.get("type") or "")
+                if kind == "quality":
+                    self._quality_records[turn_id] = rec
+                elif kind == "feedback":
+                    self._feedback_records[turn_id] = rec
+                elif kind == "review":
+                    self._review_records[turn_id] = rec
+            return recorded
 
     def has_turn(self, turn_id: str) -> bool:
         candidate = str(turn_id or "")
@@ -729,7 +983,7 @@ class QuestionLog:
             flags.append("gave_up")
         safe_context = _safe_source_context(source_database, source_context)
         allowed_schemas = safe_context.get("schema_allowlist") or []
-        recorded = self._append({
+        turn_record = {
             "type": "turn", "turn_id": turn_id, "ts": ts,
             "surface": surface, "provider": provider,
             "source_database": source_database,
@@ -742,21 +996,136 @@ class QuestionLog:
             "rounds": rounds,
             "answer_chars": len(answer or ""),
             "failed": bool(flags), "flags": flags,
-        })
+        }
+        recorded = self._append(turn_record)
         if recorded:
             with self._lock:
                 self._known_turns.add(turn_id)
-        return turn_id
+                self._active_turns.add(turn_id)
+                self._turn_records[turn_id] = turn_record
+        return turn_id if recorded else ""
 
-    def log_feedback(self, turn_id: str, verdict: str, note: str = "") -> None:
-        if not self.has_turn(turn_id):
-            return
-        self._append({
-            "type": "feedback", "turn_id": turn_id,
-            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-            "verdict": verdict,
-            "note": redact_private_text(note, limit=MAX_FEEDBACK_CHARS),
+    def log_quality(self, turn_id: str, groundedness: object, *,
+                    basis: str = RUNTIME_GROUNDING_BASIS) -> bool:
+        """Append a bounded runtime-quality result for a known turn.
+
+        Source is deliberately absent: consumers join this event to the turn
+        that owns ``turn_id``. Accepting a second caller-supplied source label
+        would make cross-silo quality contamination possible.
+        """
+        candidate = str(turn_id or "")
+        if not self.has_turn(candidate):
+            return False
+        if str(basis or "") != RUNTIME_GROUNDING_BASIS:
+            raise ValueError("unsupported quality basis")
+        raw = groundedness if isinstance(groundedness, dict) else {}
+        status = str(raw.get("status") or "")
+        if status not in GROUNDEDNESS_STATUSES:
+            raise ValueError("invalid groundedness status")
+        reasons = raw.get("reason_codes")
+        if reasons not in (None, "") and not isinstance(
+                reasons, (list, tuple, set, frozenset)):
+            raise ValueError("quality reason_codes must be a list")
+        unknown = sorted({
+            str(value) for value in (reasons or ())
+            if str(value) not in QUALITY_REASON_CODES
         })
+        if unknown:
+            raise ValueError("unknown quality reason code: "
+                             + ", ".join(unknown))
+        safe = safe_groundedness(raw)
+        # ``safe_groundedness`` is the final persistence selector. It emits
+        # every allowed count key with a bounded integer and nothing from the
+        # richer in-memory answer/evidence objects.
+        safe["counts"] = {
+            key: safe["counts"][key] for key in QUALITY_COUNT_KEYS
+        }
+        return self._append_for_turn(candidate, {
+            "type": "quality", "turn_id": candidate,
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(
+                timespec="seconds"),
+            "basis": RUNTIME_GROUNDING_BASIS,
+            "groundedness": safe,
+        })
+
+    def log_feedback(self, turn_id: str, verdict: str, note: str = "", *,
+                     categories: object = ()) -> bool:
+        candidate = str(turn_id or "")
+        normalized = str(verdict or "").strip().lower()
+        if normalized not in FEEDBACK_VERDICTS:
+            raise ValueError("feedback verdict must be good or bad")
+        if note not in (None, ""):
+            # Free text is intentionally excluded. Even aggressive redaction
+            # cannot reliably distinguish an ordinary sentence from a table,
+            # credential, customer id, or other private identifier.
+            raise ValueError(
+                "free-text feedback is disabled; choose a feedback reason")
+        selected = _feedback_categories(categories)
+        if normalized == "good" and selected:
+            raise ValueError(
+                "helpful feedback cannot carry improvement categories")
+        with self._lock:
+            if candidate not in self._known_turns:
+                return False
+            if candidate in self._feedback_turns:
+                raise FeedbackAlreadyRecorded(
+                    "feedback has already been recorded for this turn")
+            recorded = self._append_for_turn(candidate, {
+                "type": "feedback", "turn_id": candidate,
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="seconds"),
+                "verdict": normalized,
+                "categories": selected,
+            })
+            if recorded:
+                self._feedback_turns.add(candidate)
+        # A bad answer enters the review queue immediately. The review record
+        # is separate and append-only so later triage/fix/verification changes
+        # never rewrite the user's feedback.
+        if (recorded and normalized == "bad"
+                and not self.review_status(candidate)):
+            try:
+                self.log_review(candidate, "open")
+            except ValueError:
+                # An operator may have advanced the turn between the status
+                # check and this automatic open. The user's immutable rating
+                # is already recorded; never move review state backward.
+                pass
+        return recorded
+
+    def log_review(self, turn_id: str, status: str) -> bool:
+        candidate = str(turn_id or "")
+        normalized = str(status or "").strip().lower()
+        if normalized not in REVIEW_STATUSES:
+            raise ValueError("invalid review status")
+        with self._lock:
+            if candidate not in self._known_turns:
+                return False
+            current = self._review_statuses.get(candidate, "")
+            if current == normalized:
+                return True  # idempotent retry; do not append another record
+            if current in {"verified", "dismissed"}:
+                raise ValueError(f"review status {current} is terminal")
+            if normalized != "dismissed":
+                prior_rank = _REVIEW_RANK.get(current, -1)
+                next_rank = _REVIEW_RANK.get(normalized, -1)
+                if next_rank <= prior_rank:
+                    raise ValueError(
+                        "review status must move forward through the workflow")
+            recorded = self._append_for_turn(candidate, {
+                "type": "review", "turn_id": candidate,
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="seconds"),
+                "status": normalized,
+            })
+            if recorded:
+                self._review_statuses[candidate] = normalized
+        return recorded
+
+    def review_status(self, turn_id: str) -> str:
+        candidate = str(turn_id or "")
+        with self._lock:
+            return self._review_statuses.get(candidate, "")
 
 
 def review(path: str) -> int:

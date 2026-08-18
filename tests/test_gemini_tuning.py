@@ -58,7 +58,7 @@ class GeminiShortlistTests(unittest.TestCase):
         "get_coupa_rni", "search_records", "describe_record",
         "profile_record", "compare_records", "run_sql", "explain_query",
         "describe_metadata_catalog", "search_metadata",
-        "get_metadata_context",
+        "get_metadata_context", "propose_metadata_meaning",
         "wiki_lookup", "wiki_search", "wiki_get_page", "get_asset_register",
         "get_ar_aging", "get_invoice_totals", "get_billing_workbench",
         "resolve_period", "list_financial_scopes", "detect_transaction_anomalies",
@@ -96,6 +96,25 @@ class GeminiShortlistTests(unittest.TestCase):
                       "live PeopleTools search remains the unavailable-"
                       "artifact fallback")
 
+    def test_explicit_metadata_teaching_adds_only_the_pending_proposal_path(self):
+        taught = set(routing_tool_names(
+            "Remember that JOB_HDR stores P2Go integration jobs",
+            self.AVAILABLE,
+        ))
+        self.assertIn("search_metadata", taught)
+        self.assertIn("get_metadata_context", taught)
+        self.assertIn("propose_metadata_meaning", taught)
+
+        exploratory = set(routing_tool_names(
+            "Describe the columns on JOB_HDR",
+            self.AVAILABLE,
+        ))
+        self.assertIn("search_metadata", exploratory)
+        self.assertNotIn(
+            "propose_metadata_meaning", exploratory,
+            "the model may not turn its own inference into a durable proposal",
+        )
+
     def test_small_talk_is_not_constrained(self):
         self.assertEqual(routing_tool_names("thanks", self.AVAILABLE), [])
 
@@ -107,6 +126,7 @@ class ScriptedProvider:
     def __init__(self, responses):
         self.responses = list(responses)
         self.routing_questions = []
+        self.tool_result_batches = []
 
     def set_routing_question(self, text):
         self.routing_questions.append(text)
@@ -115,6 +135,7 @@ class ScriptedProvider:
         return self.responses.pop(0)
 
     def send_tool_results(self, results):
+        self.tool_result_batches.append(results)
         return self.responses.pop(0)
 
     def reset(self):
@@ -124,8 +145,10 @@ class ScriptedProvider:
 class FakeSession:
     def __init__(self, outputs):
         self.outputs = outputs
+        self.calls = []
 
     async def call_tool(self, name, arguments):
+        self.calls.append((name, dict(arguments or {})))
         await asyncio.sleep(0)
         return SimpleNamespace(
             content=[SimpleNamespace(text=json.dumps(self.outputs[name]))],
@@ -162,6 +185,51 @@ class TurnSetsExpectationTests(unittest.IsolatedAsyncioTestCase):
             "thanks, that was helpful",
             [LLMResponse(text="Glad it helped.")])
         self.assertFalse(provider.expect_tool_call)
+
+
+class GovernedMetadataTeachingTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, question: str):
+        provider = ScriptedProvider([
+            LLMResponse(tool_calls=[ToolCall(
+                id="proposal",
+                name="propose_metadata_meaning",
+                args={
+                    "identifier": "main.JOB_HDR",
+                    "meaning": "P2Go integration job headers",
+                    "aliases": "job header",
+                },
+            )]),
+            LLMResponse(text="The proposal was submitted for review."),
+        ])
+        session = FakeSession({
+            "propose_metadata_meaning": {
+                "source_database": "p2go",
+                "status": "pending",
+                "retrieval_active": False,
+            },
+        })
+        with patch("pstb.client.chat.MAX_NUDGES", 0):
+            await agent_turn(
+                provider, session, question, surface="gui",
+                scope={"source": "p2go"},
+            )
+        return provider, session
+
+    async def test_model_inference_cannot_create_even_a_pending_proposal(self):
+        provider, session = await self._run("What might JOB_HDR mean?")
+        self.assertEqual(session.calls, [])
+        result = provider.tool_result_batches[0][0]
+        self.assertIn("EXPLICIT_TEACHING_REQUIRED", result.content)
+
+    async def test_explicit_user_teaching_runs_with_injected_source(self):
+        provider, session = await self._run(
+            "Remember that JOB_HDR stores P2Go integration jobs")
+        self.assertEqual(len(session.calls), 1)
+        name, args = session.calls[0]
+        self.assertEqual(name, "propose_metadata_meaning")
+        self.assertEqual(args["source"], "p2go")
+        self.assertEqual(args["identifier"], "main.JOB_HDR")
+        self.assertIn("pending", provider.tool_result_batches[0][0].content)
 
 
 if __name__ == "__main__":

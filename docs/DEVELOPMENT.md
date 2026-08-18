@@ -127,10 +127,18 @@ silently pick up the next breaking SDK major.
 
 ## Question log & multi-step chaining
 
-Every chat turn is appended to `logs/questions.jsonl` with auto failure flags
-(tool_error / no_tool_calls / max_rounds / gave_up) plus thumbs-down feedback
-from the web UI. Review the failure backlog and deterministic, source-separated
-summary with:
+When question logging is enabled, each successfully persisted chat turn is
+appended to `logs/questions.jsonl` with auto failure flags (tool_error /
+no_tool_calls / max_rounds / gave_up), followed by a separate bounded
+runtime-grounding record when that append succeeds, and explicit good/bad
+feedback from the web UI. Bad
+feedback carries only allowlisted reasons (`not_relevant`,
+`unsupported_claim`, `wrong_number`, `wrong_source`, `incomplete`, `too_slow`,
+or `other`). Free-text feedback is deliberately not stored because it can
+contain credentials, object names, customer identifiers, or other private
+text that a heuristic redactor cannot classify reliably. Each turn accepts
+one immutable rating. Review the failure backlog
+and deterministic, source-separated summary with:
 
 ```bash
 .venv/bin/python -m pstb.qlog logs/questions.jsonl
@@ -140,9 +148,42 @@ summary with:
 The Diagnostics view reads the same summary through `/api/question-report`.
 Turns are grouped by their resolved canonical source (`default` for Finance,
 `p2go` for P2Go), and repeated failures, tool error/latency counts, catalog
-state and relationship-path evidence stay in that source's bucket. Use the
+state, relationship-path evidence, groundedness, a user-rated relevance
+proxy, feedback
+reasons, trends, and review status stay in that source's bucket. Use the
 per-source summaries as the operational rates; the top-level total is only a
 volume/backlog count and must not blend Finance and P2Go quality.
+
+Groundedness and relevance have deliberately different collection bases:
+
+- **Mechanical groundedness** is attempted for every newly logged turn from
+  the runtime
+  source/evidence/number/verdict guards as `passed`, `blocked`, `unknown`, or
+  `not_applicable`. `passed` means the checks this runtime can prove passed; it
+  does not assert whole-answer semantic entailment. Unknown and N/A are never
+  counted as passes or failures. The dashboard's scored/unscored coverage
+  makes legacy turns and append failures visible instead of treating missing
+  quality records as passes.
+- **User-rated relevance proxy** is calculated only from explicit ratings: a
+  helpful vote is positive and a bad vote carrying `not_relevant` is negative.
+  Because the positive control asks whether the answer was helpful, this is a
+  relevance proxy rather than a dedicated relevance judgment. Unrated turns
+  and bad votes for other reasons stay outside the denominator. Sparse
+  feedback is never treated as implicit approval.
+
+There is no live LLM-as-judge in this path. Whole-answer semantic relevance
+and nonnumeric entailment require an explicitly approved offline eval judge or
+human review, because scoring them means exposing the question, answer, and
+bounded evidence to another evaluator. Until such a judge is configured and
+calibrated, those turns remain unscored rather than receiving a synthetic pass.
+
+The Diagnostics review queue moves a local turn through `open`, `triaged`,
+`eval_added`, `fix_in_progress`, `fixed`, `verified`, or `dismissed`. Operators
+use the safe local turn ID to inspect the protected log, promote a reviewed and
+redacted failure with `scripts/eval.py --from-qlog`, run the affected Finance or
+P2Go suite, deploy the fix, and then mark it verified. Review records are
+append-only and move forward through the lifecycle; terminal verified or
+dismissed items cannot be reopened from this dashboard.
 
 The local JSONL record deliberately keeps a narrow per-tool observability
 envelope:
@@ -156,12 +197,19 @@ envelope:
 - per-allowed-schema TABLE/VIEW counts, missing owners and coverage status;
 - relationship-path found/confidence/evidence class and target schema owners.
 
+Separate quality/review records retain only the local turn ID, rubric basis,
+bounded status/counts/reason codes, categorical feedback, and review status.
+They contain no question, answer, judge prompt/rationale, SQL, binds, rows,
+object names, or raw errors. The report reads the active log plus its retained
+rotations oldest-to-newest, deduplicates a turn at rotation boundaries, and
+uses the latest feedback/quality/review record for that turn.
+
 The envelope does **not** persist tool arguments or extract SQL text, binds,
 result rows, object/column names, raw database errors, credentials, usernames,
 passwords, access tokens or DSNs from tool payloads. The turn record also
 stores no answer text, only its character count. The user's question (capped
-at 8,000 characters) and an optional free-form feedback note (capped at 4,000)
-are stored locally so a failure remains actionable. Credential assignments,
+at 8,000 characters) is stored locally so a failure remains actionable.
+Credential assignments,
 connection locators, bearer tokens, qualified object-name disclosures and
 SQL-shaped text are redacted before persistence. Ordinary business identifiers
 can still be sensitive, so neither the CLI summaries nor the Diagnostics
@@ -171,14 +219,18 @@ operator can locate the protected JSONL record when necessary. Active and
 rotated files are owner-only (`0600`); the default rotation is 10 MiB with
 three backups (`questions.jsonl.1` through `.3`). Treat the file and that
 endpoint as sensitive: keep them on a restricted host/path and apply your
-normal access and retention policy. With row security enabled, the web report
-is privileged-operator-only. There is no OTLP, hosted collector or
+normal access and retention policy. The web report/review API is machine-local
+even when the application is shared (use an SSH tunnel); with row security
+enabled it additionally requires a configured privileged operator. This is
+necessary because the PeopleSoft user-id chooser is a scope selector, not
+authentication. There is no OTLP, hosted collector or
 other external telemetry exporter in this implementation; logging is the
 configured local JSONL file only. A generic `truncated: false` does not become
 a completeness claim: without an explicit evidence contract, its status
 remains `unknown`.
 
-Each auto-flagged or thumbed-down question is a candidate for a source-specific
+Each auto-flagged, mechanically blocked, or negatively rated question is a
+candidate for a source-specific
 eval, curated tool or record-map entry. `scripts/eval.py --from-qlog` joins
 feedback to its turn and writes an owner-only, git-ignored review queue at
 `logs/eval-pending.json`, preserving the source/scope needed to reproduce it.
@@ -328,9 +380,12 @@ turns into the ignored owner-only review queue for a human to grade and promote.
 5. Ask one representative question in `/finance` and `/p2go`, then run
    `.venv/bin/python -m pstb.qlog_report logs/questions.jsonl`. Require separate
    `default` and `p2go` summaries with the expected scope/schema context,
-   timings and catalog/relationship status.
+   timings, catalog/relationship status, and quality denominators. Submit one
+   good vote and one categorized bad vote in a test environment; confirm they
+   appear only in their respective source panels and that the bad vote enters
+   the operator review queue.
 6. Inspect a sample JSONL record before production rollout. It may contain the
-   bounded user question and feedback note, but its tool records must contain
+   bounded user question and categorical feedback, but its tool records must contain
    no SQL, arguments, binds, rows, raw errors, credentials or connection
    locators. Confirm the active file and any `.1`-`.3` backups are mode `0600`.
 

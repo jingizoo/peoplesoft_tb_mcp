@@ -15,6 +15,7 @@ config.yaml.bak-*
 .setup-probe-config.yaml
 BUILD_INFO.json
 site_memory.json
+source_knowledge/
 
 # Per-deployment configuration. Every one of these is settings for THIS
 # machine, so none of them is tracked and `git pull` cannot overwrite them.

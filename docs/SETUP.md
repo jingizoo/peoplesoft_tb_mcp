@@ -666,12 +666,16 @@ active workspace.
 
 `/finance` stays on the primary PeopleSoft connection and retains its curated
 financial controls and business-unit/ledger/time scope. `/p2go` is hard-bound
-to the P2Go connection and exposes no PeopleSoft, Coupa, wiki, memory or
-P2Go-specific business tools. It can use only generic source-bound metadata
-search, relationship paths, live table shape, query explanation, and guarded
-read-only SQL. A P2Go workspace therefore has no PeopleSoft business unit,
-ledger, fiscal year or period controls. An unknown slash command is rejected
-in the browser without sending a model or database request.
+to the P2Go connection and exposes no PeopleSoft, Coupa, wiki, global site
+memory or P2Go-specific business tools. It can use generic source-bound
+metadata search, relationship paths, live table shape, query explanation, and
+guarded read-only SQL. When a user explicitly corrects or teaches the meaning
+of an exact catalog table/view, it may also create a **pending local metadata
+proposal**. That proposal does not affect retrieval until a host operator
+approves it; it never creates a join or writes to P2Go. A P2Go workspace
+therefore has no PeopleSoft business unit, ledger, fiscal year or period
+controls. An unknown slash command is rejected in the browser without sending
+a model or database request.
 
 Build every configured source once after enabling multi-source mode. This
 migrates Finance from the single-source legacy path and creates P2Go's separate
@@ -695,6 +699,26 @@ edges—not transaction rows. Missing or partial native relationships remain
 inconclusive, and matching column names alone are never promoted to a join.
 If `tools.allow_raw_sql: false`, `/p2go` remains useful for structural semantic
 and relationship questions but cannot answer row/count/amount questions.
+
+Review P2Go's local semantic proposals on the application host:
+
+```bash
+.venv/bin/python -m pstb.source_knowledge --source p2go
+.venv/bin/python -m pstb.source_knowledge --source p2go --approve <proposal-id>
+# or: --reject <proposal-id>; an approved item may later use --revoke <id>
+```
+
+Approved meanings and aliases are stored in an owner-only, git-ignored
+sidecar for exactly `p2go`. They are bound to P2Go's endpoint/schema
+fingerprint and exact catalog object ID. Finance and every other configured
+source use different sidecars. Pending, rejected and revoked text is never
+sent into metadata search or model context. Approval does not require or
+trigger a database write or catalog rebuild.
+
+For shared use, replace broad credentials such as APPSADM/SYSDBA with a
+dedicated read-only account restricted to P2GO and TUSINVC. The application
+allowlist is defense in depth; it is not a substitute for database
+least-privilege.
 
 Optionally have a DBA deploy the views in [`sql/oracle/`](../sql/oracle) and set
 `db.use_views: true` — see [VIEWS.md](VIEWS.md). The agent works without them.

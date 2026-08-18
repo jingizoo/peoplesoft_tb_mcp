@@ -385,7 +385,7 @@ class SourceObservabilityTests(unittest.TestCase):
             self.assertFalse(backup.is_symlink())
             self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
 
-    def test_questions_and_feedback_redact_credentials_locators_and_sql(self):
+    def test_questions_redact_sql_and_feedback_rejects_free_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             log = QuestionLog("questions.jsonl", root)
@@ -397,14 +397,17 @@ class SourceObservabilityTests(unittest.TestCase):
                 scope={"source": "p2go"},
             )
             self.assertTrue(log.has_turn(turn_id))
-            log.log_feedback(
-                turn_id, "bad", "Bearer abc.def service_name=nptg01pas")
+            with self.assertRaises(ValueError):
+                log.log_feedback(
+                    turn_id, "bad",
+                    "Bearer abc.def service_name=nptg01pas",
+                    categories=["other"])
             text = (root / "questions.jsonl").read_text()
             for secret in ("hunter2", "FINANCE", "abc.def", "nptg01pas",
                            "SECRET_TABLE"):
                 self.assertNotIn(secret, text)
             self.assertIn("[SQL REDACTED]", text)
-            self.assertIn("[REDACTED]", text)
+            self.assertNotIn('"type": "feedback"', text)
 
     def test_every_sql_statement_family_is_redacted_from_local_text(self):
         samples = (
@@ -493,20 +496,8 @@ class SourceObservabilityTests(unittest.TestCase):
                 "PRIVATE_PROMPT_SECRET", qlog_report.report_text(report))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RedactionShapeTests(unittest.TestCase):
-    """Credentials arrive shaped like env vars, not like prose.
-
-    The first cut anchored every keyword with ``\\b``. Underscore is a word
-    character, so there is no boundary between the "_" and the "A" of
-    COUPA_API_KEY — the pattern matched "password=" in a sentence and missed
-    COUPA_API_KEY=, GOOGLE_API_KEY=, ANTHROPIC_API_KEY= and client_secret:,
-    which is most of what a person actually pastes. The question and feedback
-    streams are written to logs/questions.jsonl verbatim otherwise.
-    """
+    """Credential shapes copied from environment and driver diagnostics."""
 
     SECRETS = (
         ("oracle dsn", "oracle+cx://SYSADM:Hunter2!@npp_db01:1521/FSPRD",
@@ -528,16 +519,16 @@ class RedactionShapeTests(unittest.TestCase):
 
     def test_no_secret_value_survives(self):
         from pstb.qlog import redact_private_text
+
         for label, raw, secret in self.SECRETS:
             with self.subTest(label=label):
                 out = redact_private_text(raw, limit=400)
-                self.assertNotIn(secret, out,
-                                 f"{label} leaked into the question log")
+                self.assertNotIn(secret, out)
                 self.assertIn("REDACTED", out)
 
-    def test_an_ordinary_question_is_left_alone(self):
-        """Over-redaction would gut the learning loop this log exists for."""
+    def test_ordinary_questions_are_left_alone(self):
         from pstb.qlog import redact_private_text
+
         for question in (
             "what is the trial balance for US001 period 6?",
             "which journals still need action before close?",
@@ -547,3 +538,7 @@ class RedactionShapeTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertEqual(
                     redact_private_text(question, limit=400), question)
+
+
+if __name__ == "__main__":
+    unittest.main()

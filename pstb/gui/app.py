@@ -30,7 +30,7 @@ from .. import queries as query_sql
 from ..ar import ARBilling, ARError
 from ..relationships import Relationships
 from ..vendors import VendorNetwork
-from ..qlog import QuestionLog
+from ..qlog import FeedbackAlreadyRecorded, QuestionLog
 from ..export import ExportError
 from ..report import ReportError, ReportRunner
 from ..security import RowSecurity, SecurityError, access_scope
@@ -298,6 +298,9 @@ async def _lifespan(_app):
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
               redoc_url=None, lifespan=_lifespan)
 
+_QUALITY_WRITE_PATHS = frozenset({"/api/feedback", "/api/question-review"})
+_QUALITY_WRITE_MAX_BYTES = 8 * 1024
+
 
 @app.middleware("http")
 async def _access_guard(request, call_next):
@@ -307,6 +310,28 @@ async def _access_guard(request, call_next):
     readily as it would read an admin page, so the check cannot be scoped
     to one prefix. See pstb/gui/localguard.py for what each rule stops.
     """
+    if (request.method == "POST"
+            and request.url.path in _QUALITY_WRITE_PATHS):
+        raw_length = request.headers.get("content-length", "")
+        try:
+            content_length = int(raw_length) if raw_length else -1
+        except ValueError:
+            content_length = _QUALITY_WRITE_MAX_BYTES + 1
+        if (content_length < 0
+                or request.headers.get("transfer-encoding", "")):
+            response = JSONResponse(
+                status_code=411,
+                content={"error": "a bounded Content-Length is required"},
+            )
+            localguard.apply_security_headers(response.headers)
+            return response
+        if content_length > _QUALITY_WRITE_MAX_BYTES:
+            response = JSONResponse(
+                status_code=413,
+                content={"error": "quality update body is too large"},
+            )
+            localguard.apply_security_headers(response.headers)
+            return response
     status, reason = localguard.rejection(request.scope)
     if status:
         response = JSONResponse(status_code=status,
@@ -344,7 +369,8 @@ _OPEN_PATHS = frozenset({
 # question, or "no access to the numbers" silently becomes "no access to the
 # handbook either".
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
-                       "/api/chat/reset", "/api/question-report")
+                       "/api/chat/reset", "/api/question-report",
+                       "/api/question-review")
 
 
 def _needs_unit_check(path: str) -> bool:
@@ -1327,9 +1353,9 @@ def _provider_tools_for_scope(tools: list, scope: Optional[dict]) -> list:
     source = str((scope or {}).get("source") or "").strip()
     if not source or source == "default":
         return list(tools)
-    from ..guards import SOURCE_SILO_TOOLS
+    from ..guards import SOURCE_SILO_CHAT_TOOLS
     return [tool for tool in tools
-            if getattr(tool, "name", "") in SOURCE_SILO_TOOLS]
+            if getattr(tool, "name", "") in SOURCE_SILO_CHAT_TOOLS]
 
 
 def _session_id(payload: dict) -> str:
@@ -1717,9 +1743,19 @@ def diagnostics(include_timings: int = 0):
                   connectors=[_coupa_mod.from_env(cfg=cfg)])
 
 
-@app.get("/api/question-report")
-def question_report(request: Request):
-    """Deterministic what-to-optimize-next report over the question log."""
+def _require_question_log_operator(request: Request) -> None:
+    """Protect diagnostics/review state without trusting the OPRID alone.
+
+    The PeopleSoft user-id chooser is explicitly not authentication.  The
+    operator dashboard therefore remains machine-local (an SSH tunnel arrives
+    as loopback) even when the rest of the app is shared on a VPN.
+    """
+    if (request is None
+            or not localguard.peer_is_loopback(request.scope.get("client"))):
+        raise HTTPException(
+            status_code=403,
+            detail="Question-log diagnostics are machine-local; use an SSH "
+                   "tunnel to the application host.")
     if row_security.enabled:
         access = access_for_request(request)
         if access is None or not getattr(access, "privileged", False):
@@ -1727,16 +1763,58 @@ def question_report(request: Request):
                 status_code=403,
                 detail="Question-log diagnostics are restricted to "
                        "configured privileged operators.")
+
+
+@app.get("/api/question-report")
+def question_report(request: Request):
+    """Deterministic what-to-optimize-next report over the question log."""
+    _require_question_log_operator(request)
     from pstb import qlog_report as _qr
     if not qlog.path:
         return {"turns": 0, "failed": 0, "flags": {}, "tools": [],
                 "sources": {},
                 "repeat_failures": [], "recent_failed": [], "suggestions": [],
                 "note": "question logging is not configured"}
-    r = _guard(_qr.analyze, path=qlog.path)
+    # Pass the live log object, not its pathname, so the report reader uses
+    # the same startup-pinned/no-follow directory boundary as the writer.
+    r = _guard(_qr.analyze, path=qlog)
     if isinstance(r, dict) and "error" not in r:
         r["text"] = _qr.report_text(r)
     return r
+
+
+@app.get("/api/question-review")
+def question_review(request: Request, turn_id: str = ""):
+    """Return only the bounded review status for one protected local turn."""
+    _require_question_log_operator(request)
+    candidate = str(turn_id or "")
+    if not candidate:
+        raise HTTPException(status_code=400, detail="turn_id required")
+    if not qlog.has_turn(candidate):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
+    return {"turn_id": candidate,
+            "status": qlog.review_status(candidate) or "unreviewed"}
+
+
+@app.post("/api/question-review")
+def update_question_review(payload: dict, request: Request = None):
+    """Append an operator's triage/fix/verification lifecycle state."""
+    _require_question_log_operator(request)
+    candidate = str((payload or {}).get("turn_id") or "")
+    if not candidate:
+        raise HTTPException(status_code=400, detail="turn_id required")
+    if not qlog.has_turn(candidate):
+        raise HTTPException(status_code=404, detail="unknown turn_id")
+    try:
+        recorded = qlog.log_review(
+            candidate, (payload or {}).get("status", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not recorded:
+        raise HTTPException(
+            status_code=503, detail="review status could not be recorded")
+    return {"ok": True, "turn_id": candidate,
+            "status": qlog.review_status(candidate)}
 
 
 def _export_csv_for_source(canonical: str, payload: dict,
@@ -2780,8 +2858,20 @@ def feedback(payload: dict):
         raise HTTPException(status_code=400, detail="turn_id required")
     if not qlog.has_turn(turn_id):
         raise HTTPException(status_code=404, detail="unknown turn_id")
-    qlog.log_feedback(turn_id, (payload or {}).get("verdict", "bad"),
-                      (payload or {}).get("note", ""))
+    try:
+        recorded = qlog.log_feedback(
+            turn_id,
+            (payload or {}).get("verdict", "bad"),
+            (payload or {}).get("note", ""),
+            categories=(payload or {}).get("categories") or (),
+        )
+    except FeedbackAlreadyRecorded as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not recorded:
+        raise HTTPException(
+            status_code=503, detail="feedback could not be recorded")
     return {"ok": True}
 
 

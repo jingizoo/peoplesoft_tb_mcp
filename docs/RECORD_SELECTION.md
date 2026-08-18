@@ -146,7 +146,8 @@ What exists instead is somebody saying it out loud, once:
 > "the interface file info is in TU_FILE_INTFC"
 
 `remember_record_fact(table="TU_FILE_INTFC", fact="holds inbound interface
-file headers and load status")` keeps it. Afterwards:
+file headers and load status")` proposes it for review. After an operator
+approves the proposal:
 
 - `search_records("interface file")` returns it, **ranked first** — a human
   naming a table for this purpose outranks a substring match on a name
@@ -155,19 +156,18 @@ file headers and load status")` keeps it. Afterwards:
 - `describe_record` carries a `taught_here` block
 - `what_do_we_know_about(table)` reports it directly
 
-### Why these are usable before approval
+### Why approval comes before use
 
-Site memory normally requires human approval before a fact enters prompt
-context, because an unreviewed claim must not silently shape a conclusion.
-Record facts do a different job and get a different rule: they help *find* a
-record, and whatever is found is then read from the live catalog anyway. A
-wrong one makes discovery worse; it cannot make a number wrong. Requiring a CLI
-round trip before the agent can act on something the user just said is friction
-with nothing on the other side of it.
+An unreviewed claim must not shape either a conclusion or the choice of table
+used to reach that conclusion. Pending record facts therefore have **zero**
+effect on `search_records`, `describe_record`, prompts, joins, or queries. The
+memory CLI records an explicit approved/rejected decision before retrieval can
+use the pointer.
 
 The boundary that does hold: a taught fact is a **pointer, never authority**.
 Every surface that shows one says so, and the columns always come from the
-catalog. Reject one with `python -m pstb.memory` and it stops being used.
+catalog. Reject a pending proposal—or remove an obsolete approved one—with
+`python -m pstb.memory`; it then has no retrieval effect.
 
 ## Planning a join before running it
 

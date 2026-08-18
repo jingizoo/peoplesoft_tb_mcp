@@ -505,7 +505,11 @@ class MultiSchemaEvalPackTests(unittest.TestCase):
                  "flags": [], "source_database": "p2go",
                  "scope": {"source": "p2go"},
                  "question": "P2Go thumbed-down question"},
-                {"type": "feedback", "turn_id": "p1", "verdict": "bad"},
+                {"type": "feedback", "turn_id": "p1", "verdict": "bad",
+                 "categories": ["not_relevant", "wrong_source"]},
+                {"type": "quality", "turn_id": "p1",
+                 "basis": "runtime_evidence_guards_v1",
+                 "groundedness": {"status": "blocked"}},
             ]
             qlog.write_text("\n".join(json.dumps(row) for row in records),
                             encoding="utf-8")
@@ -529,7 +533,117 @@ class MultiSchemaEvalPackTests(unittest.TestCase):
             self.assertEqual(p2go[0]["scope"], {"source": "p2go"})
             self.assertIn("user_bad",
                           p2go[0]["expect"]["_observed_flags"])
+            self.assertIn("feedback_not_relevant",
+                          p2go[0]["expect"]["_observed_flags"])
+            self.assertIn("feedback_wrong_source",
+                          p2go[0]["expect"]["_observed_flags"])
+            self.assertIn("grounding_blocked",
+                          p2go[0]["expect"]["_observed_flags"])
             self.assertEqual(pending_path.stat().st_mode & 0o777, 0o600)
+
+    def test_qlog_seed_uses_latest_feedback_and_retained_rotations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            finance_path = root / "finance.json"
+            p2go_path = root / "p2go.json"
+            finance_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            p2go_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            qlog = root / "questions.jsonl"
+            qlog.write_text("[]\n", encoding="utf-8")
+            rotated = qlog.with_name(qlog.name + ".1")
+            records = [
+                {"type": "turn", "turn_id": "oldbad", "failed": False,
+                 "flags": [], "source_database": "p2go",
+                 "scope": {"source": "p2go"}, "question": "corrected"},
+                {"type": "feedback", "turn_id": "oldbad",
+                 "verdict": "bad", "categories": ["not_relevant"]},
+                {"type": "feedback", "turn_id": "oldbad",
+                 "verdict": "good", "categories": []},
+                {"type": "turn", "turn_id": "rotatedfail",
+                 "failed": True, "flags": ["tool_error"],
+                 "source_database": "p2go", "scope": {"source": "p2go"},
+                 "question": "retained failure"},
+            ]
+            rotated.write_text(
+                "\n".join(json.dumps(row) for row in records) + "\n",
+                encoding="utf-8")
+            pending_path = root / "pending.json"
+            with mock.patch.object(self.ev, "FINANCE_CASES", finance_path), \
+                    mock.patch.object(self.ev, "P2GO_CASES", p2go_path), \
+                    mock.patch.object(self.ev, "EVAL_PENDING", pending_path):
+                self.assertEqual(self.ev._seed_from_qlog(str(qlog)), 0)
+            pending = json.loads(pending_path.read_text())
+            questions = [row["question"] for row in pending["p2go"]]
+            self.assertEqual(questions, ["retained failure"])
+
+    def test_qlog_seed_deduplicates_per_source_not_globally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            finance_path = root / "finance.json"
+            p2go_path = root / "p2go.json"
+            finance_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            p2go_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            qlog = root / "questions.jsonl"
+            rows = [
+                {"type": "turn", "turn_id": "finance1", "failed": True,
+                 "flags": ["tool_error"], "source_database": "default",
+                 "scope": {"source": "default"}, "question": "same ask"},
+                {"type": "turn", "turn_id": "p2go1", "failed": True,
+                 "flags": ["tool_error"], "source_database": "p2go",
+                 "scope": {"source": "p2go"}, "question": "same ask"},
+            ]
+            qlog.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8")
+            pending_path = root / "pending.json"
+            with mock.patch.object(self.ev, "FINANCE_CASES", finance_path), \
+                    mock.patch.object(self.ev, "P2GO_CASES", p2go_path), \
+                    mock.patch.object(self.ev, "EVAL_PENDING", pending_path):
+                self.assertEqual(self.ev._seed_from_qlog(str(qlog)), 0)
+            pending = json.loads(pending_path.read_text())
+            self.assertEqual([row["question"] for row in pending["finance"]],
+                             ["same ask"])
+            self.assertEqual([row["question"] for row in pending["p2go"]],
+                             ["same ask"])
+
+    def test_qlog_seed_does_not_resurrect_terminal_review_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            finance_path = root / "finance.json"
+            p2go_path = root / "p2go.json"
+            finance_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            p2go_path.write_text('{"cases":[]}\n', encoding="utf-8")
+            qlog = root / "questions.jsonl"
+            rows = [
+                {"type": "turn", "turn_id": "done1", "failed": False,
+                 "flags": [], "source_database": "default",
+                 "scope": {"source": "default"}, "question": "dismissed"},
+                {"type": "feedback", "turn_id": "done1",
+                 "verdict": "bad", "categories": ["other"]},
+                {"type": "review", "turn_id": "done1",
+                 "status": "dismissed"},
+                {"type": "turn", "turn_id": "done2", "failed": True,
+                 "flags": ["tool_error"], "source_database": "p2go",
+                 "scope": {"source": "p2go"}, "question": "verified"},
+                {"type": "review", "turn_id": "done2",
+                 "status": "verified"},
+                {"type": "turn", "turn_id": "open1", "failed": True,
+                 "flags": ["tool_error"], "source_database": "default",
+                 "scope": {"source": "default"}, "question": "open"},
+                {"type": "review", "turn_id": "open1", "status": "open"},
+            ]
+            qlog.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8")
+            pending_path = root / "pending.json"
+            with mock.patch.object(self.ev, "FINANCE_CASES", finance_path), \
+                    mock.patch.object(self.ev, "P2GO_CASES", p2go_path), \
+                    mock.patch.object(self.ev, "EVAL_PENDING", pending_path):
+                self.assertEqual(self.ev._seed_from_qlog(str(qlog)), 0)
+            pending = json.loads(pending_path.read_text())
+            self.assertEqual(
+                [row["question"] for row in pending["finance"]], ["open"])
+            self.assertEqual(pending["p2go"], [])
 
 
 if __name__ == "__main__":

@@ -168,6 +168,27 @@ borrowed as health evidence.
 Select sources deliberately. Catalog structure can itself reveal custom object
 and field names even though it contains no business rows.
 
+### Governed local meanings for cryptic custom objects
+
+A native catalog can prove that `P2GO.X9_HDR` exists without explaining what
+the name means. In a secondary workspace, an explicit user correction such as
+“remember that `P2GO.X9_HDR` is our inbound job header table” may create a
+source-bound proposal. It is deliberately **not learned immediately**:
+
+1. the named object must resolve unambiguously in the current source catalog;
+2. the proposal is stored pending in `source_knowledge/<source-hash>.db`;
+3. a host operator reviews it with `python -m pstb.source_knowledge --source
+   p2go` and explicitly approves or rejects it;
+4. only approved aliases/meanings may improve `search_metadata` or
+   `get_metadata_context` for that same source.
+
+The overlay is bound to the canonical source, secret-free endpoint/schema
+fingerprint, and exact catalog object ID. It is not merged into the structural
+artifact and cannot change catalog confidence, columns, keys, native foreign
+keys, view dependencies, SQL, policy, status semantics or row values.
+Pending/rejected/revoked proposals have zero retrieval effect. `join_path`
+continues to traverse only declared native FK and view-dependency evidence.
+
 ### Minimum read-only access
 
 The build uses only catalog reads and `SELECT`/PRAGMA operations. Ask the DBA

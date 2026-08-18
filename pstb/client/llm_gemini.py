@@ -8,10 +8,12 @@ Credentials (`gcloud auth application-default login`).
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from ..config import Config
 from ..guards import evidence_intent, question_financial_domains
+from ..source_knowledge import explicit_metadata_lesson
 from .llm_base import LLMProvider, LLMResponse, ToolCall, ToolResult, ToolSpec, clean_schema
 
 
@@ -60,6 +62,23 @@ _PS_GRNI_TOOLS = {"get_po_grni_candidates", "get_match_exceptions",
                   "run_playbook"}
 _COUPA_RNI_TOOLS = {"get_coupa_rni", "run_playbook"}
 _BOOKED_GRNI_TOOLS = {"run_playbook"}
+_METADATA_OBJECT_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_$#])(?:[A-Z][A-Z0-9_$#]*\.)?"
+    r"[A-Z][A-Z0-9_$#]{1,}(?![A-Za-z0-9_$#])")
+
+
+def _explicit_metadata_teaching(question: str) -> bool:
+    """Does this turn contain an explicit lesson about a named DB object?
+
+    This only opens the proposal tool in Gemini's first-call shortlist. The
+    chat execution guard later compares the tool's exact identifier with the
+    user's turn, and the store keeps every accepted proposal pending. Keeping
+    the proposal tool out of ``_DISCOVERY_TOOLS`` prevents ordinary metadata
+    exploration from acquiring a durable-write suggestion.
+    """
+    return any(
+        explicit_metadata_lesson(question, token)
+        for token in _METADATA_OBJECT_TOKEN.findall(str(question or "")))
 
 
 def routing_tool_names(question: str, available_names,
@@ -74,9 +93,12 @@ def routing_tool_names(question: str, available_names,
     """
     available = set(available_names or ())
     intent = evidence_intent(question)
-    if intent == "general" or not available:
+    teaching = _explicit_metadata_teaching(question)
+    if (intent == "general" and not teaching) or not available:
         return []
     chosen = set(_COMMON_FINANCE_TOOLS)
+    if teaching:
+        chosen |= _DISCOVERY_TOOLS | {"propose_metadata_meaning"}
     domains = question_financial_domains(question)
     if intent in ("policy", "mixed", "technical"):
         chosen |= _POLICY_TOOLS
@@ -112,7 +134,7 @@ def routing_tool_names(question: str, available_names,
                   "journal_posted_by", "journal_historical_status",
                   "report", "variance"}:
         chosen |= _GL_TOOLS | _DISCOVERY_TOOLS
-    if not domains and intent not in ("policy", "technical"):
+    if not domains and intent not in ("policy", "technical") and not teaching:
         return []
     result = sorted(chosen & available)
     # A tiny intersection usually means an old/custom server whose tool names

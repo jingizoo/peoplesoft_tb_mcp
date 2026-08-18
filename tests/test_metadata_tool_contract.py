@@ -28,11 +28,14 @@ class MetadataToolContractTests(unittest.TestCase):
         search = getattr(server, "search_metadata", None)
         describe_catalog = getattr(server, "describe_metadata_catalog", None)
         context = getattr(server, "get_metadata_context", None)
+        propose = getattr(server, "propose_metadata_meaning", None)
         self.assertIsNotNone(search, "search_metadata is not registered")
         self.assertIsNotNone(
             describe_catalog, "describe_metadata_catalog is not registered")
         self.assertIsNotNone(context,
                              "get_metadata_context is not registered")
+        self.assertIsNotNone(
+            propose, "propose_metadata_meaning is not registered")
         self.assertEqual(
             set(inspect.signature(search).parameters),
             {"query", "source", "kinds", "limit"},
@@ -42,6 +45,10 @@ class MetadataToolContractTests(unittest.TestCase):
         self.assertEqual(
             set(inspect.signature(context).parameters),
             {"identifier", "source", "limit"},
+        )
+        self.assertEqual(
+            set(inspect.signature(propose).parameters),
+            {"identifier", "meaning", "aliases", "source"},
         )
 
     def test_relationship_graph_is_registered_when_raw_sql_is_disabled(self):
@@ -80,6 +87,13 @@ class MetadataToolContractTests(unittest.TestCase):
             self.assertEqual(financial_tool_domains(tool), set())
             self.assertFalse(financial_tool_is_relevant(
                 tool, "How many billing-interface rows are rejected?"))
+        self.assertNotIn("propose_metadata_meaning", STRUCTURAL_TOOLS)
+        self.assertNotIn("propose_metadata_meaning", FINANCIAL_EVIDENCE_TOOLS)
+        self.assertEqual(financial_tool_domains("propose_metadata_meaning"), set())
+        self.assertFalse(financial_tool_is_relevant(
+            "propose_metadata_meaning",
+            "How many billing-interface rows are rejected?",
+        ))
 
     def test_acceptance_pack_uses_metadata_first_custom_paths(self) -> None:
         cases = {
@@ -121,7 +135,7 @@ class MetadataToolContractTests(unittest.TestCase):
         from pstb.guards import _TOOL_SCOPE_ARGS
 
         for tool in ("describe_metadata_catalog", "search_metadata",
-                     "get_metadata_context"):
+                     "get_metadata_context", "propose_metadata_meaning"):
             self.assertEqual(
                 _TOOL_SCOPE_ARGS.get(tool), {"source": "source"},
                 "metadata discovery follows the selected database namespace "

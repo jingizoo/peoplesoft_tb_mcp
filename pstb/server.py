@@ -9,6 +9,7 @@ carries the protocol; diagnostics go to stderr.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 
 try:  # mcp SDK >= 2.0
@@ -33,6 +34,13 @@ from .modules import ModuleError, ModulePacks
 from .playbooks import PlaybookError, PlaybookRunner
 from .rerank import HybridReranker
 from .relationships import Relationships
+from .source_knowledge import (
+    SourceKnowledge,
+    SourceKnowledgeError,
+    normalize_aliases,
+    source_knowledge_path as _source_knowledge_path,
+    validate_catalog_aliases,
+)
 from .vendors import VendorNetwork
 from .report import ReportError, ReportRunner
 from . import wiki as wiki_mod
@@ -151,7 +159,8 @@ def _safe(fn, /, **kw) -> dict:
         return fn(**kw)
     except (EngineError, DbError, WikiError, ReportError, ARError,
             PlaybookError, MemoryError_, ModuleError, ConnectorError,
-            AnomalyError, MetadataError, JournalControlError) as e:
+            AnomalyError, MetadataError, JournalControlError,
+            SourceKnowledgeError) as e:
         # These carry a remedy written for the reader. Passing the message
         # through UNPREFIXED is the point: "ConnectorError: check
         # PSFT_QAS_NODE" reads as a crash, "check PSFT_QAS_NODE" reads as
@@ -200,6 +209,150 @@ def _metadata_for_source(source: str = "") -> tuple[str, MetadataCatalog]:
             binding_error=binding_error)
         _metadata_catalogs[name] = catalog
     return name, catalog
+
+
+def _source_knowledge_for_source(source: str) -> SourceKnowledge:
+    """One local governance overlay bound to the selected DB endpoint.
+
+    Construction is intentionally cheap and repeated per call.  The reader
+    opens its private SQLite file read-only, while a proposal opens a separate
+    short transaction.  No mutable connection or annotation set is shared
+    across source silos.
+    """
+    fingerprint = _metadata_fingerprint(cfg, source)
+    return SourceKnowledge(
+        _source_knowledge_path(cfg, source),
+        source=source,
+        source_fingerprint=fingerprint,
+    )
+
+
+def _exact_metadata_subject(result: dict, source: str) -> dict:
+    """Return one proven physical table/view or refuse the proposal target."""
+    if not isinstance(result, dict) or result.get("found") is not True:
+        detail = (result or {}).get("detail") if isinstance(result, dict) else ""
+        raise SourceKnowledgeError(
+            str(detail or "the metadata catalog did not resolve one exact object"))
+    subject = result.get("subject")
+    if not isinstance(subject, dict):
+        raise SourceKnowledgeError(
+            "the metadata catalog returned no exact physical object")
+    if (str(result.get("source_database") or "") != source
+            or str(subject.get("source") or "") != source):
+        raise SourceKnowledgeError(
+            "the metadata result did not come from the selected source")
+    if (str(subject.get("kind") or "").lower() not in {"table", "view"}
+            or not subject.get("object_id")
+            or not subject.get("schema")
+            or not subject.get("physical_object")):
+        raise SourceKnowledgeError(
+            "metadata learning needs one exact physical table/view; use a "
+            "schema-qualified identifier when the name is ambiguous")
+    return subject
+
+
+def _knowledge_annotation(row: dict) -> dict:
+    """Bounded approved meaning shown as data, never prompt instructions."""
+    return {
+        "proposal_id": row.get("id"),
+        "status": "approved",
+        "meaning": row.get("meaning"),
+        "aliases": list(row.get("aliases") or []),
+        **({"matched_on": row.get("matched_on"),
+            "matched_terms": list(row.get("matched_terms") or [])}
+           if row.get("matched_on") else {}),
+        "proposed_at": row.get("proposed_at"),
+        **({"approved_at": row.get("decided_at")}
+           if row.get("decided_at") else {}),
+        "authority": "host-operator-approved source knowledge",
+        "effect": (
+            "object-selection pointer only; structural confidence, rows and "
+            "relationships are unchanged"),
+    }
+
+
+def _approved_search_candidates(
+    catalog: MetadataCatalog, source: str, query: str
+) -> tuple[dict[str, list[dict]], list[dict], dict]:
+    """Approved meaning hits plus exact current-catalog object summaries.
+
+    Annotation prose is deliberately returned separately.  The structural
+    summaries may enter the optional semantic candidate set, but approved
+    free text is attached only after Vertex scoring so enabling embeddings
+    does not create a new annotation-egress path.
+    """
+    try:
+        store = _source_knowledge_for_source(source)
+        if not store.path.exists():
+            return {}, [], {}
+        hits = store.search(query)
+    except (MetadataError, SourceKnowledgeError) as exc:
+        return {}, [], {
+            "available": False,
+            "detail": str(exc),
+            "effect": "no source annotations were used",
+        }
+    grouped: dict[str, list[dict]] = {}
+    subjects: dict[str, dict] = {}
+    ignored = 0
+    for hit in hits:
+        identifier = f"{hit.get('schema')}.{hit.get('object')}"
+        context = catalog.context(identifier, source=source, limit=1)
+        try:
+            subject = _exact_metadata_subject(context, source)
+        except SourceKnowledgeError:
+            ignored += 1
+            continue
+        object_id = str(subject["object_id"])
+        if object_id != str(hit.get("object_id") or ""):
+            ignored += 1
+            continue
+        try:
+            validate_catalog_aliases(
+                catalog, source, object_id, hit.get("aliases") or ())
+        except SourceKnowledgeError:
+            # A newly native identifier outranks an older approved alias.
+            # Quarantine the proposal at use time until it is replaced.
+            ignored += 1
+            continue
+        subjects[object_id] = dict(subject)
+        grouped.setdefault(object_id, []).append(hit)
+    info = {
+        "available": True,
+        "approved_matches": sum(len(rows) for rows in grouped.values()),
+        "matched_objects": len(grouped),
+        "ignored_stale_targets": ignored,
+        "effect": (
+            "approved meanings may select/rank an exact catalog object; "
+            "structural confidence and relationship evidence are unchanged"),
+    }
+    return grouped, list(subjects.values()), info
+
+
+def _attach_approved_context(
+    result: dict, catalog: MetadataCatalog, store: SourceKnowledge, source: str
+) -> dict:
+    """Attach approved meanings for the result's exact current object."""
+    if not isinstance(result, dict) or result.get("found") is not True:
+        return result
+    subject = _exact_metadata_subject(result, source)
+    approved = []
+    for row in store.approved_for_object(str(subject["object_id"])):
+        try:
+            validate_catalog_aliases(
+                catalog, source, str(subject["object_id"]),
+                row.get("aliases") or ())
+        except SourceKnowledgeError:
+            continue
+        approved.append(row)
+    if approved:
+        result["approved_source_meanings"] = [
+            _knowledge_annotation(row) for row in approved
+        ]
+        result["source_knowledge_note"] = (
+            "Approved meanings help select this object; they do not change "
+            "its catalog confidence or prove a join, row, status, or amount.")
+    return result
 
 
 def _sourced(source: str, method: str, /, **kw) -> dict:
@@ -550,6 +703,18 @@ def describe_metadata_catalog(source: str = "") -> dict:
         name, catalog = _metadata_for_source(source)
         result = catalog.describe()
         result["source_database"] = name
+        try:
+            # This is deliberately a bounded operational summary.  Proposal
+            # prose is available only through the private operator review
+            # command, never through this model-facing catalog description.
+            result["source_knowledge"] = (
+                _source_knowledge_for_source(name).summary())
+        except (MetadataError, SourceKnowledgeError) as exc:
+            result["source_knowledge"] = {
+                "available": False,
+                "detail": str(exc),
+                "effect": "no source annotations were used",
+            }
         return result
 
     return _safe(_describe)
@@ -573,11 +738,126 @@ def search_metadata(query: str, source: str = "", kinds: str = "",
             query=query, source=name, kinds=kinds, limit=limit)
         result["source_database"] = name
         matches = result.get("matches") if isinstance(result, dict) else None
-        if not isinstance(matches, list) or not metadata_reranker.enabled:
+        if not isinstance(matches, list):
             return result
-        ranked = metadata_reranker.rerank(query, matches)
-        result["matches"] = ranked.pop("matches")
-        result["semantic_rerank"] = ranked
+        requested = str(query or "").strip().casefold()
+        requested_forms = {
+            requested,
+            requested.replace(" ", "_"),
+        }
+        native_exact_ids = set()
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            physical = str(item.get("physical_object") or "").casefold()
+            schema = str(item.get("schema") or "").casefold()
+            logical = [
+                str(value or "").casefold()
+                for value in (item.get("logical_records") or [])
+            ]
+            native_forms = {physical, f"{schema}.{physical}", *logical}
+            if requested_forms & native_forms:
+                native_exact_ids.add(str(item.get("object_id") or ""))
+        approved, extra_subjects, knowledge_info = (
+            _approved_search_candidates(catalog, name, query))
+        wanted_kinds = {
+            token.lower() for token in str(kinds or "").replace(",", " ").split()
+            if token
+        }
+        if wanted_kinds:
+            extra_subjects = [
+                subject for subject in extra_subjects
+                if str(subject.get("kind") or "").lower() in wanted_kinds
+            ]
+            allowed_ids = {str(subject.get("object_id") or "")
+                           for subject in extra_subjects}
+            approved = {object_id: rows for object_id, rows in approved.items()
+                        if object_id in allowed_ids}
+            if knowledge_info.get("available") is True:
+                knowledge_info["approved_matches"] = sum(
+                    len(rows) for rows in approved.values())
+                knowledge_info["matched_objects"] = len(approved)
+        exact_alias_ids = {
+            object_id for object_id, rows in approved.items()
+            if any(row.get("matched_on") == "approved alias" for row in rows)
+        }
+        if len(exact_alias_ids) > 1:
+            # An approved alias is governance evidence for vocabulary, not a
+            # licence to choose between two current physical objects.  Make
+            # the collision explicit before any stable/lexical ordering can
+            # look like a recommendation to the model.
+            alias_candidates = [
+                {
+                    "object_id": str(subject.get("object_id") or ""),
+                    "source": name,
+                    "schema": subject.get("schema"),
+                    "kind": subject.get("kind"),
+                    "physical_object": subject.get("physical_object"),
+                }
+                for subject in extra_subjects
+                if str(subject.get("object_id") or "") in exact_alias_ids
+            ]
+            alias_candidates.sort(key=lambda item: (
+                str(item.get("schema") or ""),
+                str(item.get("physical_object") or ""),
+                str(item.get("object_id") or ""),
+            ))
+            knowledge_info["approved_alias_ambiguous"] = True
+            knowledge_info["approved_alias_candidates"] = alias_candidates
+            result["ambiguous"] = True
+            result["detail"] = (
+                "That exact approved source alias names more than one current "
+                "object. Pass schema.object to get_metadata_context; no "
+                "target was selected.")
+        known_ids = {str(item.get("object_id") or "") for item in matches
+                     if isinstance(item, dict)}
+        for subject in extra_subjects:
+            object_id = str(subject.get("object_id") or "")
+            if object_id not in known_ids:
+                matches.append(subject)
+                known_ids.add(object_id)
+
+        if metadata_reranker.enabled:
+            ranked = metadata_reranker.rerank(query, matches)
+            matches = ranked.pop("matches")
+            result["semantic_rerank"] = ranked
+
+        # Approved vocabulary wins after optional model similarity. Its prose
+        # is attached only now, after the embedding boundary saw structure.
+        original_position = {
+            str(item.get("object_id") or ""): position
+            for position, item in enumerate(matches)
+            if isinstance(item, dict)
+        }
+        approved_score = {
+            object_id: max(int(row.get("semantic_score") or 0)
+                           for row in rows)
+            for object_id, rows in approved.items()
+        }
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            rows = approved.get(str(item.get("object_id") or ""), [])
+            if rows:
+                item["approved_source_meanings"] = [
+                    _knowledge_annotation(row) for row in rows
+                ]
+        matches.sort(key=lambda item: (
+            0 if str(item.get("object_id") or "") in native_exact_ids else
+            1 if str(item.get("object_id") or "") in approved else 2,
+            -approved_score.get(str(item.get("object_id") or ""), 0),
+            original_position.get(str(item.get("object_id") or ""), 10**9),
+        ))
+        try:
+            cap = min(max(int(limit or 20), 1), 100)
+        except (TypeError, ValueError):
+            cap = 20  # catalog.search already reports invalid limits
+        result["matches"] = matches[:cap]
+        result["count"] = len(result["matches"])
+        result["truncated"] = bool(
+            result.get("truncated") or len(matches) > cap)
+        if knowledge_info:
+            result["source_knowledge"] = knowledge_info
         return result
 
     return _safe(_search)
@@ -598,9 +878,146 @@ def get_metadata_context(identifier: str, source: str = "",
         result = catalog.context(
             identifier=identifier, source=name, limit=limit)
         result["source_database"] = name
+        try:
+            store = _source_knowledge_for_source(name)
+            if not store.path.exists():
+                return result
+            if result.get("found") is True:
+                return _attach_approved_context(
+                    result, catalog, store, name)
+            # Approved aliases fill missing business vocabulary, but never
+            # override an ambiguous catalog identifier.
+            if result.get("ambiguous"):
+                return result
+            aliases = []
+            ignored_aliases = 0
+            for row in store.resolve_alias(identifier):
+                try:
+                    validate_catalog_aliases(
+                        catalog, name, str(row.get("object_id") or ""),
+                        row.get("aliases") or ())
+                except SourceKnowledgeError:
+                    ignored_aliases += 1
+                    continue
+                current = catalog.context(
+                    identifier=f"{row['schema']}.{row['object']}",
+                    source=name, limit=1)
+                try:
+                    current_subject = _exact_metadata_subject(current, name)
+                except SourceKnowledgeError:
+                    ignored_aliases += 1
+                    continue
+                if (str(current_subject["object_id"])
+                        != str(row.get("object_id") or "")):
+                    ignored_aliases += 1
+                    continue
+                aliases.append(row)
+            object_ids = {str(row.get("object_id") or "") for row in aliases}
+            if len(object_ids) > 1:
+                result["ambiguous"] = True
+                result["approved_alias_candidates"] = [
+                    {
+                        "object_id": row.get("object_id"),
+                        "source": name,
+                        "schema": row.get("schema"),
+                        "kind": row.get("kind"),
+                        "physical_object": row.get("object"),
+                        "approved_source_meaning": _knowledge_annotation(row),
+                    }
+                    for row in aliases
+                ]
+                result["detail"] = (
+                    "That approved source alias names more than one object. "
+                    "Pass schema.object explicitly; no target was chosen.")
+                return result
+            if len(object_ids) == 1:
+                row = aliases[0]
+                resolved = catalog.context(
+                    identifier=f"{row['schema']}.{row['object']}",
+                    source=name, limit=limit)
+                resolved["source_database"] = name
+                subject = _exact_metadata_subject(resolved, name)
+                if str(subject["object_id"]) != str(row["object_id"]):
+                    raise SourceKnowledgeError(
+                        "the approved alias target no longer matches the "
+                        "current source catalog; no annotation was used")
+                resolved["requested_identifier"] = identifier
+                resolved["identifier_resolution"] = {
+                    "via": "approved source alias",
+                    "proposal_id": row.get("id"),
+                    "status": "approved",
+                }
+                return _attach_approved_context(
+                    resolved, catalog, store, name)
+            if ignored_aliases:
+                result["source_knowledge"] = {
+                    "available": True,
+                    "ignored_stale_targets": ignored_aliases,
+                    "effect": "no stale approved alias was used",
+                }
+        except (MetadataError, SourceKnowledgeError) as exc:
+            result["source_knowledge"] = {
+                "available": False,
+                "detail": str(exc),
+                "effect": "no source annotations were used",
+            }
         return result
 
     return _safe(_context)
+
+
+@mcp.tool()
+def propose_metadata_meaning(
+    identifier: str,
+    meaning: str,
+    aliases: str = "",
+    source: str = "",
+) -> dict:
+    """PROPOSE a durable business meaning for one exact table/view.
+
+    Use only when the user explicitly names and teaches/corrects the object.
+    First call get_metadata_context, then pass its exact schema.object as
+    identifier. aliases is optional comma-separated business wording. This
+    writes only a PENDING entry to the selected source's private local review
+    queue; it does not change that database, search ranking, context, joins or
+    the prompt until a host operator approves it. Never use it for inferred
+    meanings, relationships, SQL, status rules, row values or financial facts.
+    """
+    def _propose() -> dict:
+        name, catalog = _metadata_for_source(source)
+        context = catalog.context(identifier, source=name, limit=10)
+        subject = _exact_metadata_subject(context, name)
+        alias_list = normalize_aliases(aliases)
+        validate_catalog_aliases(
+            catalog, name, str(subject["object_id"]), alias_list)
+        store = _source_knowledge_for_source(name)
+        proposal = store.propose(
+            object_id=str(subject["object_id"]),
+            schema=str(subject["schema"]),
+            object_name=str(subject["physical_object"]),
+            object_kind=str(subject["kind"]),
+            meaning=meaning,
+            aliases=alias_list,
+            origin="conversation",
+        )
+        status = str(proposal.get("status") or "pending")
+        proposal_id = str(proposal.get("id") or "")
+        return {
+            **proposal,
+            "proposal_id": proposal_id,
+            "source_database": name,
+            "retrieval_active": status == "approved",
+            "review_command": (
+                "python -m pstb.source_knowledge --source "
+                f"{shlex.quote(name)} --approve {proposal_id}"),
+            "note": (
+                "This exact proposal is already operator-approved and active."
+                if status == "approved" else
+                "Submitted for operator review. It is pending and has no "
+                "effect on retrieval, context, prompts, relationships or SQL."),
+        }
+
+    return _safe(_propose)
 
 
 @mcp.tool()

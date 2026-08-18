@@ -428,6 +428,46 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("args.db", response.json()["detail"])
 
+    def test_export_never_replays_a_local_metadata_proposal(self) -> None:
+        from fastapi.testclient import TestClient
+        from pstb.gui import app as gapp
+
+        class Registry:
+            @staticmethod
+            def resolve_command(command):
+                return "p2go"
+
+            @staticmethod
+            def resolve_name(source):
+                return str(source or "default")
+
+            @staticmethod
+            def describe():
+                return [
+                    {"source": "default", "command": "finance"},
+                    {"source": "p2go", "command": "p2go"},
+                ]
+
+        with (patch.object(gapp.engine, "registry", Registry()),
+              TestClient(gapp.app, base_url="http://127.0.0.1:8000",
+                         client=("127.0.0.1", 50000)) as client):
+            response = client.post("/api/source/p2go/export", json={
+                "tool": "propose_metadata_meaning",
+                "args": {
+                    "source": "p2go",
+                    "identifier": "main.JOB_HDR",
+                    "meaning": "P2Go integration job headers",
+                },
+                "result": {
+                    "source_database": "p2go", "status": "pending",
+                },
+            })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "not available in database workspace",
+            response.json()["detail"],
+        )
+
     def test_restricted_user_cannot_bypass_raw_sql_policy_via_export(self) -> None:
         from fastapi.testclient import TestClient
         from pstb.gui import app as gapp

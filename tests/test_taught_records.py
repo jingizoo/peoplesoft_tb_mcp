@@ -7,8 +7,9 @@ no amount of better retrieval changes that — the information was never written
 down anywhere the agent can read.
 
 What does exist is someone saying it out loud once. These tests cover that
-path: told once, findable afterwards, including by wording that differs from
-what was originally said.
+path: proposed in conversation, approved by an operator, then findable by
+wording that differs from what was originally said. A pending claim must not
+quietly steer Finance discovery while it waits in the review queue.
 
 The boundary they also enforce: a taught fact is a POINTER, never authority.
 It helps locate a record; the live catalog still decides what is in it.
@@ -43,8 +44,12 @@ class TaughtRecordTests(unittest.TestCase):
         self.db.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def teach(self, text: str) -> dict:
-        return self.memory.propose(text, kind="record", source="test")
+    def teach(self, text: str, *, approve: bool = True) -> dict:
+        proposed = self.memory.propose(text, kind="record", source="test")
+        if approve:
+            self.memory.decide(
+                proposed["fact"]["id"], approve=True, by="test operator")
+        return proposed
 
     def test_an_unknown_custom_record_is_invisible_until_taught(self) -> None:
         # Use a purpose that is genuinely absent from the sample metadata.
@@ -116,6 +121,26 @@ class TaughtRecordTests(unittest.TestCase):
             self.teach("the interface files are somewhere in the TU tables")
         self.assertIn("must start with the table name", str(ctx.exception))
 
+    def test_a_pending_finance_record_fact_never_steers_retrieval(self) -> None:
+        proposed = self.teach(
+            "XX_PENDING_ONLY: Zephyr quokka settlement staging",
+            approve=False,
+        )
+        self.assertEqual(self.memory.record_facts("XX_PENDING_ONLY"), [])
+        self.assertNotIn(
+            "XX_PENDING_ONLY",
+            [row["record"] for row in
+             self.engine.search_records("zephyr quokka settlement")["records"]],
+        )
+
+        self.memory.decide(
+            proposed["fact"]["id"], approve=True, by="test operator")
+        self.assertIn(
+            "XX_PENDING_ONLY",
+            [row["record"] for row in
+             self.engine.search_records("zephyr quokka settlement")["records"]],
+        )
+
     def test_lookup_accepts_the_name_with_or_without_the_ps_prefix(self) -> None:
         self.teach("PS_TU_FILE_INTFC: inbound interface files")
         for asked in ("PS_TU_FILE_INTFC", "TU_FILE_INTFC", "tu_file_intfc"):
@@ -123,7 +148,8 @@ class TaughtRecordTests(unittest.TestCase):
                             f"lookup by {asked!r} found nothing")
 
     def test_a_rejected_fact_stops_being_used(self) -> None:
-        got = self.teach("XX_WRONG: this table does not hold what I thought")
+        got = self.teach(
+            "XX_WRONG: this table does not hold what I thought", approve=False)
         self.memory.decide(got["fact"]["id"], approve=False, by="test")
         self.assertEqual(self.memory.record_facts("XX_WRONG"), [])
         self.assertEqual(self.engine.search_records("does not hold")["records"],

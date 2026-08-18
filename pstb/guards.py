@@ -128,6 +128,9 @@ _SOURCE_SCOPED_TOOLS = (
     # source is the same namespace boundary. A P2Go chat must not discover a
     # default-database object and then present it as P2Go context.
     "describe_metadata_catalog", "search_metadata", "get_metadata_context",
+    # Local governance write: it never mutates the selected database and is
+    # not exportable, but its proposal must still be pinned to that source.
+    "propose_metadata_meaning",
 )
 
 # Every source-accepting generic tool must prove the database that produced
@@ -146,6 +149,13 @@ SOURCE_SILO_TOOLS = frozenset({
     "describe_metadata_catalog", "search_metadata", "get_metadata_context",
     "list_tables", "describe_table", "join_path", "explain_query", "run_sql",
 })
+
+# Chat may additionally submit one bounded, PENDING local annotation.  Keep
+# this separate from ``SOURCE_SILO_TOOLS``: the latter is also the export
+# route's positive allowlist, and exporting a result must never acquire a
+# local-write capability merely because chat gained one.
+SOURCE_SILO_PROPOSAL_TOOLS = frozenset({"propose_metadata_meaning"})
+SOURCE_SILO_CHAT_TOOLS = SOURCE_SILO_TOOLS | SOURCE_SILO_PROPOSAL_TOOLS
 
 # These names look like generic database discovery, but their implementations
 # are deliberately tied to the primary PeopleSoft engine or to a global
@@ -1704,7 +1714,7 @@ def apply_request_scope(tool_name: str, args: Mapping | None,
     # denylist would let every newly added primary/global tool silently reopen
     # this boundary.
     if (selected_source != "default"
-            and tool_name not in SOURCE_SILO_TOOLS):
+            and tool_name not in SOURCE_SILO_CHAT_TOOLS):
         raise ScopeConflict(
             f"{tool_name} is not source-aware and "
             f"cannot run while source {selected_source!r} is selected; use "

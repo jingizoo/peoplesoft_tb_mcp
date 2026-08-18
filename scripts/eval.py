@@ -665,7 +665,7 @@ def _runtime_profile(cfg, provider_name: str, case: dict, tools: list,
                      skills: bool = True) -> tuple[str, list]:
     """Mirror the GUI's prompt and closed-tool profile for this workspace."""
     from pstb.client.prompt import source_silo_prompt, system_prompt
-    from pstb.guards import SOURCE_SILO_TOOLS
+    from pstb.guards import SOURCE_SILO_CHAT_TOOLS
     from pstb.memory import SiteMemory
 
     scope = case.get("scope") or {}
@@ -675,7 +675,7 @@ def _runtime_profile(cfg, provider_name: str, case: dict, tools: list,
         return (
             source_silo_prompt(secondary, surface="gui"),
             [tool for tool in tools
-             if getattr(tool, "name", "") in SOURCE_SILO_TOOLS],
+             if getattr(tool, "name", "") in SOURCE_SILO_CHAT_TOOLS],
         )
 
     # The PROVIDER decides what the Finance prompt contains — Gemini gets the
@@ -906,6 +906,8 @@ def _seed_from_qlog(path: str) -> int:
     tracked eval pack: a human must redact and promote a reviewed case.
     """
     from pstb.qlog import redact_private_text
+    from pstb.qlog_report import _records
+    from pstb.quality import RUNTIME_GROUNDING_BASIS
 
     log = Path(path)
     if not log.exists():
@@ -926,38 +928,48 @@ def _seed_from_qlog(path: str) -> int:
         if isinstance(raw_pending, dict) else [],
     }
     known = {
-        case["question"]
-        for pack in packs.values() for case in pack.get("cases", [])
+        (suite, str(case.get("question") or ""))
+        for suite, pack in packs.items()
+        for case in pack.get("cases", []) if isinstance(case, dict)
     }
     known.update(
-        str(case.get("question") or "")
-        for cases in pending.values() for case in cases
+        (suite, str(case.get("question") or ""))
+        for suite, cases in pending.items() for case in cases
         if isinstance(case, dict)
     )
-    entries = []
-    for line in log.read_text(encoding="utf-8").splitlines():
-        try:
-            entries.append(json.loads(line))
-        except ValueError:
-            continue
+    joined = _records(log)
+    entries = joined["turns"]
+    latest_feedback = joined["feedback"]
+    latest_quality = joined["quality"]
+    latest_reviews = joined["reviews"]
     bad_ids = {
-        str(entry.get("turn_id") or "")
-        for entry in entries
-        if entry.get("type") == "feedback" and entry.get("verdict") == "bad"
+        turn_id for turn_id, entry in latest_feedback.items()
+        if entry.get("verdict") == "bad"
+    }
+    blocked_ids = {
+        turn_id for turn_id, entry in latest_quality.items()
+        if entry.get("basis") == RUNTIME_GROUNDING_BASIS
+        and isinstance(entry.get("groundedness"), dict)
+        and entry["groundedness"].get("status") == "blocked"
     }
     added = {"finance": 0, "p2go": 0}
     for entry in entries:
+        turn_id = str(entry.get("turn_id") or "")
+        review = latest_reviews.get(turn_id) or {}
+        if review.get("status") in {"verified", "dismissed"}:
+            continue
         if (entry.get("type") != "turn"
                 or not (entry.get("failed")
-                        or str(entry.get("turn_id") or "") in bad_ids)):
+                        or turn_id in bad_ids
+                        or turn_id in blocked_ids)):
             continue
         question = redact_private_text(entry.get("question"), limit=8_000)
-        if not question or question in known:
-            continue
         source = str(entry.get("source_database") or
                      (entry.get("scope") or {}).get("source") or
                      "default").strip() or "default"
         suite = "p2go" if source == "p2go" else "finance"
+        if not question or (suite, question) in known:
+            continue
         raw_scope = entry.get("scope") if isinstance(
             entry.get("scope"), dict) else {}
         scope = {"source": source}
@@ -965,10 +977,22 @@ def _seed_from_qlog(path: str) -> int:
             for key in ("business_unit", "ledger", "fiscal_year", "period"):
                 if raw_scope.get(key) not in (None, ""):
                     scope[key] = raw_scope[key]
-        known.add(question)
+        known.add((suite, question))
         flags = list(entry.get("flags") or [])
-        if str(entry.get("turn_id") or "") in bad_ids:
+        if turn_id in bad_ids:
             flags.append("user_bad")
+            feedback = latest_feedback.get(turn_id) or {}
+            categories = feedback.get("categories")
+            if isinstance(categories, list):
+                flags.extend(
+                    f"feedback_{category}" for category in categories
+                    if category in {
+                        "not_relevant", "unsupported_claim", "wrong_number",
+                        "wrong_source", "incomplete", "too_slow", "other",
+                    }
+                )
+        if turn_id in blocked_ids:
+            flags.append("grounding_blocked")
         pending[suite].append({
             "id": f"qlog-{entry.get('turn_id', added[suite])}",
             "question": question,
