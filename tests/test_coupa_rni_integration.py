@@ -439,6 +439,23 @@ class CoupaRoutingTests(unittest.TestCase):
 
 
 class CoupaEvidenceTests(unittest.TestCase):
+    """Payloads from the CONTROL module's connector, which has its own zone.
+
+    This module's CURRENT_DATE is derived from BUSINESS_TIMEZONE ("UTC"),
+    but the connector() helper borrowed below is built with COUPA_TZ
+    ("America/New_York"). The gate compares as_of_date against the current
+    date in the CONNECTOR's zone, so passing this module's UTC date failed
+    for the four hours each evening when the two calendars disagree — a
+    test that was red between 20:00 and midnight New York time and green
+    the rest of the day. Derive the cut-off from the zone that will judge
+    it.
+    """
+
+    @staticmethod
+    def _connector_today() -> str:
+        from tests.test_coupa_rni_control import COUPA_TZ
+        return dt.datetime.now(ZoneInfo(COUPA_TZ)).date().isoformat()
+
     def test_actual_connector_payload_satisfies_the_strict_candidate_gate(self):
         from tests.test_coupa_rni_control import (connector, invoice,
                                                    invoice_line, receipt)
@@ -446,9 +463,10 @@ class CoupaEvidenceTests(unittest.TestCase):
             [receipt(1, amount="100")],
             [invoice(1, status="approved",
                      lines=[invoice_line(11, amount="25")])])
+        cutoff = self._connector_today()
         payload = control.received_not_invoiced(
-            business_unit="US001", as_of_date=CURRENT_DATE,
-            today=dt.date.fromisoformat(CURRENT_DATE))
+            business_unit="US001", as_of_date=cutoff,
+            today=dt.date.fromisoformat(cutoff))
         ok, why = tool_result_status("get_coupa_rni", json.dumps(payload))
         self.assertTrue(ok, why)
 
