@@ -63,13 +63,29 @@ DEFAULT_LOG_BACKUPS = 3
 MAX_QUESTION_CHARS = 8_000
 MAX_FEEDBACK_CHARS = 4_000
 
+# NOT \b before the keyword. Underscore is a word character, so \b does not
+# exist between the "_" and the "A" of COUPA_API_KEY — and an env-var name is
+# the SHAPE these actually arrive in, pasted out of a .env or an error
+# message. \b matched "password=" in prose and missed COUPA_API_KEY=,
+# GOOGLE_API_KEY=, ANTHROPIC_API_KEY= and client_secret:, which is most of
+# what there is to leak. A non-alphanumeric lookbehind admits the "_" while
+# still refusing to fire inside a longer word.
+_KEY_START = r"(?<![A-Za-z0-9])"
+_ASSIGNED_VALUE = r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)" + _KEY_START +
+    r"(password|passwd|pwd|secret|token|api[_-]?key|authorization)"
+    + _ASSIGNED_VALUE
 )
 _LOCATOR_ASSIGNMENT = re.compile(
-    r"(?i)\b(dsn|data\s+source|server|host|service(?:_name)?|uid|user\s+id)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)" + _KEY_START +
+    r"(dsn|data\s+source|server|host|service(?:_name)?|uid|user\s+id)"
+    + _ASSIGNED_VALUE
+)
+# Oracle's thin-driver form carries the credential as user/password@host,
+# with no "//" for _CREDENTIAL_URI to anchor on.
+_JDBC_CREDENTIAL = re.compile(
+    r"(?i)\b(jdbc:[a-z0-9]+:[a-z0-9]+:)[^\s/@:]+/[^\s/@]+@\S+"
 )
 _CREDENTIAL_URI = re.compile(
     r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@[^\s]+"
@@ -107,6 +123,7 @@ def redact_private_text(value: object, *, limit: int) -> str:
     if _SQL_TEXT.search(text):
         return "[SQL REDACTED]"
     text = _CREDENTIAL_URI.sub(r"\1[REDACTED]", text)
+    text = _JDBC_CREDENTIAL.sub(r"\1[REDACTED]", text)
     text = _BEARER_TOKEN.sub("Bearer [REDACTED]", text)
     text = _SECRET_ASSIGNMENT.sub(
         lambda m: f"{m.group(1)}=[REDACTED]", text)

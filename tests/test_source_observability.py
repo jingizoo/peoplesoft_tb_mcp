@@ -495,3 +495,55 @@ class SourceObservabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedactionShapeTests(unittest.TestCase):
+    """Credentials arrive shaped like env vars, not like prose.
+
+    The first cut anchored every keyword with ``\\b``. Underscore is a word
+    character, so there is no boundary between the "_" and the "A" of
+    COUPA_API_KEY — the pattern matched "password=" in a sentence and missed
+    COUPA_API_KEY=, GOOGLE_API_KEY=, ANTHROPIC_API_KEY= and client_secret:,
+    which is most of what a person actually pastes. The question and feedback
+    streams are written to logs/questions.jsonl verbatim otherwise.
+    """
+
+    SECRETS = (
+        ("oracle dsn", "oracle+cx://SYSADM:Hunter2!@npp_db01:1521/FSPRD",
+         "Hunter2!"),
+        ("prose password", "connect password=Hunter2! to db", "Hunter2!"),
+        ("pwd short form", "PWD=s3cr3t;UID=SYSADM", "s3cr3t"),
+        ("bearer", "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+         "eyJhbGciOiJIUzI1NiJ9"),
+        ("vendor api key", "COUPA_API_KEY=ab12cd34ef56", "ab12cd34ef56"),
+        ("client secret", "client_secret: GOCSPX-abcdefghijk",
+         "GOCSPX-abcdefghijk"),
+        ("google key", "GOOGLE_API_KEY=AIzaSyD-1234567890abcdefg",
+         "AIzaSyD-1234567890abcdefg"),
+        ("anthropic key", "ANTHROPIC_API_KEY=sk-ant-api03-AAAABBBB",
+         "sk-ant-api03-AAAABBBB"),
+        ("jdbc thin", "jdbc:oracle:thin:sysadm/Hunter2!@//npp_db01:1521/FSPRD",
+         "Hunter2!"),
+    )
+
+    def test_no_secret_value_survives(self):
+        from pstb.qlog import redact_private_text
+        for label, raw, secret in self.SECRETS:
+            with self.subTest(label=label):
+                out = redact_private_text(raw, limit=400)
+                self.assertNotIn(secret, out,
+                                 f"{label} leaked into the question log")
+                self.assertIn("REDACTED", out)
+
+    def test_an_ordinary_question_is_left_alone(self):
+        """Over-redaction would gut the learning loop this log exists for."""
+        from pstb.qlog import redact_private_text
+        for question in (
+            "what is the trial balance for US001 period 6?",
+            "which journals still need action before close?",
+            "show me received not invoiced for US001",
+            "why is cash up versus last year end?",
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(
+                    redact_private_text(question, limit=400), question)
