@@ -516,19 +516,24 @@ def _object_page(db, after: tuple | None, cap: int) -> tuple[list[dict], bool]:
             "AND name NOT LIKE 'sqlite_%' AND UPPER(name) > :n "
             "ORDER BY UPPER(name)", {"n": name}, max_rows=cap)
     if dialect == "oracle":
-        name = after[1] if after else ""
+        params = {}
+        cursor = ""
+        if after is not None:
+            params["n"] = after[1]
+            cursor = " AND OBJECT_NAME > :n"
         if configured:
+            params["owner"] = configured
             return db.query(
                 "SELECT OWNER AS schema_name, OBJECT_NAME AS object_name, "
                 "OBJECT_TYPE AS object_type FROM ALL_OBJECTS "
                 "WHERE OWNER=:owner AND OBJECT_TYPE IN ('TABLE','VIEW') "
-                "AND OBJECT_NAME > :n ORDER BY OBJECT_NAME",
-                {"owner": configured, "n": name}, max_rows=cap)
+                f"{cursor} ORDER BY OBJECT_NAME",
+                params, max_rows=cap)
         return db.query(
             "SELECT USER AS schema_name, OBJECT_NAME AS object_name, "
             "OBJECT_TYPE AS object_type FROM USER_OBJECTS "
-            "WHERE OBJECT_TYPE IN ('TABLE','VIEW') AND OBJECT_NAME > :n "
-            "ORDER BY OBJECT_NAME", {"n": name}, max_rows=cap)
+            "WHERE OBJECT_TYPE IN ('TABLE','VIEW') "
+            f"{cursor} ORDER BY OBJECT_NAME", params, max_rows=cap)
     if dialect == "sqlserver":
         schema, name = after or ("", "")
         params = {"s": schema, "n": name}
@@ -553,25 +558,29 @@ def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     after: tuple | None = None
     while True:
         if dialect == "oracle":
-            table, pos = after or ("", 0)
-            params = {"t": table, "p": pos}
+            params = {}
+            cursor = ""
+            if after is not None:
+                table, pos = after
+                params.update({"t": table, "p": pos})
+                cursor = (
+                    " AND (TABLE_NAME>:t OR "
+                    "(TABLE_NAME=:t AND COLUMN_ID>:p))")
             if configured:
                 sql = (
                     "SELECT OWNER AS schema_name,TABLE_NAME AS object_name,"
                     "COLUMN_NAME AS column_name,COLUMN_ID AS ordinal_position,"
                     "DATA_TYPE AS data_type,DATA_LENGTH AS data_length,"
                     "NULLABLE AS nullable FROM ALL_TAB_COLUMNS WHERE OWNER=:owner "
-                    "AND (TABLE_NAME>:t OR (TABLE_NAME=:t AND COLUMN_ID>:p)) "
-                    "ORDER BY TABLE_NAME,COLUMN_ID")
+                    f"{cursor} ORDER BY TABLE_NAME,COLUMN_ID")
                 params["owner"] = configured
             else:
                 sql = (
                     "SELECT USER AS schema_name,TABLE_NAME AS object_name,"
                     "COLUMN_NAME AS column_name,COLUMN_ID AS ordinal_position,"
                     "DATA_TYPE AS data_type,DATA_LENGTH AS data_length,"
-                    "NULLABLE AS nullable FROM USER_TAB_COLUMNS WHERE "
-                    "TABLE_NAME>:t OR (TABLE_NAME=:t AND COLUMN_ID>:p) "
-                    "ORDER BY TABLE_NAME,COLUMN_ID")
+                    "NULLABLE AS nullable FROM USER_TAB_COLUMNS WHERE 1=1 "
+                    f"{cursor} ORDER BY TABLE_NAME,COLUMN_ID")
         elif dialect == "sqlserver":
             schema, table, pos = after or ("", "", 0)
             params = {"s": schema, "t": table, "p": pos}
@@ -620,12 +629,15 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     after: tuple | None = None
     while True:
         if dialect == "oracle":
-            table, index, pos = after or ("", "", 0)
-            params = {"t": table, "i": index, "p": pos}
-            keyset = (
-                "(C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
-                "(C.INDEX_NAME>:i OR (C.INDEX_NAME=:i AND "
-                "C.COLUMN_POSITION>:p))))")
+            params = {}
+            cursor = ""
+            if after is not None:
+                table, index, pos = after
+                params.update({"t": table, "i": index, "p": pos})
+                cursor = (
+                    " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                    "(C.INDEX_NAME>:i OR (C.INDEX_NAME=:i AND "
+                    "C.COLUMN_POSITION>:p))))")
             if configured:
                 params["owner"] = configured
                 sql = (
@@ -636,7 +648,7 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "FROM ALL_IND_COLUMNS C "
                     "JOIN ALL_INDEXES I ON I.OWNER=C.INDEX_OWNER "
                     "AND I.INDEX_NAME=C.INDEX_NAME WHERE "
-                    f"C.TABLE_OWNER=:owner AND {keyset} ORDER BY C.TABLE_NAME,"
+                    f"C.TABLE_OWNER=:owner{cursor} ORDER BY C.TABLE_NAME,"
                     "C.INDEX_NAME,C.COLUMN_POSITION")
             else:
                 # USER_* is both faster and semantically correct here.  An
@@ -650,7 +662,7 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "I.UNIQUENESS AS uniqueness,0 AS filtered "
                     "FROM USER_IND_COLUMNS C "
                     "JOIN USER_INDEXES I ON I.INDEX_NAME=C.INDEX_NAME "
-                    f"WHERE {keyset} ORDER BY C.TABLE_NAME,C.INDEX_NAME,"
+                    f"WHERE 1=1{cursor} ORDER BY C.TABLE_NAME,C.INDEX_NAME,"
                     "C.COLUMN_POSITION")
         else:
             schema, table, index, pos = after or ("", "", "", 0)
@@ -708,12 +720,15 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     after: tuple | None = None
     while True:
         if dialect == "oracle":
-            table, constraint, pos = after or ("", "", 0)
-            params = {"t": table, "c": constraint, "p": pos}
-            keyset = (
-                "(C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
-                "(C.CONSTRAINT_NAME>:c OR (C.CONSTRAINT_NAME=:c AND "
-                "CC.POSITION>:p))))")
+            params = {}
+            cursor = ""
+            if after is not None:
+                table, constraint, pos = after
+                params.update({"t": table, "c": constraint, "p": pos})
+                cursor = (
+                    " AND (C.TABLE_NAME>:t OR (C.TABLE_NAME=:t AND "
+                    "(C.CONSTRAINT_NAME>:c OR (C.CONSTRAINT_NAME=:c AND "
+                    "CC.POSITION>:p))))")
             if configured:
                 params["owner"] = configured
                 sql = (
@@ -733,7 +748,7 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "LEFT JOIN ALL_CONS_COLUMNS RCC ON RCC.OWNER=RC.OWNER AND "
                     "RCC.CONSTRAINT_NAME=RC.CONSTRAINT_NAME AND "
                     "RCC.POSITION=CC.POSITION WHERE C.OWNER=:owner AND "
-                    f"C.CONSTRAINT_TYPE IN ('P','U','R') AND {keyset} "
+                    f"C.CONSTRAINT_TYPE IN ('P','U','R'){cursor} "
                     "ORDER BY C.TABLE_NAME,C.CONSTRAINT_NAME,CC.POSITION")
             else:
                 # USER_* keeps an unqualified connection in its current
@@ -756,7 +771,7 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
                     "LEFT JOIN USER_CONS_COLUMNS RCC ON "
                     "RCC.CONSTRAINT_NAME=RC.CONSTRAINT_NAME AND "
                     "RCC.POSITION=CC.POSITION WHERE "
-                    f"C.CONSTRAINT_TYPE IN ('P','U','R') AND {keyset} "
+                    f"C.CONSTRAINT_TYPE IN ('P','U','R'){cursor} "
                     "ORDER BY C.TABLE_NAME,C.CONSTRAINT_NAME,CC.POSITION")
         elif dialect == "sqlserver":
             schema, table, constraint, pos = after or ("", "", "", 0)
@@ -852,15 +867,19 @@ def _view_dependency_pages(
     after: tuple | None = None
     while True:
         if dialect == "oracle":
-            view, ref_schema, ref_object, ref_link = after or (
-                "", "", "", "")
-            params = {"v": view, "rs": ref_schema, "ro": ref_object,
-                      "rl": ref_link}
-            keyset = (
-                "(NAME>:v OR (NAME=:v AND (NVL(REFERENCED_OWNER,'')>:rs OR "
-                "(NVL(REFERENCED_OWNER,'')=:rs AND "
-                "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
-                "NVL(REFERENCED_LINK_NAME,'')>:rl))))))")
+            params = {}
+            cursor = ""
+            if after is not None:
+                view, ref_schema, ref_object, ref_link = after
+                params.update({"v": view, "rs": ref_schema,
+                               "ro": ref_object, "rl": ref_link})
+                cursor = (
+                    " AND (NAME>:v OR (NAME=:v AND "
+                    "(NVL(REFERENCED_OWNER,CHR(0))>NVL(:rs,CHR(0)) OR "
+                    "(NVL(REFERENCED_OWNER,CHR(0))=NVL(:rs,CHR(0)) AND "
+                    "(REFERENCED_NAME>:ro OR (REFERENCED_NAME=:ro AND "
+                    "NVL(REFERENCED_LINK_NAME,CHR(0))>"
+                    "NVL(:rl,CHR(0))))))))")
             if configured:
                 params["owner"] = configured
                 sql = (
@@ -871,8 +890,9 @@ def _view_dependency_pages(
                     "REFERENCED_LINK_NAME AS referenced_link FROM "
                     "ALL_DEPENDENCIES WHERE OWNER=:owner AND TYPE='VIEW' AND "
                     "REFERENCED_TYPE IN ('TABLE','VIEW','MATERIALIZED VIEW') AND "
-                    f"{keyset} ORDER BY NAME,NVL(REFERENCED_OWNER,''),"
-                    "REFERENCED_NAME,NVL(REFERENCED_LINK_NAME,'')")
+                    "1=1"
+                    f"{cursor} ORDER BY NAME,NVL(REFERENCED_OWNER,CHR(0)),"
+                    "REFERENCED_NAME,NVL(REFERENCED_LINK_NAME,CHR(0))")
             else:
                 sql = (
                     "SELECT USER AS schema_name,NAME AS view_name,"
@@ -881,9 +901,9 @@ def _view_dependency_pages(
                     "REFERENCED_TYPE AS referenced_type,"
                     "REFERENCED_LINK_NAME AS referenced_link FROM "
                     "USER_DEPENDENCIES WHERE TYPE='VIEW' AND REFERENCED_TYPE IN "
-                    f"('TABLE','VIEW','MATERIALIZED VIEW') AND {keyset} "
-                    "ORDER BY NAME,NVL(REFERENCED_OWNER,''),REFERENCED_NAME,"
-                    "NVL(REFERENCED_LINK_NAME,'')")
+                    "('TABLE','VIEW','MATERIALIZED VIEW') AND 1=1"
+                    f"{cursor} ORDER BY NAME,NVL(REFERENCED_OWNER,CHR(0)),"
+                    "REFERENCED_NAME,NVL(REFERENCED_LINK_NAME,CHR(0))")
         elif dialect == "sqlserver":
             view_schema, view, ref_schema, ref_object, ref_database, ref_server = (
                 after or ("", "", "", "", "", ""))
