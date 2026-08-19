@@ -132,6 +132,114 @@ class ApprovalQueueTests(unittest.TestCase):
         self.assertEqual(self._counts()["pending"], 2,
                          "a refused request still changed the queue")
 
+    def test_approval_routes_do_not_require_a_finance_unit(self):
+        """Governance applies to P2Go even when the operator has no BU rows."""
+        self.assertFalse(gui._needs_unit_check("/api/approvals"))
+        self.assertFalse(gui._needs_unit_check("/api/approvals/count"))
+        self.assertFalse(gui._needs_unit_check("/api/approvals/decide"))
+
+    def test_configured_privileged_user_bypasses_bu_tables(self):
+        """BATCH1 is config-authoritative; it must not need a security row."""
+        gui.row_security.invalidate("BATCH1")
+        try:
+            with patch.object(gui.cfg.security, "enabled", True), \
+                    patch.object(gui.cfg.security, "privileged_users",
+                                 ["BATCH1"]), \
+                    patch.object(gui, "_approval_source_names",
+                                 return_value=[]), \
+                    patch.object(gui.row_security, "_operator_exists",
+                                 side_effect=AssertionError(
+                                     "privileged sign-in queried PSOPRDEFN")), \
+                    patch.object(gui.row_security, "source_record",
+                                 side_effect=AssertionError(
+                                     "privileged sign-in queried BU security")):
+                client = _client()
+                signed = client.post("/api/signin", json={"oprid": "BATCH1"})
+                self.assertEqual(signed.status_code, 200)
+                self.assertTrue(signed.json()["privileged"])
+                self.assertTrue(signed.json()["all_units"])
+                self.assertEqual(client.get("/api/approvals").status_code, 200)
+        finally:
+            gui.row_security.invalidate("BATCH1")
+
+    def test_security_disabled_needs_no_signin_but_stays_machine_local(self):
+        with patch.object(gui.cfg.security, "enabled", False), \
+                patch.object(gui, "_approval_source_names", return_value=[]):
+            self.assertEqual(_client().get("/api/approvals").status_code, 200)
+
+
+class DirectMetadataProposalTests(unittest.TestCase):
+    """The visible P2Go form submits an exact inactive proposal directly."""
+
+    def _resources(self):
+        calls = []
+
+        def propose(**kwargs):
+            calls.append(kwargs)
+            return {
+                "id": "0123456789abcdef", "status": "pending",
+                "source_database": "p2go", "schema": "P2GO",
+                "object": "JOB_HDR", "meaning": kwargs["meaning"],
+                "aliases": kwargs["aliases"], "already_known": False,
+            }
+
+        store = SimpleNamespace(propose=propose)
+        catalog = SimpleNamespace(context=lambda identifier, source, limit: {
+            "found": True, "source_database": source,
+            "subject": {
+                "source": source, "object_id": "object:p2go:P2GO:JOB_HDR",
+                "schema": "P2GO", "physical_object": "JOB_HDR",
+                "kind": "table",
+            },
+        })
+        return calls, store, catalog
+
+    def test_form_submission_is_route_bound_exact_and_pending(self):
+        calls, store, catalog = self._resources()
+        with patch.object(
+                gui, "_metadata_proposal_resources",
+                return_value=("p2go", store, catalog)) as resources, \
+                patch("pstb.source_knowledge.validate_catalog_aliases",
+                      return_value=["job queue"]) as aliases:
+            body = gui.create_metadata_proposal("p2go", {
+                "identifier": "P2GO.JOB_HDR",
+                "meaning": "Inbound integration job headers",
+                "aliases": "job queue",
+            })
+        resources.assert_called_once_with("p2go")
+        aliases.assert_called_once_with(
+            catalog, "p2go", "object:p2go:P2GO:JOB_HDR", ["job queue"])
+        self.assertEqual(calls, [{
+            "object_id": "object:p2go:P2GO:JOB_HDR", "schema": "P2GO",
+            "object_name": "JOB_HDR", "object_kind": "table",
+            "meaning": "Inbound integration job headers",
+            "aliases": ["job queue"], "origin": "gui",
+        }])
+        self.assertFalse(body["retrieval_active"])
+        self.assertEqual(body["proposal"]["status"], "pending")
+        self.assertIn("inactive", body["note"])
+
+    def test_body_cannot_override_route_source_or_catalog_identity(self):
+        for key in ("source", "db", "object_id", "source_fingerprint"):
+            with self.subTest(key=key), self.assertRaises(HTTPException) as caught:
+                gui.create_metadata_proposal("p2go", {
+                    "identifier": "P2GO.JOB_HDR", "meaning": "Job headers",
+                    "aliases": "", key: "untrusted",
+                })
+            self.assertEqual(caught.exception.status_code, 400)
+
+    def test_proposal_route_is_unit_free_and_body_bounded(self):
+        self.assertFalse(gui._needs_unit_check(
+            "/api/source/p2go/metadata-proposals"))
+        self.assertFalse(gui._needs_unit_check(
+            "/api/source/finance/metadata-proposals"))
+        with patch.object(gui.cfg.security, "enabled", False):
+            oversized = _client().post(
+                "/api/source/p2go/metadata-proposals",
+                content=b"{" + b" " * (9 * 1024) + b"}",
+                headers={"content-type": "application/json"})
+        self.assertEqual(oversized.status_code, 413)
+
 
 class ApprovalPanelTests(unittest.TestCase):
     """The browser half, checked against the shipped file."""
@@ -227,6 +335,65 @@ class ApprovalBadgeCountTests(unittest.TestCase):
         self.assertEqual(set(self.client.get("/api/approvals/count").json()),
                          {"pending", "readable"},
                          "a new key here is a new thing crossing the gate")
+
+    def test_count_includes_each_configured_source_knowledge_queue(self):
+        registry = SimpleNamespace(names=lambda: ["default", "p2go", "ops"])
+        stores = {
+            "default": SimpleNamespace(list_proposals=lambda status: [
+                {"id": "f1", "status": status},
+            ]),
+            "p2go": SimpleNamespace(list_proposals=lambda status: [
+                {"id": "p1", "status": status},
+                {"id": "p2", "status": status},
+            ]),
+            "ops": SimpleNamespace(list_proposals=lambda status: [
+                {"id": "o1", "status": status},
+            ]),
+        }
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=lambda name: stores[name]):
+            body = self.client.get("/api/approvals/count").json()
+        self.assertEqual(body, {"pending": 5, "readable": True})
+
+    def test_listing_includes_default_and_p2go_metadata_queues(self):
+        registry = SimpleNamespace(names=lambda: ["default", "p2go"])
+        stores = {
+            name: SimpleNamespace(list_proposals=lambda status, name=name: [{
+                "id": ("f1" if name == "default" else "p1"),
+                "meaning": name + " meaning", "status": "pending",
+            }]) for name in ("default", "p2go")
+        }
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=lambda name: stores[name]):
+            body = self.client.get("/api/approvals").json()
+        metadata = [item for item in body["items"]
+                    if item["queue"] == "source_knowledge"]
+        self.assertEqual({item["source"] for item in metadata},
+                         {"default", "p2go"})
+        self.assertTrue(body["readable"])
+
+    def test_listing_discloses_an_unreadable_source_queue(self):
+        registry = SimpleNamespace(names=lambda: ["default"])
+        private = "/shared/secret/source_knowledge.db: ORA-01017"
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=OSError(private)):
+            body = self.client.get("/api/approvals").json()
+        self.assertFalse(body["readable"])
+        self.assertEqual(body["source_errors"][0]["source"], "default")
+        self.assertEqual(body["source_errors"][0]["error"],
+                         "proposal queue could not be read")
+        self.assertNotIn(private, json.dumps(body))
+
+    def test_unreadable_source_never_reports_a_partial_count_as_complete(self):
+        registry = SimpleNamespace(names=lambda: ["default", "p2go"])
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=OSError("knowledge store unavailable")):
+            body = self.client.get("/api/approvals/count").json()
+        self.assertEqual(body, {"pending": 1, "readable": False})
 
     def test_the_count_route_is_not_in_the_open_paths_set(self):
         """What actually keeps it non-public.
@@ -341,6 +508,76 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         self.assertIn('id="approvalbadge"', nav,
                       "the count has to appear where the operator is looking")
 
+    def test_chat_chrome_has_a_direct_metadata_approval_button(self):
+        """Ask is the visible product; nav is intentionally display:none."""
+        self.assertIn("nav{display:none}", self.page)
+        start = self.page.index("function viewChat()")
+        block = self.page[start:start + 5000]
+        self.assertIn("Metadata meanings", block)
+        self.assertIn("id='chat-approvals'", block)
+        self.assertIn("openApprovals(silo.source)", block)
+        self.assertIn("data-approval-badge", block)
+
+    def test_metadata_drawer_has_a_source_bound_direct_form(self):
+        start = self.page.index("function metadataProposalPanel(")
+        end = self.page.index("async function viewDiag()", start)
+        block = self.page[start:end]
+        self.assertIn("Exact schema.object", block)
+        self.assertIn("Short business meaning", block)
+        self.assertIn("Business aliases", block)
+        self.assertIn("Submit for review", block)
+        self.assertIn("not sent through the chat model", block)
+        self.assertIn("metadataProposalUrl(source)", block)
+        self.assertIn("/metadata-proposals", self.page)
+
+    def test_direct_approval_drawer_does_not_run_finance_diagnostics(self):
+        start = self.page.index("function openApprovals(source)")
+        end = self.page.index("async function viewDiag()", start)
+        block = self.page[start:end]
+        self.assertIn("loadApprovals(holder,drawerGeneration)", block)
+        self.assertNotIn("/api/diagnostics", block)
+        self.assertNotIn("ensureScopeDiscovered", block)
+
+    def test_drawer_async_writes_are_generation_fenced(self):
+        self.assertIn("let DRAWER_GENERATION=0", self.page)
+        for start_text, end_text in (
+            ("async function openCustomer(", "async function viewAR("),
+            ("function openApprovals(", "async function viewDiag("),
+            ("async function openAccount(", "async function postAnswerFeedback("),
+        ):
+            with self.subTest(open=start_text):
+                block = self.page[self.page.index(start_text):
+                                  self.page.index(end_text,
+                                                  self.page.index(start_text))]
+                self.assertIn("beginDrawer()", block)
+                if start_text != "function openApprovals(":
+                    self.assertIn("drawerIsCurrent(drawerGeneration)", block)
+        loader = self.page[self.page.index("async function loadApprovals("):
+                           self.page.index("function metadataProposalUrl(")]
+        self.assertIn("drawerIsCurrent(drawerGeneration)", loader)
+        closer = self.page[self.page.index("function closeDrawer()"):
+                           self.page.index("async function openAccount(")]
+        self.assertIn("++DRAWER_GENERATION", closer)
+
+    def test_older_badge_refresh_cannot_restore_a_stale_count(self):
+        start = self.page.index("async function refreshApprovalBadge()")
+        end = self.page.index("/* A thrown API error", start)
+        block = self.page[start:end]
+        self.assertIn("++APPROVAL_REFRESH_GENERATION", block)
+        self.assertIn("generation!==APPROVAL_REFRESH_GENERATION", block)
+        self.assertLess(block.index("generation!==APPROVAL_REFRESH_GENERATION"),
+                        block.index("APPROVAL_PENDING=pending"))
+
+    def test_chat_chrome_has_signout_when_the_session_is_enabled(self):
+        start = self.page.index("function viewChat()")
+        block = self.page[start:start + 6000]
+        self.assertIn("META.security.enabled&&META.security.signed_in", block)
+        self.assertIn("id='chat-signout'", block)
+        self.assertIn("signout.onclick=signOutSession", block)
+        signout = self.page[self.page.index("async function signOutSession()"):
+                            self.page.index("/* ---------- boot ---------- */")]
+        self.assertIn("/api/signout", signout)
+
     def test_the_badge_never_delays_the_first_paint(self):
         """Fire and forget: an affordance must not cost a round trip."""
         boot = self.page[self.page.index("bootSay('Drawing the workspace')"):]
@@ -356,7 +593,7 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
     def test_the_panel_does_not_paraphrase_the_servers_refusal(self):
         """Two copies of a remedy drift; the server's is the one with the port."""
         start = self.page.index("async function loadApprovals(")
-        block = self.page[start:start + 900]
+        block = self.page[start:start + 1400]
         self.assertIn("errText(e)", block)
         self.assertNotIn("SSH tunnel", block,
                          "the panel restated the remedy in its own words, so "

@@ -177,10 +177,19 @@ source-bound proposal. It is deliberately **not learned immediately**:
 
 1. the named object must resolve unambiguously in the current source catalog;
 2. the proposal is stored pending in `source_knowledge/<source-hash>.db`;
-3. a host operator reviews it with `python -m pstb.source_knowledge --source
-   p2go` and explicitly approves or rejects it;
+3. a host operator opens **Metadata meanings** in the visible Ask context bar
+   and explicitly approves or rejects it; the same drawer can submit an exact
+   `schema.object`, meaning and aliases directly without sending that wording
+   through the chat model;
 4. only approved aliases/meanings may improve `search_metadata` or
    `get_metadata_context` for that same source.
+
+The review drawer is machine-local (opening it through an SSH tunnel still
+arrives as loopback). When business-unit security is enabled, the selected
+operator must also be listed in `security.privileged_users`; that configured
+privilege is evaluated before PeopleSoft BU-security records, so the reviewer
+does not need a row in those records. The `pstb.source_knowledge` CLI remains
+available as a host-side fallback.
 
 The overlay is bound to the canonical source, secret-free endpoint/schema
 fingerprint, and exact catalog object ID. It is not merged into the structural
