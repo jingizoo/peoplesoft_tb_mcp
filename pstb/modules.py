@@ -24,6 +24,7 @@ import datetime as dt
 import math
 import re
 
+from . import queries as q
 from .db import DbError
 from .engine import EngineError, TBEngine, r2
 
@@ -1373,8 +1374,7 @@ class ModulePacks:
             f"WHERE V.BUSINESS_UNIT = :bu "
             f"AND V.INVOICE_DT >= {self.db.date_bind('since')} "
             f"AND V.INVOICE_DT <= {self.db.date_bind('asof')} "
-            f"AND V.INVOICE_ID IS NOT NULL "
-            f"AND TRIM(V.INVOICE_ID) <> '' "
+            f"AND {q.nonblank('V.INVOICE_ID')} "
             f"GROUP BY V.VENDOR_ID, V.INVOICE_ID HAVING COUNT(*) > 1",
             {"bu": bu, "since": since, "asof": asof}, max_rows=200)
         exact = [{"vendor_id": str(r["vendor_id"]),

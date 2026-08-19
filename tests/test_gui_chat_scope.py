@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dis
 import time
 import unittest
 from types import SimpleNamespace
@@ -521,3 +522,67 @@ class McpSessionDiagnosisTests(unittest.TestCase):
             body = client.get("/api/meta").json()
             self.assertIn("mcp_session", body)
             self.assertIn("shared", body["mcp_session"])
+
+
+class EndpointWiringTests(unittest.TestCase):
+    """Every GUI handler must reference names the module actually defines.
+
+    /api/vendors called `modules.search_vendors`, and `modules` was never
+    bound in pstb/gui/app.py — so browser vendor search raised NameError and
+    returned 500 to every caller, with no test noticing because nothing
+    exercised the route. The sweep below is the general form: a handler that
+    reads an undefined global is dead, and dead is indistinguishable from
+    working until somebody clicks it.
+    """
+
+    def test_every_handler_global_actually_exists(self):
+        """A general sweep, not just the one regression.
+
+        Reads each handler's global references straight out of its code
+        object and checks the module can resolve them. co_names also holds
+        attribute names, so a miss is only reported when the name is not a
+        module global, not a builtin, and not an attribute reached on some
+        local — hence the allowlist of known attribute-only names below.
+        """
+        import builtins
+        import inspect
+        import pstb.gui.app as app
+
+        known = set(dir(app)) | set(dir(builtins))
+        dangling = []
+        for name, handler in vars(app).items():
+            if not inspect.isfunction(handler):
+                continue
+            # functools.wraps copies __module__ onto a decorator's wrapper,
+            # so @asynccontextmanager makes contextlib's helper look like it
+            # lives here. The code object's filename does not lie.
+            if handler.__code__.co_filename != app.__file__:
+                continue
+            for referenced in handler.__code__.co_names:
+                if referenced in known:
+                    continue
+                # An attribute on a local object, not a global read. Only a
+                # LOAD_GLOBAL would be a real dangling reference, and the
+                # cheap way to tell them apart is the opcode.
+                loads_global = any(
+                    instruction.opname == "LOAD_GLOBAL"
+                    and instruction.argval == referenced
+                    for instruction in dis.get_instructions(handler))
+                if loads_global:
+                    dangling.append(f"{name}() -> {referenced}")
+        self.assertEqual(
+            sorted(set(dangling)), [],
+            "these handlers read globals the module never binds, so they "
+            "raise NameError and 500 for every caller: "
+            + ", ".join(sorted(set(dangling))))
+
+    def test_the_vendor_pack_is_rebuilt_by_a_reload(self):
+        """Left behind, it answers from the PREVIOUS database after a reload."""
+        import inspect
+        import pstb.gui.app as app
+        source = inspect.getsource(app._console_reload)
+        for name in ("modules", "vendor_network", "procurement"):
+            with self.subTest(name=name):
+                self.assertIn(name, source,
+                              f"{name} survives a reload pointing at the old "
+                              "database")

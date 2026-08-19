@@ -148,7 +148,11 @@ def to_csv(table: dict) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\r\n")
     columns = table["columns"]
-    writer.writerow(columns)
+    # The header row goes through _cell as well. A pivot's columns ARE
+    # database values — account descriptions, customer names, period labels —
+    # so "neutralise the cells but trust the header" leaves the injection
+    # open on exactly the row Excel evaluates first.
+    writer.writerow([_cell(c) for c in columns])
     for r in table["rows"]:
         writer.writerow([_cell(r.get(c)) for c in columns])
     return "﻿" + buf.getvalue()

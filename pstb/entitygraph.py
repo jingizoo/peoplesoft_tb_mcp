@@ -54,6 +54,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from . import queries as q
 from .procgraph import Harvest, node_id
 from .security import allowed_units
 
@@ -263,7 +264,7 @@ def harvest_entities(engine, months: int = 12, as_of_date: str = "") -> Harvest:
                 f"WHERE H.BILL_STATUS = 'INV' "
                 f"AND H.INVOICE_DT >= {db.date_bind('since')} "
                 f"AND H.INVOICE_DT <= {db.date_bind('asof')} "
-                f"AND L.IDENTIFIER IS NOT NULL AND L.IDENTIFIER <> '' "
+                f"AND {q.nonblank('L.IDENTIFIER')} "
                 f"GROUP BY H.BUSINESS_UNIT, H.BILL_TO_CUST_ID, "
                 f"L.IDENTIFIER, {cur_sel}",
                 {"since": since, "asof": asof}, max_rows=FLOW_CAP)
