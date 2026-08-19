@@ -472,6 +472,40 @@ link wins and quietly replaces it.
 `--allow-host <name>` (repeatable) restricts which `Host` names are
 accepted. Without it any name is accepted.
 
+#### Temporary passwordless metadata approval from a remote browser
+
+If an operator cannot open an SSH tunnel, metadata approvals can be exposed
+for an isolated test without a Unix password or application token. This mode
+has no automatic timeout and is deliberately unauthenticated: the PeopleSoft
+user-ID selector checks no password, so **anyone who can reach the page can
+type `BATCH1`**. It affects
+only the metadata approval list and approve/reject action; question-log and
+answer-quality review, `/console`, SQL authorization, and other machine-local
+administration stay unchanged. The ordinary database Diagnostics checks retain
+their existing signed-in access policy.
+
+Configure an exact privileged ID and the explicit unsafe switch:
+
+```yaml
+security:
+  enabled: true
+  privileged_users: ["BATCH1"]
+  allow_unauthenticated_remote_approvals: true
+```
+
+Restart the server normally; no extra `--allow-host` option is required:
+
+```bash
+.venv/bin/python -m pstb.gui
+```
+
+Open `http://<server-IP-or-DNS-name>:8016`, select `BATCH1`, open the P2Go
+workspace, and choose **Metadata meanings**. Existing pending meanings appear
+above the proposal form. Decisions are recorded as an **unverified remote
+selector**. The testing exception has no timeout; afterwards set
+`allow_unauthenticated_remote_approvals: false` and restart. A configured
+`PSTB_AUTH_TOKEN`, if present, is never bypassed.
+
 Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
 and in loopback mode an unexpected `Host` header is refused as well: a page
 on the open web can otherwise resolve its own hostname to 127.0.0.1 and

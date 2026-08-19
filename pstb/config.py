@@ -341,6 +341,12 @@ class SecurityCfg:
     # Ad-hoc SQL bypasses every curated tool's scope handling, so for a
     # restricted user it is off by default. A privileged user is unaffected.
     raw_sql_for_restricted: bool = False
+    # Emergency review path for deployments that intentionally use the
+    # passwordless OPRID selector over a trusted network.  This is NOT
+    # authentication: anyone who can reach the page can type a configured
+    # privileged ID.  In explicit testing mode there is deliberately no Host
+    # allowlist or timeout; it remains active until set false and restarted.
+    allow_unauthenticated_remote_approvals: bool = False
 
 
 @dataclass
@@ -387,6 +393,43 @@ def _apply_section(obj: Any, data: Optional[dict]) -> None:
     for k, v in data.items():
         if k in names and v is not None:
             setattr(obj, k, v)
+
+
+def _validate_security(cfg: SecurityCfg) -> None:
+    """Fail closed for the deliberately unsafe remote-approval escape hatch.
+
+    ``_apply_section`` is intentionally permissive for legacy settings, but
+    a quoted ``"false"`` is truthy in Python.  That cannot be allowed to turn
+    on a passwordless governance write path by accident.
+    """
+    enabled = getattr(cfg, "allow_unauthenticated_remote_approvals", False)
+    if type(enabled) is not bool:  # bool only; integers are not accepted
+        raise RuntimeError(
+            "security.allow_unauthenticated_remote_approvals must be the "
+            "YAML boolean true or false (without quotes)")
+    if not enabled:
+        return
+    if getattr(cfg, "enabled", False) is not True:
+        raise RuntimeError(
+            "security.allow_unauthenticated_remote_approvals requires "
+            "security.enabled: true so the browser must select a configured "
+            "privileged user")
+    users = getattr(cfg, "privileged_users", None)
+    if not isinstance(users, (list, tuple)) or not users:
+        raise RuntimeError(
+            "security.allow_unauthenticated_remote_approvals requires a "
+            "non-empty security.privileged_users list")
+    for value in users:
+        if type(value) is not str:
+            raise RuntimeError(
+                "security.privileged_users entries must be text PeopleSoft "
+                "user IDs when unauthenticated remote approvals are on")
+        candidate = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,30}", candidate):
+            raise RuntimeError(
+                "security.privileged_users entries must be PeopleSoft user "
+                "IDs using letters, numbers, '_', '.', or '-' (up to 30 "
+                "characters) when unauthenticated remote approvals are on")
 
 
 _SCHEMA_IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]{0,127}$")
@@ -752,6 +795,7 @@ def load_config(path: Optional[str] = None) -> Config:
         _validate_coupa(cfg.coupa)
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))
+        _validate_security(cfg.security)
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]
         for name, block in (data.get("sources") or {}).items():

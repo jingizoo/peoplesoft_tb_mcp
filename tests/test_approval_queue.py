@@ -18,6 +18,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -26,7 +27,9 @@ from fastapi import HTTPException
 from starlette.testclient import TestClient
 
 from pstb.gui import app as gui
+from pstb.config import load_config
 from pstb.memory import SiteMemory
+from pstb.security import Access
 
 
 def _client():
@@ -123,7 +126,7 @@ class ApprovalQueueTests(unittest.TestCase):
         def refuse(_request):
             raise HTTPException(status_code=403, detail="machine-local only")
 
-        with patch.object(gui, "_require_question_log_operator", refuse):
+        with patch.object(gui, "_require_approval_operator", refuse):
             self.assertEqual(self.client.get("/api/approvals").status_code, 403)
             self.assertEqual(
                 self.client.post("/api/approvals/decide", json={
@@ -170,6 +173,322 @@ class ApprovalQueueTests(unittest.TestCase):
         with patch.object(gui.cfg.security, "enabled", False), \
                 patch.object(gui, "_approval_source_names", return_value=[]):
             self.assertEqual(_client().get("/api/approvals").status_code, 200)
+
+
+class UnauthenticatedRemoteApprovalTests(unittest.TestCase):
+    """The requested BATCH1 testing escape hatch is narrow and explicit."""
+
+    HOST = "pfs1app2.internal"
+
+    class Store:
+        def __init__(self):
+            self.row = {
+                "proposal_id": "0123456789abcdef",
+                "source_database": "default",
+                "source_fingerprint": "sha256:" + "a" * 64,
+                "object_id": "object:default:P2GO:JOB_HDR",
+                "schema": "P2GO", "object": "JOB_HDR", "kind": "table",
+                "meaning": "Inbound integration job headers",
+                "aliases": ["job queue"], "origin": "gui",
+                "proposed_at": "2026-08-19T10:00:00+00:00",
+                "status": "pending", "decided_by": "",
+            }
+            self.decisions = []
+
+        def list_proposals(self, status=""):
+            if status and self.row["status"] != status:
+                return []
+            return [dict(self.row)]
+
+        def get(self, proposal_id):
+            if proposal_id != self.row["proposal_id"]:
+                raise RuntimeError("not found")
+            return dict(self.row)
+
+        def decide(self, proposal_id, *, approve, decided_by,
+                   current_object=None):
+            if proposal_id != self.row["proposal_id"]:
+                raise RuntimeError("not found")
+            self.row["status"] = "approved" if approve else "rejected"
+            self.row["decided_by"] = decided_by
+            self.decisions.append((approve, decided_by, current_object))
+            return dict(self.row)
+
+    def setUp(self):
+        self.store = self.Store()
+        gui.row_security.invalidate()
+
+    def tearDown(self):
+        gui.row_security.invalidate()
+
+    def _policy(self, *, narrowed=False, token=""):
+        hosts = (frozenset(gui.localguard.ALLOWED_HOSTS | {self.HOST})
+                 if narrowed else None)
+        return gui.localguard.Policy(
+            hosts=hosts, token=token, shared=True,
+            unauthenticated=not bool(token))
+
+    def _patches(self, *, enabled=True, privileged=("BATCH1",),
+                 unsafe=True, narrowed=False, token=""):
+        stack = ExitStack()
+        stack.enter_context(patch.object(gui.cfg.security, "enabled", enabled))
+        stack.enter_context(patch.object(
+            gui.cfg.security, "privileged_users", list(privileged)))
+        stack.enter_context(patch.object(
+            gui.cfg.security, "allow_unauthenticated_remote_approvals",
+            unsafe))
+        stack.enter_context(patch.object(
+            gui.localguard, "POLICY",
+            self._policy(narrowed=narrowed, token=token)))
+        stack.enter_context(patch.object(
+            gui, "_source_knowledge_store", return_value=self.store))
+        stack.enter_context(patch.object(
+            gui, "_source_catalog_identity", return_value={"proved": True}))
+        return stack
+
+    def _client(self):
+        return TestClient(gui.app, client=("10.4.1.9", 51000),
+                          base_url=f"http://{self.HOST}")
+
+    def _signin(self, client, who="BATCH1"):
+        return client.post("/api/signin", json={"oprid": who})
+
+    def _decision_headers(self, *, origin=None, marker=True,
+                          content_type="application/json"):
+        headers = {"Origin": origin or f"http://{self.HOST}",
+                   "Content-Type": content_type}
+        if marker:
+            headers["X-PSTB-Approval-Request"] = "metadata-review"
+        return headers
+
+    def test_configured_batch1_can_list_and_decide_without_bu_queries(self):
+        with self._patches(), \
+                patch.object(gui.row_security, "_operator_exists",
+                             side_effect=AssertionError("queried PSOPRDEFN")), \
+                patch.object(gui.row_security, "source_record",
+                             side_effect=AssertionError("queried BU security")):
+            client = self._client()
+            signed = self._signin(client)
+            self.assertEqual(signed.status_code, 200)
+            self.assertTrue(signed.json()["privileged"])
+            listing = client.get(
+                "/api/approvals?status=all&source=default")
+            self.assertEqual(listing.status_code, 200)
+            self.assertEqual(listing.headers["cache-control"],
+                             "no-store, private")
+            self.assertEqual([i["queue"] for i in listing.json()["items"]],
+                             ["source_knowledge"])
+            decided = client.post(
+                "/api/approvals/decide",
+                json={"queue": "source_knowledge",
+                      "source": "default", "id": self.store.row["proposal_id"],
+                      "decision": "approve"},
+                headers=self._decision_headers())
+            self.assertEqual(decided.status_code, 200, decided.text)
+            self.assertIn("unverified remote selector",
+                          decided.json()["decided_by"])
+            self.assertEqual(self.store.row["status"], "approved")
+
+    def test_default_off_and_security_off_modes_refuse(self):
+        for label, options, expected in (
+            ("off", {"unsafe": False}, "option is off"),
+            ("security off", {"enabled": False}, "security.enabled"),
+        ):
+            with self.subTest(label=label), self._patches(**options):
+                client = self._client()
+                if options.get("enabled", True):
+                    self.assertEqual(self._signin(client).status_code, 200)
+                else:
+                    client.cookies.set(gui.USER_COOKIE, "BATCH1")
+                response = client.get(
+                    "/api/approvals?status=all&source=default")
+                self.assertEqual(response.status_code, 403)
+                self.assertIn(expected, str(response.json()).lower())
+                self.assertEqual(self.store.row["status"], "pending")
+
+    def test_missing_or_nonprivileged_selector_is_refused(self):
+        with self._patches():
+            client = self._client()
+            missing = client.get(
+                "/api/approvals?status=all&source=default")
+            self.assertEqual(missing.status_code, 401)
+        with self._patches(privileged=("BATCH1",)), \
+                patch.object(gui, "access_for_request",
+                             return_value=Access(oprid="OTHER",
+                                                 privileged=False)):
+            client = self._client()
+            client.cookies.set(gui.USER_COOKIE, "OTHER")
+            denied = client.get(
+                "/api/approvals?status=all&source=default")
+            self.assertEqual(denied.status_code, 403)
+            self.assertIn("security.privileged_users", denied.text)
+
+    def test_remote_post_requires_same_origin_json_and_gui_marker(self):
+        with self._patches():
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            body = {"queue": "source_knowledge", "source": "default",
+                    "id": self.store.row["proposal_id"],
+                    "decision": "approve"}
+            cases = (
+                (self._decision_headers(marker=False), 403),
+                (self._decision_headers(origin="http://evil.example"), 403),
+                (self._decision_headers(origin=f"https://{self.HOST}"), 403),
+                (self._decision_headers(content_type="text/plain"), 415),
+            )
+            for headers, expected in cases:
+                with self.subTest(headers=headers):
+                    result = client.post("/api/approvals/decide",
+                                         content=json.dumps(body),
+                                         headers=headers)
+                    self.assertEqual(result.status_code, expected)
+                    self.assertEqual(self.store.row["status"], "pending")
+
+    def test_config_reload_cannot_reclassify_an_admitted_remote_request(self):
+        """One gate decision governs filtering, CSRF, audit, and mutation."""
+        with self._patches(), patch.object(
+                gui, "_unauthenticated_remote_approvals_active",
+                side_effect=[True, False, False]) as active:
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            listing = client.get(
+                "/api/approvals?status=all&source=default")
+            self.assertEqual(listing.status_code, 200)
+            self.assertEqual([i["queue"] for i in listing.json()["items"]],
+                             ["source_knowledge"])
+            self.assertEqual(active.call_count, 1,
+                             "testing switch was re-read after admission")
+
+        self.store.row["status"] = "pending"
+        with self._patches(), patch.object(
+                gui, "_unauthenticated_remote_approvals_active",
+                side_effect=[True, False, False]) as active:
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            decided = client.post(
+                "/api/approvals/decide",
+                json={"queue": "source_knowledge", "source": "default",
+                      "id": self.store.row["proposal_id"],
+                      "decision": "approve"},
+                headers=self._decision_headers())
+            self.assertEqual(decided.status_code, 200)
+            self.assertIn("unverified remote selector",
+                          decided.json()["decided_by"])
+            self.assertEqual(active.call_count, 1,
+                             "testing switch was re-read after admission")
+
+    def test_remote_mode_does_not_open_site_memory_or_question_diagnostics(self):
+        with self._patches():
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            memory = client.post(
+                "/api/approvals/decide",
+                json={"queue": "memory", "id": "anything",
+                      "decision": "approve"},
+                headers=self._decision_headers())
+            self.assertEqual(memory.status_code, 403)
+            self.assertEqual(client.get("/api/question-report").status_code,
+                             403)
+
+    def test_signout_immediately_removes_remote_approval_access(self):
+        with self._patches():
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            self.assertEqual(client.get(
+                "/api/approvals?status=all&source=default").status_code, 200)
+            self.assertEqual(client.post("/api/signout").status_code, 200)
+            self.assertEqual(client.get(
+                "/api/approvals?status=all&source=default").status_code, 401)
+
+    def test_unsafe_flag_never_bypasses_a_configured_access_token(self):
+        token = "team-token-123456"
+        with self._patches(narrowed=False, token=token):
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 401)
+            first = client.get(f"/?token={token}")
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(self._signin(client).status_code, 200)
+            self.assertEqual(client.get(
+                "/api/approvals?status=all&source=default").status_code, 200)
+
+    def test_forwarded_header_is_rejected_before_any_oprid_resolution(self):
+        with self._patches(), patch.object(
+                gui, "access_for_request",
+                side_effect=AssertionError("resolved identity before network")):
+            client = self._client()
+            client.cookies.set(gui.USER_COOKIE, "BATCH1")
+            response = client.get(
+                "/api/approvals?status=all&source=default",
+                headers={"X-Forwarded-For": "127.0.0.1"})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("x-forwarded-for", response.text.lower())
+
+    def test_meta_discloses_unverified_testing_readiness(self):
+        with self._patches():
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            security = client.get("/api/meta").json()["security"]
+            self.assertTrue(security["approval_review_ready"])
+            self.assertTrue(
+                security["approval_unauthenticated_remote_configured"])
+            self.assertTrue(security["approval_unauthenticated_remote_active"])
+            self.assertFalse(security["approval_identity_verified"])
+            self.assertEqual(
+                security["approval_unauthenticated_remote_expires_at"], "")
+
+    def test_testing_mode_accepts_open_host_policy_without_extra_cli_flag(self):
+        with self._patches(narrowed=False):
+            client = self._client()
+            self.assertEqual(self._signin(client).status_code, 200)
+            self.assertEqual(client.get(
+                "/api/approvals?status=all&source=default").status_code, 200)
+
+
+class UnauthenticatedRemoteApprovalConfigTests(unittest.TestCase):
+    def _load(self, security_yaml: str):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "config.yaml"
+            path.write_text("security:\n" + security_yaml)
+            return load_config(str(path))
+
+    def test_switch_must_be_an_exact_yaml_boolean(self):
+        with self.assertRaisesRegex(RuntimeError, "YAML boolean"):
+            self._load(
+                "  enabled: true\n"
+                "  privileged_users: [BATCH1]\n"
+                "  allow_unauthenticated_remote_approvals: \"false\"\n")
+
+    def test_switch_requires_security_and_a_privileged_list(self):
+        for yaml_text, reason in (
+            ("  enabled: false\n"
+             "  privileged_users: [BATCH1]\n"
+             "  allow_unauthenticated_remote_approvals: true\n",
+             "security.enabled"),
+            ("  enabled: true\n"
+             "  privileged_users: []\n"
+             "  allow_unauthenticated_remote_approvals: true\n",
+             "privileged_users"),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    self._load(yaml_text)
+
+    def test_privileged_ids_cannot_be_yaml_booleans_or_numbers(self):
+        for value in ("true", "123"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "text PeopleSoft"):
+                    self._load(
+                        "  enabled: true\n"
+                        f"  privileged_users: [{value}]\n"
+                        "  allow_unauthenticated_remote_approvals: true\n")
+
+    def test_valid_batch1_configuration_loads(self):
+        loaded = self._load(
+            "  enabled: true\n"
+            "  privileged_users: [BATCH1]\n"
+            "  allow_unauthenticated_remote_approvals: true\n")
+        self.assertTrue(
+            loaded.security.allow_unauthenticated_remote_approvals)
 
 
 class DirectMetadataProposalTests(unittest.TestCase):
@@ -557,7 +876,8 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         start = self.page.index("function openApprovals(source)")
         end = self.page.index("async function viewDiag()", start)
         block = self.page[start:end]
-        self.assertIn("loadApprovals(holder,drawerGeneration)", block)
+        self.assertIn(
+            "loadApprovals(holder,canonical,drawerGeneration)", block)
         self.assertNotIn("/api/diagnostics", block)
         self.assertNotIn("ensureScopeDiscovered", block)
 
@@ -566,7 +886,8 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         end = self.page.index("async function viewDiag()", start)
         block = self.page[start:end]
         self.assertIn("metadataApprovalAccessNotice()", block)
-        self.assertIn("loadApprovals(holder,drawerGeneration)", block)
+        self.assertIn(
+            "loadApprovals(holder,canonical,drawerGeneration)", block)
         self.assertIn("metadataProposalPanel(", block)
         self.assertLess(block.index("body.append(holder)"),
                         block.index("body.append(metadataProposalPanel("))
@@ -578,6 +899,20 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         self.assertIn("security.privileged_users", block)
         self.assertIn("Submission can work while old proposals", block)
         self.assertIn("bypasses configured BU-security rows", block)
+        self.assertIn("unauthenticated remote review", block)
+        self.assertIn("no password or SSO identity was checked", block)
+        self.assertIn("allow_unauthenticated_remote_approvals", block)
+
+    def test_remote_decision_sends_the_same_origin_gui_marker(self):
+        block = self.page[self.page.index("/api/approvals/decide"):][:500]
+        self.assertIn("X-PSTB-Approval-Request", block)
+        self.assertIn("metadata-review", block)
+
+    def test_queue_request_is_bound_to_the_active_source(self):
+        block = self.page[self.page.index("async function loadApprovals("):
+                          self.page.index("function metadataProposalUrl(")]
+        self.assertIn("source='+", block)
+        self.assertIn("encodeURIComponent(canonical)", block)
 
     def test_pending_proposals_render_before_decision_history(self):
         start = self.page.index("function renderApprovals(")
