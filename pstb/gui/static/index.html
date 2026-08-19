@@ -4498,6 +4498,7 @@ function renderApprovals(d,holder,refresh){
   const card=el('div','card');
   const items=(d&&d.items)||[];
   const pending=items.filter(i=>i.status==='pending');
+  const history=items.filter(i=>i.status!=='pending');
   card.append(el('h2',null,'Waiting for your decision '+
     (pending.length?'<span class="badge warn">'+pending.length+' pending</span>'
                    :'<span class="badge ok">nothing pending</span>')+
@@ -4512,7 +4513,14 @@ function renderApprovals(d,holder,refresh){
       : 'No facts or meanings have been proposed yet. They appear here when the assistant is taught something in conversation.')));
     holder.append(card); return;
   }
-  items.forEach(item=>{
+  const ordered=[...pending,...history];
+  ordered.forEach((item,itemIndex)=>{
+    if(itemIndex===pending.length&&history.length){
+      const historyLabel=el('div','pad','<b>Previous decisions</b> '+
+        '<span style="color:var(--muted)">approved, rejected and revoked</span>');
+      historyLabel.style.borderTop='1px solid var(--line)';
+      card.append(historyLabel);
+    }
     const row=el('div','pad');
     row.style.borderTop='1px solid var(--line)';
     const badge=item.status==='pending'?'':
@@ -4522,6 +4530,9 @@ function renderApprovals(d,holder,refresh){
       '<span style="color:var(--muted)">'+esc(item.queue==='memory'
         ? 'site fact' : 'meaning \u00b7 '+(item.source||''))+'</span>'+
       '<div style="margin:4px 0">'+esc(item.text||'')+'</div>'+
+      ((item.aliases||[]).length
+        ? '<div style="color:var(--muted);font-size:12px">aliases: '+
+          esc(item.aliases.join(', '))+'</div>' : '')+
       '<div style="color:var(--muted);font-size:12px">'+
       esc(item.origin||'')+(item.proposed?' \u00b7 '+esc(String(item.proposed).slice(0,19)):'')+
       '</div>';
@@ -4635,6 +4646,30 @@ function metadataProposalPanel(source,refresh,drawerGeneration){
   intro.append(form);return intro;
 }
 
+function metadataApprovalAccessNotice(){
+  const sec=(META&&META.security)||{};
+  const box=el('div','card');
+  if(!sec.enabled){
+    box.append(el('div','pad','<span class="badge ok">local operator mode</span> '+
+      'Business-unit security is off; approval review is available only from the app host or an SSH tunnel.'));
+  }else if(!sec.privileged){
+    box.append(el('div','pad','<span class="badge warn">review access missing</span> '+
+      'Signed in as <b>'+esc(sec.oprid||'unknown')+'</b>, but this running process does not recognize that ID in '+
+      '<code>security.privileged_users</code>. Submission can work while old proposals and approval buttons remain protected. '+
+      'Add the ID and restart or reload the app.'));
+  }else if(!sec.approval_peer_loopback){
+    box.append(el('div','pad','<span class="badge warn">local review required</span> '+
+      '<b>'+esc(sec.oprid||'operator')+'</b> is privileged and bypasses BU security, but proposal content and decisions are '+
+      'machine-local. Open this page on the host or through the SSH tunnel shown below.'));
+  }else{
+    box.append(el('div','pad','<span class="badge ok">review access ready</span> '+
+      '<b>'+esc(sec.oprid||'host operator')+'</b>'+
+      (sec.enabled?' is privileged and bypasses configured BU-security rows.':' can review locally.')+
+      ' Pending suggestions are listed first.'));
+  }
+  return box;
+}
+
 /* This entry point deliberately bypasses Diagnostics. Diagnostics first
    discovers a Finance scope and runs catalog checks; neither is relevant to
    reviewing a P2Go metadata meaning, and both can be unavailable to an
@@ -4646,7 +4681,11 @@ function openApprovals(source){
   $('#dtitle').textContent='Metadata meanings · '+descriptor.label;
   const body=$('#dbody');body.innerHTML='';
   const holder=el('div');body.append(holder);
-  body.prepend(metadataProposalPanel(
+  // Existing suggestions and any access refusal belong above the creation
+  // form.  The old ordering put a large form first, so the very proposal an
+  // operator came to approve was commonly below the fold.
+  body.prepend(metadataApprovalAccessNotice());
+  body.append(metadataProposalPanel(
     canonical,()=>loadApprovals(holder,drawerGeneration),drawerGeneration));
   $('#drawer').classList.add('on');$('#scrim').classList.add('on');
   loadApprovals(holder,drawerGeneration);
