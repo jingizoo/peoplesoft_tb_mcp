@@ -139,6 +139,30 @@ def amount_col(db: Database, amount_basis: str, alias: str = "L") -> str:
     return f"{alias}.POSTED_TOTAL_AMT"
 
 
+def nonblank(col: str) -> str:
+    """Predicate for "this column has a non-blank value", true on BOTH dialects.
+
+    Oracle stores the empty string AS NULL. So `x <> ''` is `x <> NULL`, which
+    is UNKNOWN for every row including the populated ones — the predicate
+    matches nothing and the query silently returns an empty set. `x = ''` is
+    UNKNOWN the same way. Neither raises; both just quietly answer "no rows",
+    and on SQLite, where '' is a real value distinct from NULL, both behave as
+    written. That asymmetry is invisible in development and wrong in
+    production.
+
+    A companion `IS NOT NULL` does not rescue `<> ''` — the UNKNOWN from the
+    second predicate still fails the AND.
+
+    LENGTH(TRIM(x)) > 0 is UNKNOWN only for values that really are NULL or
+    blank, which is the answer those rows should get anyway.
+
+    Lives here, beside the other dialect rules, rather than in a feature
+    module: four call sites re-derived this independently and three got it
+    wrong. tests/test_oracle_blank_predicates.py bans the raw forms.
+    """
+    return f"LENGTH(TRIM({col})) > 0"
+
+
 def asof_expr(db: Database, params: dict, as_of: str = "",
               key: str = "asof") -> str:
     """SQL for the date effective-dated master data should be read AT.

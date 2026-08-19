@@ -526,3 +526,42 @@ class EndpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeaderRowInjectionTests(unittest.TestCase):
+    """A pivot's COLUMNS are database values, so the header needs the same
+    neutralising the cells already get.
+
+    to_csv passed `columns` straight to writerow while every data cell went
+    through _cell. On a pivot the column labels come from the database —
+    account descriptions, customer names, period labels — so poisoning
+    PS_GL_ACCOUNT_TBL.DESCR put the payload on the one row Excel evaluates
+    first, under a module docstring promising "no formula injection".
+    """
+
+    RISKY = ("=cmd|'/C calc.exe'!A0", "+1+1", "-2+3", "@SUM(A1:A9)")
+
+    def test_a_poisoned_column_label_is_neutralised(self):
+        from pstb.export import to_csv
+        for payload in self.RISKY:
+            with self.subTest(payload=payload):
+                csv_text = to_csv({"columns": ["account", payload],
+                                   "rows": [{"account": "1000", payload: 1}]})
+                header = csv_text.lstrip("﻿").splitlines()[0]
+                self.assertNotIn(f",{payload}", header,
+                                 "the label reached Excel as a formula")
+                self.assertIn("'" + payload, header)
+
+    def test_ordinary_headers_are_untouched(self):
+        from pstb.export import to_csv
+        csv_text = to_csv({"columns": ["account", "Ending DR", "FY2026 P6"],
+                           "rows": []})
+        self.assertEqual(csv_text.lstrip("﻿").splitlines()[0],
+                         "account,Ending DR,FY2026 P6")
+
+    def test_the_row_cells_still_work(self):
+        """Guard against fixing the header by breaking what already worked."""
+        from pstb.export import to_csv
+        csv_text = to_csv({"columns": ["vendor"],
+                           "rows": [{"vendor": "=cmd|'/C calc'!A0"}]})
+        self.assertIn("'=cmd", csv_text)

@@ -62,7 +62,11 @@ report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 relationships = Relationships(ar)
 from ..modules import ModulePacks as _MP
-vendor_network = VendorNetwork(_MP(engine))
+# One pack, shared by the vendor-network and vendor-search endpoints.
+# /api/vendors referenced a bare `modules` that was never defined here,
+# so browser vendor search raised NameError and 500'd for every caller.
+modules = _MP(engine)
+vendor_network = VendorNetwork(modules)
 from ..entitygraph import EntityGraph as _EG, graph_path as _eg_path
 from ..procgraph import ProcessGraph as _PG, graph_path as _pg_path
 from ..procurement import Procurement as _Proc
@@ -2802,6 +2806,7 @@ def _console_reload() -> dict:
     plainly that the chat path needs a restart.
     """
     global cfg, db, engine, ar, report_runner, relationships
+    global modules, vendor_network, procurement
     reloaded: list = []
     # Adopt what the console just wrote to .env BEFORE rebuilding. dotenv
     # loads with override=False, so os.environ still holds the values from
@@ -2836,13 +2841,22 @@ def _console_reload() -> dict:
         new_ar = ARBilling(new_engine)
         new_relationships = Relationships(new_ar)
         new_report = ReportRunner(new_engine)
+        # Built from the pack, so they must be rebuilt with it. Left behind,
+        # they keep answering from the PREVIOUS database after a reload —
+        # which is the failure mode a reload exists to prevent.
+        new_modules = _MP(new_engine)
+        new_vendor_network = VendorNetwork(new_modules)
+        new_procurement = _Proc(new_modules)
     except Exception as e:
         # The old objects are still live and serving; say so.
         return {"reloaded": [],
                 "error": f"kept the running configuration: {e}"}
     cfg, db, engine, ar, report_runner, relationships = (
         fresh, new_db, new_engine, new_ar, new_report, new_relationships)
-    reloaded = ["trial balance", "AR and billing", "reports", "diagnostics"]
+    modules, vendor_network, procurement = (
+        new_modules, new_vendor_network, new_procurement)
+    reloaded = ["trial balance", "AR and billing", "reports", "diagnostics",
+                "vendors and procurement"]
     _scope_cache.update({"value": None, "expires": 0.0})
     reloaded.append("scope catalog")
     return {"reloaded": reloaded}

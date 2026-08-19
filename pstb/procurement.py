@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+from . import queries as q
 from .engine import r2
 from .modules import ModuleError, ModulePacks, _iso
 from .engine import resolve_party_ref
@@ -190,8 +191,8 @@ class Procurement:
             f"FROM {p}PS_VOUCHER_LINE L "
             f"JOIN {p}PS_VOUCHER V ON V.BUSINESS_UNIT = L.BUSINESS_UNIT "
             f"AND V.VOUCHER_ID = L.VOUCHER_ID "
-            f"WHERE L.BUSINESS_UNIT = :bu AND L.PO_ID IS NOT NULL "
-            f"AND L.PO_ID <> '' AND V.INVOICE_DT >= :since "
+            f"WHERE L.BUSINESS_UNIT = :bu "
+            f"AND {q.nonblank('L.PO_ID')} AND V.INVOICE_DT >= :since "
             f"AND V.INVOICE_DT <= :asof",
             {"bu": bu, "since": since, "asof": asof},
             max_rows=DETAIL_CAP * 4)
@@ -651,7 +652,7 @@ class Procurement:
             rows, _ = self.db.query(
                 f"SELECT DISTINCT PO_ID AS x FROM {p}PS_VOUCHER_LINE "
                 "WHERE BUSINESS_UNIT = :bu AND UPPER(VOUCHER_ID) = :r "
-                "AND PO_ID IS NOT NULL AND PO_ID <> '' ORDER BY PO_ID",
+                f"AND {q.nonblank('PO_ID')} ORDER BY PO_ID",
                 {"bu": bu, "r": r}, max_rows=PO_CAP + 1)
             if rows:
                 return ([str(x["x"]) for x in rows],
