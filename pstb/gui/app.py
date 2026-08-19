@@ -1456,6 +1456,15 @@ def meta(request: Request = None):
         meta_signed_in = True
     except HTTPException:
         meta_access, meta_signed_in = None, not row_security.enabled
+    approval_peer_loopback = bool(
+        request is None
+        or localguard.peer_is_loopback(request.scope.get("client")))
+    approval_privileged = bool(
+        meta_access is not None
+        and getattr(meta_access, "privileged", False))
+    approval_review_ready = bool(
+        approval_peer_loopback
+        and (not row_security.enabled or approval_privileged))
     out = {
         "defaults": {
             "business_unit": d.business_unit,
@@ -1502,6 +1511,13 @@ def meta(request: Request = None):
                      "oprid": (meta_access.oprid if meta_access else ""),
                      "all_units": (meta_access.all_units
                                    if meta_access else True),
+                     # Approval submission is intentionally broader than
+                     # review.  Surface the distinction so a signed-in user
+                     # does not mistake a working form for authority to read
+                     # or decide the private queue.
+                     "privileged": approval_privileged,
+                     "approval_peer_loopback": approval_peer_loopback,
+                     "approval_review_ready": approval_review_ready,
                      "is_authentication": False},
         "raw_sql": cfg.tools.allow_raw_sql,
     }
@@ -2169,13 +2185,20 @@ def list_approvals(request: Request = None, status: str = "pending"):
             })
             continue
         for row in proposals or []:
+            schema = str(row.get("schema") or "")
+            object_name = str(row.get("object") or "")
+            physical = (f"{schema}.{object_name}"
+                        if schema and object_name else "")
             items.append({
                 "queue": "source_knowledge",
                 "source": name,
                 "id": row.get("proposal_id") or row.get("id"),
                 "text": row.get("meaning") or row.get("text"),
                 "kind": row.get("kind") or "metadata meaning",
-                "subject": row.get("object_id") or row.get("object") or "",
+                "subject": physical or row.get("object_id") or object_name,
+                "schema": schema,
+                "object": object_name,
+                "aliases": list(row.get("aliases") or []),
                 "origin": row.get("origin") or "proposed in conversation",
                 "proposed": row.get("proposed_at") or row.get("proposed"),
                 "status": row.get("status"),

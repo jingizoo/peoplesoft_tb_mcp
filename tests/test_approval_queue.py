@@ -158,6 +158,10 @@ class ApprovalQueueTests(unittest.TestCase):
                 self.assertEqual(signed.status_code, 200)
                 self.assertTrue(signed.json()["privileged"])
                 self.assertTrue(signed.json()["all_units"])
+                meta = client.get("/api/meta").json()["security"]
+                self.assertTrue(meta["privileged"])
+                self.assertTrue(meta["approval_peer_loopback"])
+                self.assertTrue(meta["approval_review_ready"])
                 self.assertEqual(client.get("/api/approvals").status_code, 200)
         finally:
             gui.row_security.invalidate("BATCH1")
@@ -374,6 +378,25 @@ class ApprovalBadgeCountTests(unittest.TestCase):
                          {"default", "p2go"})
         self.assertTrue(body["readable"])
 
+    def test_listing_uses_recognizable_physical_names_and_aliases(self):
+        registry = SimpleNamespace(names=lambda: ["p2go"])
+        store = SimpleNamespace(list_proposals=lambda status: [{
+            "id": "p1", "meaning": "Inbound integration jobs",
+            "schema": "P2GO", "object": "JOB_HDR",
+            "object_id": "object:p2go:P2GO:JOB_HDR",
+            "aliases": ["job queue", "inbound jobs"],
+            "status": "pending",
+        }])
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             return_value=store):
+            item = next(i for i in self.client.get("/api/approvals").json()[
+                "items"] if i["queue"] == "source_knowledge")
+        self.assertEqual(item["subject"], "P2GO.JOB_HDR")
+        self.assertEqual(item["schema"], "P2GO")
+        self.assertEqual(item["object"], "JOB_HDR")
+        self.assertEqual(item["aliases"], ["job queue", "inbound jobs"])
+
     def test_listing_discloses_an_unreadable_source_queue(self):
         registry = SimpleNamespace(names=lambda: ["default"])
         private = "/shared/secret/source_knowledge.db: ORA-01017"
@@ -537,6 +560,31 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         self.assertIn("loadApprovals(holder,drawerGeneration)", block)
         self.assertNotIn("/api/diagnostics", block)
         self.assertNotIn("ensureScopeDiscovered", block)
+
+    def test_existing_approvals_and_access_state_are_above_the_form(self):
+        start = self.page.index("function openApprovals(source)")
+        end = self.page.index("async function viewDiag()", start)
+        block = self.page[start:end]
+        self.assertIn("metadataApprovalAccessNotice()", block)
+        self.assertIn("loadApprovals(holder,drawerGeneration)", block)
+        self.assertIn("metadataProposalPanel(", block)
+        self.assertLess(block.index("body.append(holder)"),
+                        block.index("body.append(metadataProposalPanel("))
+
+    def test_privilege_notice_explains_submit_without_review_access(self):
+        start = self.page.index("function metadataApprovalAccessNotice()")
+        end = self.page.index("function openApprovals(source)", start)
+        block = self.page[start:end]
+        self.assertIn("security.privileged_users", block)
+        self.assertIn("Submission can work while old proposals", block)
+        self.assertIn("bypasses configured BU-security rows", block)
+
+    def test_pending_proposals_render_before_decision_history(self):
+        start = self.page.index("function renderApprovals(")
+        end = self.page.index("async function loadApprovals(", start)
+        block = self.page[start:end]
+        self.assertIn("const ordered=[...pending,...history]", block)
+        self.assertIn("Previous decisions", block)
 
     def test_drawer_async_writes_are_generation_fenced(self):
         self.assertIn("let DRAWER_GENERATION=0", self.page)
