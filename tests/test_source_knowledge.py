@@ -8,6 +8,7 @@ current source fingerprint and catalog identity.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -879,6 +880,59 @@ class SourceKnowledgeTests(unittest.TestCase):
             same_column_only["detail"],
         )
 
+
+class NeverBuiltSidecarTests(unittest.TestCase):
+    """A source that was never taught must read as an empty queue.
+
+    The parent directory is created the moment ANY source is taught. From
+    then on, reading a second, never-taught source took the "sidecar
+    absent" path -- which closed the pinned directory fd and returned,
+    leaving the finally block to close the same descriptor a second time.
+
+    The visible half is OSError EBADF, which the GUI listing swallowed, so
+    the whole metadata queue silently vanished. The dangerous half is fd
+    reuse: if the runtime has handed that number to something else between
+    the two closes, the second close destroys a live handle and the read
+    returns normally. list_approvals is a sync def, so Starlette runs it in
+    a worker thread -- the victim can be another request's socket.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="pstb-sidecar-")
+        self.root = Path(self.tmp.name) / "source_knowledge"
+        self.fp = "sha256:" + ("a" * 64)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _store(self, name):
+        from pstb.source_knowledge import SourceKnowledge
+        return SourceKnowledge(self.root / f"{name}.db", source=name,
+                               source_fingerprint=self.fp)
+
+    def test_an_untaught_source_reads_as_empty_once_another_was_taught(self):
+        taught = self._store("default")
+        taught.propose(object_id="table:" + "0" * 24, schema="SYSADM",
+                       object_name="PS_VOUCHER", object_kind="table",
+                       meaning="accounts payable voucher header")
+        self.assertTrue(self.root.exists(), "precondition: parent now exists")
+        self.assertEqual(self._store("p2go").list_proposals("pending"), [])
+
+    def test_the_pinned_directory_is_closed_exactly_once(self):
+        self._store("default").propose(
+            object_id="table:" + "0" * 24, schema="SYSADM",
+            object_name="PS_VOUCHER", object_kind="table",
+            meaning="accounts payable voucher header")
+        closed, real_close = [], os.close
+
+        def spy(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        with patch.object(os, "close", spy):
+            self._store("p2go").list_proposals("pending")
+        self.assertEqual(len(closed), len(set(closed)),
+                         f"a descriptor was closed twice: {closed}")
 
 if __name__ == "__main__":
     unittest.main()

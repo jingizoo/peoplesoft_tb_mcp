@@ -58,6 +58,29 @@ class SourceRegistry:
         """The default source first, then the configured extras."""
         return ["default"] + sorted(self.cfg.sources)
 
+    def _configured_as(self, name: str) -> str:
+        """The configured source matching this name, case-insensitively.
+
+        __init__ already refuses two sources that differ only by case, so at
+        most one can match. The alias tests below asked
+        ``name not in cfg.sources`` -- an exact-case test guarding a
+        case-insensitive alias list, so a site with a source literally named
+        "gl" or "main" or "erp" had "GL" answered from the PeopleSoft
+        primary instead. That is a silent cross-database misroute, and on
+        the approvals path it would apply a decision to the wrong source's
+        review queue.
+        """
+        if not name:
+            return ""
+        configured = self.cfg.sources or {}
+        if name in configured:
+            return name
+        folded = name.casefold()
+        for candidate in configured:
+            if str(candidate).casefold() == folded:
+                return str(candidate)
+        return ""
+
     def resolve_name(self, source: str = "") -> str:
         """The canonical name get() would answer from, for provenance.
 
@@ -71,10 +94,13 @@ class SourceRegistry:
         name = (source or "").strip()
         if name in ("", "default"):
             return "default"
-        if (name.lower() in _PRIMARY_ALIASES
-                and name not in (self.cfg.sources or {})):
+        configured = self._configured_as(name)
+        if name.lower() in _PRIMARY_ALIASES and not configured:
             return "default"
-        return name
+        # Report the spelling the site configured, not the caller's casing:
+        # provenance that varies by how the name was typed makes one source
+        # look like several.
+        return configured or name
 
     def get(self, source: str = "") -> Database:
         """Database for a named source; '' or 'default' is the primary.
@@ -90,9 +116,10 @@ class SourceRegistry:
         # spends a whole turn on a correction that teaches nothing — accept
         # the obvious aliases, unless the site has configured a real source
         # under that name, which always wins.
-        if (name.lower() in _PRIMARY_ALIASES
-                and name not in (self.cfg.sources or {})):
+        configured = self._configured_as(name)
+        if name.lower() in _PRIMARY_ALIASES and not configured:
             return self._primary
+        name = configured or name
         if name not in self.cfg.sources:
             raise DbError(
                 f"Unknown source {name!r}. Configured sources: "
