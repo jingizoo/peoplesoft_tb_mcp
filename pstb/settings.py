@@ -111,20 +111,24 @@ SETTINGS: tuple = (
     Setting("ps_api.max_rows", "QAS row cap",
             "Upper bound on rows returned by one query.",
             "int", minimum=1, maximum=100000, restart=True),
+# These three are applied live by the console reload, which rebuilds
+# RowSecurity against the new configuration. Nothing else reads them —
+# pstb/server.py never touches cfg.security — so there is no second live
+# surface to disagree, and a "restart to apply" pill on them is false.
     Setting("security.enabled", "Restrict data by business unit",
             "On: each person signs in with their user ID and sees only the "
             "business units the finance system grants them. This is a scope "
             "selector, not a login — no password is asked for or checked. "
             "Run scripts/diagnose_bu_security.py on the host first.",
-            "bool", restart=True),
+            "bool", restart=False),
     Setting("security.on_unavailable", "If security cannot be read",
             "refuse shows nothing and names the missing grant; allow "
             "degrades to full access. Refuse unless you have a reason.",
-            "choice", choices=("refuse", "allow"), restart=True),
+            "choice", choices=("refuse", "allow"), restart=False),
     Setting("security.raw_sql_for_restricted", "Ad-hoc SQL for restricted users",
             "Off: only privileged users run run_sql. Ad-hoc SQL writes its "
             "own WHERE clause, so no check can bound it to a unit.",
-            "bool", restart=True),
+            "bool", restart=False),
     Setting("tools.max_rows", "Tool row cap",
             "Upper bound on rows any curated tool returns.",
             "int", minimum=1, maximum=100000, restart=True),

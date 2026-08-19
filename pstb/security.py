@@ -41,7 +41,7 @@ import threading
 import time
 import contextvars
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .db import DbError
 
@@ -64,6 +64,12 @@ ROW_SECURITY_FIELD = "ROWSECCLASS"
 # front of everything. Short enough that a grant added during a support call
 # takes effect without a restart.
 ACCESS_TTL_SECONDS = 300
+
+# A discovered record is installation metadata, but it is still live
+# metadata: grants can be added after the process starts and a temporary
+# catalog outage must not become the answer until restart.  Only a positive
+# discovery is cached, and even that is periodically revalidated.
+SOURCE_TTL_SECONDS = 300
 
 
 class SecurityError(Exception):
@@ -151,12 +157,25 @@ def _normalise(values) -> frozenset:
 class RowSecurity:
     """Reads PeopleSoft's business-unit security for a user ID."""
 
-    def __init__(self, db, cfg):
+    def __init__(self, db, cfg,
+                 clock: Callable[[], float] = time.monotonic):
         self.db = db
         self.cfg = cfg
+        self._clock = clock
         self._cache: dict = {}
         self._lock = threading.RLock()
-        self._source_cache: Optional[tuple] = None
+        self._source_cache: Optional[tuple[float, tuple]] = None
+        # Invalidation can race a slow catalog/access query.  A generation
+        # makes the clear linearizable: work that began before invalidate()
+        # may finish for its caller, but it cannot repopulate either cache.
+        self._cache_generation = 0
+        # Invalidation is not the only ordering hazard: two ordinary misses
+        # can overlap and the older snapshot can finish last.  Only the most
+        # recently started attempt for a user/source is allowed to publish.
+        self._access_attempt_sequence = 0
+        self._latest_access_attempt: dict[str, int] = {}
+        self._source_attempt_sequence = 0
+        self._latest_source_attempt: Optional[int] = None
 
     # ---- configuration ---------------------------------------------------
     @property
@@ -179,12 +198,21 @@ class RowSecurity:
     def source_record(self) -> tuple:
         """(record, key_field, kind) for this site, or ("", "", "none").
 
-        Probed once and remembered: the catalog lookup is itself a query,
-        and this is asked on every sign-in.
+        Positive discoveries are remembered briefly: the catalog lookup is
+        itself a query, and this is asked on every sign-in.  A negative probe
+        is never cached because it can mean a transient connection or grant
+        failure rather than "this installation has no security record".
         """
         with self._lock:
-            if self._source_cache is not None:
-                return self._source_cache
+            now = self._clock()
+            hit = self._source_cache
+            if hit is not None and now < hit[0]:
+                return hit[1]
+            self._source_cache = None
+            generation = self._cache_generation
+            self._source_attempt_sequence += 1
+            attempt = self._source_attempt_sequence
+            self._latest_source_attempt = attempt
         configured = str(getattr(self._sec, "unit_record", "") or "").strip()
         if configured:
             key = (str(getattr(self._sec, "unit_key", "") or "OPRID").strip()
@@ -200,7 +228,13 @@ class RowSecurity:
                     found = (record, key, kind)
                     break
         with self._lock:
-            self._source_cache = found
+            if found[0]:
+                if (generation == self._cache_generation
+                        and attempt == self._latest_source_attempt):
+                    self._source_cache = (
+                        self._clock() + SOURCE_TTL_SECONDS, found)
+            if attempt == self._latest_source_attempt:
+                self._latest_source_attempt = None
         return found
 
     def _columns(self, record: str) -> set:
@@ -208,6 +242,7 @@ class RowSecurity:
             return {c.upper() for c in self.db.columns(record)}
         except Exception:
             return set()
+
 
     # ---- the question ----------------------------------------------------
     def access_for(self, oprid: str) -> Access:
@@ -221,18 +256,46 @@ class RowSecurity:
                           detail=("Business-unit security is switched off "
                                   "for this deployment "
                                   "(security.enabled: false)."))
-        now = time.monotonic()
         with self._lock:
+            now = self._clock()
             hit = self._cache.get(who)
             if hit and now < hit[0]:
                 return hit[1]
-        access = self._resolve(who)
+            generation = self._cache_generation
+            self._access_attempt_sequence += 1
+            attempt = self._access_attempt_sequence
+            self._latest_access_attempt[who] = attempt
+        try:
+            access = self._resolve(who)
+        except BaseException:
+            with self._lock:
+                if self._latest_access_attempt.get(who) == attempt:
+                    self._latest_access_attempt.pop(who, None)
+            raise
+        # "Unavailable" is not a PeopleSoft grant.  In fail-open mode it is
+        # represented as all-units so the request can proceed, but remembering
+        # that answer would keep broad access alive after the database or grant
+        # recovers.  Valid empty grants remain cacheable: those are an
+        # authoritative result from the configured security record.
         with self._lock:
-            self._cache[who] = (now + ACCESS_TTL_SECONDS, access)
+            if access.source != "unavailable":
+                if (generation == self._cache_generation
+                        and self._latest_access_attempt.get(who) == attempt):
+                    # Bound a grant from the start of its statement-consistent
+                    # read.  A slow query must not extend a revoked grant by
+                    # its latency; an already-expired entry simply refreshes
+                    # on the next request.
+                    self._cache[who] = (
+                        now + ACCESS_TTL_SECONDS, access)
+            if self._latest_access_attempt.get(who) == attempt:
+                self._latest_access_attempt.pop(who, None)
         return access
 
     def invalidate(self, oprid: str = "") -> None:
         with self._lock:
+            self._cache_generation += 1
+            self._latest_access_attempt.clear()
+            self._latest_source_attempt = None
             if oprid:
                 self._cache.pop(oprid.strip().upper(), None)
             else:
@@ -268,8 +331,10 @@ class RowSecurity:
             units = (self._units_by_user(record, key, who) if kind == "user"
                      else self._units_by_class(record, key, who))
         except DbError as e:
+            dependency = (record if kind == "user" else
+                          f"{record} or {OPERATOR_RECORD}.{ROW_SECURITY_FIELD}")
             return self._unavailable(
-                who, f"Could not read {record}: {e}. A read-only reporting "
+                who, f"Could not read {dependency}: {e}. A read-only reporting "
                      f"account often lacks SELECT on the security records; "
                      f"that grant is what this needs.")
         if not units:
@@ -335,13 +400,41 @@ class RowSecurity:
         return _normalise(r.get("bu") for r in rows)
 
     def _row_security_classes(self, who: str) -> frozenset:
-        cols = self._columns(OPERATOR_RECORD)
-        if ROW_SECURITY_FIELD not in cols:
+        """Row-security classes for a user, or frozenset() if this site has none.
+
+        Two situations must not share an answer, and the catalog cannot tell
+        them apart: on Oracle a table you lack SELECT on DESCRIBES AS ZERO
+        COLUMNS rather than raising, so "no ROWSECCLASS column" and "no grant
+        on PSOPRDEFN" look identical from db.columns().
+
+        Reading a failure as absence manufactures an authoritative empty
+        grant out of an outage. Reading absence as a failure hands every user
+        all_units on a fail-open site, for a schema shape that is stable and
+        legitimate — sites really do expose a read-only PSOPRDEFN view
+        without the column.
+
+        So neither is inferred from the catalog. The query runs, and if it
+        fails we ask a question the catalog cannot fudge: is PSOPRDEFN
+        readable AT ALL? A successful OPRID read alongside a failing
+        ROWSECCLASS read means the table is granted and the column is
+        genuinely absent. Both failing means we cannot see the record, which
+        is an outage and must reach _resolve() as unavailable.
+        """
+        try:
+            rows, _ = self.db.query(
+                f"SELECT {ROW_SECURITY_FIELD} AS cls "
+                f"FROM {self.db.prefix}{OPERATOR_RECORD} "
+                "WHERE UPPER(OPRID) = :who", {"who": who}, max_rows=10)
+        except DbError:
+            try:
+                self.db.query(
+                    f"SELECT OPRID FROM {self.db.prefix}{OPERATOR_RECORD} "
+                    "WHERE UPPER(OPRID) = :who", {"who": who}, max_rows=1)
+            except DbError:
+                raise               # cannot read the record: a real outage
+            # The record is readable, so the column is the thing missing.
+            # That is an authoritative "this site has no classes".
             return frozenset()
-        rows, _ = self.db.query(
-            f"SELECT {ROW_SECURITY_FIELD} AS cls "
-            f"FROM {self.db.prefix}{OPERATOR_RECORD} "
-            "WHERE UPPER(OPRID) = :who", {"who": who}, max_rows=10)
         return _normalise(r.get("cls") for r in rows)
 
     # ---- what the console and the diagnose script report ------------------

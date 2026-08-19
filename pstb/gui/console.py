@@ -170,6 +170,22 @@ def register(app, get_cfg, on_reload) -> None:
         if not isinstance(changes, dict) or not changes:
             return _refuse(400, "Nothing to save.")
 
+        # Settings the live reload really applies, keyed to the label
+        # _console_reload reports for them. Membership here is a CLAIM about
+        # the running process, so it is proved rather than asserted: the
+        # key is dropped from restart_required only when that label actually
+        # comes back in `reloaded`.
+        #
+        # These three are read by pstb/security.py and pstb/gui/app.py and by
+        # nothing else — pstb/server.py never touches cfg.security — so the
+        # "two live surfaces would disagree" reasoning behind their restart
+        # flag does not apply to them. Adding row_security to the reload made
+        # them live; the flag stayed True and started lying.
+        live_on_reload = {
+            "security.enabled": "business-unit security",
+            "security.on_unavailable": "business-unit security",
+            "security.raw_sql_for_restricted": "business-unit security",
+        }
         clean, restart_needed = {}, []
         for key, raw in changes.items():
             try:
@@ -183,7 +199,7 @@ def register(app, get_cfg, on_reload) -> None:
                     f"{spec.label} is currently forced by {spec.env_var} "
                     "in .env, so saving here would change nothing.",
                     f"Remove {spec.env_var} from .env first.")
-            if spec.restart:
+            if spec.restart and key not in live_on_reload:
                 restart_needed.append(spec.label)
 
         # Merge over whatever the overlay already holds, so one save does
@@ -211,11 +227,31 @@ def register(app, get_cfg, on_reload) -> None:
         saved_as = st.backup(overlay_path)
         st.atomic_write(overlay_path, text)
         report = on_reload()
+        reload_error = str(report.get("error") or "").strip()[:1000]
         return {
             "ok": True, "saved": sorted(clean),
             "backup": saved_as,
             "reloaded": report.get("reloaded", []),
-            "restart_required": sorted(set(restart_needed)),
+            # Saving and applying are separate outcomes.  The validated file
+            # remains the next-start configuration when a live rebuild fails,
+            # but the operator must not be told that the running policy moved.
+            "applied": not bool(reload_error),
+            "reload_error": reload_error,
+            # A key claimed live must have been proved live. If the reload
+            # failed, or it did not report the label, the setting is on disk
+            # and NOT running — which is exactly the restart case.
+            "restart_required": sorted(set(
+                restart_needed
+                + [st.BY_KEY[k].label for k in clean
+                   if k in live_on_reload
+                   and (reload_error
+                        or live_on_reload[k] not in report.get("reloaded", []))]
+            )),
+            "applied_live": sorted({
+                st.BY_KEY[k].label for k in clean
+                if k in live_on_reload and not reload_error
+                and live_on_reload[k] in report.get("reloaded", [])
+            }),
             "restart_note": (
                 "These take effect when the service is restarted. The "
                 "running answer engine is a separate process that binds its "

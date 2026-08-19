@@ -6,7 +6,7 @@ import dis
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -598,3 +598,223 @@ class EndpointWiringTests(unittest.TestCase):
                 self.assertIn(name, source,
                               f"{name} survives a reload pointing at the old "
                               "database")
+
+    def test_guard_preserves_an_intentional_retryable_http_status(self):
+        import pstb.gui.app as app
+
+        def retryable():
+            raise HTTPException(status_code=503, detail="retry scope load")
+
+        with self.assertRaises(HTTPException) as ctx:
+            app._guard(retryable)
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "retry scope load")
+
+    def test_reload_rebuilds_row_security_with_fresh_identity_and_caches(self):
+        """A reload must not carry old grants or discovery into the new DB."""
+        import pstb.gui.app as app
+        from pstb.security import RowSecurity
+
+        root = app.cfg.root
+        old_cfg = SimpleNamespace(
+            root=root,
+            security=SimpleNamespace(
+                enabled=True, privileged_users=["OLDADMIN"],
+                on_unavailable="refuse"),
+        )
+        fresh_cfg = SimpleNamespace(
+            root=root,
+            security=SimpleNamespace(
+                enabled=True, privileged_users=["NEWADMIN"],
+                on_unavailable="refuse"),
+        )
+        old_db = SimpleNamespace(close=Mock())
+        new_db = SimpleNamespace(close=Mock())
+        stale_catalog = {"scopes": [{"business_unit": "OLD01"}]}
+        old_engine = SimpleNamespace(
+            list_financial_scopes=Mock(return_value=stale_catalog))
+        new_engine = object()
+        old_security = RowSecurity(old_db, old_cfg)
+        old_security._cache["OLDUSER"] = (time.monotonic() + 600, object())
+        old_source_expiry = time.monotonic() + 600
+        old_security._source_cache = (
+            old_source_expiry, ("PS_OLD_SEC", "OPRID", "user"))
+        old_objects = {
+            "ar": object(),
+            "report_runner": object(),
+            "relationships": object(),
+            "modules": object(),
+            "vendor_network": object(),
+            "procurement": object(),
+        }
+        new_objects = {name: object() for name in old_objects}
+        scope_cache = {
+            "value": object(), "expires": 123.0,
+            "refreshing": True, "generation": 7,
+        }
+
+        with (
+            patch.multiple(
+                app, cfg=old_cfg, db=old_db, engine=old_engine,
+                row_security=old_security, _scope_cache=scope_cache,
+                **old_objects),
+            patch.object(app, "load_config", return_value=fresh_cfg),
+            patch.object(app, "Database", return_value=new_db),
+            patch.object(app, "TBEngine", return_value=new_engine),
+            patch.object(app, "ARBilling", return_value=new_objects["ar"]),
+            patch.object(
+                app, "Relationships",
+                return_value=new_objects["relationships"]),
+            patch.object(
+                app, "ReportRunner",
+                return_value=new_objects["report_runner"]),
+            patch.object(app, "_MP", return_value=new_objects["modules"]),
+            patch.object(
+                app, "VendorNetwork",
+                return_value=new_objects["vendor_network"]),
+            patch.object(
+                app, "_Proc", return_value=new_objects["procurement"]),
+            patch.object(app.threading, "Thread") as thread_ctor,
+            patch.object(app, "_persist_scope_catalog") as persist,
+            patch("dotenv.dotenv_values", return_value={}),
+        ):
+            # Schedule against the old engine but hold the worker until the
+            # new configuration has invalidated its cache generation.
+            app._refresh_scope_catalog_async()
+            stale_worker = thread_ctor.call_args.kwargs["target"]
+            result = app._console_reload()
+            stale_worker()
+            current = app.row_security
+
+            self.assertIs(app.cfg, fresh_cfg)
+            self.assertIs(app.db, new_db)
+            self.assertIs(app.engine, new_engine)
+            self.assertIsNot(current, old_security)
+            self.assertIs(current.db, new_db)
+            self.assertIs(current.cfg, fresh_cfg)
+            self.assertEqual(current.privileged_users, frozenset({"NEWADMIN"}))
+            self.assertEqual(current._cache, {})
+            self.assertIsNone(current._source_cache)
+            self.assertIn("OLDUSER", old_security._cache)
+            self.assertEqual(
+                old_security._source_cache,
+                (old_source_expiry, ("PS_OLD_SEC", "OPRID", "user")))
+            self.assertIn("business-unit security", result["reloaded"])
+            self.assertEqual(
+                scope_cache,
+                {"value": None, "expires": 0.0,
+                 "refreshing": False, "generation": 8})
+            old_engine.list_financial_scopes.assert_called_once_with(
+                include_activity=False)
+            persist.assert_not_called()
+            old_db.close.assert_not_called()
+            new_db.close.assert_not_called()
+
+    def test_force_scope_build_retries_after_reload_generation_changes(self):
+        """An in-flight old catalog is discarded, not returned as current."""
+        import threading
+        import pstb.gui.app as app
+
+        started = threading.Event()
+        release = threading.Event()
+        old_catalog = {"scopes": [{"business_unit": "OLD01"}]}
+        new_catalog = {"scopes": [{"business_unit": "NEW01"}]}
+
+        def old_build(**_kwargs):
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release old scope build")
+            return old_catalog
+
+        old_engine = SimpleNamespace(
+            list_financial_scopes=Mock(side_effect=old_build))
+        new_engine = SimpleNamespace(
+            list_financial_scopes=Mock(return_value=new_catalog))
+        scope_cache = {
+            "value": None, "expires": 0.0,
+            "refreshing": False, "generation": 9,
+        }
+        results, errors = [], []
+
+        def build() -> None:
+            try:
+                results.append(app._financial_scope_catalog(force=True))
+            except BaseException as exc:  # captured for the test thread
+                errors.append(exc)
+
+        with (
+            patch.multiple(app, engine=old_engine, _scope_cache=scope_cache),
+            patch.object(app, "_persist_scope_catalog") as persist,
+        ):
+            worker = threading.Thread(target=build, daemon=True)
+            worker.start()
+            did_start = started.wait(3)
+            if did_start:
+                with app._scope_cache_lock:
+                    app.engine = new_engine
+                    scope_cache.update({
+                        "value": None, "expires": 0.0,
+                        "refreshing": False, "generation": 10,
+                    })
+            release.set()
+            worker.join(3)
+
+            self.assertTrue(did_start, "old scope build never reached barrier")
+            self.assertFalse(worker.is_alive(), "scope build did not finish")
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [new_catalog])
+            self.assertIs(scope_cache["value"], new_catalog)
+            self.assertEqual(scope_cache["generation"], 10)
+            old_engine.list_financial_scopes.assert_called_once_with(
+                include_activity=False)
+            new_engine.list_financial_scopes.assert_called_once_with(
+                include_activity=False)
+            persist.assert_called_once_with(new_catalog)
+
+    def test_row_security_construction_failure_preserves_every_old_object(self):
+        """A bad replacement cannot split security from the serving graph."""
+        import pstb.gui.app as app
+
+        root = app.cfg.root
+        old_cfg = SimpleNamespace(root=root)
+        fresh_cfg = SimpleNamespace(root=root)
+        old_db = SimpleNamespace(close=Mock())
+        old_objects = {
+            "cfg": old_cfg,
+            "db": old_db,
+            "engine": object(),
+            "row_security": object(),
+            "ar": object(),
+            "report_runner": object(),
+            "relationships": object(),
+            "modules": object(),
+            "vendor_network": object(),
+            "procurement": object(),
+        }
+        new_db = SimpleNamespace(close=Mock())
+        new_engine = object()
+        scope_value = object()
+        scope_cache = {"value": scope_value, "expires": 123.0}
+
+        with (
+            patch.multiple(app, _scope_cache=scope_cache, **old_objects),
+            patch.object(app, "load_config", return_value=fresh_cfg),
+            patch.object(app, "Database", return_value=new_db),
+            patch.object(app, "TBEngine", return_value=new_engine),
+            patch.object(
+                app, "RowSecurity",
+                side_effect=RuntimeError("security policy is invalid")) as ctor,
+            patch("dotenv.dotenv_values", return_value={}),
+        ):
+            result = app._console_reload()
+
+            ctor.assert_called_once_with(new_db, fresh_cfg)
+            for name, old in old_objects.items():
+                with self.subTest(name=name):
+                    self.assertIs(getattr(app, name), old)
+            self.assertEqual(result["reloaded"], [])
+            self.assertIn("kept the running configuration", result["error"])
+            self.assertIs(scope_cache["value"], scope_value)
+            self.assertEqual(scope_cache["expires"], 123.0)
+            new_db.close.assert_called_once_with()
+            old_db.close.assert_not_called()

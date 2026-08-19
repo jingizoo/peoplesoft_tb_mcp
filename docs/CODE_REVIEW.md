@@ -8,18 +8,20 @@ reproduced and then adversarially re-tested before it was written down.
 
 ## Status
 
-Five items are closed. The rest stand.
+Six items are closed. The rest stand.
 
 | item | what | closed by |
 |---|---|---|
 | 1 | `''` predicates match nothing on Oracle — three controls reported clean | #154 |
 | 2 | `profile_record` / `compare_records` returned any unit's rows | #155 |
-| 3 | `_console_reload` staleness — **partial**: the vendor/procurement pack is rebuilt; `row_security`, `qlog` and `wiki` are still left behind | #154 |
+| 3 | `_console_reload` staleness — **partial**: the vendor/procurement pack and BU `row_security` are coherently rebuilt; `qlog`, `wiki`, the engine source registry and true concurrent atomicity are still open | #154 + follow-up |
+| 4 | transient security discovery/read failures poisoned process-lifetime caches | follow-up |
 | 23 | CSV export wrote the header row un-neutralised | #154 |
 | 31 | `/api/vendors` raised `NameError` and 500'd for every caller | #154 |
 
 Items 1, 2, 23 and 31 carry regression tests that fail if the defect is
 reintroduced — each was sabotage-checked by putting the bug back.
+Items 3 and 4 carry focused lifecycle and concurrency regressions.
 
 The two systemic fixes that would close whole classes rather than
 instances — Theme A's Oracle-hostile CI pass and Theme B's derived guard
@@ -103,15 +105,15 @@ Ranked by expected harm to an accountant on Linux/Oracle. **If you only have one
 *Fix:* add both names to `_UNSCOPED_DATA_TOOLS`. They take no `business_unit`, so no argument check can bound them; refusal-with-remedy is the only correct answer on the MCP path.
 *Evidence:* driving the real `python -m pstb.server` subprocess as a US001-only user: `unit_access_block -> ''` and the payload contained `{'business_unit': 'EU001', 'invoice': 'EU-SECRET-1', 'invoice_amount': 8675309.0}`. On Oracle `ROWNUM <= 50` over a real `PS_LEDGER` returns whatever sits in the first blocks — arbitrary units. `PS_SEC_BU_OPR` is itself profileable.
 
-**[PARTLY CLOSED — #154]** **3. `_console_reload` rebinds six objects and leaves seven pointed at the old database — including row security.**
+**[PARTLY CLOSED — #154 + follow-up]** **3. `_console_reload` now coherently rebuilds vendor/procurement and BU row security, but still leaves `qlog`, `wiki`, the new engine's source registry and true concurrent atomicity open.**
 `pstb/gui/app.py:2677`.
-*Fix:* rebuild `row_security`, `procurement`, `vendor_network`, `qlog`, `wiki` and `new_engine.registry` inside the same try, and add them to the `global` list (or adopt the Theme-D context).
-*Evidence:* after a reload onto a second DB, `engine.db -> b.db` but `row_security.db -> a.db`; a user whose grant was deleted in b.db still passed, and `engine.registry` became `None`, so every named secondary source silently collapsed to `default`.
+*Remaining fix:* adopt the Theme-D `AppContext` for a genuinely atomic concurrent-request swap, build `qlog`, `wiki` and `new_engine.registry` into that replacement context, and retire the prior database only after its in-flight requests release it.
+*Regression evidence:* the follow-up constructs every replacement, including `RowSecurity(new_db, fresh)`, before changing the serving globals. It proves that the new security caches start empty, a failed construction preserves every old serving object while closing only the unused candidate database, and an old background scope build cannot repopulate the cache after reload. The globals are still stored individually, so this intentionally does **not** claim atomicity for a request running concurrently with their assignment. The original source-registry failure also remains: `new_engine.registry` is still `None`, so named secondary sources do not yet participate in console reload.
 
-**4. One transient DB error permanently poisons `RowSecurity`'s discovered security record — for every user, until restart.**
+**[CLOSED — follow-up]** **4. One transient DB error permanently poisoned `RowSecurity`'s discovered security record — for every user, until restart.**
 `pstb/security.py:203`.
-*Fix:* cache only a positive discovery (`if found[0]: self._source_cache = found`); let `DbError` propagate out of `_columns()` rather than being swallowed; give `_source_cache` the same TTL shape as `_cache`.
-*Evidence:* one `DbError` at first probe → `source_record` returns `('', '', 'none')` forever; after full recovery every user still gets `SecurityError`. With `on_unavailable: allow` the same blip permanently grants **every** user `all_units=True`.
+*Resolution:* only positive discoveries are cached, with a TTL; unavailable fail-open access is never cached; and invalidation plus per-attempt ordering prevent an older in-flight probe or grant query from resurrecting/overwriting cache state.
+*Regression evidence:* controlled-clock tests prove negative probes recover immediately, positive metadata expires and re-probes, unavailable access recovers without retaining all-unit reach, and access TTL starts before the database read. Barrier tests prove invalidation defeats in-flight source/access work and a slower older attempt cannot overwrite a newer authoritative result. An unreadable class lookup is reported as unavailable rather than cached as an authoritative empty grant.
 
 **5. Raw ISO strings compared to Oracle DATE columns — an NLS_DATE_FORMAT lottery.**
 `pstb/queries.py:162` (`asof_expr` returns a bare `:asof`), `pstb/procurement.py:194,195,207`.

@@ -16,6 +16,7 @@ The rules under test, in the order they matter:
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -25,7 +26,13 @@ sys.path.insert(0, str(ROOT))
 from pstb.config import load_config  # noqa: E402
 from pstb.db import Database, DbError  # noqa: E402
 from pstb.guards import unit_access_block  # noqa: E402
-from pstb.security import Access, RowSecurity, SecurityError  # noqa: E402
+from pstb.security import (  # noqa: E402
+    ACCESS_TTL_SECONDS,
+    SOURCE_TTL_SECONDS,
+    Access,
+    RowSecurity,
+    SecurityError,
+)
 
 LOOP = {"base_url": "http://127.0.0.1:8000", "client": ("127.0.0.1", 50000)}
 
@@ -116,6 +123,335 @@ class FailClosedTests(unittest.TestCase):
         # Otherwise the one account that can fix the grant is locked out by
         # the grant being broken.
         self.assertTrue(self.sec.access_for("ADMIN").all_units)
+
+
+class CacheLifecycleTests(unittest.TestCase):
+    """Outages recover without a restart or an over-broad cached grant."""
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    class _RecoveringDb:
+        prefix = ""
+
+        def __init__(self) -> None:
+            self.catalog_available = True
+            self.class_catalog_available = False
+            self.units_available = True
+            self.units = ["US001"]
+            self.source_probes = 0
+            self.unit_queries = 0
+            self.on_source_probe = None
+            self.on_unit_query = None
+            self.source_probe_started = None
+            self.release_source_probe = None
+            self.block_source_probe_number = None
+            self.unit_query_started = None
+            self.release_unit_query = None
+            self.block_unit_query_number = None
+
+        def columns(self, table):
+            if table == "PSOPRDEFN":
+                return {"OPRID", "ROWSECCLASS"}
+            if table == "PS_SEC_BU_OPR":
+                self.source_probes += 1
+                probe_number = self.source_probes
+                available = self.catalog_available
+                if self.on_source_probe is not None:
+                    self.on_source_probe()
+                if (self.source_probe_started is not None
+                        and (self.block_source_probe_number is None
+                             or probe_number == self.block_source_probe_number)):
+                    self.source_probe_started.set()
+                    self.release_source_probe.wait(timeout=5)
+                if available:
+                    return {"OPRID", "BUSINESS_UNIT"}
+            if table == "PS_SEC_BU_CLS" and self.class_catalog_available:
+                return {"OPRCLASS", "BUSINESS_UNIT"}
+            return set()
+
+        def query(self, sql, params, max_rows=0):
+            if "FROM PSOPRDEFN" in sql:
+                return ([{"oprid": params["who"]}], False)
+            if "FROM PS_SEC_BU_OPR" in sql:
+                self.unit_queries += 1
+                query_number = self.unit_queries
+                available = self.units_available
+                units = list(self.units)
+                if self.on_unit_query is not None:
+                    self.on_unit_query()
+                if (self.unit_query_started is not None
+                        and (self.block_unit_query_number is None
+                             or query_number == self.block_unit_query_number)):
+                    self.unit_query_started.set()
+                    self.release_unit_query.wait(timeout=5)
+                if not available:
+                    raise DbError("temporary security-table outage")
+                return ([{"bu": unit} for unit in units], False)
+            raise AssertionError(f"unexpected query: {sql}")
+
+    class _RecoveringClassDb:
+        prefix = ""
+
+        def __init__(self) -> None:
+            self.operator_available = False
+            self.class_unit_queries = 0
+
+        def columns(self, table):
+            if table == "PSOPRDEFN" and self.operator_available:
+                return {"OPRID", "ROWSECCLASS"}
+            return set()
+
+        def query(self, sql, params, max_rows=0):
+            if "FROM PSOPRDEFN" in sql:
+                if not self.operator_available:
+                    raise DbError("temporary PSOPRDEFN outage")
+                if "ROWSECCLASS AS cls" in sql:
+                    return ([{"cls": "AP_CLERK"}], False)
+                return ([{"oprid": params["who"]}], False)
+            if "FROM PS_SEC_BU_CLS" in sql:
+                self.class_unit_queries += 1
+                return ([{"bu": "US001"}], False)
+            raise AssertionError(f"unexpected query: {sql}")
+
+    def setUp(self) -> None:
+        self.cfg = _secured_cfg()
+        self.clock = self._Clock()
+        self.db = self._RecoveringDb()
+        self.sec = RowSecurity(self.db, self.cfg, clock=self.clock)
+
+    def test_a_negative_source_probe_is_not_cached(self) -> None:
+        self.db.catalog_available = False
+        self.assertEqual(self.sec.source_record(), ("", "", "none"))
+        first_probes = self.db.source_probes
+
+        self.db.catalog_available = True
+        self.assertEqual(self.sec.source_record()[0], "PS_SEC_BU_OPR")
+        self.assertGreater(self.db.source_probes, first_probes)
+
+    def test_positive_source_cache_expires_and_recovers(self) -> None:
+        self.db.on_source_probe = lambda: self.clock.advance(40)
+        self.assertEqual(self.sec.source_record()[0], "PS_SEC_BU_OPR")
+        first_probes = self.db.source_probes
+        self.db.catalog_available = False
+
+        self.clock.advance(SOURCE_TTL_SECONDS - 1)
+        self.assertEqual(self.sec.source_record()[0], "PS_SEC_BU_OPR")
+        self.assertEqual(self.db.source_probes, first_probes)
+
+        self.clock.advance(1)
+        self.assertEqual(self.sec.source_record(), ("", "", "none"))
+        self.assertGreater(self.db.source_probes, first_probes)
+        failed_probes = self.db.source_probes
+
+        self.db.catalog_available = True
+        self.assertEqual(self.sec.source_record()[0], "PS_SEC_BU_OPR")
+        self.assertGreater(self.db.source_probes, failed_probes)
+
+    def test_fail_open_unavailable_access_is_never_cached(self) -> None:
+        self.cfg.security.on_unavailable = "allow"
+        self.db.units_available = False
+        degraded = self.sec.access_for("FIN_US001")
+        self.assertTrue(degraded.all_units)
+        self.assertEqual(degraded.source, "unavailable")
+
+        self.db.units_available = True
+        recovered = self.sec.access_for("FIN_US001")
+        self.assertFalse(recovered.all_units)
+        self.assertEqual(recovered.units, frozenset({"US001"}))
+        self.assertEqual(self.db.unit_queries, 2)
+
+    def test_access_ttl_is_bounded_from_query_start(self) -> None:
+        self.db.on_unit_query = lambda: self.clock.advance(40)
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"US001"}))
+        self.db.units = ["CA001"]
+
+        self.clock.advance(ACCESS_TTL_SECONDS - 41)
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"US001"}))
+        self.assertEqual(self.db.unit_queries, 1)
+
+        self.clock.advance(1)
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"CA001"}))
+        self.assertEqual(self.db.unit_queries, 2)
+
+    def test_invalidate_clears_access_and_source_caches(self) -> None:
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"US001"}))
+        first_probes = self.db.source_probes
+        self.assertEqual(self.db.unit_queries, 1)
+        self.db.units = ["CA001"]
+
+        self.sec.invalidate()
+
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"CA001"}))
+        self.assertGreater(self.db.source_probes, first_probes)
+        self.assertEqual(self.db.unit_queries, 2)
+
+    def test_inflight_access_cannot_resurrect_after_invalidate(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        self.db.unit_query_started = started
+        self.db.release_unit_query = release
+        self.db.block_unit_query_number = 1
+        self.addCleanup(release.set)
+        outcome = {}
+
+        def resolve() -> None:
+            try:
+                outcome["access"] = self.sec.access_for("FIN_US001")
+            except BaseException as exc:  # surfaced in the test thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=resolve, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2), "unit query did not block")
+        self.db.units = ["CA001"]
+        self.sec.invalidate()
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "unit query did not finish")
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertEqual(outcome["access"].units, frozenset({"US001"}))
+
+        self.db.unit_query_started = None
+        self.db.release_unit_query = None
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"CA001"}))
+        self.assertEqual(self.db.unit_queries, 2)
+
+    def test_inflight_source_cannot_resurrect_after_invalidate(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        self.db.source_probe_started = started
+        self.db.release_source_probe = release
+        self.db.block_source_probe_number = 1
+        self.addCleanup(release.set)
+        outcome = {}
+
+        def discover() -> None:
+            try:
+                outcome["source"] = self.sec.source_record()
+            except BaseException as exc:  # surfaced in the test thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=discover, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2), "source probe did not block")
+        self.db.catalog_available = False
+        self.sec.invalidate()
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "source probe did not finish")
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertEqual(outcome["source"][0], "PS_SEC_BU_OPR")
+
+        self.db.source_probe_started = None
+        self.db.release_source_probe = None
+        probes_before_retry = self.db.source_probes
+        self.assertEqual(self.sec.source_record(), ("", "", "none"))
+        self.assertGreater(self.db.source_probes, probes_before_retry)
+
+    def test_class_lookup_outage_is_unavailable_not_an_empty_grant(self) -> None:
+        self.cfg.security.unit_record = "PS_SEC_BU_CLS"
+        self.cfg.security.unit_key = "OPRCLASS"
+        self.cfg.security.on_unavailable = "allow"
+        db = self._RecoveringClassDb()
+        sec = RowSecurity(db, self.cfg, clock=self.clock)
+
+        degraded = sec.access_for("AP_CLERK")
+        self.assertEqual(degraded.source, "unavailable")
+        self.assertTrue(degraded.all_units)
+        self.assertIn("PS_SEC_BU_CLS", degraded.detail)
+        self.assertIn("PSOPRDEFN.ROWSECCLASS", degraded.detail)
+
+        db.operator_available = True
+        recovered = sec.access_for("AP_CLERK")
+        self.assertEqual(recovered.source, "PS_SEC_BU_CLS")
+        self.assertEqual(recovered.units, frozenset({"US001"}))
+        self.assertEqual(db.class_unit_queries, 1)
+
+    def test_older_access_attempt_cannot_overwrite_newer_result(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        self.db.unit_query_started = started
+        self.db.release_unit_query = release
+        self.db.block_unit_query_number = 1
+        self.addCleanup(release.set)
+        older = {}
+
+        def resolve_older() -> None:
+            try:
+                older["access"] = self.sec.access_for("FIN_US001")
+            except BaseException as exc:
+                older["error"] = exc
+
+        worker = threading.Thread(target=resolve_older, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2), "older query did not block")
+        self.db.units = ["CA001"]
+
+        newer = self.sec.access_for("FIN_US001")
+        self.assertEqual(newer.units, frozenset({"CA001"}))
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "older query did not finish")
+        if "error" in older:
+            raise older["error"]
+        self.assertEqual(older["access"].units, frozenset({"US001"}))
+
+        self.db.unit_query_started = None
+        self.db.release_unit_query = None
+        self.assertEqual(
+            self.sec.access_for("FIN_US001").units, frozenset({"CA001"}))
+        self.assertEqual(self.db.unit_queries, 2)
+
+    def test_older_source_probe_cannot_overwrite_newer_result(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        self.db.source_probe_started = started
+        self.db.release_source_probe = release
+        self.db.block_source_probe_number = 1
+        self.addCleanup(release.set)
+        older = {}
+
+        def discover_older() -> None:
+            try:
+                older["source"] = self.sec.source_record()
+            except BaseException as exc:
+                older["error"] = exc
+
+        worker = threading.Thread(target=discover_older, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=2), "older probe did not block")
+        self.db.catalog_available = False
+        self.db.class_catalog_available = True
+
+        newer = self.sec.source_record()
+        self.assertEqual(newer[0], "PS_SEC_BU_CLS")
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "older probe did not finish")
+        if "error" in older:
+            raise older["error"]
+        self.assertEqual(older["source"][0], "PS_SEC_BU_OPR")
+
+        self.db.source_probe_started = None
+        self.db.release_source_probe = None
+        self.assertEqual(self.sec.source_record()[0], "PS_SEC_BU_CLS")
+        self.assertEqual(self.db.source_probes, 2)
 
 
 class ToolGateTests(unittest.TestCase):
@@ -406,3 +742,131 @@ class RowSamplingToolTests(unittest.TestCase):
             # different axis; what must not appear is a business_unit
             # binding, which would imply an argument gate they cannot have.
             self.assertNotIn("business_unit", _TOOL_SCOPE_ARGS.get(name, {}))
+
+
+class AbsentColumnVersusOutageTests(unittest.TestCase):
+    """A missing column and a missing grant need OPPOSITE answers.
+
+    On Oracle a table you lack SELECT on DESCRIBES AS ZERO COLUMNS rather
+    than raising, so db.columns() cannot separate "this site has no
+    ROWSECCLASS" from "this account cannot read PSOPRDEFN". Both readings
+    of that ambiguity are fail-open in different directions:
+
+      absence read as failure  -> _unavailable() -> all_units on a
+                                  fail-open site, for a stable and
+                                  legitimate schema shape
+      failure read as absence  -> frozenset() -> an authoritative empty
+                                  grant manufactured out of an outage
+
+    Measured before the fix, on a site whose PSOPRDEFN view omits the
+    column with on_unavailable=allow: main gave all_units=False units=[],
+    the slice gave all_units=True source='unavailable'.
+
+    So the catalog is not consulted. The class query runs; if it fails we
+    ask whether PSOPRDEFN is readable at all, which is a question no
+    describe can fudge.
+    """
+
+    def _sec(self, drop_column=False, oprdefn_unreadable=False):
+        import shutil
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        from pstb.config import load_config
+        from pstb.db import Database, DbError
+        from pstb.security import RowSecurity
+
+        root = Path(__file__).resolve().parents[1]
+        sample = root / "sample_data" / "ps_sample.db"
+        if not sample.exists():
+            raise unittest.SkipTest("run scripts/seed_sample_data.py first")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        shutil.copy(sample, d / "x.db")
+        if drop_column:
+            con = sqlite3.connect(d / "x.db")
+            cols = [c[1] for c in con.execute("PRAGMA table_info(PSOPRDEFN)")]
+            keep = [c for c in cols if c != "ROWSECCLASS"]
+            con.execute("CREATE TABLE _t AS SELECT %s FROM PSOPRDEFN"
+                        % ",".join(keep))
+            con.execute("DROP TABLE PSOPRDEFN")
+            con.execute("ALTER TABLE _t RENAME TO PSOPRDEFN")
+            con.commit()
+            con.close()
+        (d / "config.yaml").write_text(
+            f"db:\n  backend: sqlite\n  sqlite_path: {d / 'x.db'}\n"
+            "defaults:\n  business_unit: US001\n  ledger: ACTUALS\n"
+            "security:\n  enabled: true\n  unit_record: PS_SEC_BU_CLS\n"
+            "  unit_key: ROWSECCLASS\n  on_unavailable: allow\n")
+        cfg = load_config(str(d / "config.yaml"))
+        sec = RowSecurity(Database(cfg), cfg)
+        if oprdefn_unreadable:
+            real = sec.db.query
+
+            def query(sql, binds=None, **kw):
+                if "PSOPRDEFN" in sql:
+                    raise DbError("ORA-00942: table or view does not exist")
+                return real(sql, binds, **kw)
+
+            sec.db.query = query
+            # Oracle's shape for an ungranted table: describes as nothing.
+            sec.db.columns = lambda rec: (
+                set() if rec.upper().endswith("PSOPRDEFN") else [])
+        return sec
+
+    def test_an_absent_column_is_an_authoritative_empty_grant(self):
+        access = self._sec(drop_column=True).access_for("FIN_US001")
+        self.assertFalse(
+            access.all_units,
+            "a legitimate schema shape handed the user every business unit")
+        self.assertEqual(access.source, "PS_SEC_BU_CLS")
+
+    def test_an_unreadable_record_is_unavailable_not_an_empty_grant(self):
+        access = self._sec(oprdefn_unreadable=True).access_for("FIN_US001")
+        self.assertEqual(
+            access.source, "unavailable",
+            "an outage was reported as an authoritative empty grant")
+
+    def test_the_normal_site_is_unaffected(self):
+        access = self._sec().access_for("FIN_US001")
+        self.assertEqual(access.source, "PS_SEC_BU_CLS")
+        self.assertFalse(access.all_units)
+
+
+class LiveSecuritySettingsTests(unittest.TestCase):
+    """The console must not claim a restart for what it already applied.
+
+    _console_reload rebuilds RowSecurity, so these three take effect the
+    moment they are saved. Nothing else reads them — pstb/server.py never
+    touches cfg.security — so there is no second live surface to disagree,
+    which was the stated reason for the restart flag.
+    """
+
+    LIVE = ("security.enabled", "security.on_unavailable",
+            "security.raw_sql_for_restricted")
+
+    def test_security_settings_do_not_claim_a_restart(self):
+        import pstb.settings as st
+        for key in self.LIVE:
+            with self.subTest(key=key):
+                self.assertFalse(
+                    st.BY_KEY[key].restart,
+                    f"{key} is applied live by the console reload, so a "
+                    "'restart to apply' pill on it is false")
+
+    def test_settings_the_reload_does_not_touch_still_need_one(self):
+        """Guard the guard: not a blanket removal of the restart flag."""
+        import pstb.settings as st
+        for key in ("llm.provider", "tools.max_rows"):
+            with self.subTest(key=key):
+                self.assertTrue(st.BY_KEY[key].restart)
+
+    def test_the_reload_really_rebuilds_security(self):
+        """The claim above is only true while this stays true."""
+        import inspect
+
+        from pstb.gui import app as gui
+        source = inspect.getsource(gui._console_reload)
+        self.assertIn("RowSecurity(new_db", source)
+        self.assertIn("business-unit security", source)
