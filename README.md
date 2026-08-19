@@ -272,7 +272,10 @@ For cryptic custom objects, a user can explicitly teach an exact source table
 meaning. The chat stores this as a pending, source-isolated proposal; a host
 operator must approve it before it affects semantic search. Approved meanings
 remain pointers to catalog objects and never become joins, SQL, policies or
-database writes. See the governed-learning section in
+database writes. The visible **Metadata meanings** control in the Ask context
+bar also accepts an exact `schema.object`, meaning and aliases without sending
+that text through the chat model; its drawer shows the same pending approval
+queue. See the governed-learning section in
 [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md#governed-local-meanings-for-cryptic-custom-objects).
 
 Optional semantic re-ranking and resumable controller workflows are described

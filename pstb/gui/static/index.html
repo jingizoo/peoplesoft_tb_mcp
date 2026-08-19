@@ -297,6 +297,15 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .drawer header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
 .drawer header h3{margin:0;font-size:14px;font-weight:650}
 .drawer .body{overflow:auto;flex:1}
+.metadata-review-intro{padding:14px 16px;border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.55}
+.metadata-proposal-form{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink)}
+.metadata-proposal-form label{display:block;margin-top:9px;color:var(--muted);font-size:11.5px;font-weight:650}
+.metadata-proposal-form input,.metadata-proposal-form textarea{width:100%;margin-top:4px;padding:8px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--ink);font:inherit}
+.metadata-proposal-form textarea{min-height:66px;resize:vertical}
+.metadata-proposal-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:11px}
+.metadata-review-message{margin-top:9px;padding:8px 9px;border-radius:7px;background:var(--ok-soft);color:var(--ok)}
+.metadata-review-error{padding:7px 0 0;color:var(--bad);white-space:pre-wrap}
+.btn.compact{padding:4px 9px;font-size:11.5px}
 .x{margin-left:auto;background:none;border:0;color:var(--muted);cursor:pointer;font-size:20px;line-height:1;padding:2px 6px}
 .x:hover{color:var(--ink)}
 
@@ -366,7 +375,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="reports">Reports</button>
     <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
-    <button data-v="diag">Diagnostics<span id="approvalbadge" class="badge warn" hidden></span></button>
+    <button data-v="diag">Diagnostics<span id="approvalbadge" data-approval-badge class="badge warn" hidden></span></button>
     <div class="navfoot" id="navfoot"></div>
   </nav>
 
@@ -409,6 +418,11 @@ const coupaAmount=v=>(v===null||v===undefined||v==='')?'':Number(v).toLocaleStri
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let META={}, VIEW='chat', LAST=null, CHAT_SCOPE=null, LAST_FINANCE_SCOPE=null;
 let SCOPE_YEARS=[], CARDSEQ=0;
+let DRAWER_GENERATION=0;
+function beginDrawer(){return ++DRAWER_GENERATION;}
+function drawerIsCurrent(generation){
+  return generation===DRAWER_GENERATION&&$('#drawer').classList.contains('on');
+}
 let SCOPE_YEARS_STALE=false;
 function lazyLoadScopeYears(){
   if(!SCOPE_YEARS_STALE||!CHAT_SCOPE) return;
@@ -3762,13 +3776,18 @@ function renderBilling(d){
   return frag;
 }
 async function openCustomer(cust_id,name){
+  const drawerGeneration=beginDrawer();
   $('#dtitle').textContent=cust_id+(name?' · '+name:'');
   $('#dbody').innerHTML='<div class="empty"><span class="spin"></span> Loading…</div>';
   $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
   try{
     const d=await api('/api/ar/customer?'+qs({customer:cust_id,business_unit:scope().bu}));
+    if(!drawerIsCurrent(drawerGeneration))return;
     $('#dbody').innerHTML=''; const pad=el('div','pad'); pad.append(renderCustomerAR(d)); $('#dbody').append(pad);
-  }catch(e){ $('#dbody').innerHTML='<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>'; }
+  }catch(e){
+    if(drawerIsCurrent(drawerGeneration))
+      $('#dbody').innerHTML='<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>';
+  }
 }
 async function viewAR(){
   busy('Loading receivables…');
@@ -3933,6 +3952,11 @@ function showSignIn(){
   });
 }
 
+async function signOutSession(){
+  await fetch('/api/signout',{method:'POST'});
+  location.reload();
+}
+
 /* ---------- boot ---------- */
 (async function(){
   bootStart();
@@ -4055,8 +4079,7 @@ function showSignIn(){
     $('#navfoot').before(who);
     who.querySelector('#signout').onclick=async e=>{
       e.preventDefault();
-      await fetch('/api/signout',{method:'POST'});
-      location.reload();
+      await signOutSession();
     };
   }
   $('#navfoot').innerHTML=((META.scope&&META.scope.discovered)
@@ -4434,15 +4457,25 @@ function renderDiag(d,holder){
    Fetched after boot and never awaited by it: a badge must not cost the page
    a round trip before it paints. */
 async function refreshApprovalBadge(){
-  const dot=$('#approvalbadge');
-  if(!dot) return;
+  const generation=++APPROVAL_REFRESH_GENERATION;
+  let pending=null;
   try{
     const d=await api('/api/approvals/count');
-    const n=(d&&d.readable)?Number(d.pending||0):0;
+    pending=(d&&d.readable)?Number(d.pending||0):null;
+  }catch(e){ pending=null; }
+  if(generation!==APPROVAL_REFRESH_GENERATION)return;
+  APPROVAL_PENDING=pending;
+  paintApprovalBadges();          // never turn an affordance into an error
+}
+let APPROVAL_PENDING=null;
+let APPROVAL_REFRESH_GENERATION=0;
+function paintApprovalBadges(){
+  document.querySelectorAll('[data-approval-badge]').forEach(dot=>{
+    const n=APPROVAL_PENDING===null?0:APPROVAL_PENDING;
     dot.textContent=String(n);
     dot.hidden=!n;
     dot.title=n?(n+' waiting for your decision'):'';
-  }catch(e){ dot.hidden=true; }   // never turn an affordance into an error
+  });
 }
 
 /* A thrown API error carries .message as a STRING for a plain detail and as
@@ -4469,9 +4502,14 @@ function renderApprovals(d,holder,refresh){
     (pending.length?'<span class="badge warn">'+pending.length+' pending</span>'
                    :'<span class="badge ok">nothing pending</span>')+
     '<span class="sub">nothing here reaches an answer until it is approved</span>'));
+  ((d&&d.source_errors)||[]).forEach(problem=>{
+    card.append(el('div','pad','<span class="badge warn">queue unavailable</span> '+
+      esc(problem.source||'source')+' · '+esc(problem.error||'could not be read')));
+  });
   if(!items.length){
-    card.append(el('div','pad','No facts or meanings have been proposed yet. '+
-      'They appear here when the assistant is taught something in conversation.'));
+    card.append(el('div','pad',(d&&d.readable===false
+      ? 'No readable proposals are shown; one or more source queues are unavailable.'
+      : 'No facts or meanings have been proposed yet. They appear here when the assistant is taught something in conversation.')));
     holder.append(card); return;
   }
   items.forEach(item=>{
@@ -4523,7 +4561,7 @@ function renderApprovals(d,holder,refresh){
   holder.append(card);
 }
 
-async function loadApprovals(holder){
+async function loadApprovals(holder,drawerGeneration){
   // Replace the panel in place. Re-entering with the inner box as the
   // parent nested a second panel inside the first, so a decision landed on
   // the server while the heading above it still showed the old count.
@@ -4532,9 +4570,12 @@ async function loadApprovals(holder){
   const box=el('div'); box.setAttribute('data-approvals','1');
   holder.append(box);
   try{
-    renderApprovals(await api('/api/approvals?status=all'),box,
-                    ()=>loadApprovals(holder));
+    const data=await api('/api/approvals?status=all');
+    if(drawerGeneration!==undefined&&!drawerIsCurrent(drawerGeneration))return;
+    renderApprovals(data,box,
+                    ()=>loadApprovals(holder,drawerGeneration));
   }catch(e){
+    if(drawerGeneration!==undefined&&!drawerIsCurrent(drawerGeneration))return;
     const c=el('div','card');
     c.append(el('h2',null,'Waiting for your decision'));
     c.append(el('div','pad',e.status===403
@@ -4542,6 +4583,73 @@ async function loadApprovals(holder){
       : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
     box.append(c);
   }
+}
+
+function metadataProposalUrl(source){
+  const d=descriptorForSource(source);
+  if(!d)throw new Error('Unknown database workspace '+String(source||''));
+  return '/api/source/'+encodeURIComponent(d.command)+'/metadata-proposals';
+}
+function metadataProposalPanel(source,refresh,drawerGeneration){
+  const intro=el('div','metadata-review-intro');
+  intro.innerHTML=sourceBadgeHtml(source)+
+    '<div style="margin-top:9px">Teach one exact table or view. The wording '+
+    'goes directly to this database\u2019s private proposal queue; it is '+
+    '<b>not sent through the chat model</b> and remains pending and inactive until approved. '+
+    'Meanings help semantic table selection only; they never create joins, SQL '+
+    'rules, row values, or financial evidence.</div>';
+  const form=el('form','metadata-proposal-form');
+  form.append(el('b',null,'Add a table or view meaning'));
+  const fields=[
+    ['identifier','Exact schema.object','P2GO.JOB_HDR','input'],
+    ['meaning','Short business meaning','Inbound integration job headers','textarea'],
+    ['aliases','Business aliases (comma-separated)','job queue, inbound jobs','input']
+  ];
+  const controls={};
+  fields.forEach(([name,label,placeholder,kind])=>{
+    const lab=el('label',null,esc(label));
+    const control=document.createElement(kind);control.name=name;
+    control.placeholder=placeholder;control.autocomplete='off';control.maxLength=500;
+    lab.append(control);form.append(lab);controls[name]=control;
+  });
+  const actions=el('div','metadata-proposal-actions');
+  const submit=el('button','btn compact','Submit for review');submit.type='submit';
+  const status=el('div','metadata-review-error');
+  actions.append(submit);form.append(actions,status);
+  form.onsubmit=async event=>{
+    event.preventDefault();status.textContent='';submit.disabled=true;
+    try{
+      const data=await api(metadataProposalUrl(source),{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({identifier:controls.identifier.value,
+          meaning:controls.meaning.value,aliases:controls.aliases.value})});
+      if(!drawerIsCurrent(drawerGeneration))return;
+      status.className='metadata-review-message';
+      status.textContent=data.note||'Submitted as pending for operator review.';
+      controls.identifier.value=controls.meaning.value=controls.aliases.value='';
+      await refresh();refreshApprovalBadge();
+    }catch(e){
+      status.className='metadata-review-error';status.textContent=errText(e);
+    }finally{submit.disabled=false;}
+  };
+  intro.append(form);return intro;
+}
+
+/* This entry point deliberately bypasses Diagnostics. Diagnostics first
+   discovers a Finance scope and runs catalog checks; neither is relevant to
+   reviewing a P2Go metadata meaning, and both can be unavailable to an
+   operator who has no Finance rows. */
+function openApprovals(source){
+  const drawerGeneration=beginDrawer();
+  const canonical=String(source||ACTIVE_CHAT_SOURCE||'default');
+  const descriptor=descriptorForSource(canonical)||{label:canonical};
+  $('#dtitle').textContent='Metadata meanings · '+descriptor.label;
+  const body=$('#dbody');body.innerHTML='';
+  const holder=el('div');body.append(holder);
+  body.prepend(metadataProposalPanel(
+    canonical,()=>loadApprovals(holder,drawerGeneration),drawerGeneration));
+  $('#drawer').classList.add('on');$('#scrim').classList.add('on');
+  loadApprovals(holder,drawerGeneration);
 }
 
 async function viewDiag(){
@@ -4591,8 +4699,12 @@ document.addEventListener('click',e=>{
 });
 
 /* ---------- account drawer ---------- */
-function closeDrawer(){ $('#drawer').classList.remove('on'); $('#scrim').classList.remove('on'); }
+function closeDrawer(){
+  ++DRAWER_GENERATION;
+  $('#drawer').classList.remove('on');$('#scrim').classList.remove('on');
+}
 async function openAccount(account,descr,ctx){
+  const drawerGeneration=beginDrawer();
   const s=Object.assign(scope(),ctx||{});
   $('#dtitle').textContent=account+(descr?' · '+descr:'');
   $('#dbody').innerHTML='<div class="empty"><span class="spin"></span> Loading…</div>';
@@ -4603,7 +4715,13 @@ async function openAccount(account,descr,ctx){
       fiscal_year:s.fy,through_period:s.per}));
     j=await api('/api/journals?'+qs({account,period:s.per,business_unit:s.bu,ledger:s.ledger,fiscal_year:s.fy}))
         .catch(()=>null);
-  }catch(e){ $('#dbody').innerHTML='<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>'; return; }
+  }catch(e){
+    if(drawerIsCurrent(drawerGeneration))
+      $('#dbody').innerHTML='<div class="empty" style="color:var(--bad)">'+esc(e.message)+'</div>';
+    return;
+  }
+
+  if(!drawerIsCurrent(drawerGeneration))return;
 
   const pts=a.periods||[];
   let chart='';
@@ -4873,6 +4991,16 @@ function viewChat(){
   }else{
     context.append(el('span','sub','Database read-only · governed metadata suggestions'));
   }
+  const approvals=el('button','btn ghost compact','Metadata meanings '+
+    '<span id="chat-approvalbadge" data-approval-badge class="badge warn" hidden></span>');
+  approvals.type='button';approvals.id='chat-approvals';
+  approvals.title='Review site facts and source-bound metadata meanings';
+  approvals.onclick=()=>openApprovals(silo.source);context.append(approvals);
+  if(META.security&&META.security.enabled&&META.security.signed_in){
+    const signout=el('button','btn ghost compact','Sign out '+esc(META.security.oprid||''));
+    signout.type='button';signout.id='chat-signout';
+    signout.onclick=signOutSession;context.append(signout);
+  }
   const build=el('span','build-tag');
   build.id='build-tag';
   context.append(build);
@@ -4886,6 +5014,7 @@ function viewChat(){
   if(chips)wrap.append(chips);
   wrap.append(context,comp);
   w.append(wrap);
+  paintApprovalBadges();
   const input=$('#q');input.value=silo.draft||'';input.disabled=silo.resetting;
   $('#send').disabled=silo.resetting;$('#clr').disabled=silo.resetting;
   $('#send').onclick=send;$('#clr').onclick=clearActiveSilo;

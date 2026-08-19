@@ -302,8 +302,17 @@ async def _lifespan(_app):
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
               redoc_url=None, lifespan=_lifespan)
 
-_QUALITY_WRITE_PATHS = frozenset({"/api/feedback", "/api/question-review"})
-_QUALITY_WRITE_MAX_BYTES = 8 * 1024
+_PROTECTED_WRITE_PATHS = frozenset({
+    "/api/feedback", "/api/question-review", "/api/approvals/decide",
+})
+_PROTECTED_WRITE_MAX_BYTES = 8 * 1024
+_METADATA_PROPOSAL_PATH = re.compile(
+    r"^/api/source/[^/]+/metadata-proposals$")
+
+
+def _is_bounded_write_path(path: str) -> bool:
+    return (path in _PROTECTED_WRITE_PATHS
+            or _METADATA_PROPOSAL_PATH.fullmatch(path) is not None)
 
 
 @app.middleware("http")
@@ -315,12 +324,12 @@ async def _access_guard(request, call_next):
     to one prefix. See pstb/gui/localguard.py for what each rule stops.
     """
     if (request.method == "POST"
-            and request.url.path in _QUALITY_WRITE_PATHS):
+            and _is_bounded_write_path(request.url.path)):
         raw_length = request.headers.get("content-length", "")
         try:
             content_length = int(raw_length) if raw_length else -1
         except ValueError:
-            content_length = _QUALITY_WRITE_MAX_BYTES + 1
+            content_length = _PROTECTED_WRITE_MAX_BYTES + 1
         if (content_length < 0
                 or request.headers.get("transfer-encoding", "")):
             response = JSONResponse(
@@ -329,10 +338,10 @@ async def _access_guard(request, call_next):
             )
             localguard.apply_security_headers(response.headers)
             return response
-        if content_length > _QUALITY_WRITE_MAX_BYTES:
+        if content_length > _PROTECTED_WRITE_MAX_BYTES:
             response = JSONResponse(
                 status_code=413,
-                content={"error": "quality update body is too large"},
+                content={"error": "protected update body is too large"},
             )
             localguard.apply_security_headers(response.headers)
             return response
@@ -374,7 +383,7 @@ _OPEN_PATHS = frozenset({
 # handbook either".
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
                        "/api/chat/reset", "/api/question-report",
-                       "/api/question-review")
+                       "/api/question-review", "/api/approvals")
 
 
 def _needs_unit_check(path: str) -> bool:
@@ -388,7 +397,13 @@ def _needs_unit_check(path: str) -> bool:
         # below, and the source-bound chat/export handlers apply their own
         # exact source and raw-SQL policy.  Finance keeps the ordinary BU
         # middleware because /finance is the primary PeopleSoft workspace.
-        command = path[len("/api/source/"):].split("/", 1)[0]
+        remainder = path[len("/api/source/"):]
+        command, _, operation = remainder.partition("/")
+        # Proposing an annotation has no PeopleSoft BU dimension, even if
+        # the selected workspace is /finance. It still passes the signed-in
+        # branch and is source-bound by the URL in its handler.
+        if operation == "metadata-proposals":
+            return False
         try:
             return engine.registry.resolve_command(command) == "default"
         except (AttributeError, DbError):
@@ -1893,6 +1908,141 @@ def _source_knowledge_store(source: str):
         source_fingerprint=source_fingerprint(cfg, source))
 
 
+def _metadata_proposal_resources(command: str):
+    """Resolve a route-bound workspace to its store and current catalog.
+
+    The URL is authoritative. Client JSON never chooses a source,
+    fingerprint, catalog path, or physical object identity.
+    """
+    from ..metadata import (MetadataCatalog, MetadataError,
+                            source_catalog_path, source_fingerprint)
+    from ..source_knowledge import SourceKnowledgeError
+
+    if engine.registry is None:
+        raise HTTPException(
+            status_code=404, detail="No data workspaces configured")
+    try:
+        canonical = engine.registry.resolve_command(command)
+    except DbError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        fingerprint = source_fingerprint(cfg, canonical)
+        store = _source_knowledge_store(canonical)
+        catalog = MetadataCatalog(
+            source_catalog_path(cfg, canonical),
+            stale_after_hours=getattr(
+                cfg.metadata_catalog, "stale_after_hours", 168),
+            source=canonical, expected_fingerprint=fingerprint)
+    except (MetadataError, SourceKnowledgeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return canonical, store, catalog
+
+
+@app.post("/api/source/{command}/metadata-proposals")
+def create_metadata_proposal(
+    command: str, payload: dict, request: Request = None,
+):
+    """Store one exact, source-bound meaning as pending and inactive.
+
+    This is an explicit form submission, not an LLM inference. The current
+    catalog resolves the exact physical table/view and validates every alias
+    before the private proposal store accepts it.
+    """
+    unexpected = sorted(
+        str(key) for key in (payload or {})
+        if key not in {"identifier", "meaning", "aliases"})
+    if unexpected:
+        raise HTTPException(
+            status_code=400,
+            detail=("metadata proposals accept only identifier, meaning, "
+                    f"and aliases; remove: {', '.join(unexpected)}"))
+    values = {
+        key: (payload or {}).get(key, "")
+        for key in ("identifier", "meaning", "aliases")
+    }
+    if any(not isinstance(value, str) for value in values.values()):
+        raise HTTPException(
+            status_code=400,
+            detail="identifier, meaning, and aliases must be text")
+    identifier = values["identifier"].strip()
+    if not identifier or not values["meaning"].strip():
+        raise HTTPException(
+            status_code=400,
+            detail="an exact schema.object and business meaning are required")
+
+    canonical, store, catalog = _metadata_proposal_resources(command)
+    try:
+        from ..source_knowledge import (
+            SourceKnowledgeError, normalize_aliases,
+            validate_catalog_aliases,
+        )
+        result = catalog.context(identifier, source=canonical, limit=10)
+        if (not isinstance(result, dict)
+                or result.get("found") is not True
+                or result.get("ambiguous")):
+            detail = ((result or {}).get("detail")
+                      if isinstance(result, dict) else "")
+            raise SourceKnowledgeError(
+                str(detail or "the catalog did not resolve one exact object"))
+        subject = result.get("subject")
+        if not isinstance(subject, dict):
+            raise SourceKnowledgeError(
+                "the catalog returned no exact physical object")
+        if (str(result.get("source_database") or "") != canonical
+                or str(subject.get("source") or "") != canonical):
+            raise SourceKnowledgeError(
+                "the metadata result did not come from the selected source")
+        kind = str(subject.get("kind") or "").lower()
+        schema = str(subject.get("schema") or "")
+        object_name = str(subject.get("physical_object") or "")
+        object_id = str(subject.get("object_id") or "")
+        exact_identifier = f"{schema}.{object_name}"
+        if (kind not in {"table", "view"} or not object_id
+                or not schema or not object_name):
+            raise SourceKnowledgeError(
+                "metadata learning needs one exact physical table/view")
+        if identifier.casefold() != exact_identifier.casefold():
+            raise SourceKnowledgeError(
+                "use the exact schema-qualified physical name "
+                f"{exact_identifier}")
+        alias_list = normalize_aliases(values["aliases"])
+        validate_catalog_aliases(
+            catalog, canonical, object_id, alias_list)
+        proposal = store.propose(
+            object_id=object_id, schema=schema, object_name=object_name,
+            object_kind=kind, meaning=values["meaning"], aliases=alias_list,
+            origin="gui")
+    except Exception as exc:
+        from ..metadata import MetadataError
+        from ..source_knowledge import SourceKnowledgeError
+        if isinstance(exc, (MetadataError, SourceKnowledgeError)):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
+    status = str(proposal.get("status") or "pending")
+    if status in {"rejected", "revoked"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"An identical proposal is already {status} and cannot "
+                    "move backward. Revise the meaning or aliases to create "
+                    "a new pending proposal."))
+    if status not in {"pending", "approved"}:
+        raise HTTPException(
+            status_code=409,
+            detail="The proposal store returned an unsupported lifecycle state")
+    return {
+        "ok": True, "source_database": canonical, "proposal": proposal,
+        "proposal_id": str(proposal.get("id") or ""),
+        "retrieval_active": status == "approved",
+        "note": (
+            "Already approved and active."
+            if status == "approved" else
+            ("An identical proposal is already pending and inactive."
+             if proposal.get("already_known") else
+             "Submitted for operator review. It remains inactive until "
+             "approved.")),
+    }
+
+
 def _source_catalog_identity(source: str, proposal: dict) -> dict:
     """Prove the proposal still points at a real object before approving it.
 
@@ -1916,6 +2066,18 @@ def _operator_name(request: Request) -> str:
     except HTTPException:
         access = None
     return (getattr(access, "oprid", "") or "operator").strip() or "operator"
+
+
+def _approval_source_names() -> list[str]:
+    """Every configured source that can hold governed meanings.
+
+    Site memory and SourceKnowledge are different queues: Finance can have
+    general site facts in the former and exact metadata meanings in the
+    latter. An absent per-source artifact reads as an empty store.
+    """
+    if engine.registry is None:
+        return []
+    return list(engine.registry.names())
 
 
 @app.get("/api/approvals/count")
@@ -1948,7 +2110,19 @@ def approvals_count(request: Request = None):
         # A badge is an affordance, not evidence. If the queue cannot be
         # read, show nothing rather than a wrong number or an error card.
         return {"pending": 0, "readable": False}
-    return {"pending": pending, "readable": True}
+
+    # Metadata meanings live in one private store per database.
+    # Counting only site memory made the badge say zero while P2Go proposals
+    # were waiting. If any configured store cannot be read, do not present a
+    # partial total as authoritative.
+    readable = True
+    for name in _approval_source_names():
+        try:
+            pending += len(
+                _source_knowledge_store(name).list_proposals("pending") or [])
+        except Exception:                    # noqa: BLE001
+            readable = False
+    return {"pending": pending, "readable": readable}
 
 
 @app.get("/api/approvals")
@@ -1982,15 +2156,17 @@ def list_approvals(request: Request = None, status: str = "pending"):
 
     # Per-source metadata proposals. A source whose artifact has never been
     # built simply has no queue; that is not an error worth failing on.
-    sources = []
-    if engine.registry is not None:
-        sources = [n for n in engine.registry.names() if n != "default"]
-    for name in sources:
+    source_errors = []
+    for name in _approval_source_names():
         try:
             store = _source_knowledge_store(name)
             proposals = store.list_proposals(
                 "" if wanted == "all" else wanted)
         except Exception:
+            source_errors.append({
+                "source": name,
+                "error": "proposal queue could not be read",
+            })
             continue
         for row in proposals or []:
             items.append({
@@ -2008,7 +2184,9 @@ def list_approvals(request: Request = None, status: str = "pending"):
     counts = listing.get("counts") or {}
     return {"status": wanted, "items": items, "memory_counts": counts,
             "pending_total": sum(1 for i in items
-                                 if i.get("status") == "pending")}
+                                 if i.get("status") == "pending"),
+            "readable": not source_errors,
+            "source_errors": source_errors}
 
 
 @app.post("/api/approvals/decide")

@@ -312,7 +312,7 @@ that is the single most common reason this feature shows nobody anything.
 ```yaml
 security:
   enabled: true
-  privileged_users: ["FINADMIN"]     # keep at least one
+  privileged_users: ["BATCH1"]      # use a real operator ID at this site
   on_unavailable: refuse
 ```
 
@@ -320,7 +320,14 @@ Or from `/console`, which has the same three switches.
 
 - `privileged_users` is read from config, not from the database, on
   purpose: it is the account that still works while a grant is being
-  fixed.
+  fixed. A listed operator is granted all-unit access before any
+  `PS_SEC_BU_OPR` / `PS_SEC_BU_CLS` lookup, so it does not need a row in
+  those records. Restart or reload after changing this list so an older
+  cached access decision cannot remain in the running process.
+- With `security.enabled: false`, the app has no sign-in session and therefore
+  shows no **Sign out** control. Machine-local metadata approval remains
+  available; when security is enabled, it additionally requires a configured
+  privileged operator.
 - `on_unavailable: refuse` means security that is on but unreadable shows
   **nothing** and names the missing grant. `allow` degrades to full access
   instead — a decision that should be typed rather than reached.
