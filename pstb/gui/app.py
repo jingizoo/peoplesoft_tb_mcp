@@ -832,7 +832,15 @@ def _activity_done(session_id: str, turn: str) -> None:
                 event["status"] = "failed"
 
 
-_scope_cache: dict = {"expires": 0.0, "value": None, "refreshing": False}
+_scope_cache: dict = {
+    "expires": 0.0,
+    "value": None,
+    "refreshing": False,
+    # A background build captures this before it touches the database. A
+    # console reload increments it, so work from the previous database can
+    # finish for its caller without repopulating this process-wide cache.
+    "generation": 0,
+}
 _scope_cache_lock = threading.RLock()
 # (bu, ledger, fy) -> (expires, last_period_with_data). The last query left
 # on /api/meta's warm path; see the comment at its use.
@@ -894,25 +902,37 @@ def _load_persisted_scope_catalog() -> dict | None:
 
 
 def _refresh_scope_catalog_async() -> None:
+    with _scope_cache_lock:
+        generation = int(_scope_cache.get("generation", 0))
+        refresh_engine = engine
+
     def work() -> None:
         started = time.monotonic()
         try:
-            value = engine.list_financial_scopes(include_activity=False)
+            value = refresh_engine.list_financial_scopes(
+                include_activity=False)
         except Exception as e:                    # noqa: BLE001
+            with _scope_cache_lock:
+                if generation != _scope_cache.get("generation", 0):
+                    return
+                _scope_cache["refreshing"] = False
             print(f"[pstb] scope catalog refresh failed: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
-            with _scope_cache_lock:
-                _scope_cache["refreshing"] = False
             progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
             return
         elapsed_ms = int((time.monotonic() - started) * 1000)
         with _scope_cache_lock:
+            if generation != _scope_cache.get("generation", 0):
+                return
             _scope_cache.update({
                 "value": value,
                 "expires": time.monotonic() + _SCOPE_CACHE_SECONDS,
                 "refreshing": False,
             })
-        _persist_scope_catalog(value)
+            # Keep the generation check and the site-keyed disk write in one
+            # lock interval. Otherwise reload can swap cfg between them and
+            # an old catalog can be written under the new database's key.
+            _persist_scope_catalog(value)
         progress.end("scopes")
         print(f"[pstb] scope catalog refreshed in {elapsed_ms} ms",
               file=sys.stderr)
@@ -937,6 +957,10 @@ def _prime_scope_catalog() -> None:
     where it was: triggered by the page's own background /api/scopes call,
     once the person already has a usable screen.
     """
+    with _scope_cache_lock:
+        generation = int(_scope_cache.get("generation", 0))
+        prime_engine = engine
+
     def work() -> None:
         with _scope_cache_lock:
             if _scope_cache["value"] is not None:
@@ -949,10 +973,12 @@ def _prime_scope_catalog() -> None:
             # run. Boot must not pay that on exactly the grant-limited
             # sites where it is slowest; the first browse view pays it
             # once, later, behind an honest "finding your business unit".
-            built = engine.list_financial_scopes(include_activity=False,
-                                                 verify_pairs=False,
-                                                 setup_only=True)
+            built = prime_engine.list_financial_scopes(
+                include_activity=False, verify_pairs=False, setup_only=True)
         except Exception as e:                    # noqa: BLE001
+            with _scope_cache_lock:
+                if generation != _scope_cache.get("generation", 0):
+                    return
             print(f"[pstb] scope catalog prime failed: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
             progress.end("scopes", ok=False, note=f"{type(e).__name__}: {e}")
@@ -965,17 +991,16 @@ def _prime_scope_catalog() -> None:
         built["note"] = ((built.get("note") or "") +
                          " Scope pairs not yet verified against ledger "
                          "data; opening the page confirms them.").strip()
-        cached = False
         with _scope_cache_lock:
+            if generation != _scope_cache.get("generation", 0):
+                return
             if _scope_cache["value"] is None:
                 # expires=0.0 on purpose: unverified is stale the moment it
                 # exists, so the first /api/scopes call replaces it.
                 _scope_cache.update({"value": built, "expires": 0.0})
-                cached = True
-        # Persist only what was actually adopted: a prime that lost the
-        # race to a real catalog must not overwrite it on disk either.
-        if cached:
-            _persist_scope_catalog(built)
+                # Persist only what was actually adopted, under the same
+                # generation/configuration checked above.
+                _persist_scope_catalog(built)
         progress.end("scopes")
 
     progress.begin("scopes")
@@ -1007,49 +1032,59 @@ def _financial_scope_catalog(force: bool = False) -> dict:
     refreshes; force=True (an explicit user refresh) still rebuilds
     synchronously because that user asked to wait for truth.
     """
-    now = time.monotonic()
-    with _scope_cache_lock:
-        value = _scope_cache["value"]
-        if not force and value is not None:
-            if now >= _scope_cache["expires"] and not _scope_cache["refreshing"]:
-                _scope_cache["refreshing"] = True
-                _refresh_scope_catalog_async()
-            return value
-    # First-ever load: build the UNVERIFIED catalog — setup reads only,
-    # milliseconds on any installation — because this is the one synchronous
-    # build left, and if it could time out, the retry button would repeat
-    # the same doomed build forever with nothing ever cached to serve stale.
-    # The verified catalog (ledger existence probes and all) is what the
-    # background refresh builds and replaces this with. An explicit
-    # force=True refresh still builds verified synchronously: that user
-    # asked to wait for truth.
-    if force:
-        built = engine.list_financial_scopes(include_activity=False)
-    else:
-        built = engine.list_financial_scopes(include_activity=False,
-                                             verify_pairs=False)
-        built["verified"] = False
-        built["note"] = ((built.get("note") or "") +
-                         " Scope pairs not yet verified against ledger "
-                         "data; a background refresh is confirming them."
-                         ).strip()
-    with _scope_cache_lock:
-        already_refreshing = _scope_cache["refreshing"]
-        _scope_cache.update(
-            {"value": built,
-             # An unverified catalog is immediately stale on purpose, so the
-             # next request triggers the verified background refresh.
-             "expires": (time.monotonic() + _SCOPE_CACHE_SECONDS if force
-                         else 0.0),
-             "refreshing": already_refreshing}
-        )
-    _persist_scope_catalog(built)
-    if not force:
+    # A synchronous route runs in an AnyIO worker and can overlap console
+    # reload. Retry once against the replacement engine rather than returning
+    # an old database's catalog as though it described the new deployment.
+    for attempt in range(2):
+        now = time.monotonic()
         with _scope_cache_lock:
-            if not _scope_cache["refreshing"]:
+            value = _scope_cache["value"]
+            if not force and value is not None:
+                if (now >= _scope_cache["expires"]
+                        and not _scope_cache["refreshing"]):
+                    _scope_cache["refreshing"] = True
+                    _refresh_scope_catalog_async()
+                return value
+            generation = int(_scope_cache.get("generation", 0))
+            catalog_engine = engine
+        # First-ever load: build the UNVERIFIED catalog — setup reads only,
+        # milliseconds on any installation — because this is the one
+        # synchronous build left. force=True still builds the verified form.
+        if force:
+            built = catalog_engine.list_financial_scopes(
+                include_activity=False)
+        else:
+            built = catalog_engine.list_financial_scopes(
+                include_activity=False, verify_pairs=False)
+            built["verified"] = False
+            built["note"] = ((built.get("note") or "") +
+                             " Scope pairs not yet verified against ledger "
+                             "data; a background refresh is confirming them."
+                             ).strip()
+        with _scope_cache_lock:
+            if generation != _scope_cache.get("generation", 0):
+                if attempt == 0:
+                    continue
+                raise HTTPException(
+                    status_code=503,
+                    detail=("Database configuration changed repeatedly while "
+                            "loading business units. Please retry."),
+                )
+            already_refreshing = _scope_cache["refreshing"]
+            _scope_cache.update(
+                {"value": built,
+                 # An unverified catalog is immediately stale on purpose, so
+                 # the next request triggers the verified background refresh.
+                 "expires": (time.monotonic() + _SCOPE_CACHE_SECONDS if force
+                             else 0.0),
+                 "refreshing": already_refreshing}
+            )
+            _persist_scope_catalog(built)
+            if not force and not _scope_cache["refreshing"]:
                 _scope_cache["refreshing"] = True
                 _refresh_scope_catalog_async()
-    return built
+            return built
+    raise AssertionError("scope catalog retry loop exhausted")  # pragma: no cover
 
 
 def _visible_scopes(catalog: dict, access) -> list:
@@ -1378,6 +1413,11 @@ def _session_id(payload: dict) -> str:
 def _guard(fn, **kw):
     try:
         return fn(**kw)
+    except HTTPException:
+        # A guarded helper may deliberately choose a non-400 status, such as
+        # the retryable 503 used when configuration changes twice during a
+        # scope build. Preserve that contract instead of wrapping it as 500.
+        raise
     except (EngineError, DbError, ReportError, ARError, ExportError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # surface the reason instead of a bare 500
@@ -2965,7 +3005,7 @@ def _console_reload() -> dict:
     worse than not reloading. So this reloads the read-only views and says
     plainly that the chat path needs a restart.
     """
-    global cfg, db, engine, ar, report_runner, relationships
+    global cfg, db, engine, row_security, ar, report_runner, relationships
     global modules, vendor_network, procurement
     reloaded: list = []
     # Adopt what the console just wrote to .env BEFORE rebuilding. dotenv
@@ -2995,9 +3035,16 @@ def _console_reload() -> dict:
         fresh = load_config(os.environ.get("PSTB_CONFIG"))
     except Exception as e:
         return {"reloaded": [], "error": f"{type(e).__name__}: {e}"}
+    new_db = None
     try:
         new_db = Database(fresh)
         new_engine = TBEngine(new_db, fresh)
+        # Row security owns both a per-operator grant cache and a discovered
+        # security-record cache. Reusing it after a reload would keep both
+        # the previous database and the previous policy configuration alive.
+        # Build the replacement before changing any module global so a
+        # construction failure leaves the running security boundary intact.
+        new_row_security = RowSecurity(new_db, fresh)
         new_ar = ARBilling(new_engine)
         new_relationships = Relationships(new_ar)
         new_report = ReportRunner(new_engine)
@@ -3008,16 +3055,36 @@ def _console_reload() -> dict:
         new_vendor_network = VendorNetwork(new_modules)
         new_procurement = _Proc(new_modules)
     except Exception as e:
-        # The old objects are still live and serving; say so.
+        # The old objects are still live and serving. The candidate database
+        # is not: no request can hold it yet, so release its pool rather than
+        # leaking a failed reload's sessions. Never close the old database
+        # here (or on success); in-flight requests may still be using it.
+        if new_db is not None:
+            try:
+                new_db.close()
+            except Exception:
+                pass
         return {"reloaded": [],
                 "error": f"kept the running configuration: {e}"}
-    cfg, db, engine, ar, report_runner, relationships = (
-        fresh, new_db, new_engine, new_ar, new_report, new_relationships)
-    modules, vendor_network, procurement = (
-        new_modules, new_vendor_network, new_procurement)
+    # All replacements exist before the serving graph changes. The scope
+    # lock also advances the cache generation in the same interval, so an
+    # old background catalog cannot land after the swap. These remain
+    # separate module globals, however: true concurrent-request atomicity
+    # requires the AppContext follow-up documented in CODE_REVIEW.md.
+    with _scope_cache_lock:
+        (cfg, db, engine, row_security, ar, report_runner, relationships,
+         modules, vendor_network, procurement) = (
+            fresh, new_db, new_engine, new_row_security, new_ar, new_report,
+            new_relationships, new_modules, new_vendor_network,
+            new_procurement)
+        _scope_cache.update({
+            "value": None,
+            "expires": 0.0,
+            "refreshing": False,
+            "generation": int(_scope_cache.get("generation", 0)) + 1,
+        })
     reloaded = ["trial balance", "AR and billing", "reports", "diagnostics",
-                "vendors and procurement"]
-    _scope_cache.update({"value": None, "expires": 0.0})
+                "vendors and procurement", "business-unit security"]
     reloaded.append("scope catalog")
     return {"reloaded": reloaded}
 

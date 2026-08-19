@@ -266,6 +266,53 @@ class RestartHonestyTests(unittest.TestCase):
         self.assertTrue(st.BY_KEY["llm.provider"].restart)
         self.assertFalse(st.BY_KEY["defaults.business_unit"].restart)
 
+    def test_a_saved_setting_discloses_a_failed_live_reload(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        from pstb.config import Config
+
+        cfg = Config.sample(Path(tempfile.mkdtemp()))
+        isolated = FastAPI()
+        console.register(
+            isolated,
+            lambda: cfg,
+            lambda: {
+                "reloaded": [],
+                "error": "kept the running configuration: database refused",
+            },
+        )
+        client = TestClient(isolated, **LOOP)
+        unlocked = client.post(
+            "/api/console/unlock",
+            json={"code": console.expected_codes()[0]},
+            headers=H,
+        )
+        self.assertEqual(unlocked.status_code, 200, unlocked.text)
+
+        with patch.object(console, "_probe_config", return_value=(True, "")):
+            response = client.post(
+                "/api/console/settings",
+                json={"changes": {"tools.max_rows": cfg.tools.max_rows + 1}},
+                headers=H,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["ok"], "the validated file was saved")
+        self.assertFalse(body["applied"])
+        self.assertEqual(body["reloaded"], [])
+        self.assertIn("kept the running configuration", body["reload_error"])
+        self.assertTrue((cfg.root / st.OVERLAY_NAME).exists())
+
+    def test_console_renders_reload_failure_as_a_warning(self) -> None:
+        text = (ROOT / "pstb/gui/static/console.html").read_text()
+        self.assertIn("Not applied to the running service", text)
+        self.assertIn("say(msg, text, !r.data.reload_error)", text)
+
 
 
 class TokenShapeTests(unittest.TestCase):

@@ -232,10 +232,15 @@ document.getElementById("save").onclick = async () => {
   if (!r.ok) return say(msg, (r.data.error||"") + " " + (r.data.remedy||""), false);
   let text = "Saved " + r.data.saved.join(", ") + ".";
   if (r.data.reloaded?.length) text += " Applied now: " + r.data.reloaded.join(", ") + ".";
+  if (r.data.reload_error)
+    text += " Not applied to the running service: " + r.data.reload_error +
+            " Restart the service to load the saved configuration.";
+  if (r.data.applied_live?.length)
+    text += " Running now: " + r.data.applied_live.join(", ") + ".";
   if (r.data.restart_required?.length)
     text += " Needs a restart: " + r.data.restart_required.join(", ") +
             ". " + r.data.restart_note;
-  say(msg, text, true);
+  say(msg, text, !r.data.reload_error);
   await load();
 };
 
