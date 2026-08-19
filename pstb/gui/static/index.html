@@ -366,7 +366,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="reports">Reports</button>
     <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
-    <button data-v="diag">Diagnostics</button>
+    <button data-v="diag">Diagnostics<span id="approvalbadge" class="badge warn" hidden></span></button>
     <div class="navfoot" id="navfoot"></div>
   </nav>
 
@@ -3952,6 +3952,8 @@ function showSignIn(){
     META=await api('/api/meta');      // re-read: the catalog is per-user
   }
   bootSay('Drawing the workspace');
+  // Fire and forget: the badge must never delay the first paint.
+  refreshApprovalBadge();
   // The token rode in on the URL and is now a cookie; scrub it from the
   // address bar so it does not live on in browser history, bookmarks and
   // screen shares for everyone the link was pasted to.
@@ -4423,6 +4425,26 @@ function renderDiag(d,holder){
     holder.append(c);
   }
 }
+/* The queue is behind a machine-local gate, so an operator reading this
+   over the VPN saw no sign it existed — four facts sat undecided for eleven
+   days. The COUNT is not gated (it is one integer, no content), so the badge
+   can say "there is something here" wherever you are, and Diagnostics then
+   tells you how to act on it.
+
+   Fetched after boot and never awaited by it: a badge must not cost the page
+   a round trip before it paints. */
+async function refreshApprovalBadge(){
+  const dot=$('#approvalbadge');
+  if(!dot) return;
+  try{
+    const d=await api('/api/approvals/count');
+    const n=(d&&d.readable)?Number(d.pending||0):0;
+    dot.textContent=String(n);
+    dot.hidden=!n;
+    dot.title=n?(n+' waiting for your decision'):'';
+  }catch(e){ dot.hidden=true; }   // never turn an affordance into an error
+}
+
 /* A thrown API error carries .message as a STRING for a plain detail and as
    an OBJECT for a FastAPI validation error, which rendered as
    "[object Object]" in the one place a reader most needs the reason. */
@@ -4483,6 +4505,7 @@ function renderApprovals(d,holder,refresh){
             body:JSON.stringify({queue:item.queue,id:item.id,
               source:item.source||'',decision:decision})});
           refresh();
+          refreshApprovalBadge();
         }catch(e){
           say.innerHTML='<span class="badge bad">'+esc(errText(e))+'</span>';
           yes.disabled=no.disabled=false;
@@ -4515,7 +4538,7 @@ async function loadApprovals(holder){
     const c=el('div','card');
     c.append(el('h2',null,'Waiting for your decision'));
     c.append(el('div','pad',e.status===403
-      ? '<span class="badge warn">operator access required</span> Approvals are machine-local. Open the app on the host or through an SSH tunnel, and use a privileged operator when row security is enabled.'
+      ? '<span class="badge warn">operator access required</span> '+esc(errText(e))
       : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
     box.append(c);
   }

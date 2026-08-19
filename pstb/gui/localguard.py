@@ -4,7 +4,7 @@ The default is unchanged and is still the right default: bind 127.0.0.1,
 answer only a caller on this machine. Two browser-side attacks reach a
 loopback server from the open internet without needing any network position
 at all, and both matter for an owner who works with
-``ssh -L 8000:localhost:8000`` up while browsing the web on the same laptop.
+an SSH tunnel up while browsing the web on the same laptop.
 
 DNS REBINDING. A page on evil.example resolves its own hostname to
 127.0.0.1 and issues same-origin requests to this server. The connection
@@ -288,6 +288,38 @@ def apply_security_headers(headers) -> None:
         headers.setdefault(key, value)
 
 
+# The CLI default, and the fallback when a scope carries no server address.
+DEFAULT_PORT = 8016
+
+
+def served_port(scope=None, default: int = DEFAULT_PORT) -> int:
+    """The port this process is really answering on, read from the scope.
+
+    The refusal below used to name a hardcoded 8000 while the CLI has
+    defaulted to 8016 since it grew a --port flag, so the one line a
+    locked-out reader was told to paste could not have worked. The ASGI
+    scope carries the bound address, which is both accurate and available
+    here without importing the app (this module stays a pure function of
+    the scope so it can be tested without a server).
+    """
+    server = (scope or {}).get("server") or ()
+    port = server[1] if len(server) > 1 else None
+    try:
+        return int(port) if port else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def tunnel_command(port: int = DEFAULT_PORT) -> str:
+    """The single place the SSH remedy is worded.
+
+    Three copies of this sentence had drifted apart. A remedy the reader
+    can paste is the whole difference between a refusal they can act on
+    and one they give up at, so it gets one formatter.
+    """
+    return f"ssh -L {port}:localhost:{port} <this-host>"
+
+
 def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     """(status, reason) when this request must not be served, else (0, "").
 
@@ -300,7 +332,7 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     if not policy.shared and not peer_is_loopback(scope.get("client")):
         return 403, ("This server answers only on the loopback interface. "
                      "Reach it through an SSH tunnel: "
-                     "ssh -L 8000:localhost:8000 <host>")
+                     f"{tunnel_command(served_port(scope))}")
     for name in _FORWARDED:
         if name in headers:
             return 400, (
@@ -348,5 +380,5 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
             return 403, (
                 "The configuration console answers only from the machine "
                 "itself, even in shared mode. Reach it through an SSH "
-                "tunnel: ssh -L 8000:localhost:8000 <this-host>")
+                f"tunnel: {tunnel_command(served_port(scope))}")
     return 0, ""
