@@ -1787,6 +1787,23 @@ def diagnostics(include_timings: int = 0):
                   connectors=[_coupa_mod.from_env(cfg=cfg)])
 
 
+# The port this process is actually serving on, so a refusal can print the
+# command that fixes it instead of a placeholder. main() sets it; the default
+# matches the CLI default for the library-import case.
+_SERVED_PORT = localguard.DEFAULT_PORT
+
+
+def tunnel_hint() -> str:
+    """The exact SSH command that turns a refused request into an allowed one.
+
+    "Use an SSH tunnel" is a direction, not a remedy — the reader still has
+    to work out the port and the flag order. Printing the line they can
+    paste is the difference between a refusal they can act on and one they
+    give up at.
+    """
+    return localguard.tunnel_command(_SERVED_PORT)
+
+
 def _require_question_log_operator(request: Request) -> None:
     """Protect diagnostics/review state without trusting the OPRID alone.
 
@@ -1798,8 +1815,9 @@ def _require_question_log_operator(request: Request) -> None:
             or not localguard.peer_is_loopback(request.scope.get("client"))):
         raise HTTPException(
             status_code=403,
-            detail="Question-log diagnostics are machine-local; use an SSH "
-                   "tunnel to the application host.")
+            detail="Question-log diagnostics and approvals are machine-local. "
+                   f"Run  {tunnel_hint()}  then open "
+                   f"http://localhost:{_SERVED_PORT} and use this page there.")
     if row_security.enabled:
         access = access_for_request(request)
         if access is None or not getattr(access, "privileged", False):
@@ -1898,6 +1916,39 @@ def _operator_name(request: Request) -> str:
     except HTTPException:
         access = None
     return (getattr(access, "oprid", "") or "operator").strip() or "operator"
+
+
+@app.get("/api/approvals/count")
+def approvals_count(request: Request = None):
+    """How many items await a decision. A NUMBER, never their content.
+
+    This endpoint is deliberately NOT behind the machine-local operator
+    gate that /api/approvals uses, and the difference is the point. The
+    queue was invisible: an operator reading the app over the VPN saw no
+    sign that four facts had been sitting undecided for eleven days, and
+    nothing prompted them to open a tunnel and look. Discoverability has
+    to reach where the person actually is.
+
+    What leaks is one integer: how many proposals exist. Not their text,
+    not the records they name, not who proposed them — those stay behind
+    the operator gate. A count carries no financial figure and no
+    entitlement, and it is strictly less than the Diagnostics tab already
+    advertises by existing.
+
+    A signed-in session is still required, so it is not public. That comes
+    from _row_security_guard, which gates every /api/ path that is not in
+    _OPEN_PATHS -- this route is deliberately absent from that set, and a
+    handler-local repeat of the check would only suggest the guarantee
+    lives here when it does not.
+    """
+    try:
+        listing = _site_memory().list_facts("pending")
+        pending = len(listing.get("facts") or [])
+    except Exception:                        # noqa: BLE001
+        # A badge is an affordance, not evidence. If the queue cannot be
+        # read, show nothing rather than a wrong number or an error card.
+        return {"pending": 0, "readable": False}
+    return {"pending": pending, "readable": True}
 
 
 @app.get("/api/approvals")
@@ -3201,6 +3252,8 @@ def main() -> None:
              "alone.")
     args = ap.parse_args()
 
+    global _SERVED_PORT
+    _SERVED_PORT = int(args.port)
     loopback = localguard.peer_is_loopback((args.host, args.port))
     # --share used to be a REQUIRED acknowledgement, and refusing to start
     # without it was worth it while the default was loopback: a routable
