@@ -277,6 +277,11 @@ bar also accepts an exact `schema.object`, meaning and aliases without sending
 that text through the chat model; its drawer shows the same pending approval
 queue. See the governed-learning section in
 [docs/METADATA_CATALOG.md](docs/METADATA_CATALOG.md#governed-local-meanings-for-cryptic-custom-objects).
+The normal review path is machine-local or an SSH tunnel. A default-off,
+passwordless remote exception exists for isolated testing. It is explicitly
+unauthenticated, has no Host-allowlist or timeout requirement, and remains on
+until disabled and restarted. See
+[docs/SETUP.md](docs/SETUP.md#temporary-passwordless-metadata-approval-from-a-remote-browser).
 
 Optional semantic re-ranking and resumable controller workflows are described
 in [docs/AI_ORCHESTRATION.md](docs/AI_ORCHESTRATION.md).

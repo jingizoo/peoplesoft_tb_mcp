@@ -109,6 +109,12 @@ security:
   # Ad-hoc SQL picks its own WHERE clause, so no argument check can bound
   # it to a unit. Off for restricted users; privileged users are unaffected.
   raw_sql_for_restricted: false
+  # TEMPORARY AND UNAUTHENTICATED. When true, a remote browser that types one
+  # of privileged_users may approve metadata meanings without a password or
+  # token. Anyone who can reach the page can type that same ID. No --allow-host
+  # or timeout is required in this testing mode. It stays active until set
+  # false and the server is restarted. Never enable it outside isolated tests.
+  allow_unauthenticated_remote_approvals: false
 
 llm:
   provider: ollama        # ollama | gemini | claude  (override per run: --provider, or PSTB_LLM_PROVIDER)

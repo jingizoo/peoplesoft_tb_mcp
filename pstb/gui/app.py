@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 from ..client.llm_base import PROVIDERS, provider_model
 from ..config import load_config
@@ -345,6 +346,18 @@ async def _access_guard(request, call_next):
             )
             localguard.apply_security_headers(response.headers)
             return response
+        if request.url.path == "/api/approvals/decide":
+            content_type = str(
+                request.headers.get("content-type") or "").split(
+                    ";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                response = JSONResponse(
+                    status_code=415,
+                    content={"error": "approval decisions require "
+                                      "application/json"},
+                )
+                localguard.apply_security_headers(response.headers)
+                return response
     status, reason = localguard.rejection(request.scope)
     if status:
         response = JSONResponse(status_code=status,
@@ -463,6 +476,19 @@ async def _row_security_guard(request, call_next):
     access would be answering a question nobody asked.
     """
     path = request.url.path
+    # The row-security middleware is currently the outer middleware, so it
+    # would otherwise resolve a claimed OPRID before the Host/forwarded-header
+    # guard runs.  That ordering becomes material when the deliberately
+    # unauthenticated remote approval exception is enabled.  Reject the two
+    # private approval routes at the network boundary first; the inner guard
+    # still performs the same check and sets a token cookie when applicable.
+    if path in ("/api/approvals", "/api/approvals/decide"):
+        status, reason = localguard.rejection(request.scope)
+        if status:
+            response = JSONResponse(status_code=status,
+                                    content={"error": reason})
+            localguard.apply_security_headers(response.headers)
+            return response
     if not row_security.enabled or path in _OPEN_PATHS \
             or not path.startswith("/api/") \
             or path.startswith("/api/console"):
@@ -1462,9 +1488,15 @@ def meta(request: Request = None):
     approval_privileged = bool(
         meta_access is not None
         and getattr(meta_access, "privileged", False))
+    approval_unauthenticated_remote_active = bool(
+        not approval_peer_loopback
+        and approval_privileged
+        and row_security.enabled
+        and _unauthenticated_remote_approvals_active())
     approval_review_ready = bool(
-        approval_peer_loopback
-        and (not row_security.enabled or approval_privileged))
+        (approval_peer_loopback
+         and (not row_security.enabled or approval_privileged))
+        or approval_unauthenticated_remote_active)
     out = {
         "defaults": {
             "business_unit": d.business_unit,
@@ -1518,6 +1550,12 @@ def meta(request: Request = None):
                      "privileged": approval_privileged,
                      "approval_peer_loopback": approval_peer_loopback,
                      "approval_review_ready": approval_review_ready,
+                     "approval_unauthenticated_remote_configured":
+                         _unauthenticated_remote_approvals_configured(),
+                     "approval_unauthenticated_remote_active":
+                         approval_unauthenticated_remote_active,
+                     "approval_unauthenticated_remote_expires_at": "",
+                     "approval_identity_verified": False,
                      "is_authentication": False},
         "raw_sql": cfg.tools.allow_raw_sql,
     }
@@ -1823,7 +1861,6 @@ def diagnostics(include_timings: int = 0):
 # matches the CLI default for the library-import case.
 _SERVED_PORT = localguard.DEFAULT_PORT
 
-
 def tunnel_hint() -> str:
     """The exact SSH command that turns a refused request into an allowed one.
 
@@ -1835,8 +1872,28 @@ def tunnel_hint() -> str:
     return localguard.tunnel_command(_SERVED_PORT)
 
 
+def _unauthenticated_remote_approvals_configured() -> bool:
+    return (getattr(cfg.security,
+                    "allow_unauthenticated_remote_approvals", False)
+            is True)
+
+
+def _unauthenticated_remote_approvals_active() -> bool:
+    return _unauthenticated_remote_approvals_configured()
+
+
+def _is_unverified_remote_approval_request(request: Request) -> bool:
+    # Set exactly once by _require_approval_operator.  Never recompute the
+    # testing switch midway through a request: a config reload after admission
+    # must not reclassify a remote caller as local and widen its queue.
+    return bool(
+        request is not None
+        and request.scope.get("pstb.approval_mode")
+        == "unverified_remote")
+
+
 def _require_question_log_operator(request: Request) -> None:
-    """Protect diagnostics/review state without trusting the OPRID alone.
+    """Protect question diagnostics/review without trusting the OPRID alone.
 
     The PeopleSoft user-id chooser is explicitly not authentication.  The
     operator dashboard therefore remains machine-local (an SSH tunnel arrives
@@ -1846,7 +1903,7 @@ def _require_question_log_operator(request: Request) -> None:
             or not localguard.peer_is_loopback(request.scope.get("client"))):
         raise HTTPException(
             status_code=403,
-            detail="Question-log diagnostics and approvals are machine-local. "
+            detail="Question-log diagnostics are machine-local. "
                    f"Run  {tunnel_hint()}  then open "
                    f"http://localhost:{_SERVED_PORT} and use this page there.")
     if row_security.enabled:
@@ -1856,6 +1913,75 @@ def _require_question_log_operator(request: Request) -> None:
                 status_code=403,
                 detail="Question-log diagnostics are restricted to "
                        "configured privileged operators.")
+
+
+def _require_approval_operator(request: Request) -> None:
+    """Authorize metadata decisions, including explicit unsafe test mode.
+
+    Loopback keeps the established operator gate.  Remotely, the typed OPRID
+    is admitted only through the exact default-off configuration switch. This
+    is intentionally honest about being a claimed identity, not authentication;
+    no Host allowlist, token, or timeout is implied by this testing exception.
+    """
+    if (request is None
+            or localguard.peer_is_loopback(request.scope.get("client"))):
+        _require_question_log_operator(request)
+        if request is not None:
+            request.scope["pstb.approval_mode"] = "local"
+        return
+    if not _unauthenticated_remote_approvals_active():
+        raise HTTPException(
+            status_code=403,
+            detail="Metadata approvals are machine-local. The explicitly "
+                   "unsafe remote review option is off.")
+    if not row_security.enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthenticated remote approvals require "
+                   "security.enabled: true and a configured privileged user.")
+    who = resolve_operator(request)
+    if not who:
+        raise HTTPException(
+            status_code=401,
+            detail="Select a configured privileged PeopleSoft user ID first.")
+    # Direct configuration membership is deliberate: this path must never
+    # depend on PSOPRDEFN or BU-security rows, even when they are empty.
+    if who not in row_security.privileged_users:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{who} is not listed in security.privileged_users.")
+    request.scope["pstb.approval_mode"] = "unverified_remote"
+
+
+def _require_remote_approval_post_contract(request: Request) -> None:
+    """Browser-CSRF checks for the passwordless remote decision path.
+
+    These checks are not authentication.  They only ensure that an ordinary
+    foreign web page cannot submit the decision form cross-origin.
+    """
+    if not _is_unverified_remote_approval_request(request):
+        return
+    content_type = str(request.headers.get("content-type") or "").split(
+        ";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415,
+                            detail="approval decisions require application/json")
+    if request.headers.get("x-pstb-approval-request") != "metadata-review":
+        raise HTTPException(
+            status_code=403,
+            detail="approval decision is missing the GUI request marker")
+    origin = str(request.headers.get("origin") or "").strip()
+    host = str(request.headers.get("host") or "").strip()
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        parsed = None
+    if (parsed is None or parsed.scheme not in ("http", "https")
+            or parsed.scheme.casefold() != request.url.scheme.casefold()
+            or not parsed.netloc or parsed.netloc.casefold() != host.casefold()):
+        raise HTTPException(
+            status_code=403,
+            detail="approval decisions require the same browser origin")
 
 
 @app.get("/api/question-report")
@@ -2077,6 +2203,9 @@ def _source_catalog_identity(source: str, proposal: dict) -> dict:
 
 def _operator_name(request: Request) -> str:
     """Who to record against a decision. Never blank in the audit trail."""
+    if _is_unverified_remote_approval_request(request):
+        who = resolve_operator(request) or "operator"
+        return f"{who} - unverified remote selector"
     try:
         access = access_for_request(request)
     except HTTPException:
@@ -2142,7 +2271,8 @@ def approvals_count(request: Request = None):
 
 
 @app.get("/api/approvals")
-def list_approvals(request: Request = None, status: str = "pending"):
+def list_approvals(request: Request, response: Response,
+                   status: str = "pending", source: str = ""):
     """Everything waiting on a human decision, in one list.
 
     Two governed queues existed and both were terminal-only: taught site
@@ -2151,13 +2281,37 @@ def list_approvals(request: Request = None, status: str = "pending"):
     approval step part of the product rather than an admin chore — and a
     queue you can only reach by SSH is a queue that does not get emptied.
     """
-    _require_question_log_operator(request)
+    _require_approval_operator(request)
+    response.headers["Cache-Control"] = "no-store, private"
+    remote_unverified = _is_unverified_remote_approval_request(request)
     wanted = str(status or "").strip().lower() or "pending"
     if wanted not in ("pending", "approved", "rejected", "all"):
         raise HTTPException(
             status_code=400,
             detail="status must be pending, approved, rejected or all")
-    listing = _site_memory().list_facts("" if wanted == "all" else wanted)
+    source_names = _approval_source_names()
+    if remote_unverified:
+        # The exception exists for P2Go metadata review, not to publish the
+        # cross-source site-memory queue and decision history to a claimed
+        # identity.  Require the active drawer's canonical source and return
+        # only its pending SourceKnowledge rows.
+        requested_source = str(source or "").strip()
+        if not requested_source:
+            raise HTTPException(
+                status_code=400,
+                detail="source is required for unauthenticated remote review")
+        if engine.registry is None:
+            raise HTTPException(status_code=404, detail="no sources configured")
+        try:
+            canonical_source = engine.registry.resolve_name(requested_source)
+        except DbError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        source_names = [canonical_source]
+        wanted = "pending"
+        listing = {"facts": [], "counts": {}}
+    else:
+        listing = _site_memory().list_facts(
+            "" if wanted == "all" else wanted)
     items = [{
         "queue": "memory",
         "id": fact.get("id"),
@@ -2173,7 +2327,7 @@ def list_approvals(request: Request = None, status: str = "pending"):
     # Per-source metadata proposals. A source whose artifact has never been
     # built simply has no queue; that is not an error worth failing on.
     source_errors = []
-    for name in _approval_source_names():
+    for name in source_names:
         try:
             store = _source_knowledge_store(name)
             proposals = store.list_proposals(
@@ -2213,7 +2367,7 @@ def list_approvals(request: Request = None, status: str = "pending"):
 
 
 @app.post("/api/approvals/decide")
-def decide_approval(payload: dict, request: Request = None):
+def decide_approval(payload: dict, request: Request, response: Response):
     """Approve or reject one queued item.
 
     Deliberately one item at a time and never "approve all": each of these
@@ -2221,7 +2375,10 @@ def decide_approval(payload: dict, request: Request = None):
     the queue routinely holds several near-duplicate phrasings of one fact
     where approving every one of them injects it repeatedly.
     """
-    _require_question_log_operator(request)
+    _require_approval_operator(request)
+    _require_remote_approval_post_contract(request)
+    response.headers["Cache-Control"] = "no-store, private"
+    remote_unverified = _is_unverified_remote_approval_request(request)
     body = dict(payload or {})
     queue = str(body.get("queue") or "memory").strip().lower()
     item_id = str(body.get("id") or "").strip()
@@ -2232,6 +2389,12 @@ def decide_approval(payload: dict, request: Request = None):
         raise HTTPException(
             status_code=400, detail="decision must be approve or reject")
     by = _operator_name(request)
+
+    if remote_unverified and queue != "source_knowledge":
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthenticated remote review is limited to metadata "
+                   "meanings for the selected database.")
 
     if queue == "memory":
         from ..memory import MemoryError_
@@ -2265,6 +2428,11 @@ def decide_approval(payload: dict, request: Request = None):
                 item_id, approve=(decision == "approve"), decided_by=by,
                 current_object=identity)
         except Exception as exc:
+            if remote_unverified:
+                raise HTTPException(
+                    status_code=400,
+                    detail="metadata decision could not be applied; refresh "
+                           "the queue and try again") from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "queue": queue, "source": canonical,
                 "id": item_id,
@@ -3561,6 +3729,18 @@ def main() -> None:
     if not loopback and not args.allow_host:
         print("  Accepting any Host header; pass --allow-host <name> to "
               "narrow it.")
+    if (not loopback
+            and _unauthenticated_remote_approvals_configured()):
+        print("\n  DANGER — UNAUTHENTICATED REMOTE METADATA APPROVAL IS ON.")
+        print("  A typed PeopleSoft ID is not verified. Anyone who can reach "
+              "this URL can type a configured privileged ID such as BATCH1 "
+              "and approve or reject metadata meanings.")
+        print("  This exception affects metadata approvals only; question-log "
+              "and answer-quality review plus /console remain machine-local.")
+        print("  Testing exception stays active until the configuration "
+              "switch is disabled and this process is restarted.")
+        print("  Set security.allow_unauthenticated_remote_approvals: false "
+              "and restart after the supervised review.")
     print("\n  Ctrl+C to stop\n")
     if args.open:
         import threading

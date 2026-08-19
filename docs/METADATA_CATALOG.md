@@ -191,6 +191,19 @@ privilege is evaluated before PeopleSoft BU-security records, so the reviewer
 does not need a row in those records. The `pstb.source_knowledge` CLI remains
 available as a host-side fallback.
 
+For an isolated test deployment that cannot use a tunnel, the default-off
+`security.allow_unauthenticated_remote_approvals` exception permits a configured
+privileged ID to review pending metadata from the remote GUI during isolated
+testing. It requires `security.enabled: true` but deliberately requires neither
+an application password, `--allow-host`, nor a timeout. It does not consult
+BU-security rows, exposes only pending meanings for the active source, and
+records the reviewer as unverified. This is not authentication:
+anyone reaching the page can type the same ID. Question-log/answer-quality
+review, site-memory facts, decision history, and `/console` remain
+machine-local; ordinary database Diagnostics retain their existing signed-in
+policy. See the exact setup and shutdown steps in
+[SETUP.md](SETUP.md#temporary-passwordless-metadata-approval-from-a-remote-browser).
+
 The overlay is bound to the canonical source, secret-free endpoint/schema
 fingerprint, and exact catalog object ID. It is not merged into the structural
 artifact and cannot change catalog confidence, columns, keys, native foreign

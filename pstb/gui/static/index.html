@@ -4550,7 +4550,8 @@ function renderApprovals(d,holder,refresh){
           // enforces it, which is what stops a cross-origin page POSTing
           // JSON at a local endpoint. Omitting it 422s.
           await api('/api/approvals/decide',{method:'POST',
-            headers:{'Content-Type':'application/json'},
+            headers:{'Content-Type':'application/json',
+              'X-PSTB-Approval-Request':'metadata-review'},
             body:JSON.stringify({queue:item.queue,id:item.id,
               source:item.source||'',decision:decision})});
           refresh();
@@ -4572,7 +4573,7 @@ function renderApprovals(d,holder,refresh){
   holder.append(card);
 }
 
-async function loadApprovals(holder,drawerGeneration){
+async function loadApprovals(holder,source,drawerGeneration){
   // Replace the panel in place. Re-entering with the inner box as the
   // parent nested a second panel inside the first, so a decision landed on
   // the server while the heading above it still showed the old count.
@@ -4581,10 +4582,12 @@ async function loadApprovals(holder,drawerGeneration){
   const box=el('div'); box.setAttribute('data-approvals','1');
   holder.append(box);
   try{
-    const data=await api('/api/approvals?status=all');
+    const canonical=String(source||ACTIVE_CHAT_SOURCE||'default');
+    const data=await api('/api/approvals?status=all&source='+
+      encodeURIComponent(canonical));
     if(drawerGeneration!==undefined&&!drawerIsCurrent(drawerGeneration))return;
     renderApprovals(data,box,
-                    ()=>loadApprovals(holder,drawerGeneration));
+                    ()=>loadApprovals(holder,canonical,drawerGeneration));
   }catch(e){
     if(drawerGeneration!==undefined&&!drawerIsCurrent(drawerGeneration))return;
     const c=el('div','card');
@@ -4657,6 +4660,16 @@ function metadataApprovalAccessNotice(){
       'Signed in as <b>'+esc(sec.oprid||'unknown')+'</b>, but this running process does not recognize that ID in '+
       '<code>security.privileged_users</code>. Submission can work while old proposals and approval buttons remain protected. '+
       'Add the ID and restart or reload the app.'));
+  }else if(sec.approval_unauthenticated_remote_active){
+    box.append(el('div','pad','<span class="badge bad">unauthenticated remote review</span> '+
+      '<b>'+esc(sec.oprid||'operator')+'</b> is only a claimed ID; no password or SSO identity was checked. '+
+      'Anyone who can reach this URL can type the same privileged ID and approve or reject metadata. '+
+      'This testing exception stays active until you disable <code>security.allow_unauthenticated_remote_approvals</code> '+
+      'and restart the server.'));
+  }else if(!sec.approval_peer_loopback&&sec.approval_unauthenticated_remote_configured){
+    box.append(el('div','pad','<span class="badge warn">testing review unavailable</span> '+
+      'Remote testing approval requires security to be enabled and this signed-in ID to be listed in '+
+      '<code>security.privileged_users</code>.'));
   }else if(!sec.approval_peer_loopback){
     box.append(el('div','pad','<span class="badge warn">local review required</span> '+
       '<b>'+esc(sec.oprid||'operator')+'</b> is privileged and bypasses BU security, but proposal content and decisions are '+
@@ -4686,9 +4699,9 @@ function openApprovals(source){
   // operator came to approve was commonly below the fold.
   body.prepend(metadataApprovalAccessNotice());
   body.append(metadataProposalPanel(
-    canonical,()=>loadApprovals(holder,drawerGeneration),drawerGeneration));
+    canonical,()=>loadApprovals(holder,canonical,drawerGeneration),drawerGeneration));
   $('#drawer').classList.add('on');$('#scrim').classList.add('on');
-  loadApprovals(holder,drawerGeneration);
+  loadApprovals(holder,canonical,drawerGeneration);
 }
 
 async function viewDiag(){
@@ -4708,7 +4721,7 @@ async function viewDiag(){
     try{
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
-      await loadApprovals(holder);
+      await loadApprovals(holder,ACTIVE_CHAT_SOURCE);
       try{
         holder.append(renderQlogReport(await api('/api/question-report')));
       }catch(e2){
