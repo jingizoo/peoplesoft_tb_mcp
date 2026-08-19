@@ -306,3 +306,103 @@ class WebTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RowSamplingToolTests(unittest.TestCase):
+    """A tool that returns ROWS needs a unit gate, whatever else it is for.
+
+    profile_record and compare_records exist for structure discovery, so
+    they read as catalog lookups — but their payloads carry `sample`, the
+    first rows of whichever table was named, with no unit predicate and no
+    argument that could carry one. A US001-only caller profiling PS_LEDGER
+    received:
+
+        sample units: ['EU001', 'US001']
+        {"business_unit": "EU001", "account": "9999",
+         "posted_total_amt": 8675309.0}
+
+    The column masking in profiles.py is a different control: it hides bank
+    and tax identifiers wherever they appear and says nothing about WHICH
+    ROWS the caller may see.
+    """
+
+    ROW_SAMPLERS = ("profile_record", "compare_records")
+    # Structure only — columns, indexes, record names. Never values. These
+    # must stay available: taking them away costs a restricted user their
+    # ability to find anything and protects nothing.
+    STRUCTURE_ONLY = ("describe_table", "search_records", "search_metadata",
+                      "get_metadata_context", "join_path")
+
+    def setUp(self):
+        from pstb.security import Access
+        self.restricted = Access(oprid="US001USER",
+                                 units=frozenset({"US001"}), all_units=False)
+        self.unrestricted = Access(oprid="ADMIN", units=frozenset(),
+                                   all_units=True)
+
+    def test_row_samplers_are_refused_for_a_restricted_user(self):
+        from pstb.guards import unit_access_block
+        for tool in self.ROW_SAMPLERS:
+            with self.subTest(tool=tool):
+                denied = unit_access_block(
+                    tool, {"table": "PS_LEDGER"}, self.restricted)
+                self.assertTrue(
+                    denied,
+                    f"{tool} returns sample rows from any table and cannot "
+                    "be bounded to a granted unit")
+
+    def test_the_refusal_gives_the_true_reason_and_a_way_forward(self):
+        from pstb.guards import unit_access_block
+        denied = unit_access_block(
+            "profile_record", {"table": "PS_LEDGER"}, self.restricted)
+        self.assertNotIn(
+            "arbitrary SQL", denied,
+            "profile_record does not run arbitrary SQL; a refusal the "
+            "reader can tell is wrong is one they learn to route around")
+        self.assertIn("sample ROWS", denied)
+        self.assertIn("describe_table", denied)
+
+    def test_structure_only_discovery_stays_available(self):
+        from pstb.guards import unit_access_block
+        for tool in self.STRUCTURE_ONLY:
+            with self.subTest(tool=tool):
+                self.assertEqual(
+                    unit_access_block(tool, {"table": "PS_LEDGER"},
+                                      self.restricted), "",
+                    f"{tool} returns no values, so gating it removes "
+                    "discovery without protecting anything")
+
+    def test_an_unrestricted_caller_is_unaffected(self):
+        from pstb.guards import unit_access_block
+        for tool in self.ROW_SAMPLERS + self.STRUCTURE_ONLY:
+            with self.subTest(tool=tool):
+                self.assertEqual(
+                    unit_access_block(tool, {"table": "PS_LEDGER"},
+                                      self.unrestricted), "")
+
+    def test_every_row_sampler_is_declared_unscoped(self):
+        """The invariant, not just the two names.
+
+        A future tool that samples rows and takes no business_unit must be
+        added to _UNSCOPED_DATA_TOOLS or it reopens this hole. Derive the
+        candidates from the live tool signatures rather than a second
+        hand-kept list.
+        """
+        import inspect
+
+        from pstb import server
+        from pstb.guards import _UNSCOPED_DATA_TOOLS, _TOOL_SCOPE_ARGS
+
+        for name in self.ROW_SAMPLERS:
+            handler = getattr(server, name, None)
+            self.assertIsNotNone(handler, f"{name} is no longer a tool")
+            self.assertNotIn(
+                "business_unit", inspect.signature(handler).parameters,
+                f"{name} now takes a business unit — gate it through "
+                "_TOOL_SCOPE_ARGS instead of refusing it outright")
+            self.assertIn(name, _UNSCOPED_DATA_TOOLS)
+            # They ARE in _TOOL_SCOPE_ARGS, carrying the `source` binding
+            # that keeps a /p2go silo on its own database. That is a
+            # different axis; what must not appear is a business_unit
+            # binding, which would imply an argument gate they cannot have.
+            self.assertNotIn("business_unit", _TOOL_SCOPE_ARGS.get(name, {}))

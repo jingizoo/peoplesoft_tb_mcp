@@ -301,7 +301,26 @@ BU_ALL_TOOLS = {"get_top_billing_customers"}
 # restricted user reaching them would see every unit's rows. They are not
 # refused outright — most are catalogs or shape lookups with no figures in
 # them — but the ad-hoc ones are, below.
-_UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"}
+#
+# profile_record and compare_records belong here because they RETURN ROWS.
+# The distinction that matters is not "does the tool read a table" — every
+# catalog lookup does — it is "does the payload carry values out of it".
+# Both sample the first rows of any table named, with no unit predicate and
+# no argument that could carry one, so a US001-only caller reading
+# PS_LEDGER got EU001's amounts. Measured on a seeded sample:
+#   profile_record sample units: ['EU001', 'US001']
+#   leaked: {"business_unit": "EU001", "account": "9999",
+#            "posted_total_amt": 8675309.0}
+# The column masking already in profiles.py is a DIFFERENT control — it
+# hides bank and tax identifiers wherever they appear, and says nothing
+# about which rows the caller may see.
+#
+# describe_table, search_records and the metadata tools are deliberately NOT
+# here: they return columns, indexes and record names, never values. Adding
+# them would take structural discovery away from a restricted user for no
+# confidentiality gain.
+_ROW_SAMPLING_TOOLS = frozenset({"profile_record", "compare_records"})
+_UNSCOPED_DATA_TOOLS = {"run_sql", "run_ps_query"} | _ROW_SAMPLING_TOOLS
 _UNSCOPED_EXTERNAL_DATA_TOOLS = {
     "coupa_to_ap_tie", "get_coupa_invoices",
     "get_coupa_stuck_approvals", "get_coupa_budget_lines",
@@ -380,13 +399,28 @@ def unit_access_block(tool_name: str, args, access,
         return ""                       # the catalog is filtered at source
     if tool_name in _UNSCOPED_DATA_TOOLS and not allow_raw_sql:
         # Ad-hoc SQL and a saved PSQuery both choose their own WHERE
-        # clause, so no argument check can bound them to a unit. Rather
-        # than pretend otherwise, they are off for a restricted user and
-        # the refusal says which curated tools answer the same question.
+        # clause, so no argument check can bound them to a unit. The row
+        # samplers cannot be bounded either, for a different reason: they
+        # take a table name and nothing else. Rather than pretend
+        # otherwise, both are off for a restricted user.
+        #
+        # The REASON has to be the true one. Telling someone that
+        # profile_record "runs arbitrary SQL" is false, and a refusal a
+        # reader can tell is wrong is one they learn to route around.
+        granted = ", ".join(sorted(access.units)) or "none"
+        if tool_name in _ROW_SAMPLING_TOOLS:
+            return (
+                f"{tool_name} is not available to {access.oprid}: it returns "
+                "sample ROWS from whichever table is named, and takes no "
+                "business-unit argument that could limit them to the units "
+                f"PeopleSoft grants this user ({granted}). Use "
+                "describe_table or search_records for the structure — those "
+                "return columns and record names, never values — or a "
+                "curated tool for the figures, which carries the unit.")
         return (
             f"{tool_name} is not available to {access.oprid}: it runs "
             "arbitrary SQL, which cannot be limited to the business units "
-            f"PeopleSoft grants this user ({', '.join(sorted(access.units)) or 'none'}). "
+            f"PeopleSoft grants this user ({granted}). "
             "Use the curated tools — they carry the unit and are filtered.")
     if tool_name in _UNSCOPED_EXTERNAL_DATA_TOOLS:
         return (
