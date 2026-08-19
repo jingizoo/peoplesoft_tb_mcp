@@ -4423,6 +4423,104 @@ function renderDiag(d,holder){
     holder.append(c);
   }
 }
+/* A thrown API error carries .message as a STRING for a plain detail and as
+   an OBJECT for a FastAPI validation error, which rendered as
+   "[object Object]" in the one place a reader most needs the reason. */
+function errText(e){
+  const m=e&&e.message;
+  if(typeof m==='string'&&m) return m;
+  if(m) { try{ return JSON.stringify(m); }catch(_){ } }
+  return (e&&e.status?'request failed ('+e.status+')':'request failed');
+}
+
+/* ---------- approval queue ----------
+   Facts taught in conversation and proposed metadata meanings are recorded
+   PENDING and reach no answer until a human decides. Both queues were
+   terminal-only, and a queue you can only empty over SSH is a queue that
+   does not get emptied. Same machine-local operator gate as the rest of
+   this view. */
+function renderApprovals(d,holder,refresh){
+  const card=el('div','card');
+  const items=(d&&d.items)||[];
+  const pending=items.filter(i=>i.status==='pending');
+  card.append(el('h2',null,'Waiting for your decision '+
+    (pending.length?'<span class="badge warn">'+pending.length+' pending</span>'
+                   :'<span class="badge ok">nothing pending</span>')+
+    '<span class="sub">nothing here reaches an answer until it is approved</span>'));
+  if(!items.length){
+    card.append(el('div','pad','No facts or meanings have been proposed yet. '+
+      'They appear here when the assistant is taught something in conversation.'));
+    holder.append(card); return;
+  }
+  items.forEach(item=>{
+    const row=el('div','pad');
+    row.style.borderTop='1px solid var(--line)';
+    const badge=item.status==='pending'?'':
+      '<span class="badge '+(item.status==='approved'?'ok':'dim')+'">'+
+      esc(item.status)+(item.decided_by?' by '+esc(item.decided_by):'')+'</span> ';
+    row.innerHTML=badge+'<b>'+esc(item.subject||item.kind||'')+'</b> '+
+      '<span style="color:var(--muted)">'+esc(item.queue==='memory'
+        ? 'site fact' : 'meaning \u00b7 '+(item.source||''))+'</span>'+
+      '<div style="margin:4px 0">'+esc(item.text||'')+'</div>'+
+      '<div style="color:var(--muted);font-size:12px">'+
+      esc(item.origin||'')+(item.proposed?' \u00b7 '+esc(String(item.proposed).slice(0,19)):'')+
+      '</div>';
+    if(item.status==='pending'){
+      const bar=el('div'); bar.style.marginTop='6px';
+      const yes=el('button','btn','Approve');
+      const no=el('button','btn ghost','Reject');
+      no.style.marginLeft='6px';
+      const say=el('span'); say.style.marginLeft='10px';
+      async function decide(decision){
+        yes.disabled=no.disabled=true;
+        say.innerHTML='<span class="spin"></span>';
+        try{
+          // Content-Type is required, not optional: this FastAPI version
+          // enforces it, which is what stops a cross-origin page POSTing
+          // JSON at a local endpoint. Omitting it 422s.
+          await api('/api/approvals/decide',{method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({queue:item.queue,id:item.id,
+              source:item.source||'',decision:decision})});
+          refresh();
+        }catch(e){
+          say.innerHTML='<span class="badge bad">'+esc(errText(e))+'</span>';
+          yes.disabled=no.disabled=false;
+        }
+      }
+      yes.onclick=()=>decide('approve');
+      no.onclick=()=>decide('reject');
+      bar.append(yes,no,say); row.append(bar);
+    }
+    card.append(row);
+  });
+  card.append(el('div','pad','<span style="color:var(--muted)">Near-duplicate '+
+    'phrasings of one fact are common. Approve the clearest and reject the '+
+    'rest \u2014 each approved fact is injected separately.</span>'));
+  holder.append(card);
+}
+
+async function loadApprovals(holder){
+  // Replace the panel in place. Re-entering with the inner box as the
+  // parent nested a second panel inside the first, so a decision landed on
+  // the server while the heading above it still showed the old count.
+  const existing=holder.querySelector('[data-approvals]');
+  if(existing) existing.remove();
+  const box=el('div'); box.setAttribute('data-approvals','1');
+  holder.append(box);
+  try{
+    renderApprovals(await api('/api/approvals?status=all'),box,
+                    ()=>loadApprovals(holder));
+  }catch(e){
+    const c=el('div','card');
+    c.append(el('h2',null,'Waiting for your decision'));
+    c.append(el('div','pad',e.status===403
+      ? '<span class="badge warn">operator access required</span> Approvals are machine-local. Open the app on the host or through an SSH tunnel, and use a privileged operator when row security is enabled.'
+      : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
+    box.append(c);
+  }
+}
+
 async function viewDiag(){
   const w=$('#wrap'); w.innerHTML='';
   const intro=el('div','card');
@@ -4440,6 +4538,7 @@ async function viewDiag(){
     try{
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
+      await loadApprovals(holder);
       try{
         holder.append(renderQlogReport(await api('/api/question-report')));
       }catch(e2){

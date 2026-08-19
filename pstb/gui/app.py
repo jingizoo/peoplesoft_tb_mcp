@@ -1821,6 +1821,166 @@ def update_question_review(payload: dict, request: Request = None):
             "status": qlog.review_status(candidate)}
 
 
+def _source_knowledge_store(source: str):
+    """The proposal store for one named source, built exactly as the CLI does.
+
+    Fingerprint and path resolution live in source_knowledge/metadata; going
+    through the same constructors keeps the GUI from drifting into a second,
+    subtly different notion of which artifact belongs to which database.
+    """
+    from ..metadata import source_fingerprint
+    from ..source_knowledge import SourceKnowledge, source_knowledge_path
+    return SourceKnowledge(
+        source_knowledge_path(cfg, source), source=source,
+        source_fingerprint=source_fingerprint(cfg, source))
+
+
+def _source_catalog_identity(source: str, proposal: dict) -> dict:
+    """Prove the proposal still points at a real object before approving it.
+
+    An approval is durable; the catalog it referred to may have been rebuilt
+    since the proposal was made. The CLI performs this check, so the GUI
+    must too or the two paths would grant different things.
+    """
+    from ..metadata import (MetadataCatalog, source_catalog_path,
+                            source_fingerprint)
+    from ..source_knowledge import _catalog_identity
+    catalog = MetadataCatalog(
+        source_catalog_path(cfg, source), source=source,
+        expected_fingerprint=source_fingerprint(cfg, source))
+    return _catalog_identity(catalog, source, proposal)
+
+
+def _operator_name(request: Request) -> str:
+    """Who to record against a decision. Never blank in the audit trail."""
+    try:
+        access = access_for_request(request)
+    except HTTPException:
+        access = None
+    return (getattr(access, "oprid", "") or "operator").strip() or "operator"
+
+
+@app.get("/api/approvals")
+def list_approvals(request: Request = None, status: str = "pending"):
+    """Everything waiting on a human decision, in one list.
+
+    Two governed queues existed and both were terminal-only: taught site
+    facts and, per source, proposed metadata meanings. Nothing either of
+    them holds reaches an answer until it is approved, which makes the
+    approval step part of the product rather than an admin chore — and a
+    queue you can only reach by SSH is a queue that does not get emptied.
+    """
+    _require_question_log_operator(request)
+    wanted = str(status or "").strip().lower() or "pending"
+    if wanted not in ("pending", "approved", "rejected", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail="status must be pending, approved, rejected or all")
+    listing = _site_memory().list_facts("" if wanted == "all" else wanted)
+    items = [{
+        "queue": "memory",
+        "id": fact.get("id"),
+        "text": fact.get("text"),
+        "kind": fact.get("kind"),
+        "subject": fact.get("table") or fact.get("record") or "",
+        "origin": fact.get("source"),
+        "proposed": fact.get("proposed"),
+        "status": fact.get("status"),
+        "decided_by": fact.get("decided_by"),
+    } for fact in (listing.get("facts") or [])]
+
+    # Per-source metadata proposals. A source whose artifact has never been
+    # built simply has no queue; that is not an error worth failing on.
+    sources = []
+    if engine.registry is not None:
+        sources = [n for n in engine.registry.names() if n != "default"]
+    for name in sources:
+        try:
+            store = _source_knowledge_store(name)
+            proposals = store.list_proposals(
+                "" if wanted == "all" else wanted)
+        except Exception:
+            continue
+        for row in proposals or []:
+            items.append({
+                "queue": "source_knowledge",
+                "source": name,
+                "id": row.get("proposal_id") or row.get("id"),
+                "text": row.get("meaning") or row.get("text"),
+                "kind": row.get("kind") or "metadata meaning",
+                "subject": row.get("object_id") or row.get("object") or "",
+                "origin": row.get("origin") or "proposed in conversation",
+                "proposed": row.get("proposed_at") or row.get("proposed"),
+                "status": row.get("status"),
+                "decided_by": row.get("decided_by"),
+            })
+    counts = listing.get("counts") or {}
+    return {"status": wanted, "items": items, "memory_counts": counts,
+            "pending_total": sum(1 for i in items
+                                 if i.get("status") == "pending")}
+
+
+@app.post("/api/approvals/decide")
+def decide_approval(payload: dict, request: Request = None):
+    """Approve or reject one queued item.
+
+    Deliberately one item at a time and never "approve all": each of these
+    becomes something the model is told is true about this deployment, and
+    the queue routinely holds several near-duplicate phrasings of one fact
+    where approving every one of them injects it repeatedly.
+    """
+    _require_question_log_operator(request)
+    body = dict(payload or {})
+    queue = str(body.get("queue") or "memory").strip().lower()
+    item_id = str(body.get("id") or "").strip()
+    decision = str(body.get("decision") or "").strip().lower()
+    if not item_id:
+        raise HTTPException(status_code=400, detail="id required")
+    if decision not in ("approve", "reject"):
+        raise HTTPException(
+            status_code=400, detail="decision must be approve or reject")
+    by = _operator_name(request)
+
+    if queue == "memory":
+        from ..memory import MemoryError_
+        try:
+            fact = _site_memory().decide(
+                item_id, decision == "approve", by=by)
+        except MemoryError_ as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True, "queue": queue, "id": item_id,
+                "status": fact.get("status"), "decided_by": by}
+
+    if queue == "source_knowledge":
+        source = str(body.get("source") or "").strip()
+        if not source:
+            raise HTTPException(
+                status_code=400,
+                detail="source required for a metadata-meaning decision")
+        if engine.registry is None:
+            raise HTTPException(status_code=404, detail="no sources configured")
+        try:
+            canonical = engine.registry.resolve_name(source)
+        except DbError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        store = _source_knowledge_store(canonical)
+        try:
+            identity = None
+            if decision == "approve":
+                identity = _source_catalog_identity(
+                    canonical, store.get(item_id))
+            decided = store.decide(
+                item_id, approve=(decision == "approve"), decided_by=by,
+                current_object=identity)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "queue": queue, "source": canonical,
+                "id": item_id,
+                "status": (decided or {}).get("status"), "decided_by": by}
+
+    raise HTTPException(status_code=400, detail=f"unknown queue {queue!r}")
+
+
 def _export_csv_for_source(canonical: str, payload: dict,
                            request: Request = None):
     """Full-population CSV for one result card.
