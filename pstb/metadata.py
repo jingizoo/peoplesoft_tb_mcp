@@ -32,6 +32,7 @@ from typing import Iterable, Optional
 
 from . import profiling
 from .config import normalize_db_schemas
+from .db import DbError
 
 
 SCHEMA_VERSION = 2
@@ -639,6 +640,7 @@ CREATE TABLE object_profiles (
   analyzed_at TEXT,
   column_count INTEGER NOT NULL,
   populated_columns INTEGER,
+  modified_since_stats INTEGER,
   reference_count INTEGER NOT NULL,
   signature TEXT NOT NULL,
   value_score REAL NOT NULL,
@@ -2183,7 +2185,43 @@ def _table_statistics(db, owners: tuple[str, ...]) -> tuple[dict, str, bool]:
             entry = stats.setdefault(key, {"row_estimate": None,
                                            "analyzed_at": ""})
             entry["populated_columns"] = row.get("populated")
-        return stats, "ALL_TAB_STATISTICS + ALL_TAB_COL_STATISTICS", True
+        # DML recorded since the last statistics gather. This is what makes
+        # an old estimate trustworthy: a row here means changes AFTER the
+        # stats; absence, on a readable view, means the verdict is CURRENT
+        # however long ago it was measured. On the deployment this targets,
+        # 90% of tables are measured EMPTY but only 7.4% were analyzed in
+        # the last year -- without this, a table emptied in 2019 and busy
+        # ever since would be confidently skipped. ALL_TAB_MODIFICATIONS
+        # first (plain visibility on tables the account can read), DBA_ as
+        # the fallback; neither being readable degrades to exactly the old
+        # behaviour. Oracle flushes this view periodically, so it can lag
+        # by minutes; the lie it prevents is measured in years.
+        mods_evidence = ""
+        for view in ("ALL_TAB_MODIFICATIONS", "DBA_TAB_MODIFICATIONS"):
+            mparams: dict = {}
+            mscope = _owner_scope("TABLE_OWNER", owners, mparams) if owners else ""
+            mwhere = f"WHERE {mscope} AND " if mscope else "WHERE "
+            try:
+                mods, _ = db.query(
+                    "SELECT TABLE_OWNER, TABLE_NAME, "
+                    "NVL(INSERTS,0)+NVL(UPDATES,0)+NVL(DELETES,0) AS MODS "
+                    f"FROM {view} {mwhere}PARTITION_NAME IS NULL",
+                    mparams, max_rows=_PROFILE_MAX_OBJECTS)
+            except DbError:
+                continue
+            # Readable view: every table WITHOUT a row is verified current.
+            for entry in stats.values():
+                entry.setdefault("modified_since_stats", 0)
+            for row in mods:
+                key = (_u(row.get("table_owner")), _u(row.get("table_name")))
+                entry = stats.setdefault(key, {"row_estimate": None,
+                                               "analyzed_at": ""})
+                entry["modified_since_stats"] = row.get("mods")
+            mods_evidence = f" + {view}"
+            break
+        return (stats,
+                "ALL_TAB_STATISTICS + ALL_TAB_COL_STATISTICS" + mods_evidence,
+                True)
 
     if dialect == "sqlite":
         # The bundled sample has no optimizer statistics and is small
@@ -2282,6 +2320,8 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
         entry = stats.get((_u(schema), _u(name))) or {}
         state_of = profiling.liveness(entry.get("row_estimate"),
                                       analyzed=measured)
+        mods = entry.get("modified_since_stats")
+        state_of, contradicted = profiling.reconcile_liveness(state_of, mods)
         populated = entry.get("populated_columns")
         profile = {
             "node_id": node_id, "source": source, "schema_name": schema,
@@ -2291,6 +2331,8 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
             "analyzed_at": entry.get("analyzed_at") or "",
             "column_count": len(own),
             "populated_columns": (None if populated is None else int(populated)),
+            "modified_since_stats": (None if mods is None else int(mods)),
+            "stats_contradicted": contradicted,
             "reference_count": references.get(node_id, 0),
             # A truncated column list is a subset of the truth, not a
             # shorter truth. Signing it would invite a false match against
@@ -2322,12 +2364,14 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
     con.executemany(
         "INSERT OR REPLACE INTO object_profiles "
         "(node_id,source,schema_name,name,kind,liveness,row_estimate,"
-        "analyzed_at,column_count,populated_columns,reference_count,"
+        "analyzed_at,column_count,populated_columns,modified_since_stats,"
+        "reference_count,"
         "signature,value_score,components,evidence,collected_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [(p["node_id"], p["source"], p["schema_name"], p["name"], p["kind"],
           p["liveness"], p["row_estimate"], p["analyzed_at"],
-          p["column_count"], p["populated_columns"], p["reference_count"],
+          p["column_count"], p["populated_columns"],
+          p["modified_since_stats"], p["reference_count"],
           p["signature"], p["value_score"],
           json.dumps(p["components"], sort_keys=True), evidence,
           state.collected_at) for p in profiles])
@@ -4054,14 +4098,20 @@ class MetadataCatalog:
         a missing enhancement must not take down context().
         """
         try:
+            # SELECT * on purpose: an artifact on disk outlives the code
+            # that wrote it, and a catalog built before a column existed
+            # must degrade to "that field is unknown", not lose the whole
+            # usefulness block.
             row = con.execute(
-                "SELECT liveness, row_estimate, value_score, components, "
-                "evidence, reference_count FROM object_profiles WHERE node_id=?",
+                "SELECT * FROM object_profiles WHERE node_id=?",
                 (node_id,)).fetchone()
         except sqlite3.OperationalError:
             return {}
         if row is None:
             return {}
+        fields = set(row.keys())
+        mods = (row["modified_since_stats"]
+                if "modified_since_stats" in fields else None)
         out = {
             "liveness": row["liveness"],
             "row_estimate": row["row_estimate"],
@@ -4070,11 +4120,35 @@ class MetadataCatalog:
             "referenced_by": row["reference_count"],
             "evidence": row["evidence"],
         }
-        if row["liveness"] == "unknown":
+        if row["analyzed_at"]:
+            out["measured_at"] = row["analyzed_at"]
+        if mods is not None:
+            out["modified_since_stats"] = int(mods)
+        when = f" (gathered {row['analyzed_at']})" if row["analyzed_at"] else ""
+        if row["liveness"] == "unknown" and (mods or 0) > 0                 and row["row_estimate"] is not None:
+            # The contradiction case: statistics said empty, the
+            # modification log says rows changed after they were gathered.
+            out["caveat"] = (
+                f"The statistics report zero rows{when}, but {int(mods)} row "
+                "changes were recorded after they were gathered. The table "
+                "may be live; treat 'empty' as unverified rather than "
+                "skipping it.")
+        elif row["liveness"] == "unknown" and (mods or 0) > 0:
+            out["caveat"] = (
+                f"No row estimate exists, but {int(mods)} row changes have "
+                "been recorded since statistics were last gathered -- the "
+                "table is IN USE, just unmeasured. Do not report it as "
+                "having no data.")
+        elif row["liveness"] == "unknown":
             out["caveat"] = (
                 "No row estimate exists for this object, so it is UNMEASURED "
                 "-- which is not the same as empty. Do not report it as "
                 "having no data.")
+        elif row["liveness"] == "empty" and mods is not None and int(mods) == 0:
+            out["caveat"] = (
+                f"The database's own statistics report zero rows{when}, and "
+                "no changes have been recorded since -- the emptiness is "
+                "current, not just historical.")
         elif row["liveness"] == "empty":
             out["caveat"] = (
                 "The database's own statistics report zero rows. Confirm "

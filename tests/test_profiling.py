@@ -16,6 +16,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pstb import metadata, profiling as P
 from pstb.config import Config
@@ -561,6 +562,198 @@ class TruncatedColumnsTests(unittest.TestCase):
         self.assertTrue(profiles["PS_KEYS"]["signature"])
         self.assertEqual(profiles["PS_KEYS"]["liveness"], "empty")
 
+
+class ReconcileLivenessTests(unittest.TestCase):
+    """EMPTY plus recorded DML after the stats gather is no verdict at all.
+
+    Oracle clears modification tracking every time statistics are gathered,
+    so a surviving count is change the statistics have not seen. On the
+    instance this targets, 90% of tables are measured EMPTY but only 7.4%
+    were analyzed in the last year -- a table emptied in 2019 and busy ever
+    since would be confidently skipped, and prefer_instead would redirect
+    answers away from it. That is the one way the profiler can actively
+    lie, and both failures read exactly like correct behaviour.
+    """
+
+    def test_contradicted_empty_becomes_unknown(self):
+        self.assertEqual(P.reconcile_liveness(P.EMPTY, 5), (P.UNKNOWN, True))
+        self.assertEqual(P.reconcile_liveness(P.EMPTY, 40_000),
+                         (P.UNKNOWN, True))
+
+    def test_verified_empty_stays_empty(self):
+        """A readable modification log with no surviving changes means the
+        verdict is CURRENT however old the gather date -- that is exactly
+        what makes a 2019 estimate trustworthy."""
+        self.assertEqual(P.reconcile_liveness(P.EMPTY, 0), (P.EMPTY, False))
+
+    def test_no_modification_signal_changes_nothing(self):
+        self.assertEqual(P.reconcile_liveness(P.EMPTY, None),
+                         (P.EMPTY, False))
+
+    def test_only_empty_is_reconciled(self):
+        """Stale POPULATED fails soft (a query finds nothing and says so);
+        UNKNOWN asserts nothing that could be contradicted."""
+        self.assertEqual(P.reconcile_liveness(P.POPULATED, 900),
+                         (P.POPULATED, False))
+        self.assertEqual(P.reconcile_liveness(P.UNKNOWN, 900),
+                         (P.UNKNOWN, False))
+
+    def test_junk_counts_never_flip_a_verdict(self):
+        self.assertEqual(P.reconcile_liveness(P.EMPTY, "lots"),
+                         (P.EMPTY, False))
+
+    def test_the_contradiction_has_its_own_basis(self):
+        """Same midpoint as unmeasured -- the honest amount of knowledge is
+        the same -- but a reader deciding whether to trust a skip needs to
+        see WHY the table is unknown."""
+        out = P.value_score({"liveness": P.UNKNOWN, "row_estimate": None,
+                             "column_count": 4, "populated_columns": None,
+                             "reference_count": 0,
+                             "stats_contradicted": True})
+        self.assertEqual(out["components"]["population_basis"], "contradicted")
+        self.assertEqual(out["components"]["population"], 0.5)
+
+
+class _FakeOracle:
+    """Scripted responses for _table_statistics, one query at a time."""
+
+    dialect = "oracle"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.sql_seen = []
+
+    def query(self, sql, params=None, max_rows=None):
+        self.sql_seen.append(" ".join(sql.split()))
+        step = self.responses.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step, False
+
+
+class OracleModificationTrackingTests(unittest.TestCase):
+    STATS = [{"owner": "SYSADM", "table_name": "PS_BUSY", "num_rows": 0,
+              "analyzed_at": "2019-03-04"},
+             {"owner": "SYSADM", "table_name": "PS_QUIET", "num_rows": 0,
+              "analyzed_at": "2019-03-04"}]
+    COLS = [{"owner": "SYSADM", "table_name": "PS_BUSY",
+             "col_count": 4, "populated": 2}]
+    MODS = [{"table_owner": "SYSADM", "table_name": "PS_BUSY", "mods": 912}]
+
+    def test_changes_land_on_the_right_table_and_absence_is_zero(self):
+        from pstb.metadata import _table_statistics
+        db = _FakeOracle([self.STATS, self.COLS, self.MODS])
+        stats, evidence, measured = _table_statistics(db, ("SYSADM",))
+        self.assertTrue(measured)
+        self.assertEqual(
+            stats[("SYSADM", "PS_BUSY")]["modified_since_stats"], 912)
+        self.assertEqual(
+            stats[("SYSADM", "PS_QUIET")]["modified_since_stats"], 0,
+            "a readable log with no row means verified current, not unknown")
+        self.assertIn("ALL_TAB_MODIFICATIONS", evidence)
+
+    def test_dba_view_is_the_fallback(self):
+        from pstb.db import DbError
+        from pstb.metadata import _table_statistics
+        db = _FakeOracle([self.STATS, self.COLS,
+                          DbError("ORA-00942: table or view does not exist"),
+                          self.MODS])
+        stats, evidence, _ = _table_statistics(db, ("SYSADM",))
+        self.assertEqual(
+            stats[("SYSADM", "PS_BUSY")]["modified_since_stats"], 912)
+        self.assertIn("DBA_TAB_MODIFICATIONS", evidence)
+
+    def test_no_grant_at_all_degrades_to_the_old_behaviour(self):
+        from pstb.db import DbError
+        from pstb.metadata import _table_statistics
+        db = _FakeOracle([self.STATS, self.COLS,
+                          DbError("ORA-00942"), DbError("ORA-00942")])
+        stats, evidence, measured = _table_statistics(db, ("SYSADM",))
+        self.assertTrue(measured)
+        self.assertNotIn("modified_since_stats", stats[("SYSADM", "PS_BUSY")],
+                         "unreadable must stay None-semantics, never 0")
+        self.assertNotIn("MODIFICATIONS", evidence)
+
+    def test_the_modification_scope_is_bound_not_inlined(self):
+        from pstb.metadata import _table_statistics
+        db = _FakeOracle([self.STATS, self.COLS, self.MODS])
+        _table_statistics(db, ("SYSADM",))
+        mods_sql = db.sql_seen[-1]
+        self.assertIn("TABLE_OWNER", mods_sql)
+        self.assertNotIn("'SYSADM'", mods_sql,
+                         "owner names are bind parameters everywhere else")
+
+
+class StaleEmptyEndToEndTests(unittest.TestCase):
+    """The full path: contradicted statistics reach the model's context."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-stale-")
+        self.root = Path(self.temp.name)
+        db_path = self.root / "primary.db"
+        con = sqlite3.connect(db_path)
+        con.executescript(
+            "CREATE TABLE PS_BUSY (A TEXT, B TEXT);"
+            "CREATE TABLE PS_QUIET (A TEXT);")
+        con.commit()
+        con.close()
+        self.cfg = Config.sample(self.root)
+        self.cfg.db.sqlite_path = str(db_path)
+        self.cfg.sources = {}
+        self.catalog_path = self.root / "catalog.db"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _build_with(self, stats):
+        db = Database(self.cfg)
+        try:
+            with patch.object(metadata, "_table_statistics",
+                              return_value=(stats, "scripted statistics",
+                                            True)):
+                build_catalog(self.catalog_path, [("default", db)],
+                              peopletools_source="default")
+        finally:
+            db.close()
+        return MetadataCatalog(self.catalog_path)
+
+    def test_a_contradicted_empty_is_not_skippable(self):
+        catalog = self._build_with({
+            ("MAIN", "PS_BUSY"): {"row_estimate": 0,
+                                  "analyzed_at": "2019-03-04",
+                                  "modified_since_stats": 912},
+            ("MAIN", "PS_QUIET"): {"row_estimate": 0,
+                                   "analyzed_at": "2019-03-04",
+                                   "modified_since_stats": 0}})
+        useful = catalog.context("PS_BUSY", source="default")["usefulness"]
+        self.assertEqual(useful["liveness"], "unknown",
+                         "an empty verdict with later DML is no verdict")
+        self.assertEqual(useful["basis"], "contradicted")
+        self.assertEqual(useful["modified_since_stats"], 912)
+        self.assertEqual(useful["measured_at"], "2019-03-04")
+        self.assertIn("912", useful["caveat"])
+        self.assertIn("unverified", useful["caveat"])
+
+    def test_a_verified_empty_says_its_emptiness_is_current(self):
+        catalog = self._build_with({
+            ("MAIN", "PS_QUIET"): {"row_estimate": 0,
+                                   "analyzed_at": "2019-03-04",
+                                   "modified_since_stats": 0}})
+        useful = catalog.context("PS_QUIET", source="default")["usefulness"]
+        self.assertEqual(useful["liveness"], "empty")
+        self.assertIn("no changes have been recorded", useful["caveat"])
+
+    def test_activity_on_a_never_analyzed_table_is_surfaced(self):
+        catalog = self._build_with({
+            ("MAIN", "PS_BUSY"): {"row_estimate": None,
+                                  "analyzed_at": "",
+                                  "modified_since_stats": 77}})
+        useful = catalog.context("PS_BUSY", source="default")["usefulness"]
+        self.assertEqual(useful["liveness"], "unknown")
+        self.assertEqual(useful["basis"], "unmeasured",
+                         "no verdict existed, so nothing was contradicted")
+        self.assertIn("IN USE", useful["caveat"])
+        self.assertIn("77", useful["caveat"])
 
 if __name__ == "__main__":
     unittest.main()
