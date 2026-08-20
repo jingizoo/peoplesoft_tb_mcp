@@ -53,6 +53,31 @@ class SourceAliasTests(unittest.TestCase):
         self.assertNotIn("Unknown source", str(ctx.exception),
                          "a configured source was shadowed by the alias list")
 
+    def test_a_configured_source_beats_the_alias_in_any_casing(self) -> None:
+        """__init__ already refuses two sources differing only by case.
+
+        The "a configured source wins" test was exact-case, though, guarding
+        a case-insensitive alias list -- so a site naming a source "gl" or
+        "main" or "erp" had "GL" quietly answered from the PeopleSoft
+        primary. That is a cross-database misroute, and on the approvals
+        path it would apply a decision to the wrong source's review queue.
+        """
+        self.cfg.sources = {"gl": object()}
+        for typed in ("gl", "GL", "Gl"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self.registry.resolve_name(typed), "gl",
+                                 "the configured spelling, not the primary")
+                with self.assertRaises(Exception) as ctx:
+                    self.registry.get(typed)
+                self.assertNotIn("Unknown source", str(ctx.exception))
+
+    def test_an_alias_still_reaches_the_primary_when_unconfigured(self) -> None:
+        """The fix must not break the alias list it guards."""
+        self.cfg.sources = {}
+        for typed in ("peoplesoft", "PeopleSoft", "PS", "gl"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self.registry.resolve_name(typed), "default")
+
     def test_describe_exposes_slash_workspace_contract(self) -> None:
         self.cfg.sources = {
             "p2go": DbCfg(

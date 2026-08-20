@@ -4577,10 +4577,13 @@ async function loadApprovals(holder,source,drawerGeneration){
   // Replace the panel in place. Re-entering with the inner box as the
   // parent nested a second panel inside the first, so a decision landed on
   // the server while the heading above it still showed the old count.
+  // replaceWith, not remove()+append: appending sent the panel to the
+  // bottom of Diagnostics after every decision, below cards added after
+  // the first load. (Reading nextSibling after remove() returns null, so
+  // an insertBefore fix would silently be a no-op.)
   const existing=holder.querySelector('[data-approvals]');
-  if(existing) existing.remove();
   const box=el('div'); box.setAttribute('data-approvals','1');
-  holder.append(box);
+  if(existing) existing.replaceWith(box); else holder.append(box);
   try{
     const canonical=String(source||ACTIVE_CHAT_SOURCE||'default');
     const data=await api('/api/approvals?status=all&source='+

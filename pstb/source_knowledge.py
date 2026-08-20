@@ -862,7 +862,14 @@ class SourceKnowledge:
                     lock_fd = self._lock_writer(dir_fd)
                 snapshot = self._read_snapshot(dir_fd)
                 if snapshot is None and not write:
-                    os.close(dir_fd)
+                    # Closing here would close it twice: the finally below
+                    # still sees a non-None dir_fd and closes it again. The
+                    # second close lands on whatever descriptor the runtime
+                    # has since handed out, which -- because list_approvals
+                    # is a sync def and therefore runs in a worker thread --
+                    # can be another request's socket or sqlite handle. It
+                    # is destroyed with no error raised anywhere. Let the
+                    # finally own the fd, exactly as _connect_windows does.
                     return None
                 if snapshot is not None and not snapshot:
                     raise SourceKnowledgeError(
@@ -1286,8 +1293,23 @@ def _catalog_identity(catalog, source: str, proposal: dict) -> dict:
     identifier = f"{proposal['schema']}.{proposal['object']}"
     result = catalog.context(identifier, source=source, limit=10)
     if not isinstance(result, dict) or result.get("found") is not True:
-        raise SourceKnowledgeError(
-            "the current source catalog cannot resolve the proposal target")
+        # One sentence used to cover four different states: catalog never
+        # built, catalog mid-rebuild, catalog rebound to another endpoint,
+        # and a genuine miss. It reads as "your proposal is stale" and the
+        # remedy for the first three is the opposite of the remedy for the
+        # last. catalog.context() already returns the right words and the
+        # exact build command, so pass them through rather than discarding
+        # them. Both the CLI --approve and the browser reach this function,
+        # so it is fixed here and neither grows its own copy.
+        detail = how = ""
+        if isinstance(result, dict):
+            detail = str(result.get("detail") or "").strip()
+            how = str(result.get("how_to_build") or "").strip()
+        message = detail or ("the current source catalog cannot resolve the "
+                             "proposal target")
+        if how and isinstance(result, dict) and result.get("available") is False:
+            message = f"{message} Build it with: {how}"
+        raise SourceKnowledgeError(message)
     subject = result.get("subject") if isinstance(result.get("subject"), dict) else {}
     snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
     object_id = str(subject.get("object_id") or result.get("object_id") or "")

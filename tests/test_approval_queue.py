@@ -597,8 +597,12 @@ class ApprovalPanelTests(unittest.TestCase):
         still read the previous number of pending items.
         """
         start = self.page.index("async function loadApprovals(")
-        block = self.page[start:start + 500]
-        self.assertIn("existing.remove()", block)
+        block = self.page[start:start + 1000]
+        self.assertIn("existing.replaceWith(box)", block,
+                      "replaceWith keeps the panel's position; remove()+append "
+                      "sent it below cards added after the first load")
+        self.assertIn("else holder.append(box)", block,
+                      "appending is the first-load fallback only")
 
 
 class ApprovalBadgeCountTests(unittest.TestCase):
@@ -729,13 +733,44 @@ class ApprovalBadgeCountTests(unittest.TestCase):
                          "proposal queue could not be read")
         self.assertNotIn(private, json.dumps(body))
 
-    def test_unreadable_source_never_reports_a_partial_count_as_complete(self):
+    def test_one_unreadable_source_does_not_blank_the_badge(self):
+        """An unreadable source is skipped, not treated as unknowable.
+
+        This replaces an assertion that a partial total reports
+        readable=False. The intent behind it was right -- do not present an
+        incomplete count as authoritative -- but readable=False does not
+        render as "partial", it renders as NOTHING:
+        index.html does `n = readable ? pending : 0; dot.hidden = !n`. So a
+        single broken sidecar hid the badge while a site fact sat genuinely
+        waiting, which is the exact invisibility the badge was added to
+        remove.
+
+        An undercount still says "there is something here", which is the
+        badge's whole job, and the operator who opens the panel sees the
+        source named in `source_errors` straight away. readable=False stays
+        reserved for the site-memory read, the one failure that leaves
+        nothing countable at all.
+        """
         registry = SimpleNamespace(names=lambda: ["default", "p2go"])
         with patch.object(gui.engine, "registry", registry), \
                 patch.object(gui, "_source_knowledge_store",
                              side_effect=OSError("knowledge store unavailable")):
             body = self.client.get("/api/approvals/count").json()
-        self.assertEqual(body, {"pending": 1, "readable": False})
+        self.assertEqual(body, {"pending": 1, "readable": True})
+        self.assertEqual(set(body), {"pending", "readable"},
+                         "nothing but an integer crosses this ungated route")
+
+    def test_the_panel_still_names_a_source_it_could_not_read(self):
+        """The other half of the trade above: the badge undercounts
+        silently, so the gated listing must say what it could not see."""
+        registry = SimpleNamespace(names=lambda: ["default", "p2go"])
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=OSError("knowledge store unavailable")):
+            body = self.client.get("/api/approvals").json()
+        self.assertEqual(
+            sorted(e["source"] for e in body.get("source_errors") or []),
+            ["default", "p2go"])
 
     def test_the_count_route_is_not_in_the_open_paths_set(self):
         """What actually keeps it non-public.
@@ -981,6 +1016,109 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         self.assertNotIn("SSH tunnel", block,
                          "the panel restated the remedy in its own words, so "
                          "it could not learn the real port")
+
+class UnknownSourceOnDecideTests(unittest.TestCase):
+    """resolve_name returns unknown names unchanged rather than raising.
+
+    So the `except DbError` guarding it could never fire, the name flowed
+    on to source_fingerprint(), and its MetadataError escaped the handler
+    as a text/plain 500. index.html parses a failure body as JSON, so the
+    one place a reader most needs the reason rendered a red badge reading
+    "bad response".
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.mem = Path(self._dir.name) / "site_memory.json"
+        SiteMemory(self.mem)
+        self._p = patch.object(gui, "_site_memory",
+                               lambda: SiteMemory(self.mem))
+        self._p.start()
+        self.client = _client()
+
+    def tearDown(self):
+        self._p.stop()
+        self._dir.cleanup()
+
+    def test_an_unknown_source_is_refused_by_name_not_by_crash(self):
+        registry = SimpleNamespace(
+            names=lambda: ["default", "p2go"],
+            resolve_name=lambda source="": (source or "").strip() or "default")
+        with patch.object(gui.engine, "registry", registry):
+            out = self.client.post("/api/approvals/decide", json={
+                "queue": "source_knowledge", "source": "nosuch",
+                "id": "abc", "decision": "approve"})
+        self.assertEqual(out.status_code, 404)
+        detail = out.json()["detail"]
+        self.assertIn("nosuch", detail)
+        self.assertIn("p2go", detail, "name the sources that would have worked")
+
+    def test_a_store_that_cannot_be_built_is_not_a_client_error(self):
+        """An unbuilt catalog or an unreachable TNS alias is infrastructure.
+
+        It used to escape as a 500; labelling it 400 would be just as wrong,
+        because nothing about the request was malformed.
+        """
+        registry = SimpleNamespace(
+            names=lambda: ["default"],
+            resolve_name=lambda source="": "default")
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_source_knowledge_store",
+                             side_effect=OSError("TNS alias will not resolve")):
+            out = self.client.post("/api/approvals/decide", json={
+                "queue": "source_knowledge", "source": "default",
+                "id": "abc", "decision": "approve"})
+        self.assertEqual(out.status_code, 503)
+        self.assertIn("TNS", out.json()["detail"])
+
+class CatalogRefusalNamesTheRemedyTests(unittest.TestCase):
+    """One sentence covered four states and read as "your proposal is stale".
+
+    Catalog never built, catalog mid-rebuild, catalog rebound to another
+    endpoint, and a genuine miss all produced the same words -- and the
+    remedy for the first three is the opposite of the remedy for the last.
+    It reaches the browser verbatim as a 400 badge, so it invited a reject
+    on a proposal that was fine.
+
+    Fixed in _catalog_identity rather than in app.py: the CLI's --approve
+    calls the same function, so patching the handler would have fixed one
+    of two callers and grown a second copy of the string.
+    """
+
+    def test_an_absent_catalog_is_named_with_the_command_that_builds_it(self):
+        from pstb.source_knowledge import SourceKnowledgeError, _catalog_identity
+
+        class AbsentCatalog:
+            def context(self, identifier, source="", limit=10):
+                return {"available": False, "found": False,
+                        "source_database": source,
+                        "detail": "No readable metadata catalog at foo.db.",
+                        "how_to_build": "python scripts/build_metadata_catalog.py"}
+
+        with self.assertRaises(SourceKnowledgeError) as caught:
+            _catalog_identity(AbsentCatalog(), "default",
+                              {"schema": "SYSADM", "object": "PS_VOUCHER"})
+        message = str(caught.exception)
+        self.assertIn("No readable metadata catalog", message)
+        self.assertIn("build_metadata_catalog.py", message,
+                      "a refusal with no remedy is a dead end")
+
+    def test_a_genuine_miss_does_not_tell_anyone_to_rebuild(self):
+        """The opposite remedy. A built catalog that simply does not hold
+        the object must not send the reader off to rebuild it."""
+        from pstb.source_knowledge import SourceKnowledgeError, _catalog_identity
+
+        class BuiltButMissing:
+            def context(self, identifier, source="", limit=10):
+                return {"available": True, "found": False,
+                        "detail": f"{identifier} is not in this catalog."}
+
+        with self.assertRaises(SourceKnowledgeError) as caught:
+            _catalog_identity(BuiltButMissing(), "default",
+                              {"schema": "SYSADM", "object": "PS_VOUCHER"})
+        message = str(caught.exception)
+        self.assertIn("not in this catalog", message)
+        self.assertNotIn("Build it with", message)
 
 if __name__ == "__main__":
     unittest.main()

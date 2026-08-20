@@ -2260,14 +2260,22 @@ def approvals_count(request: Request = None):
     # Counting only site memory made the badge say zero while P2Go proposals
     # were waiting. If any configured store cannot be read, do not present a
     # partial total as authoritative.
-    readable = True
+    # A source that will not read is SKIPPED, not treated as unknowable.
+    # readable=False hides the dot outright (index.html: n = readable ?
+    # pending : 0; dot.hidden = !n), so one broken sidecar would take the
+    # badge down while site facts sat genuinely waiting -- the exact
+    # invisibility the badge was added to remove. An undercount still says
+    # "there is something here", which is the job; the panel names the
+    # source it could not read. readable=False stays reserved for the site
+    # memory read above, which is the one failure that leaves nothing to
+    # count at all.
     for name in _approval_source_names():
         try:
             pending += len(
                 _source_knowledge_store(name).list_proposals("pending") or [])
         except Exception:                    # noqa: BLE001
-            readable = False
-    return {"pending": pending, "readable": readable}
+            continue
+    return {"pending": pending, "readable": True}
 
 
 @app.get("/api/approvals")
@@ -2414,11 +2422,27 @@ def decide_approval(payload: dict, request: Request, response: Response):
                 detail="source required for a metadata-meaning decision")
         if engine.registry is None:
             raise HTTPException(status_code=404, detail="no sources configured")
+        # resolve_name returns unknown names unchanged rather than raising
+        # (sources.py: "Unknown names are returned unchanged so the caller's
+        # own error path reports them"), so the except below could never
+        # fire and the name flowed on to source_fingerprint(), whose
+        # MetadataError escaped the handler as a text/plain 500. The panel
+        # parses a failure body as JSON, so the operator got a red badge
+        # reading "bad response".
+        canonical = engine.registry.resolve_name(source)
+        known = _approval_source_names()
+        if canonical not in known:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown source {source!r}; choose one of "
+                       f"{', '.join(known)}")
         try:
-            canonical = engine.registry.resolve_name(source)
-        except DbError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        store = _source_knowledge_store(canonical)
+            store = _source_knowledge_store(canonical)
+        except Exception as exc:              # noqa: BLE001
+            # A configured source whose fingerprint cannot be computed --
+            # unbuilt catalog, unreachable TNS alias -- is an
+            # infrastructure fault, not a bad request from the browser.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         try:
             identity = None
             if decision == "approve":
