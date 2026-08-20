@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -609,6 +610,41 @@ class WebTests(unittest.TestCase):
             "tool": "get_trial_balance",
             "args": {"business_unit": "CA001"}})
         self.assertEqual(response.status_code, 403)
+
+    def test_batch_worker_inherits_the_verified_user_grant(self) -> None:
+        """A context variable is not inherited by a bare pool thread."""
+        from unittest.mock import patch
+        from pstb.security import current_access
+
+        observed = []
+
+        def fake_export(_tool, _args, _registry, *, path, progress,
+                        **_kwargs):
+            access = current_access()
+            observed.append((access.oprid, sorted(access.units)))
+            Path(path).write_text("account\r\n1000\r\n", encoding="utf-8")
+            progress(1)
+            return {"rows": 1, "columns": 1, "truncated": False,
+                    "filename": "safe.csv", "note": "complete"}
+
+        client = self._as("FIN_US001")
+        with patch("pstb.export.batch_to_file", side_effect=fake_export):
+            started = client.post(
+                "/api/source/finance/batch-exports", json={
+                    "tool": "get_trial_balance",
+                    "args": {"business_unit": "US001", "ledger": "ACTUALS",
+                             "fiscal_year": 2026, "period": 6},
+                })
+            self.assertEqual(started.status_code, 202, started.text)
+            job = started.json()
+            for _ in range(100):
+                status = client.get(
+                    f"/api/batch-exports/{job['job_id']}").json()
+                if status.get("state") not in {"queued", "running"}:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(status.get("state"), "ready", status)
+        self.assertEqual(observed, [("FIN_US001", ["US001"])])
 
     def test_an_unknown_user_cannot_sign_in(self) -> None:
         client = self.TestClient(self.gapp.app, **LOOP)

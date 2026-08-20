@@ -533,6 +533,17 @@ tools:
   max_rows: {max_rows}
   question_log: "logs/questions.jsonl"
   reports_path: "reports"
+
+batch_exports:
+  enabled: true
+  inline_rows: 100
+  max_rows: 1000000
+  max_file_mb: 1024
+  fetch_size: 2000
+  workers: 2
+  max_queued: 8
+  ttl_minutes: 60
+  directory: "logs/batch_exports"
 """.format(
         bu=_y(str(state.get("business_unit", "US001"))),
         ledger=_y(str(state.get("ledger", "ACTUALS"))),

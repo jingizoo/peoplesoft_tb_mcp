@@ -32,7 +32,8 @@ from ..ar import ARBilling, ARError
 from ..relationships import Relationships
 from ..vendors import VendorNetwork
 from ..qlog import FeedbackAlreadyRecorded, QuestionLog
-from ..export import ExportError
+from ..export import ExportError, batch_hint, preview_payload
+from ..batch_export import BatchExportError, BatchExportManager
 from ..report import ReportError, ReportRunner
 from ..security import RowSecurity, SecurityError, access_scope
 from ..wiki import WikiError, make_wiki
@@ -77,6 +78,42 @@ process_graph = _PG(_pg_path(cfg))
 entity_graph = _EG(_eg_path(cfg))
 procurement = _Proc(_MP(engine))
 qlog = QuestionLog(getattr(cfg.tools, "question_log", ""), cfg.root)
+_BATCH_EXPORTS: Optional[BatchExportManager] = None
+_BATCH_EXPORTS_LOCK = threading.Lock()
+
+
+def _batch_worker_count() -> int:
+    """Leave an Oracle session available for interactive chat.
+
+    Batch work is deliberately lower priority than a question on screen.  The
+    configured worker count remains the limit for SQLite/SQL Server; against
+    Oracle it is also bounded to ``pool_max - 1`` whenever the pool has room
+    for a reserved interactive session.
+    """
+    requested = max(1, int(cfg.batch_exports.workers or 1))
+    if str(cfg.db.backend or "").lower() == "oracle":
+        pool_max = max(1, int(cfg.db.pool_max or 1))
+        requested = min(requested, max(1, pool_max - 1))
+    return requested
+
+
+def _batch_manager() -> BatchExportManager:
+    """Lazy so importing the GUI never starts workers or touches disk."""
+    global _BATCH_EXPORTS
+    if not getattr(cfg.batch_exports, "enabled", True):
+        raise BatchExportError("Batch exports are disabled in config.yaml")
+    if _BATCH_EXPORTS is not None:
+        return _BATCH_EXPORTS
+    with _BATCH_EXPORTS_LOCK:
+        if _BATCH_EXPORTS is None:
+            settings = cfg.batch_exports
+            _BATCH_EXPORTS = BatchExportManager(
+                cfg.resolve_path(settings.directory),
+                max_rows=settings.max_rows,
+                workers=_batch_worker_count(),
+                max_queued=settings.max_queued,
+                ttl_seconds=int(settings.ttl_minutes) * 60)
+    return _BATCH_EXPORTS
 try:
     wiki = make_wiki(cfg)
 except WikiError:
@@ -298,6 +335,11 @@ async def _lifespan(_app):
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await worker
         _MCP.update({"session": None, "tools": None})
+        global _BATCH_EXPORTS
+        with _BATCH_EXPORTS_LOCK:
+            manager, _BATCH_EXPORTS = _BATCH_EXPORTS, None
+        if manager is not None:
+            manager.close()
 
 
 app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
@@ -396,7 +438,8 @@ _OPEN_PATHS = frozenset({
 # handbook either".
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
                        "/api/chat/reset", "/api/question-report",
-                       "/api/question-review", "/api/approvals")
+                       "/api/question-review", "/api/approvals",
+                       "/api/batch-exports")
 
 
 def _needs_unit_check(path: str) -> bool:
@@ -1558,6 +1601,15 @@ def meta(request: Request = None):
                      "approval_identity_verified": False,
                      "is_authentication": False},
         "raw_sql": cfg.tools.allow_raw_sql,
+        "batch_exports": {
+            "enabled": bool(cfg.batch_exports.enabled),
+            "inline_rows": int(cfg.batch_exports.inline_rows),
+            "max_rows": max(1, min(int(cfg.batch_exports.max_rows),
+                                   BatchExportManager.HARD_MAX_ROWS)),
+            "max_file_mb": int(cfg.batch_exports.max_file_mb),
+            "workers": _batch_worker_count(),
+            "ttl_minutes": int(cfg.batch_exports.ttl_minutes),
+        },
     }
     # PS_LEDGER is the authority for selectable financial scopes.  The GL
     # business-unit setup table is useful metadata, but it must not collapse the
@@ -2466,7 +2518,8 @@ def decide_approval(payload: dict, request: Request, response: Response):
 
 
 def _export_csv_for_source(canonical: str, payload: dict,
-                           request: Request = None):
+                           request: Request = None, *,
+                           prepare_only: bool = False):
     """Full-population CSV for one result card.
 
     The browser holds a display-capped preview; this re-runs the same tool
@@ -2563,7 +2616,15 @@ def _export_csv_for_source(canonical: str, payload: dict,
     if denied:
         raise HTTPException(status_code=403, detail=denied)
 
+    selected_engine = engine
     if canonical == "default":
+        # The MCP engine already has these attachments; the GUI's direct
+        # export engine is a separate instance. Without them, a policy-bound
+        # result rendered correctly in chat but its CSV re-run failed with
+        # "policy could not be resolved" on the same arguments.
+        memory = _site_memory()
+        engine.attach_policy(wiki, memory)
+        engine.attach_memory(memory)
         registry = _export.build_registry(
             engine=engine, ar=ar, modules=ModulePacks(engine),
             report_runner=report_runner, coupa=_coupa_mod.from_env(cfg=cfg),
@@ -2573,16 +2634,24 @@ def _export_csv_for_source(canonical: str, payload: dict,
             bound_engine = engine.for_source(canonical)
         except (EngineError, DbError) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        selected_engine = bound_engine
         # Only run_sql is re-runnable from the generic export registry. The
         # structural tools export their already source-verified card payload.
         registry = _export.build_registry(engine=bound_engine)
-    out = _guard(_export.export, tool=tool, args=args,
-                 registry=registry, payload=body.get("result"))
     source_command = next(
         (str(item["command"]) for item in engine.registry.describe()
          if item.get("source") == canonical),
         "finance" if canonical == "default" else "source",
     )
+    if prepare_only:
+        return {
+            "canonical": canonical, "source_command": source_command,
+            "tool": tool, "args": args, "payload": body.get("result"),
+            "registry": registry, "engine": selected_engine,
+            "access": access,
+        }
+    out = _guard(_export.export, tool=tool, args=args,
+                 registry=registry, payload=body.get("result"))
     download_name = f"{source_command}_{out['filename']}"
     return Response(
         content=out["csv"], media_type="text/csv; charset=utf-8",
@@ -2614,6 +2683,82 @@ def source_export_csv(command: str, payload: dict, request: Request = None):
     except DbError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     return _export_csv_for_source(canonical, payload, request)
+
+
+def _batch_owner(request: Request = None) -> str:
+    access = access_for_request(request)
+    return (f"oprid:{access.oprid}" if access is not None
+            else "local-browser")
+
+
+@app.post("/api/source/{command}/batch-exports", status_code=202)
+def start_batch_export(command: str, payload: dict,
+                       request: Request = None):
+    """Queue a full CSV only after the person clicks the large-result card."""
+    try:
+        canonical = engine.registry.resolve_command(command)
+    except DbError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    context = _export_csv_for_source(
+        canonical, payload, request, prepare_only=True)
+    if context["tool"] not in context["registry"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{context['tool']} cannot re-create a full population; "
+                    "the ordinary CSV contains only the captured result."))
+    owner = _batch_owner(request)
+    settings = cfg.batch_exports
+
+    def produce(path, cap, progress):
+        from .. import export as _export
+
+        # Context variables do NOT cross into a ThreadPoolExecutor. Rebind the
+        # verified caller explicitly or a background "ALL"/fan-out tool would
+        # run as unrestricted after the HTTP request returned.
+        with access_scope(context["access"]):
+            meta = _export.batch_to_file(
+                context["tool"], context["args"], context["registry"],
+                engine=context["engine"], payload=context["payload"],
+                path=path, row_cap=cap, fetch_size=settings.fetch_size,
+                max_bytes=max(1, int(settings.max_file_mb)) * 1024 * 1024,
+                progress=progress)
+        meta["filename"] = (
+            f"{context['source_command']}_{meta['filename']}")
+        return meta
+
+    try:
+        return _batch_manager().submit(
+            owner=owner, source=canonical, tool=context["tool"],
+            producer=produce)
+    except BatchExportError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+
+
+@app.get("/api/batch-exports/{job_id}")
+def batch_export_status(job_id: str, request: Request = None):
+    try:
+        return _batch_manager().status(job_id, owner=_batch_owner(request))
+    except BatchExportError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.get("/api/batch-exports/{job_id}/download")
+def download_batch_export(job_id: str, request: Request = None):
+    try:
+        path, status = _batch_manager().file(
+            job_id, owner=_batch_owner(request))
+    except BatchExportError as e:
+        code = 409 if "not ready" in str(e).lower() else 404
+        raise HTTPException(status_code=code, detail=str(e)) from e
+    return FileResponse(
+        path, media_type="text/csv; charset=utf-8",
+        filename=status["filename"],
+        headers={
+            "Cache-Control": "no-store, private",
+            "X-Export-Source": status["source"],
+            "X-Export-Rows": str(status["rows"]),
+            "X-Export-Truncated": "1" if status["truncated"] else "0",
+        })
 
 
 @app.get("/api/rollup")
@@ -3211,10 +3356,33 @@ async def chat(payload: dict, request: Request = None):
                 # silence. Hand the text through and let it be readable.
                 data = {"error": str(out)[:4000],
                         "non_json_result": True}
-            calls.append({
+            batch = None
+            if ok and getattr(cfg.batch_exports, "enabled", True):
+                batch = batch_hint(
+                    name, data,
+                    inline_rows=cfg.batch_exports.inline_rows,
+                    source=(secondary_source or "default"))
+                if batch:
+                    inline = batch["inline_rows"]
+                    data, omitted = preview_payload(data, inline)
+                    if isinstance(data, dict):
+                        data["browser_preview"] = {
+                            "inline_rows": inline,
+                            "rows_omitted": omitted,
+                            "batch_export_available": True,
+                            "note": batch["note"],
+                        }
+                    batch["rows_omitted_from_browser"] = omitted
+                    batch["max_rows"] = max(
+                        1, min(int(cfg.batch_exports.max_rows),
+                               BatchExportManager.HARD_MAX_ROWS))
+            call = {
                 "tool": name, "args": args, "ms": ms, "ok": ok,
                 "result": data,
-            })
+            }
+            if batch:
+                call["batch_export"] = batch
+            calls.append(call)
 
         # One question at a time per browser tab and scope. Getting in is
         # now BOUNDED, because an unbounded wait is what turned one slow

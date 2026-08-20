@@ -216,7 +216,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
   word-break:break-word;max-height:34vh;overflow:auto}
 .tool-card>.inline{margin-top:6px}
 .csvbtn{margin-left:auto;background:transparent;color:var(--muted);border:1px solid var(--line);
-  border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+  border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer;
+  white-space:nowrap;text-decoration:none}
 .csvbtn:hover:not(:disabled){color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
 .csvbtn:disabled{opacity:.7;cursor:default}
 .fig{border-bottom:1px dashed var(--accent);cursor:pointer;font-variant-numeric:tabular-nums}
@@ -1124,6 +1125,61 @@ async function downloadExport(tool,args,result,btn,source){
   setTimeout(()=>{btn.textContent=label;btn.disabled=false;
     btn.title=CSV_HINT;},5000);
 }
+function waitMs(ms){ return new Promise(resolve=>setTimeout(resolve,ms)); }
+async function prepareBatchExport(tool,args,result,btn,source){
+  const label=btn.textContent;
+  btn.disabled=true;btn.textContent='queueing export…';
+  try{
+    const descriptor=descriptorForSource(source)||descriptorForSource('default');
+    const route='/api/source/'+encodeURIComponent(descriptor.command)+'/batch-exports';
+    const started=await fetch(route,{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tool:tool,args:args||{},result:result})});
+    if(!started.ok){
+      let detail='';try{detail=(await started.json()).detail||'';}catch(_e){}
+      throw new Error(detail||('batch export failed (HTTP '+started.status+')'));
+    }
+    let job=await started.json();
+    const statusUrl='/api/batch-exports/'+encodeURIComponent(job.job_id);
+    const deadline=Date.now()+30*60*1000;
+    while(job.state==='queued'||job.state==='running'){
+      btn.textContent=(job.state==='queued'?'queued':'exporting')+
+        (job.rows?(' · '+Number(job.rows).toLocaleString()+' rows'):'')+'…';
+      if(Date.now()>deadline) throw new Error(
+        'Export is still running. Start it again from this result if needed.');
+      await waitMs(job.state==='queued'?750:1200);
+      const polled=await fetch(statusUrl,{headers:{'Accept':'application/json'}});
+      if(!polled.ok){
+        let detail='';try{detail=(await polled.json()).detail||'';}catch(_e){}
+        throw new Error(detail||('status failed (HTTP '+polled.status+')'));
+      }
+      job=await polled.json();
+    }
+    if(job.state!=='ready') throw new Error(job.error||job.note||'Export failed');
+    const link=el('a','csvbtn');
+    link.href=job.download_url;link.download=job.filename||'';
+    link.textContent=(job.truncated?'⚠ ':'↓ ')+
+      Number(job.rows||0).toLocaleString()+' row CSV';
+    link.title=(job.note||'Download the prepared CSV')+
+      ' · expires '+(job.expires_at||'');
+    link.onclick=ev=>ev.stopPropagation();
+    btn.replaceWith(link);
+  }catch(e){
+    btn.disabled=false;btn.textContent='export failed';btn.title=e.message;
+    setTimeout(()=>{btn.textContent=label;btn.title=BATCH_HINT;},6000);
+  }
+}
+function batchButton(tool,args,result,batch,source){
+  const b=el('button','csvbtn','Prepare full CSV');
+  b.type='button';b.title=(batch&&batch.note)||BATCH_HINT;
+  b.setAttribute('aria-label','Prepare the full result as a background CSV');
+  b.onclick=ev=>{ev.preventDefault();ev.stopPropagation();
+    prepareBatchExport(tool,args,result,b,source||'default');};
+  return b;
+}
+const BATCH_HINT='Create a temporary CSV in the background. The database is '+
+  'queried only after this button is clicked. The file reflects live data at '+
+  'that time, which may differ from the earlier preview.';
 const CSV_HINT='Download the FULL result as CSV \u2014 re-run server-side, '+
   'beyond the rows shown here';
 /* ===== copy =====
@@ -2449,9 +2505,17 @@ function renderToolResult(name,data,args){
   const body = renderToolBody(name,data,args);
   if(!body) return body;
   const badge = sourceBadge(data);
-  if(!badge) return body;
+  const preview=data&&data.browser_preview;
+  if(!badge&&!preview) return body;
   const wrap = document.createDocumentFragment();
-  wrap.append(body, badge);
+  if(preview){
+    const note=el('div','pad');
+    note.innerHTML='<span class="badge warn">large result</span> '+
+      esc(preview.note||('Only '+preview.inline_rows+' rows are shown.'));
+    wrap.append(note);
+  }
+  wrap.append(body);
+  if(badge)wrap.append(badge);
   return wrap;
 }
 function renderToolBody(name,data,args){
@@ -5192,7 +5256,10 @@ async function send(messageOverride,appendUser){
         '<span class="ms">'+(c.ms!==undefined?c.ms+' ms':'')+'</span>';
       const rb=resultBadge(c.result);
       if(rb) summary.append(el('span','badge '+rb.cls,esc(rb.text)));
-      if(c.ok!==false&&c.tool==='get_coupa_rni'){
+      if(c.ok!==false&&c.batch_export&&c.batch_export.required){
+        summary.append(batchButton(c.tool,c.args||{},c.result,
+          c.batch_export,silo.source));
+      }else if(c.ok!==false&&c.tool==='get_coupa_rni'){
         if(Array.isArray((c.result||{}).lines)&&(c.result||{}).lines.length)
           summary.append(csvButton(c.tool,c.args||{},c.result,'Candidate CSV',null,silo.source));
         const exportRows=(((c.result||{}).export_evidence||{}).receipt_transactions)||[];

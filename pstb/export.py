@@ -27,13 +27,33 @@ import datetime as dt
 import inspect
 import io
 import json
+import os
 import re
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Ceiling for one export. High enough that a real population fits, low
 # enough that a mistyped query cannot pull a multi-million-row table
 # through the web process.
 EXPORT_MAX_ROWS = 50_000
+
+# Tools whose full population can be re-created from their recorded arguments.
+# A result-only control is still downloadable through the ordinary CSV button,
+# but it must never advertise a million-row batch that would only package its
+# already-capped preview.
+BATCH_REPLAY_TOOLS = frozenset({
+    "get_trial_balance", "run_sql", "get_budget_variance",
+    "drill_to_journals", "rollup_trial_balance", "compare_trial_balance",
+    "explain_balance_change", "search_accounts", "get_invoice_lifecycle",
+    "get_dso_trend", "get_cash_outlook", "get_customer_intelligence",
+    "get_invoice_totals", "get_ar_aging", "get_top_billing_customers",
+    "get_customer_ar", "get_billing_workbench", "get_open_payables",
+    "get_vendor_intelligence", "get_duplicate_payments",
+    "get_vendor_payments", "get_asset_register", "get_project_costs",
+    "run_report", "run_ps_query", "get_coupa_invoices",
+    "get_coupa_stuck_approvals", "get_coupa_budget_lines",
+    "get_coupa_rni", "get_coupa_supplier_spend",
+})
 
 # Keys that hold the answer's table, best first. The finder falls back to
 # "largest list of dicts" for anything not listed, so new tools work
@@ -156,6 +176,213 @@ def to_csv(table: dict) -> str:
     for r in table["rows"]:
         writer.writerow([_cell(r.get(c)) for c in columns])
     return "﻿" + buf.getvalue()
+
+
+def preview_payload(payload: Any, row_limit: int = 100) -> tuple[Any, int]:
+    """Copy a payload while capping every record collection for the browser.
+
+    Totals, control statuses, scope notes and source provenance remain intact;
+    only lists of row dictionaries are shortened.  The original payload still
+    exists in the answer engine and can be re-run by the export endpoint.
+    """
+    limit = max(1, int(row_limit or 100))
+    omitted = 0
+
+    def trim(node):
+        nonlocal omitted
+        if isinstance(node, dict):
+            return {k: trim(v) for k, v in node.items()}
+        if isinstance(node, list):
+            if node and all(isinstance(item, dict) for item in node):
+                omitted += max(0, len(node) - limit)
+                return [trim(item) for item in node[:limit]]
+            return [trim(item) for item in node]
+        return node
+
+    return trim(payload), omitted
+
+
+def batch_hint(tool: str, payload: Any, *, inline_rows: int = 100,
+               source: str = "default") -> Optional[dict]:
+    """Describe a lazy batch action when a card is larger than chat."""
+    if not isinstance(payload, dict):
+        return None
+    table = tabular(payload)
+    if table is None:
+        # A status/control payload can legitimately report that one of its
+        # internal checks was truncated without containing a row set. Do not
+        # offer a CSV button that can only fail after it is clicked.
+        return None
+    visible = len(table["rows"]) if table else 0
+    reported = payload.get("row_count")
+    if not isinstance(reported, int) or isinstance(reported, bool):
+        reported = visible
+
+    def cut(node) -> bool:
+        if isinstance(node, dict):
+            return any(
+                ((k in {"truncated", "display_truncated"} and v is True)
+                 or (k == "rows_omitted_for_context"
+                     and isinstance(v, int) and not isinstance(v, bool)
+                     and v > 0)
+                 or cut(v)) for k, v in node.items())
+        if isinstance(node, list):
+            return any(cut(item) for item in node[:20])
+        return False
+
+    limit = max(1, int(inline_rows or 100))
+    large = visible > limit or reported > limit or cut(payload)
+    if not large:
+        return None
+    canonical = str(source or "default")
+    capable = (str(tool) == "run_sql" if canonical != "default"
+               else str(tool) in BATCH_REPLAY_TOOLS)
+    if not capable:
+        return None
+    return {
+        "available": True,
+        "required": True,
+        "inline_rows": limit,
+        "preview_rows": min(visible, limit),
+        "reported_rows": reported,
+        "source_truncated": cut(payload),
+        "mode": "streamed" if str(tool) == "run_sql" else "background",
+        "note": (
+            f"This result is larger than {limit:,} rows. Only a preview is "
+            "shown; prepare the full CSV when needed. The original question "
+            "does not run an export query."
+        ),
+    }
+
+
+class CsvStreamSink:
+    """CSV writer resettable across a dead-session retry."""
+
+    def __init__(self, path: Path, *, progress: Callable[[int], None],
+                 fetch_size: int = 2_000,
+                 max_bytes: int = 1_073_741_824):
+        self.path = Path(path)
+        self.progress = progress
+        self.fetch_size = max(1, int(fetch_size or 2_000))
+        self.max_bytes = max(1, int(max_bytes))
+        self.rows = 0
+        self.columns: list[str] = []
+        self._fh = None
+        self._writer = None
+
+    def start(self, columns: list[str]) -> None:
+        self.close()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("w", encoding="utf-8", newline="")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        self._fh.write("﻿")
+        self._writer = csv.writer(self._fh, lineterminator="\r\n")
+        self.columns = [str(c) for c in columns]
+        self.rows = 0
+        self._writer.writerow([_cell(c) for c in self.columns])
+        self._check_size()
+
+    def _check_size(self) -> None:
+        if self._fh is not None and self._fh.tell() > self.max_bytes:
+            raise ExportError(
+                "The batch CSV exceeded its configured file-size ceiling. "
+                "Narrow the result or raise batch_exports.max_file_mb after "
+                "checking available disk space.")
+
+    def write_rows(self, rows: list[dict]) -> None:
+        if self._writer is None:
+            raise ExportError("CSV stream was not initialized")
+        for row in rows:
+            self._writer.writerow([_cell(row.get(c)) for c in self.columns])
+            self.rows += 1
+            # Enforce while writing, not after a whole fetch batch. A query
+            # may project a CLOB; checking only after 2,000 such rows can
+            # overshoot the configured disk ceiling by gigabytes.
+            self._check_size()
+        self.progress(self.rows)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
+                self._writer = None
+
+
+def batch_to_file(tool: str, args: dict, registry: dict, *, engine=None,
+                  payload: Any = None, path: Path, row_cap: int = 1_000_000,
+                  fetch_size: int = 2_000,
+                  max_bytes: int = 1_073_741_824,
+                  progress: Callable[[int], None] = lambda _rows: None,
+                  today: Optional[dt.date] = None) -> dict:
+    """Write one batch export to ``path`` without retaining it in memory.
+
+    Ad-hoc SQL uses a cursor-to-file stream and may reach ``row_cap``. Other
+    curated tools retain their existing 50k in-memory safety ceiling but run
+    off the request thread, which keeps chat responsive and preserves their
+    domain-specific aggregation semantics.
+    """
+    cap = max(1, int(row_cap or 1_000_000))
+    clean_args = dict(args or {})
+    for key in ("source", "db", "_export_view"):
+        if key != "_export_view":
+            clean_args.pop(key, None)
+    if (str(tool) == "run_sql" and engine is not None
+            and not clean_args.get("partition")
+            and not clean_args.get("pivot")):
+        sink = CsvStreamSink(path, progress=progress, fetch_size=fetch_size,
+                             max_bytes=max_bytes)
+        try:
+            result = _call_filtered(
+                engine.run_sql, clean_args,
+                {"max_rows": cap, "row_ceiling": cap,
+                 "_batch_sink": sink})
+        finally:
+            sink.close()
+        rows = int(result.get("row_count") or sink.rows)
+        truncated = bool(result.get("truncated"))
+        return {
+            "rows": rows, "columns": len(sink.columns),
+            "truncated": truncated,
+            "filename": filename(str(tool), rows, truncated, today),
+            "note": (
+                f"Streamed {rows:,} rows directly from the database. "
+                "The query was re-run when this batch started, so the CSV "
+                "reflects that live-data time rather than a snapshot of the "
+                "earlier chat preview. "
+                + (f"The {cap:,}-row safety ceiling was reached; narrow the "
+                   "query and export the remaining population separately."
+                   if truncated else "The complete selected population was written.")
+            ),
+        }
+
+    # Curated tools already own their correctness and shape rules. Reuse that
+    # path in the worker rather than teaching a second exporter their schemas.
+    out = export(tool, clean_args, registry, payload=payload,
+                 row_cap=min(cap, EXPORT_MAX_ROWS), today=today)
+    with Path(path).open("w", encoding="utf-8", newline="") as fh:
+        fh.write(out.pop("csv"))
+    if Path(path).stat().st_size > max(1, int(max_bytes)):
+        Path(path).unlink(missing_ok=True)
+        raise ExportError(
+            "The batch CSV exceeded its configured file-size ceiling. "
+            "Narrow the result or raise batch_exports.max_file_mb after "
+            "checking available disk space.")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    progress(int(out.get("rows") or 0))
+    out["note"] = (
+        str(out.get("note") or "")
+        + " The tool was re-run when this batch started, so the CSV reflects "
+          "that live-data time rather than a snapshot of the earlier chat preview."
+    ).strip()
+    return out
 
 
 def filename(tool: str, rows: int, truncated: bool,

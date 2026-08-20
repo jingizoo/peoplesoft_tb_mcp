@@ -197,6 +197,20 @@ tools:
                           # at all — shape, fill rates and status-code counts
                           # still come back, so record selection keeps working.
 
+# Large row sets stay out of the model context and browser DOM. The original
+# question does no extra work: a background export starts only when the user
+# clicks Prepare full CSV. Files are private, temporary and deleted after TTL.
+batch_exports:
+  enabled: true
+  inline_rows: 100
+  max_rows: 1000000
+  max_file_mb: 1024
+  fetch_size: 2000
+  workers: 2
+  max_queued: 8
+  ttl_minutes: 60
+  directory: logs/batch_exports
+
 # Offline process-graph build limits. Catalogs are fetched in keyset pages,
 # so the 100k installation-wide defaults do not become one giant DB result.
 # Reaching a catalog limit writes an explicitly PARTIAL graph; exceeding a

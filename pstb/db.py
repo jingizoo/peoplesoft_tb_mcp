@@ -703,6 +703,89 @@ class Database:
             except Exception as ex2:
                 raise self._translate(ex2) from ex2
 
+    def stream_query(
+        self, sql: str, params: Optional[dict] = None, *,
+        max_rows: int, batch_size: int = 2_000,
+        on_start, on_rows,
+    ) -> tuple[int, bool, int]:
+        """Fetch a SELECT in bounded chunks and hand each chunk to a sink.
+
+        Returns ``(rows_written, truncated, column_count)``.  At no point is
+        the full population retained in memory.  A dead session is retried
+        once from the beginning; ``on_start`` is called for each attempt so a
+        file sink can truncate the partial first attempt before replaying.
+        """
+        params = params or {}
+        cap = max(1, int(max_rows))
+        chunk = max(1, min(int(batch_size or 2_000), 20_000))
+        for attempt in range(2):
+            try:
+                return self._stream_execute(
+                    sql, params, cap, chunk, on_start, on_rows)
+            except DbError:
+                raise
+            except Exception as ex:
+                if attempt == 0 and _is_dead_connection(str(ex)):
+                    self._discard_session()
+                    continue
+                raise self._translate(ex) from ex
+        raise DbError("Streamed query could not be completed")
+
+    def _stream_execute(self, sql: str, params: dict, cap: int,
+                        batch_size: int, on_start, on_rows
+                        ) -> tuple[int, bool, int]:
+        with self._session() as (conn, needs_lock):
+            lock = self._lock if needs_lock else contextlib.nullcontext()
+            with lock:
+                cur = conn.cursor()
+                try:
+                    # Driver prefetch stays bounded too.  Oracle may expose
+                    # either attribute depending on driver generation.
+                    for attr in ("arraysize", "prefetchrows"):
+                        try:
+                            setattr(cur, attr, batch_size)
+                        except Exception:
+                            pass
+                    if self.dialect == "sqlserver":
+                        qsql, seq = _to_qmark(sql, params)
+                        cur.execute(qsql, seq)
+                    else:
+                        cur.execute(sql, _bound_params(sql, params))
+                    cols = [d[0].lower() for d in cur.description]
+                    on_start(cols)
+                    written = 0
+                    truncated = False
+                    while True:
+                        # One extra row proves whether the hard ceiling cut a
+                        # population.  Without it an exact-cap result and a
+                        # truncated result would receive the same filename.
+                        remaining = cap - written
+                        request = min(batch_size, remaining + 1)
+                        raw = cur.fetchmany(max(request, 1))
+                        if not raw:
+                            break
+                        allowed = raw[:remaining]
+                        if allowed:
+                            rows = [
+                                {k: _jsonable(v) for k, v in zip(cols, row)}
+                                for row in allowed
+                            ]
+                            on_rows(rows)
+                            written += len(rows)
+                        if len(raw) > len(allowed):
+                            truncated = True
+                            break
+                        if written >= cap:
+                            extra = cur.fetchmany(1)
+                            truncated = bool(extra)
+                            break
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+        return written, truncated, len(cols)
+
     def _execute(self, sql: str, params: dict, cap: int) -> tuple[list[dict], bool]:
         with self._session() as (conn, needs_lock):
             lock = self._lock if needs_lock else contextlib.nullcontext()
