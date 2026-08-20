@@ -149,6 +149,26 @@ class ToolsCfg:
 
 
 @dataclass
+class BatchExportCfg:
+    """Large-result delivery without putting the population in chat.
+
+    The browser only receives ``inline_rows`` records.  A user can then start
+    a bounded background CSV export; the database cursor is fetched in small
+    batches and written directly to disk, so ``max_rows`` is a governance
+    ceiling rather than a memory allocation.
+    """
+    enabled: bool = True
+    inline_rows: int = 100
+    max_rows: int = 1_000_000
+    max_file_mb: int = 1_024
+    fetch_size: int = 2_000
+    workers: int = 2
+    max_queued: int = 8
+    ttl_minutes: int = 60
+    directory: str = "logs/batch_exports"
+
+
+@dataclass
 class ProcessGraphCfg:
     """Offline PeopleTools process-graph build ceilings.
 
@@ -367,6 +387,7 @@ class Config:
     llm: LlmCfg = field(default_factory=LlmCfg)
     wiki: WikiCfg = field(default_factory=WikiCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
+    batch_exports: BatchExportCfg = field(default_factory=BatchExportCfg)
     process_graph: ProcessGraphCfg = field(default_factory=ProcessGraphCfg)
     metadata_catalog: MetadataCatalogCfg = field(
         default_factory=MetadataCatalogCfg)

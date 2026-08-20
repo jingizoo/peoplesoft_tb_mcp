@@ -469,6 +469,16 @@ The curated tools carry the whole chain server-side:
 Chain across ROUNDS only when a later query genuinely needs an earlier
 answer as input; never to reassemble what one grouped call returns whole.
 
+## Large row sets are batch work, not chat prose
+When the user asks for a list that may exceed 100 rows, issue ONE correctly
+filtered query and summarize its scope; do not enumerate the rows in prose and
+do not split the query into month-by-month or page-by-page tool calls. The GUI
+shows a bounded preview and a **Prepare full CSV** action. That action streams
+the same guarded query to a temporary file only when the user clicks it, so the
+population never enters model context or the browser DOM. If ``truncated`` is
+true, say that the result exceeds the preview and direct the user to that CSV;
+do not call the preview's row_count the population total.
+
 ## Joining two records: ask, do not guess
 Before ANY multi-table run_sql, call join_path(from_record, to_record). It
 reads this instance's own catalog and returns the ON columns, a FROM/JOIN

@@ -576,6 +576,28 @@ is limited to a short comment and labelled as commentary. This is deliberate:
 in testing, a small local model produced incorrect prose next to a correct
 table.
 
+### Large results and batch CSV
+
+Results above 100 rows are not expanded into chat. The card keeps a 100-row
+preview and shows **Prepare full CSV**. Nothing extra runs until that button is
+clicked. The export then runs in a background worker and, for `run_sql`, streams
+database fetch batches directly to a private file rather than collecting the
+population in web-server memory. The card becomes a download link when ready.
+The export re-runs the governed query when the batch starts; it is therefore a
+live-data result at that time, not a database snapshot of the earlier preview.
+
+Defaults require no setup change: one export may contain up to 1,000,000 rows
+or 1 GB, two run concurrently, and files expire after 60 minutes under
+`logs/batch_exports/`. Override `batch_exports.inline_rows`, `max_rows`,
+`workers`, or `ttl_minutes` in `config.yaml` if the site needs different
+limits. A filename containing `TRUNCATED_at_...` means the configured ceiling
+was reached; narrow the scope before exporting the remainder. Restarting the
+GUI invalidates temporary links and removes orphaned batch files.
+
+On Oracle, the effective worker count is automatically held below `db.pool_max`
+when possible so a background download does not consume every session needed by
+interactive chat.
+
 **Security:** the UI has no login and no per-user authorization. Bind it to
 `--host 127.0.0.1` and treat it as a single-user tool until an
 authenticated gateway exists — see `docs/REVIEW_RESPONSE.md`.

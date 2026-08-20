@@ -3904,7 +3904,7 @@ class TBEngine:
                 pivot: Optional[dict] = None,
                 list_binds: Optional[dict] = None,
                 partition: Optional[dict] = None,
-                row_ceiling: int = 0) -> dict:
+                row_ceiling: int = 0, _batch_sink=None) -> dict:
         """Run a guarded SELECT.
 
         policy_binds maps a bind name to a policy figure the wiki defines, e.g.
@@ -4042,7 +4042,29 @@ class TBEngine:
         # absent from the MCP tool signature, so a model cannot lift its
         # own limit -- the export endpoint is the only caller that can.
         cap = min(max(int(max_rows or 100), 1), int(row_ceiling or 0) or 500)
-        if partition:
+        if _batch_sink is not None and (partition or pivot):
+            raise EngineError(
+                "A streamed raw-row export cannot also pivot or partition. "
+                "Export the consolidated result, or run a filtered row query "
+                "without pivot/partition for the large detail file.")
+        streamed_count = None
+        if _batch_sink is not None:
+            # Internal path used only by the GUI's batch worker. The MCP
+            # wrapper does not expose _batch_sink or row_ceiling, so a model
+            # can never lift its own context limit. Cursor batches go straight
+            # to the CSV sink; a million-row cap is not a million-row list.
+            try:
+                plan_note = self._cost_gate(s, scrubbed)
+                streamed_count, truncated, _ = self.db.stream_query(
+                    s, {**binds, **expanded_lists}, max_rows=cap,
+                    batch_size=getattr(_batch_sink, "fetch_size", 2_000),
+                    on_start=_batch_sink.start,
+                    on_rows=_batch_sink.write_rows)
+            except (DbError, EngineError) as e:
+                raise EngineError(self._sql_error_remedy(s, e))
+            rows = []
+            partition_info = None
+        elif partition:
             try:
                 rows, partition_info = self._run_partitioned(
                     s, scrubbed, partition, {**binds, **expanded_lists}, cap)
@@ -4062,9 +4084,14 @@ class TBEngine:
             except (DbError, EngineError) as e:
                 raise EngineError(self._sql_error_remedy(s, e))
             partition_info = None
-        out = {"rows": rows, "row_count": len(rows), "truncated": truncated,
+        out = {"rows": rows,
+               "row_count": (streamed_count if streamed_count is not None
+                             else len(rows)),
+               "truncated": truncated,
                "sql_executed": s,
                "target_owners": self._target_owners(refs)}
+        if streamed_count is not None:
+            out["batch_streamed"] = True
         if partition_info:
             out["partitioned"] = partition_info
         if pivot:
