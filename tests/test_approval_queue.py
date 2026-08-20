@@ -32,6 +32,30 @@ from pstb.memory import SiteMemory
 from pstb.security import Access
 
 
+def _js_function(page: str, name: str) -> str:
+    """The whole body of one shipped JS function, by brace matching.
+
+    These checks used to slice a fixed number of bytes from the function's
+    opening line. That silently stops testing the moment the function
+    grows past the window -- which is exactly what happened when
+    loadApprovals gained a `source` argument and a few comment lines: the
+    slice ended mid-word at "esc(errTex" and the assertion it was carrying
+    went from proving something to being unable to see it.
+    """
+    start = page.index(f"function {name}(")
+    open_brace = page.index("{", start)
+    depth, i = 0, open_brace
+    while i < len(page):
+        if page[i] == "{":
+            depth += 1
+        elif page[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return page[start:i + 1]
+        i += 1
+    raise AssertionError(f"{name} is not brace-balanced in the shipped page")
+
+
 def _client():
     # Loopback + a real Host header: the app refuses anything else before a
     # handler is reached, which is a different control and has its own tests.
@@ -596,8 +620,7 @@ class ApprovalPanelTests(unittest.TestCase):
         Observed: the decision reached the server and the heading above it
         still read the previous number of pending items.
         """
-        start = self.page.index("async function loadApprovals(")
-        block = self.page[start:start + 1000]
+        block = _js_function(self.page, "loadApprovals")
         self.assertIn("existing.replaceWith(box)", block,
                       "replaceWith keeps the panel's position; remove()+append "
                       "sent it below cards added after the first load")
@@ -1010,8 +1033,7 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
 
     def test_the_panel_does_not_paraphrase_the_servers_refusal(self):
         """Two copies of a remedy drift; the server's is the one with the port."""
-        start = self.page.index("async function loadApprovals(")
-        block = self.page[start:start + 1400]
+        block = _js_function(self.page, "loadApprovals")
         self.assertIn("errText(e)", block)
         self.assertNotIn("SSH tunnel", block,
                          "the panel restated the remedy in its own words, so "
