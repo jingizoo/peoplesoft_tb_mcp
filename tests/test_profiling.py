@@ -477,5 +477,90 @@ class UsefulnessReachesTheModelTests(unittest.TestCase):
         self.assertTrue(result["found"])
         self.assertEqual(result["usefulness"], {})
 
+class TruncatedColumnsTests(unittest.TestCase):
+    """At real scale the column cap bites and signatures go partial.
+
+    The instance this targets has 3,186,495 columns against a default
+    max_fields of 500,000, so most tables get no columns at all -- safe,
+    because an empty signature is never grouped -- and the one straddling
+    the cut keeps a PARTIAL list, which is not safe. A partial signature is
+    a subset of the truth, not a shorter truth, and on a PeopleSoft schema
+    where families of tables share their leading key columns it can equal a
+    smaller table's complete signature. That is a false "prefer that one
+    instead" manufactured entirely by a build limit.
+
+    PS_KEYS_OLD below really has four columns and really is not a copy of
+    the two-column PS_KEYS. Cut to its first two it looks exactly like one,
+    and its name supplies the second signal.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-trunc-")
+        self.root = Path(self.temp.name)
+        db_path = self.root / "primary.db"
+        con = sqlite3.connect(db_path)
+        con.executescript("""
+            CREATE TABLE PS_KEYS (K1 TEXT, K2 TEXT);
+            CREATE TABLE PS_KEYS_OLD (K1 TEXT, K2 TEXT, C3 TEXT, C4 TEXT);
+        """)
+        con.commit()
+        con.close()
+        self.cfg = Config.sample(self.root)
+        self.cfg.db.sqlite_path = str(db_path)
+        self.cfg.sources = {}
+        self.catalog_path = self.root / "catalog.db"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _build(self, max_fields):
+        db = Database(self.cfg)
+        try:
+            build_catalog(self.catalog_path, [("default", db)],
+                          limits=metadata.MetadataBuildLimits(
+                              max_fields=max_fields),
+                          peopletools_source="default")
+        finally:
+            db.close()
+        con = sqlite3.connect(self.catalog_path)
+        con.row_factory = sqlite3.Row
+        try:
+            profiles = {r["name"]: dict(r) for r in
+                        con.execute("SELECT * FROM object_profiles")}
+            pairs = [(r["s"], r["c"]) for r in con.execute(
+                "SELECT s.name AS s, d.name AS c FROM edges e "
+                "JOIN nodes s ON s.id=e.src JOIN nodes d ON d.id=e.dst "
+                "WHERE e.kind='shadow_of'")]
+            return profiles, pairs
+        finally:
+            con.close()
+
+    def test_with_room_the_real_shape_is_kept_and_no_copy_is_claimed(self):
+        """The control: four columns collected, the tables differ, silence."""
+        profiles, pairs = self._build(max_fields=100)
+        self.assertEqual(profiles["PS_KEYS_OLD"]["column_count"], 4)
+        self.assertEqual(pairs, [])
+
+    def test_a_build_limit_cannot_manufacture_a_copy(self):
+        """max_fields=4 cuts PS_KEYS_OLD to exactly PS_KEYS's columns.
+
+        Without the guard this yields ('PS_KEYS_OLD', 'PS_KEYS') -- a
+        confident redirection to a table with half the columns, produced by
+        nothing but where the cap happened to fall.
+        """
+        profiles, pairs = self._build(max_fields=4)
+        self.assertEqual(pairs, [],
+                         "a subset signature must never be matched")
+        self.assertEqual(profiles["PS_KEYS_OLD"]["signature"], "",
+                         "the truncated object must carry no signature")
+        self.assertEqual(profiles["PS_KEYS"]["signature"].count("|") + 1, 2,
+                         "the complete object keeps its signature")
+
+    def test_a_fully_collected_neighbour_is_unaffected(self):
+        profiles, _ = self._build(max_fields=4)
+        self.assertTrue(profiles["PS_KEYS"]["signature"])
+        self.assertEqual(profiles["PS_KEYS"]["liveness"], "empty")
+
+
 if __name__ == "__main__":
     unittest.main()

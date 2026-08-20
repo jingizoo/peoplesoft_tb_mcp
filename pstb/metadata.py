@@ -659,6 +659,9 @@ class _Writer:
         self.partial = False
         self.degraded: set[str] = set()
         self.limit_hits: list[dict] = []
+        # Objects whose column list was cut off by the field cap. Their
+        # signatures are subsets of the truth and must never be matched.
+        self.partial_columns: set[str] = set()
 
     def source(self, name: str, db) -> None:
         db_cfg = getattr(getattr(db, "cfg", None), "db", None)
@@ -1803,12 +1806,24 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
     object_keys = {(o["schema"], o["name"]): o for o in objects}
     fields = 0
     field_overflow = False
+    last_owner_id = ""
 
     def add_column(schema: str, obj: str, row: dict) -> None:
         nonlocal fields
         key = (_u(schema) or "MAIN", _u(obj))
         owner = object_keys.get(key)
-        if owner is None or fields >= limits.max_fields:
+        if owner is None:
+            return
+        if fields >= limits.max_fields:
+            # The cap bites mid-stream, so the object being filled at this
+            # moment keeps a PARTIAL column list. Objects after it get none
+            # at all, which is safely detectable (an empty signature is
+            # never grouped); a partial one is not -- it is a real-looking
+            # signature that happens to be a subset, and on a PeopleSoft
+            # schema where families of tables share their leading key
+            # columns it can collide with a smaller table's complete one.
+            # Remembered here so the profiler can refuse to match it.
+            state.partial_columns.add(owner["id"])
             return
         name = _u(row.get("column_name") or row.get("name"))
         if not name:
@@ -1833,6 +1848,8 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
         state.alias(source, f"{owner['name']}.{name}", fid, "physical column")
         state.term(fid, "data type", attrs["data_type"])
         fields += 1
+        nonlocal last_owner_id
+        last_owner_id = owner["id"]
 
     if db.dialect == "sqlite":
         for obj in objects:
@@ -1850,6 +1867,8 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
                 {"table_name": obj["name"]},
                 max_rows=min(10_000, remaining))
             field_overflow = field_overflow or truncated
+            if truncated:
+                state.partial_columns.add(obj["id"])
             for row in rows:
                 row = {**row, "ordinal_position": int(row.get("cid") or 0) + 1,
                        "nullable": "N" if row.get("is_notnull") else "Y"}
@@ -1866,6 +1885,13 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
                 add_column(row.get("schema_name"), row.get("object_name"), row)
                 if fields >= limits.max_fields:
                     field_overflow = (pos < len(page) - 1 or _truncated)
+                    # Conservative: the object owning the last accepted
+                    # column may have had more, and we cannot tell from
+                    # here whether the cap fell on its final column or its
+                    # first. Losing one true signature beats inventing a
+                    # false copy from a subset.
+                    if last_owner_id:
+                        state.partial_columns.add(last_owner_id)
                     break
             if fields >= limits.max_fields:
                 break
@@ -2266,7 +2292,11 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
             "column_count": len(own),
             "populated_columns": (None if populated is None else int(populated)),
             "reference_count": references.get(node_id, 0),
-            "signature": profiling.column_signature(own),
+            # A truncated column list is a subset of the truth, not a
+            # shorter truth. Signing it would invite a false match against
+            # a smaller table that genuinely has those columns and no more.
+            "signature": ("" if node_id in state.partial_columns
+                          else profiling.column_signature(own)),
         }
         profiles.append(profile)
 

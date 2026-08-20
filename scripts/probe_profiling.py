@@ -142,25 +142,45 @@ def main(argv=None) -> int:
     # markers actually in use here can be read off, since the built-in
     # list was written from experience elsewhere.
     _section("COPIES  (identically shaped tables, worst offenders first)")
+    # ORA-01489 on the first attempt: LISTAGG of every column name
+    # overflows 4000 characters on a schema with 3.19M columns. Hashing
+    # instead cannot overflow. SUM is commutative, so the signature is
+    # order-independent for free -- and collisions only ever produce a
+    # CANDIDATE here, which is then read by eye.
     rows, err = _rows(
         db,
-        "SELECT SIGNATURE, COUNT(*) AS N, "
-        "LISTAGG(TABLE_NAME, ', ') WITHIN GROUP (ORDER BY TABLE_NAME) AS NAMES "
-        "FROM (SELECT OWNER, TABLE_NAME, LISTAGG(COLUMN_NAME || ':' || "
-        "DATA_TYPE, '|') WITHIN GROUP (ORDER BY COLUMN_NAME) AS SIGNATURE "
-        f"FROM ALL_TAB_COLUMNS {where} GROUP BY OWNER, TABLE_NAME) "
-        "GROUP BY SIGNATURE HAVING COUNT(*) > 1 "
-        "ORDER BY COUNT(*) DESC FETCH FIRST 15 ROWS ONLY", params, cap=15)
+        "SELECT NCOLS, SIG, COUNT(*) AS N, "
+        "  SUBSTR(LISTAGG(TABLE_NAME, ', ') WITHIN GROUP "
+        "         (ORDER BY TABLE_NAME), 1, 300) AS NAMES "
+        "FROM (SELECT OWNER, TABLE_NAME, COUNT(*) AS NCOLS, "
+        "        SUM(ORA_HASH(COLUMN_NAME || ':' || DATA_TYPE)) AS SIG "
+        f"      FROM ALL_TAB_COLUMNS {where} GROUP BY OWNER, TABLE_NAME) "
+        "GROUP BY NCOLS, SIG HAVING COUNT(*) > 1 "
+        "ORDER BY COUNT(*) DESC FETCH FIRST 20 ROWS ONLY", params, cap=20)
+    if err:
+        # The inner LISTAGG is now over table names within one signature
+        # group, not every column in the schema, so it is far shorter --
+        # but a group with hundreds of members can still overflow.
+        rows, err = _rows(
+            db,
+            "SELECT NCOLS, SIG, COUNT(*) AS N, MIN(TABLE_NAME) AS NAMES "
+            "FROM (SELECT OWNER, TABLE_NAME, COUNT(*) AS NCOLS, "
+            "        SUM(ORA_HASH(COLUMN_NAME || ':' || DATA_TYPE)) AS SIG "
+            f"      FROM ALL_TAB_COLUMNS {where} GROUP BY OWNER, TABLE_NAME) "
+            "GROUP BY NCOLS, SIG HAVING COUNT(*) > 1 "
+            "ORDER BY COUNT(*) DESC FETCH FIRST 20 ROWS ONLY", params, cap=20)
     if err:
         print(f"  UNREADABLE: {err}")
-        print("  (LISTAGG overflows past 4000 chars on very wide tables; if "
-              "that is the error, say so and this becomes a client-side pass)")
     elif not rows:
         print("  none -- no two tables in this schema share a column signature")
     else:
+        total = sum(int(r.get("n") or 0) for r in rows)
+        print(f"  {len(rows)} shapes shown, covering {total} tables")
+        print("  (a shape is a column-count + hash of its columns; names are")
+        print("   what the marker list has to recognise)")
         for row in rows:
-            names = str(row.get("names") or "")
-            print(f"  x{row.get('n'):<3} {names[:150]}")
+            print(f"  x{row.get('n'):<4} {row.get('ncols'):>3} cols  "
+                  f"{str(row.get('names') or '')[:130]}")
 
     # --------------------------------------------------------- GRANTS
     # Everything above works on a plain read-only account. These two do
