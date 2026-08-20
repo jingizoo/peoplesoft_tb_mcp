@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from . import profiling
 from .config import normalize_db_schemas
 
 
@@ -627,6 +628,26 @@ CREATE TABLE notes (
   partial INTEGER NOT NULL,
   status TEXT NOT NULL
 );
+CREATE TABLE object_profiles (
+  node_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  schema_name TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  liveness TEXT NOT NULL,
+  row_estimate INTEGER,
+  analyzed_at TEXT,
+  column_count INTEGER NOT NULL,
+  populated_columns INTEGER,
+  reference_count INTEGER NOT NULL,
+  signature TEXT NOT NULL,
+  value_score REAL NOT NULL,
+  components TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  collected_at TEXT NOT NULL
+);
+CREATE INDEX object_profiles_rank ON object_profiles(source, value_score DESC);
+CREATE INDEX object_profiles_signature ON object_profiles(source, signature);
 """
 
 
@@ -2077,8 +2098,232 @@ def _pt_public_query_rows(db, *, page_size: int, cap: int,
         on_limit(kept)
 
 
+# One row per object; the build already caps objects far below this, so
+# this only stops a pathological dictionary from streaming forever.
+_PROFILE_MAX_OBJECTS = 50_000
+# Only ever interpolated for the sqlite sample, where there is no bind
+# form for an identifier. Anything not matching is skipped rather than
+# quoted-and-hoped.
+_SAFE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 _RECTYPE = {0: "table", 1: "view", 2: "derived", 3: "subrecord",
             5: "dynamic view", 6: "query view", 7: "temp table"}
+
+
+def _table_statistics(db, owners: tuple[str, ...]) -> tuple[dict, str, bool]:
+    """Row estimates and column population the database already computed.
+
+    Returns (by_object, evidence, measured). ``measured`` is False when the
+    dialect has no optimizer statistics to read, in which case liveness
+    stays UNKNOWN and only the structural half of the profile is used --
+    which still detects shadow copies, because that half needs no query.
+
+    Never counts rows on Oracle. NUM_ROWS is already sitting in the data
+    dictionary and a COUNT(*) sweep across a mismanaged schema is exactly
+    the kind of full-table scan a read-only reporting account gets its
+    access revoked for.
+    """
+    dialect = str(getattr(db, "dialect", "")).lower()
+    stats: dict[tuple[str, str], dict] = {}
+
+    if dialect == "oracle":
+        params: dict = {}
+        scope = _owner_scope("OWNER", owners, params) if owners else ""
+        where = f"WHERE {scope} AND " if scope else "WHERE "
+        rows, _ = db.query(
+            "SELECT OWNER, TABLE_NAME, NUM_ROWS, "
+            "TO_CHAR(LAST_ANALYZED,'YYYY-MM-DD') AS ANALYZED_AT "
+            "FROM ALL_TAB_STATISTICS "
+            f"{where}PARTITION_NAME IS NULL AND OBJECT_TYPE='TABLE'",
+            params, max_rows=_PROFILE_MAX_OBJECTS)
+        for row in rows:
+            key = (_u(row.get("owner")), _u(row.get("table_name")))
+            stats[key] = {"row_estimate": row.get("num_rows"),
+                          "analyzed_at": _s(row.get("analyzed_at"))}
+        # Aggregated in the database on purpose: one row per table instead
+        # of one per column, which on a wide schema is the difference
+        # between thousands of rows and hundreds of thousands.
+        params = {}
+        scope = _owner_scope("OWNER", owners, params) if owners else ""
+        where = f"WHERE {scope} " if scope else ""
+        cols, _ = db.query(
+            "SELECT OWNER, TABLE_NAME, COUNT(*) AS COL_COUNT, "
+            "SUM(CASE WHEN NUM_DISTINCT > 0 THEN 1 ELSE 0 END) AS POPULATED "
+            f"FROM ALL_TAB_COL_STATISTICS {where}"
+            "GROUP BY OWNER, TABLE_NAME", params,
+            max_rows=_PROFILE_MAX_OBJECTS)
+        for row in cols:
+            key = (_u(row.get("owner")), _u(row.get("table_name")))
+            entry = stats.setdefault(key, {"row_estimate": None,
+                                           "analyzed_at": ""})
+            entry["populated_columns"] = row.get("populated")
+        return stats, "ALL_TAB_STATISTICS + ALL_TAB_COL_STATISTICS", True
+
+    if dialect == "sqlite":
+        # The bundled sample has no optimizer statistics and is small
+        # enough to count. This branch is reachable only for sqlite, which
+        # in this deployment means the sample -- it must never become the
+        # path a real instance takes.
+        objects, _ = db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            {}, max_rows=_PROFILE_MAX_OBJECTS)
+        for row in objects:
+            name = _s(row.get("name"))
+            if not name or not _SAFE_IDENT.fullmatch(name):
+                continue
+            try:
+                counted, _ = db.query(
+                    f'SELECT COUNT(*) AS N FROM "{name}"', {}, max_rows=1)
+            except DbError:
+                continue
+            value = counted[0].get("n") if counted else None
+            stats[("MAIN", name.upper())] = {
+                "row_estimate": value, "analyzed_at": ""}
+        return stats, "SELECT COUNT(*) (sample database)", True
+
+    return stats, "no optimizer statistics for this dialect", False
+
+
+def _collect_profile(state: _Writer, source: str, db) -> str:
+    """Rank objects by whether they are worth reading, ignoring their names.
+
+    Runs after the native collector so the shape and the reference graph
+    are already in the artifact: signature and connectivity are read back
+    out of the catalog rather than re-queried, which makes the whole
+    structural half of this dialect-independent and free.
+    """
+    con = state.con
+    objects = list(con.execute(
+        "SELECT id, schema_name, name, kind FROM nodes "
+        "WHERE source=? AND kind IN ('table','view') ORDER BY name",
+        (source,)))
+    if not objects:
+        return "no_objects"
+
+    columns: dict[str, list[dict]] = {}
+    for row in con.execute(
+            "SELECT e.src AS owner_id, n.name AS name, n.attrs AS attrs "
+            "FROM edges e JOIN nodes n ON n.id = e.dst "
+            "WHERE e.kind='object_has_column' AND n.source=?", (source,)):
+        try:
+            attrs = json.loads(row["attrs"] or "{}")
+        except (TypeError, ValueError):
+            attrs = {}
+        columns.setdefault(row["owner_id"], []).append(
+            {"name": row["name"], "data_type": attrs.get("data_type")})
+
+    # What else points at this object. An index is investment by whoever
+    # runs the database; a view, a foreign key or a PeopleTools record is
+    # someone having written the object's name down on purpose.
+    references: dict[str, int] = {}
+    for row in con.execute(
+            "SELECT dst AS id, COUNT(*) AS n FROM edges WHERE kind IN "
+            "('foreign_key_references_object','view_depends_on',"
+            "'record_physicalizes_to') GROUP BY dst"):
+        references[row["id"]] = int(row["n"] or 0)
+    for row in con.execute(
+            "SELECT src AS id, COUNT(*) AS n FROM edges "
+            "WHERE kind='object_has_index' GROUP BY src"):
+        references[row["id"]] = references.get(row["id"], 0) + int(row["n"] or 0)
+    # A view naming five tables is a human's recorded understanding of a
+    # join, which is the closest thing to documentation a mismanaged
+    # schema has. Counted outbound, because nothing points at a view.
+    depends_on: dict[str, list[str]] = {}
+    for row in con.execute(
+            "SELECT src, dst FROM edges WHERE kind='view_depends_on'"):
+        depends_on.setdefault(row["src"], []).append(row["dst"])
+        references[row["src"]] = references.get(row["src"], 0) + 1
+
+    try:
+        stats, evidence, measured = _table_statistics(
+            db, _configured_schemas(db))
+    except Exception as exc:                  # noqa: BLE001
+        # A missing grant on the statistics views is common on a read-only
+        # reporting account and must not fail the build: the structural
+        # half still ranks and still finds copies.
+        state.note(source, "profile",
+                   f"optimizer statistics are not readable ({exc}); objects "
+                   "are profiled on structure alone and no object is "
+                   "reported as empty", ok=False, partial=True)
+        stats, evidence, measured = {}, "structure only", False
+
+    profiles = []
+    for row in objects:
+        node_id, schema, name, kind = (row["id"], row["schema_name"],
+                                       row["name"], row["kind"])
+        own = columns.get(node_id) or []
+        entry = stats.get((_u(schema), _u(name))) or {}
+        state_of = profiling.liveness(entry.get("row_estimate"),
+                                      analyzed=measured)
+        populated = entry.get("populated_columns")
+        profile = {
+            "node_id": node_id, "source": source, "schema_name": schema,
+            "name": name, "kind": kind,
+            "liveness": state_of,
+            "row_estimate": entry.get("row_estimate"),
+            "analyzed_at": entry.get("analyzed_at") or "",
+            "column_count": len(own),
+            "populated_columns": (None if populated is None else int(populated)),
+            "reference_count": references.get(node_id, 0),
+            "signature": profiling.column_signature(own),
+        }
+        profiles.append(profile)
+
+    # Views are never in table statistics, so their own liveness can only
+    # come from what they select from. Done as a second pass so the
+    # targets already carry their measured row estimates.
+    measured_rows = {p["node_id"]: p["row_estimate"] for p in profiles
+                     if p["liveness"] == profiling.POPULATED}
+    for profile in profiles:
+        if profile["liveness"] != profiling.UNKNOWN:
+            continue
+        targets = [measured_rows.get(t) for t in
+                   depends_on.get(profile["node_id"], [])]
+        rows_seen = [int(t) for t in targets if t is not None]
+        if rows_seen:
+            profile["inherited_rows"] = max(rows_seen)
+
+    for profile in profiles:
+        scored = profiling.value_score(profile)
+        profile["value_score"] = scored["score"]
+        profile["components"] = scored["components"]
+
+    con.executemany(
+        "INSERT OR REPLACE INTO object_profiles "
+        "(node_id,source,schema_name,name,kind,liveness,row_estimate,"
+        "analyzed_at,column_count,populated_columns,reference_count,"
+        "signature,value_score,components,evidence,collected_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(p["node_id"], p["source"], p["schema_name"], p["name"], p["kind"],
+          p["liveness"], p["row_estimate"], p["analyzed_at"],
+          p["column_count"], p["populated_columns"], p["reference_count"],
+          p["signature"], p["value_score"],
+          json.dumps(p["components"], sort_keys=True), evidence,
+          state.collected_at) for p in profiles])
+
+    shadows = profiling.shadow_candidates(profiles)
+    for pair in shadows:
+        # Direction matters: the edge reads "shadow is a copy of canonical",
+        # so a reader following it lands on the table to query.
+        state.edge(
+            pair["shadow_id"], pair["canonical_id"], "shadow_of",
+            confidence="likely", evidence=f"identical column signature "
+            f"({pair['signature_columns']} columns) and a "
+            f"{pair['relation'].replace('_', ' ')} name",
+            collector="profile", authority="derived",
+            attrs={"relation": pair["relation"],
+                   "canonical": pair["canonical"],
+                   "canonical_rows": pair["canonical_rows"],
+                   "shadow_rows": pair["shadow_rows"]})
+    if shadows:
+        state.note(source, "profile",
+                   f"{len(shadows)} object(s) look like copies of another "
+                   "table with the same column signature; prefer the "
+                   "canonical one", ok=True)
+    if not measured:
+        return "structure_only"
+    return "complete"
 
 
 def _collect_peopletools(state: _Writer, source: str, db) -> str:
@@ -2509,6 +2754,18 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                 objects, fields = _collect_native(state, source, db)
                 if source == peopletools_source:
                     pt_status = _collect_peopletools(state, source, db)
+                # Last, and isolated. The profiler reads shape and the
+                # reference graph back out of the artifact rather than
+                # asking the database twice, but it does touch the
+                # statistics views -- and a ranking is an enhancement. It
+                # must never be able to cost the caller the catalog.
+                try:
+                    _collect_profile(state, source, db)
+                except Exception as exc:      # noqa: BLE001
+                    state.note(source, "profile",
+                               f"objects were not ranked ({exc}); the "
+                               "catalog itself is unaffected",
+                               ok=False, partial=True)
                 configured_schemas = list(_configured_schemas(db))
                 if configured_schemas:
                     observed = {
@@ -3754,6 +4011,61 @@ class MetadataCatalog:
         finally:
             con.close()
 
+    def _usefulness(self, con, node_id: str) -> dict:
+        """What the profiler concluded about one object, or {} if it did not.
+
+        This is the point of the profiling pass. Ranking objects in a table
+        nobody reads changes nothing; the model asks get_metadata_context
+        before it chooses what to query, so the answer to "is this the live
+        table" has to arrive there.
+
+        Returns {} rather than raising for a catalog built before profiles
+        existed -- an artifact on disk outlives the code that wrote it, and
+        a missing enhancement must not take down context().
+        """
+        try:
+            row = con.execute(
+                "SELECT liveness, row_estimate, value_score, components, "
+                "evidence, reference_count FROM object_profiles WHERE node_id=?",
+                (node_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return {}
+        if row is None:
+            return {}
+        out = {
+            "liveness": row["liveness"],
+            "row_estimate": row["row_estimate"],
+            "value_score": row["value_score"],
+            "basis": _json(row["components"]).get("population_basis"),
+            "referenced_by": row["reference_count"],
+            "evidence": row["evidence"],
+        }
+        if row["liveness"] == "unknown":
+            out["caveat"] = (
+                "No row estimate exists for this object, so it is UNMEASURED "
+                "-- which is not the same as empty. Do not report it as "
+                "having no data.")
+        elif row["liveness"] == "empty":
+            out["caveat"] = (
+                "The database's own statistics report zero rows. Confirm "
+                "before building an answer on it.")
+        try:
+            shadow = con.execute(
+                "SELECT n.name AS canonical, e.attrs AS attrs, e.evidence AS why "
+                "FROM edges e JOIN nodes n ON n.id = e.dst "
+                "WHERE e.src=? AND e.kind='shadow_of'", (node_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return out
+        if shadow is not None:
+            attrs = _json(shadow["attrs"])
+            out["prefer_instead"] = {
+                "object": shadow["canonical"],
+                "relation": attrs.get("relation"),
+                "why": shadow["why"],
+                "canonical_rows": attrs.get("canonical_rows"),
+            }
+        return out
+
     def context(self, identifier: str, source: str = "", limit: int = 40) -> dict:
         asked = _u(identifier)
         if not asked:
@@ -4123,6 +4435,7 @@ class MetadataCatalog:
                 "dependencies": dependencies_out,
                 "mappings": mappings_out,
                 "relationships": relationships,
+                "usefulness": self._usefulness(con, subject["object_id"]),
                 "notes": notes,
                 "truncated": total > cap or context_truncated,
                 "snapshot": snapshot,
