@@ -7,6 +7,7 @@ current source fingerprint and catalog identity.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -933,6 +934,96 @@ class NeverBuiltSidecarTests(unittest.TestCase):
             self._store("p2go").list_proposals("pending")
         self.assertEqual(len(closed), len(set(closed)),
                          f"a descriptor was closed twice: {closed}")
+
+class PersistFailureIsDiagnosableTests(unittest.TestCase):
+    """"source knowledge could not be persisted safely" was a dead end.
+
+    The owner hit it on the work box and could only ask "what could be the
+    issue" -- the errno that answers that was attached to __cause__, where
+    only a debugger looks. A persistence refusal has unusually good
+    remedies because the causes are so distinguishable: full disk, wrong
+    owner on a 0700 directory, read-only mount, a network filesystem
+    refusing directory fsync. The message now names which.
+    """
+
+    def _make_store(self, root):
+        from pstb.source_knowledge import SourceKnowledge
+        return SourceKnowledge(Path(root) / "sk" / "default.db",
+                               source="default",
+                               source_fingerprint="sha256:" + "a" * 64)
+
+    # ---------------------------------------------------------- the helper
+    def test_a_full_disk_names_itself_and_the_directory(self):
+        from pstb.source_knowledge import _persist_failure_message
+        message = _persist_failure_message(
+            OSError(errno.ENOSPC, "No space left on device"),
+            Path("/data/sk/default.db"))
+        self.assertIn("out of space", message)
+        self.assertIn("ENOSPC", message)
+        self.assertIn("/data/sk", message)
+
+    def test_permission_denied_points_at_the_0700_owner_trap(self):
+        from pstb.source_knowledge import _persist_failure_message
+        message = _persist_failure_message(
+            OSError(errno.EACCES, "Permission denied"),
+            Path("/data/sk/default.db"))
+        self.assertIn("permission denied", message.lower())
+        self.assertIn("0700", message)
+        self.assertIn("ls -ld", message)
+
+    def test_a_network_filesystem_refusing_fsync_is_named(self):
+        from pstb.source_knowledge import _persist_failure_message
+        message = _persist_failure_message(
+            OSError(errno.EINVAL, "Invalid argument"),
+            Path("/nfs/home/sk/default.db"))
+        self.assertIn("NFS", message)
+        self.assertIn("EINVAL", message)
+
+    def test_an_unrecognised_cause_is_still_carried_not_swallowed(self):
+        from pstb.source_knowledge import _persist_failure_message
+        message = _persist_failure_message(
+            RuntimeError("mmap failed for reasons"),
+            Path("/data/sk/default.db"))
+        self.assertIn("RuntimeError", message)
+        self.assertIn("mmap failed", message)
+        self.assertIn("could not be persisted safely", message,
+                      "the greppable sentence must survive")
+
+    # ------------------------------------------------------ the wrap sites
+    def test_the_shipped_write_path_reports_the_real_cause(self):
+        """os.replace fails with ENOSPC mid-persist: the operator's error
+        must say the disk is full, and the original OSError must remain on
+        __cause__ for anyone who does attach a debugger."""
+        from pstb.source_knowledge import SourceKnowledgeError
+        with tempfile.TemporaryDirectory() as root:
+            store = self._make_store(root)
+            real = os.replace
+
+            def full_disk(*args, **kwargs):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch.object(os, "replace", full_disk), \
+                    self.assertRaises(SourceKnowledgeError) as caught:
+                store.propose(object_id="table:" + "0" * 24, schema="SYSADM",
+                              object_name="PS_VOUCHER", object_kind="table",
+                              meaning="accounts payable voucher header")
+            self.assertIn("out of space", str(caught.exception))
+            self.assertIn("ENOSPC", str(caught.exception))
+            cause = caught.exception.__cause__
+            self.assertIsInstance(cause, OSError)
+            self.assertEqual(cause.errno, errno.ENOSPC)
+            os.replace = real
+
+    def test_no_wrap_site_still_swallows_the_cause(self):
+        """All three copies of the bare sentence are gone from the source;
+        the only occurrences left are the helper's prefix."""
+        import pstb.source_knowledge as sk
+        source = Path(sk.__file__).read_text()
+        self.assertNotIn(
+            '"source knowledge could not be persisted safely") from exc',
+            source)
+        self.assertEqual(
+            source.count("_persist_failure_message(exc, self.path)"), 3)
 
 if __name__ == "__main__":
     unittest.main()

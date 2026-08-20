@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import errno
 import json
 import os
 import re
@@ -109,6 +110,43 @@ _LITERAL_VALUE = re.compile(
     r"\b[A-Z]{1,5}\d{3,}\b")
 
 
+def _persist_failure_message(exc: BaseException, path) -> str:
+    """Name the cause and, where it is diagnosable, the remedy.
+
+    The wrapper used to say "source knowledge could not be persisted
+    safely" and stop -- discarding the errno that says WHY. The owner hit
+    exactly that on the work box and had nothing to act on; the cause was
+    on __cause__ all along, where only a debugger looks. House doctrine is
+    refuse-with-remedy, and a persistence refusal has unusually good
+    remedies because the causes are so distinguishable.
+    """
+    prefix = "source knowledge could not be persisted safely"
+    where = str(getattr(path, "parent", path))
+    code = getattr(exc, "errno", None)
+    name = errno.errorcode.get(code, str(code)) if code is not None else ""
+    if code in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+        return (f"{prefix}: the filesystem holding {where} is out of space "
+                f"or over quota ({name}). Nothing was partially written; "
+                "free space and retry.")
+    if code in (errno.EACCES, errno.EPERM):
+        return (f"{prefix}: permission denied in {where} ({name}). The "
+                "store directory is created mode 0700 by whoever first "
+                "taught this source; if the app once ran as a different "
+                "user, that owner still holds it -- compare `ls -ld` there "
+                "with `id`.")
+    if code == getattr(errno, "EROFS", -1):
+        return f"{prefix}: {where} is on a read-only filesystem ({name})."
+    if code == errno.EINVAL:
+        return (f"{prefix}: the filesystem refused a durability call "
+                f"({name}), which some network filesystems do for fsync on "
+                f"a directory. If {where} is on NFS, move it to a local "
+                "filesystem.")
+    detail = f"{type(exc).__name__}: {exc}".strip().rstrip(".")
+    if name:
+        detail = f"{detail} [{name}]"
+    return f"{prefix}: {detail}. Nothing was partially written."
+
+
 class SourceKnowledgeError(RuntimeError):
     pass
 
@@ -142,7 +180,7 @@ class _SnapshotConnection(sqlite3.Connection):
                 raise
             except Exception as exc:
                 raise SourceKnowledgeError(
-                    "source knowledge could not be persisted safely") from exc
+                    _persist_failure_message(exc, self.path)) from exc
 
     def close(self) -> None:
         try:
@@ -485,7 +523,7 @@ class SourceKnowledge:
             if isinstance(exc, SourceKnowledgeError):
                 raise
             raise SourceKnowledgeError(
-                "source knowledge could not be persisted safely") from exc
+                _persist_failure_message(exc, self.path)) from exc
 
     def _create_staging(self, snapshot: bytes | None) -> tuple[str, tuple[int, int]]:
         fd, name = tempfile.mkstemp(
@@ -749,7 +787,7 @@ class SourceKnowledge:
             if isinstance(exc, SourceKnowledgeError):
                 raise
             raise SourceKnowledgeError(
-                "source knowledge could not be persisted safely") from exc
+                _persist_failure_message(exc, self.path)) from exc
 
     def _windows_persist_staging(
         self, staging_path: str, staging_identity: tuple[int, int],
