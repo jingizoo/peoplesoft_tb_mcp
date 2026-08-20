@@ -188,6 +188,7 @@ def main(argv=None) -> int:
     # recency, and what anyone actually queries.
     _section("GRANTS  (phase two signals -- expected to fail on a bare account)")
     for label, sql in (
+        ("ALL_TAB_MODIFICATIONS", "SELECT COUNT(*) FROM ALL_TAB_MODIFICATIONS"),
         ("DBA_TAB_MODIFICATIONS", "SELECT COUNT(*) FROM DBA_TAB_MODIFICATIONS"),
         ("V$SQL", "SELECT COUNT(*) FROM V$SQL"),
         ("DBA_HIST_SQLSTAT", "SELECT COUNT(*) FROM DBA_HIST_SQLSTAT"),

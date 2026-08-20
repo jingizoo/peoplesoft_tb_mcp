@@ -153,6 +153,28 @@ def _glued_marker(base: str, variant: str) -> str:
     return ""
 
 
+def reconcile_liveness(state: str, modified_since_stats) -> tuple:
+    """(state, contradicted): an EMPTY verdict with DML recorded after the
+    statistics were gathered is no verdict at all.
+
+    Oracle's modification tracking is cleared every time statistics are
+    gathered, so any surviving count is change the stats have not seen.
+    Only EMPTY is reconciled, because only EMPTY is dangerous when stale:
+    it makes ranking skip the table and shadow detection redirect away
+    from it, and both read as correct. A stale POPULATED fails soft -- a
+    query finds nothing and says so -- and UNKNOWN asserts nothing that
+    could be contradicted (activity on a never-analyzed table is surfaced
+    as a caveat instead, not a state change).
+    """
+    try:
+        mods = 0 if modified_since_stats is None else int(modified_since_stats)
+    except (TypeError, ValueError):
+        mods = 0
+    if state == EMPTY and mods > 0:
+        return UNKNOWN, True
+    return state, False
+
+
 def liveness(row_estimate: object, *, analyzed: bool = True) -> str:
     """POPULATED / EMPTY / UNKNOWN from a row estimate.
 
@@ -219,6 +241,13 @@ def value_score(profile: Mapping) -> dict:
         # a live table is live.
         population, basis = (_saturate(float(inherited), 1_000_000.0),
                              "inherited")
+    elif profile.get("stats_contradicted"):
+        # The statistics said EMPTY and the modification log says rows
+        # changed after they were gathered. Same midpoint as unmeasured --
+        # the honest amount of knowledge is the same -- but the basis is
+        # different and a reader deciding whether to trust a skip needs to
+        # see WHY this table is unknown.
+        population, basis = 0.5, "contradicted"
     else:
         # A PRIOR, not a measurement, and it is reported as one. Unknown
         # means unmeasured -- in a schema where nothing has been analyzed,
