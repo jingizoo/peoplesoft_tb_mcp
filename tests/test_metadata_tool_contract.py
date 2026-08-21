@@ -48,7 +48,7 @@ class MetadataToolContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(inspect.signature(propose).parameters),
-            {"identifier", "meaning", "aliases", "source"},
+            {"identifier", "meaning", "aliases", "source", "selection"},
         )
 
     def test_relationship_graph_is_registered_when_raw_sql_is_disabled(self):

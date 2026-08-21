@@ -338,7 +338,7 @@ class RecordGraph:
 
     # ---- the question ----------------------------------------------------
     def path(self, start: str, goal: str, extra=(),
-             max_hops: int = MAX_HOPS) -> Optional[JoinPath]:
+             max_hops: int = MAX_HOPS, exclude=()) -> Optional[JoinPath]:
         """Cheapest join path, or None.
 
         Cheapest by INDEX SUPPORT first and hop count second — a two-hop
@@ -347,7 +347,10 @@ class RecordGraph:
         catalog rather than from a diagram.
         """
         start, goal = start.upper(), goal.upper()
-        pool = self.universe(list(extra) + [start, goal])
+        blocked = {str(name or "").strip().upper()
+                   for name in (exclude or ()) if str(name or "").strip()}
+        pool = [name for name in self.universe(list(extra) + [start, goal])
+                if name not in blocked]
         if start not in pool or goal not in pool:
             return None
         if start == goal:
@@ -377,12 +380,15 @@ class RecordGraph:
         found = best.get(goal)
         return found[1] if found else None
 
-    def paths_from(self, record: str, extra=()) -> list:
+    def paths_from(self, record: str, extra=(), exclude=()) -> list:
         """Everything this record can reach in one hop, cheapest first —
         the answer to "what can I join this to", which is the question
         somebody asks before they know the target."""
         record = record.upper()
-        pool = self.universe(list(extra) + [record])
+        blocked = {str(name or "").strip().upper()
+                   for name in (exclude or ()) if str(name or "").strip()}
+        pool = [name for name in self.universe(list(extra) + [record])
+                if name not in blocked]
         hops = self.neighbours(record, pool)
         hops.sort(key=lambda h: (h.cost(), -len(h.specific), h.right))
         return hops

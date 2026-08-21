@@ -33,6 +33,8 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
+from .record_governance import exclusion_reason, selection_effect
+
 try:  # POSIX advisory locking; Windows uses msvcrt below.
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised by Windows CI/deployments
@@ -357,7 +359,12 @@ def explicit_metadata_lesson(question: str, object_name: str) -> bool:
         rf"(?:table|view)\b).{{0,80}}{name_pattern}", text)
     directive = re.search(
         rf"(?i)\b(?:please\s+)?use\s+{name_pattern}\s+for\b", text)
-    return bool(teaching or statement or correction or directive)
+    exclusion = re.search(
+        rf"(?i)\b(?:do\s+not|don['’]?t['’]?|never)\s+"
+        rf"(?:use|query|choose)\b"
+        rf".{{0,80}}{name_pattern}|"
+        rf"\b(?:exclude|avoid)\b.{{0,80}}{name_pattern}", text)
+    return bool(teaching or statement or correction or directive or exclusion)
 
 
 class SourceKnowledge:
@@ -1070,6 +1077,16 @@ class SourceKnowledge:
             approved_at = ""
         else:
             approved_at = timestamp("decided_at")
+        effect = selection_effect(meaning, active_status=status)
+        # Lifecycle and selection are intentionally separate.  A legacy row
+        # was approved because the operator agreed with its sentence; when the
+        # sentence says "do not use", its effective state is an exclusion.
+        # Present that state directly so no caller can mistake it for a
+        # positive approved pointer.
+        effective_status = (
+            "excluded" if status == "approved" and effect == "exclude"
+            else status
+        )
         return {
             "id": proposal_id,
             "source_database": source,
@@ -1079,7 +1096,8 @@ class SourceKnowledge:
             "kind": kind,
             "meaning": meaning,
             "aliases": normalized_aliases,
-            "status": status,
+            "status": effective_status,
+            "selection_effect": effect,
             "proposed_at": proposed_at,
             **({"decided_at": approved_at} if approved_at else {}),
         }
@@ -1107,24 +1125,27 @@ class SourceKnowledge:
     def summary(self) -> dict:
         rows = self._rows()
         counts = {status: 0 for status in (
-            "pending", "approved", "rejected", "revoked")}
+            "pending", "approved", "excluded", "rejected", "revoked")}
         for row in rows:
-            status = str(row["status"] or "pending")
+            status = str(self._public(row).get("status") or "pending")
             if status in counts:
                 counts[status] += 1
         return {
             "available": True,
             "source_database": self.source,
             "counts": counts,
-            "active": counts["approved"],
+            "active": counts["approved"] + counts["excluded"],
+            "active_pointers": counts["approved"],
+            "active_exclusions": counts["excluded"],
             "note": (
-                "Only operator-approved object meanings affect semantic "
-                "retrieval. They are pointers, not row or relationship evidence."),
+                "Operator-approved meanings either prefer or exclude one exact "
+                "object. They are selection controls, not row or relationship "
+                "evidence."),
         }
 
     def propose(self, *, object_id: str, schema: str, object_name: str,
                 object_kind: str, meaning: str, aliases: object = (),
-                origin: str = "conversation") -> dict:
+                origin: str = "conversation", selection: str = "prefer") -> dict:
         oid = str(object_id or "").strip()
         owner = str(schema or "").strip()
         name = str(object_name or "").strip()
@@ -1132,8 +1153,20 @@ class SourceKnowledge:
         if not oid or not owner or not name or kind not in {"table", "view"}:
             raise SourceKnowledgeError(
                 "a proposal needs one exact catalog table/view identity")
+        requested = str(selection or "prefer").strip().casefold()
+        if requested not in {"prefer", "exclude"}:
+            raise SourceKnowledgeError(
+                "selection must be prefer or exclude")
         body = _one_line(
             meaning, label="meaning", limit=MAX_MEANING_CHARS)
+        # Persist an explicit, human-readable veto without changing the v1
+        # sidecar schema. Existing readers still see a safe sentence; new
+        # readers derive the structured selection_effect from it. Explicit
+        # negative wording always wins over a conflicting default of prefer.
+        if requested == "exclude" and selection_effect(body) != "exclude":
+            body = _one_line(
+                f"Do not use this record for answers — {body}",
+                label="meaning", limit=MAX_MEANING_CHARS)
         alias_list = normalize_aliases(aliases)
         canonical = json.dumps({
             "source": self.source,
@@ -1267,8 +1300,27 @@ class SourceKnowledge:
 
     def approved_for_object(self, object_id: str) -> list[dict]:
         wanted = str(object_id or "").strip()
-        return [self._public(row) for row in self._rows()
-                if row["status"] == "approved" and row["object_id"] == wanted]
+        return [row for row in self.active_rules(wanted)
+                if row["status"] == "approved"]
+
+    def exclusions_for_object(self, object_id: str) -> list[dict]:
+        """Active operator vetoes for one exact catalog object."""
+        wanted = str(object_id or "").strip()
+        return [row for row in self.active_rules(wanted)
+                if row["status"] == "excluded"]
+
+    def exclusions(self) -> list[dict]:
+        """All active vetoes in this source, bounded by MAX_PROPOSALS."""
+        return [row for row in self.active_rules()
+                if row["status"] == "excluded"]
+
+    def active_rules(self, object_id: str = "") -> list[dict]:
+        """One-read snapshot of active positive pointers and exclusions."""
+        wanted = str(object_id or "").strip()
+        return [public for row in self._rows()
+                for public in (self._public(row),)
+                if public["status"] in {"approved", "excluded"}
+                and (not wanted or public["object_id"] == wanted)]
 
     def resolve_alias(self, identifier: str) -> list[dict]:
         asked = str(identifier or "").strip().casefold()
@@ -1276,14 +1328,16 @@ class SourceKnowledge:
             return []
         out = []
         for row in self._rows():
-            if row["status"] != "approved":
-                continue
             public = self._public(row)
+            if public["status"] != "approved":
+                continue
             if asked in {alias.casefold() for alias in public["aliases"]}:
                 out.append(public)
         return out[:MAX_SEARCH_RESULTS]
 
-    def search(self, query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
+    @staticmethod
+    def _search_active(public_rows: list[dict], query: str,
+                       limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
         terms = [match.group(0).casefold() for match in _WORD.finditer(
             str(query or "")) if len(match.group(0)) > 1][:20]
         if not terms:
@@ -1291,10 +1345,9 @@ class SourceKnowledge:
         cap = min(max(int(limit or MAX_SEARCH_RESULTS), 1), MAX_SEARCH_RESULTS)
         found = []
         phrase = " ".join(str(query or "").casefold().split())
-        for row in self._rows():
-            if row["status"] != "approved":
+        for public in public_rows:
+            if public["status"] != "approved":
                 continue
-            public = self._public(row)
             values = [public["meaning"], public["object"],
                       f"{public['schema']}.{public['object']}",
                       *public["aliases"]]
@@ -1317,14 +1370,96 @@ class SourceKnowledge:
             -row["semantic_score"], row["schema"], row["object"], row["id"]))
         return found[:cap]
 
+    def search(self, query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict]:
+        public = [self._public(row) for row in self._rows()]
+        return self._search_active(public, query, limit)
+
+    def search_with_exclusions(
+        self, query: str, limit: int = MAX_SEARCH_RESULTS
+    ) -> tuple[list[dict], list[dict]]:
+        """Positive matches and all vetoes from one immutable snapshot read."""
+        public = [self._public(row) for row in self._rows()]
+        return (
+            self._search_active(public, query, limit),
+            [row for row in public if row["status"] == "excluded"],
+        )
+
     def list_proposals(self, status: str = "") -> list[dict]:
         wanted = str(status or "").strip().lower()
-        allowed = {"", "pending", "approved", "rejected", "revoked"}
+        allowed = {"", "pending", "approved", "excluded", "rejected", "revoked"}
         if wanted not in allowed:
             raise SourceKnowledgeError(
-                "status must be pending, approved, rejected or revoked")
-        return [self._public(row) for row in self._rows()
-                if not wanted or row["status"] == wanted]
+                "status must be pending, approved, excluded, rejected or revoked")
+        return [public for row in self._rows()
+                for public in (self._public(row),)
+                if not wanted or public["status"] == wanted]
+
+
+class SourceExclusionIndex:
+    """Fast, source-bound view of active record vetoes.
+
+    SQL execution may consult this on every ad-hoc call, so unchanged private
+    sidecars are served from memory after one cheap ``stat``. Atomic sidecar
+    replacement changes the inode/mtime signature and makes an approval or
+    revocation visible on the very next call without a process restart.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._lock = threading.RLock()
+        self._cache: dict[str, tuple[tuple, list[dict]]] = {}
+        self._fingerprints: dict[str, str] = {}
+
+    def _fingerprint(self, source: str) -> str:
+        with self._lock:
+            known = self._fingerprints.get(source)
+        if known:
+            return known
+        from .metadata import source_fingerprint
+
+        value = source_fingerprint(self.cfg, source)
+        with self._lock:
+            self._fingerprints[source] = value
+        return value
+
+    def for_source(self, source: str = "default") -> list[dict]:
+        canonical = str(source or "default").strip() or "default"
+        path = source_knowledge_path(self.cfg, canonical)
+        try:
+            entry = path.stat()
+            signature = (
+                entry.st_dev, entry.st_ino, entry.st_mtime_ns, entry.st_size)
+        except FileNotFoundError:
+            signature = (0, 0, 0, 0)
+        with self._lock:
+            cached = self._cache.get(canonical)
+            if cached and cached[0] == signature:
+                return [dict(row) for row in cached[1]]
+        if signature == (0, 0, 0, 0):
+            rows: list[dict] = []
+        else:
+            store = SourceKnowledge(
+                path, source=canonical,
+                source_fingerprint=self._fingerprint(canonical))
+            rows = [{
+                "source_database": canonical,
+                "object_id": row.get("object_id"),
+                "schema": row.get("schema"),
+                "object": row.get("object"),
+                "reason": exclusion_reason(row.get("meaning")),
+                "proposal_id": row.get("id"),
+                "authority": "host-operator-approved record exclusion",
+            } for row in store.exclusions()]
+        with self._lock:
+            self._cache[canonical] = (signature, rows)
+        return [dict(row) for row in rows]
+
+    def invalidate(self, source: str = "") -> None:
+        with self._lock:
+            if source:
+                self._cache.pop(str(source), None)
+            else:
+                self._cache.clear()
 
 
 def _catalog_identity(catalog, source: str, proposal: dict) -> dict:
@@ -1413,9 +1548,9 @@ def main(argv: list[str] | None = None) -> int:
     rows = store.list_proposals(args.status)
     summary = store.summary()
     counts = summary["counts"]
-    print(f"{source}: {counts['approved']} approved, "
-          f"{counts['pending']} pending, {counts['rejected']} rejected, "
-          f"{counts['revoked']} revoked")
+    print(f"{source}: {counts['approved']} preferred, "
+          f"{counts['excluded']} excluded, {counts['pending']} pending, "
+          f"{counts['rejected']} rejected, {counts['revoked']} revoked")
     for row in rows:
         aliases = f" aliases={row['aliases']}" if row["aliases"] else ""
         print(f"[{row['id']}] {row['status']} "

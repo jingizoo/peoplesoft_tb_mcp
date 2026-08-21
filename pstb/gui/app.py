@@ -60,6 +60,10 @@ engine = TBEngine(db, cfg)
 # against. pstb/server.py does the same on its side.
 from ..sources import SourceRegistry as _SourceRegistry
 engine.registry = _SourceRegistry(cfg, db)
+from ..source_knowledge import SourceExclusionIndex as _SourceExclusionIndex
+from ..record_governance import selection_effect as _record_selection_effect
+record_exclusions = _SourceExclusionIndex(cfg)
+engine.attach_record_exclusions(record_exclusions)
 report_runner = ReportRunner(engine)
 ar = ARBilling(engine)
 relationships = Relationships(ar)
@@ -2144,20 +2148,25 @@ def create_metadata_proposal(
     """
     unexpected = sorted(
         str(key) for key in (payload or {})
-        if key not in {"identifier", "meaning", "aliases"})
+        if key not in {"identifier", "meaning", "aliases", "selection"})
     if unexpected:
         raise HTTPException(
             status_code=400,
             detail=("metadata proposals accept only identifier, meaning, "
-                    f"and aliases; remove: {', '.join(unexpected)}"))
+                    f"aliases, and selection; remove: {', '.join(unexpected)}"))
     values = {
         key: (payload or {}).get(key, "")
-        for key in ("identifier", "meaning", "aliases")
+        for key in ("identifier", "meaning", "aliases", "selection")
     }
+    values["selection"] = values["selection"] or "prefer"
     if any(not isinstance(value, str) for value in values.values()):
         raise HTTPException(
             status_code=400,
-            detail="identifier, meaning, and aliases must be text")
+            detail="identifier, meaning, aliases, and selection must be text")
+    selection = values["selection"].strip().casefold()
+    if selection not in {"prefer", "exclude"}:
+        raise HTTPException(
+            status_code=400, detail="selection must be prefer or exclude")
     identifier = values["identifier"].strip()
     if not identifier or not values["meaning"].strip():
         raise HTTPException(
@@ -2205,7 +2214,7 @@ def create_metadata_proposal(
         proposal = store.propose(
             object_id=object_id, schema=schema, object_name=object_name,
             object_kind=kind, meaning=values["meaning"], aliases=alias_list,
-            origin="gui")
+            origin="gui", selection=selection)
     except Exception as exc:
         from ..metadata import MetadataError
         from ..source_knowledge import SourceKnowledgeError
@@ -2219,17 +2228,18 @@ def create_metadata_proposal(
             detail=(f"An identical proposal is already {status} and cannot "
                     "move backward. Revise the meaning or aliases to create "
                     "a new pending proposal."))
-    if status not in {"pending", "approved"}:
+    if status not in {"pending", "approved", "excluded"}:
         raise HTTPException(
             status_code=409,
             detail="The proposal store returned an unsupported lifecycle state")
     return {
         "ok": True, "source_database": canonical, "proposal": proposal,
         "proposal_id": str(proposal.get("id") or ""),
-        "retrieval_active": status == "approved",
+        "retrieval_active": status in {"approved", "excluded"},
         "note": (
-            "Already approved and active."
-            if status == "approved" else
+            ("Already approved as an active record exclusion."
+             if status == "excluded" else "Already approved and active.")
+            if status in {"approved", "excluded"} else
             ("An identical proposal is already pending and inactive."
              if proposal.get("already_known") else
              "Submitted for operator review. It remains inactive until "
@@ -2345,10 +2355,10 @@ def list_approvals(request: Request, response: Response,
     response.headers["Cache-Control"] = "no-store, private"
     remote_unverified = _is_unverified_remote_approval_request(request)
     wanted = str(status or "").strip().lower() or "pending"
-    if wanted not in ("pending", "approved", "rejected", "all"):
+    if wanted not in ("pending", "approved", "excluded", "rejected", "all"):
         raise HTTPException(
             status_code=400,
-            detail="status must be pending, approved, rejected or all")
+            detail="status must be pending, approved, excluded, rejected or all")
     source_names = _approval_source_names()
     if remote_unverified:
         # The exception exists for P2Go metadata review, not to publish the
@@ -2381,6 +2391,9 @@ def list_approvals(request: Request, response: Response,
         "origin": fact.get("source"),
         "proposed": fact.get("proposed"),
         "status": fact.get("status"),
+        "selection_effect": (
+            _record_selection_effect(fact.get("detail") or fact.get("text"))
+            if fact.get("kind") == "record" else "prefer"),
         "decided_by": fact.get("decided_by"),
     } for fact in (listing.get("facts") or [])]
 
@@ -2416,6 +2429,7 @@ def list_approvals(request: Request, response: Response,
                 "origin": row.get("origin") or "proposed in conversation",
                 "proposed": row.get("proposed_at") or row.get("proposed"),
                 "status": row.get("status"),
+                "selection_effect": row.get("selection_effect") or "prefer",
                 "decided_by": row.get("decided_by"),
             })
     counts = listing.get("counts") or {}
@@ -2445,9 +2459,10 @@ def decide_approval(payload: dict, request: Request, response: Response):
     decision = str(body.get("decision") or "").strip().lower()
     if not item_id:
         raise HTTPException(status_code=400, detail="id required")
-    if decision not in ("approve", "reject"):
+    if decision not in ("approve", "reject", "revoke"):
         raise HTTPException(
-            status_code=400, detail="decision must be approve or reject")
+            status_code=400,
+            detail="decision must be approve, reject, or revoke")
     by = _operator_name(request)
 
     if remote_unverified and queue != "source_knowledge":
@@ -2457,6 +2472,11 @@ def decide_approval(payload: dict, request: Request, response: Response):
                    "meanings for the selected database.")
 
     if queue == "memory":
+        if decision == "revoke":
+            raise HTTPException(
+                status_code=400,
+                detail="site-memory decisions cannot be revoked here; remove "
+                       "the fact with the memory review command")
         from ..memory import MemoryError_
         try:
             fact = _site_memory().decide(
@@ -2497,12 +2517,18 @@ def decide_approval(payload: dict, request: Request, response: Response):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         try:
             identity = None
-            if decision == "approve":
+            if decision == "revoke":
+                decided = store.revoke(item_id, decided_by=by)
+            elif decision == "approve":
                 identity = _source_catalog_identity(
                     canonical, store.get(item_id))
-            decided = store.decide(
-                item_id, approve=(decision == "approve"), decided_by=by,
-                current_object=identity)
+                decided = store.decide(
+                    item_id, approve=True, decided_by=by,
+                    current_object=identity)
+            else:
+                decided = store.decide(
+                    item_id, approve=False, decided_by=by,
+                    current_object=None)
         except Exception as exc:
             if remote_unverified:
                 raise HTTPException(

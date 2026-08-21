@@ -144,6 +144,30 @@ class ApprovalQueueTests(unittest.TestCase):
                 self.assertTrue(str(r.json().get("detail") or "").strip(),
                                 "a refusal with no reason is a dead end")
 
+    def test_an_active_source_exclusion_can_be_restored_from_the_panel(self):
+        calls = []
+
+        def revoke(item_id, *, decided_by):
+            calls.append((item_id, decided_by))
+            return {"id": item_id, "status": "revoked"}
+
+        registry = SimpleNamespace(
+            names=lambda: ["default"],
+            resolve_name=lambda source="": "default")
+        store = SimpleNamespace(revoke=revoke)
+        with patch.object(gui.engine, "registry", registry), \
+                patch.object(gui, "_approval_source_names",
+                             return_value=["default"]), \
+                patch.object(gui, "_source_knowledge_store",
+                             return_value=store):
+            out = self.client.post("/api/approvals/decide", json={
+                "queue": "source_knowledge", "source": "default",
+                "id": "0123456789abcdef", "decision": "revoke",
+            })
+        self.assertEqual(out.status_code, 200, out.text)
+        self.assertEqual(out.json()["status"], "revoked")
+        self.assertEqual(calls[0][0], "0123456789abcdef")
+
     # -------------------------------------------------------------- gate
     def test_both_endpoints_require_the_operator_gate(self):
         """Same gate as the question log: not reachable from a shared VPN."""
@@ -561,10 +585,27 @@ class DirectMetadataProposalTests(unittest.TestCase):
             "object_name": "JOB_HDR", "object_kind": "table",
             "meaning": "Inbound integration job headers",
             "aliases": ["job queue"], "origin": "gui",
+            "selection": "prefer",
         }])
         self.assertFalse(body["retrieval_active"])
         self.assertEqual(body["proposal"]["status"], "pending")
         self.assertIn("inactive", body["note"])
+
+    def test_form_can_submit_a_hard_exclusion_without_aliases(self):
+        calls, store, catalog = self._resources()
+        with patch.object(
+                gui, "_metadata_proposal_resources",
+                return_value=("p2go", store, catalog)), patch(
+                "pstb.source_knowledge.validate_catalog_aliases",
+                return_value=[]):
+            gui.create_metadata_proposal("p2go", {
+                "identifier": "P2GO.JOB_HDR",
+                "meaning": "Obsolete scratch copy",
+                "aliases": "",
+                "selection": "exclude",
+            })
+        self.assertEqual(calls[0]["selection"], "exclude")
+        self.assertEqual(calls[0]["aliases"], [])
 
     def test_body_cannot_override_route_source_or_catalog_identity(self):
         for key in ("source", "db", "object_id", "source_fingerprint"):
@@ -626,6 +667,14 @@ class ApprovalPanelTests(unittest.TestCase):
                       "sent it below cards added after the first load")
         self.assertIn("else holder.append(box)", block,
                       "appending is the first-load fallback only")
+
+    def test_exclusion_controls_are_explicit_and_reversible(self):
+        proposal = _js_function(self.page, "metadataProposalPanel")
+        approvals = self.page[self.page.index("function renderApprovals("):
+                              self.page.index("async function loadApprovals(")]
+        self.assertIn("Exclude from answers", proposal)
+        self.assertIn("selection:controls.selection.value", proposal)
+        self.assertIn("Restore as a candidate", approvals)
 
 
 class ApprovalBadgeCountTests(unittest.TestCase):
@@ -925,7 +974,8 @@ class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
         self.assertIn("Exact schema.object", block)
         self.assertIn("Short business meaning", block)
         self.assertIn("Business aliases", block)
-        self.assertIn("Submit for review", block)
+        self.assertIn("Submit meaning for review", block)
+        self.assertIn("Exclude from answers", block)
         self.assertIn("not sent through the chat model", block)
         self.assertIn("metadataProposalUrl(source)", block)
         self.assertIn("/metadata-proposals", self.page)

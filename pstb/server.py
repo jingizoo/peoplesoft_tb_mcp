@@ -35,6 +35,7 @@ from .playbooks import PlaybookError, PlaybookRunner
 from .rerank import HybridReranker
 from .relationships import Relationships
 from .source_knowledge import (
+    SourceExclusionIndex,
     SourceKnowledge,
     SourceKnowledgeError,
     normalize_aliases,
@@ -67,6 +68,7 @@ from .procurement import Procurement
 procurement = Procurement(modules)
 memory = SiteMemory(cfg.resolve_path(
     getattr(cfg.tools, 'site_memory', 'site_memory.json')))
+record_exclusions = SourceExclusionIndex(cfg)
 from .entitygraph import EntityGraph, graph_path as _eg_path
 entity_graph = EntityGraph(_eg_path(cfg))
 from .procgraph import ProcessGraph, graph_path
@@ -150,6 +152,9 @@ except WikiError as e:
 engine.attach_policy(wiki, memory)
 # Record discovery uses what people here have taught about their own tables.
 engine.attach_memory(memory)
+# A local, mtime-cached index makes an approved "do not use" decision a hard
+# guard on discovery, profiling and SQL without adding a database round trip.
+engine.attach_record_exclusions(record_exclusions)
 
 mcp = FastMCP("peoplesoft-tb")
 
@@ -271,9 +276,26 @@ def _knowledge_annotation(row: dict) -> dict:
     }
 
 
+def _exclusion_annotation(row: dict) -> dict:
+    """Bounded operator veto shown separately from selectable candidates."""
+    return {
+        "proposal_id": row.get("id"),
+        "status": "excluded",
+        "selection_effect": "exclude",
+        "reason": row.get("meaning"),
+        "proposed_at": row.get("proposed_at"),
+        **({"approved_at": row.get("decided_at")}
+           if row.get("decided_at") else {}),
+        "authority": "host-operator-approved record exclusion",
+        "effect": (
+            "hard veto: do not recommend, profile, compare, or query this "
+            "object for answers"),
+    }
+
+
 def _approved_search_candidates(
     catalog: MetadataCatalog, source: str, query: str
-) -> tuple[dict[str, list[dict]], list[dict], dict]:
+) -> tuple[dict[str, list[dict]], list[dict], dict[str, list[dict]], dict]:
     """Approved meaning hits plus exact current-catalog object summaries.
 
     Annotation prose is deliberately returned separately.  The structural
@@ -284,15 +306,16 @@ def _approved_search_candidates(
     try:
         store = _source_knowledge_for_source(source)
         if not store.path.exists():
-            return {}, [], {}
-        hits = store.search(query)
+            return {}, [], {}, {}
+        hits, exclusions = store.search_with_exclusions(query)
     except (MetadataError, SourceKnowledgeError) as exc:
-        return {}, [], {
+        return {}, [], {}, {
             "available": False,
             "detail": str(exc),
             "effect": "no source annotations were used",
         }
     grouped: dict[str, list[dict]] = {}
+    excluded = {}
     subjects: dict[str, dict] = {}
     ignored = 0
     for hit in hits:
@@ -317,16 +340,28 @@ def _approved_search_candidates(
             continue
         subjects[object_id] = dict(subject)
         grouped.setdefault(object_id, []).append(hit)
+    for row in exclusions:
+        object_id = str(row.get("object_id") or "")
+        if object_id:
+            excluded.setdefault(object_id, []).append(row)
+    # A veto wins over a positive pointer for the same object. This also
+    # handles two operators approving opposite historical proposals without
+    # silently depending on proposal order.
+    for object_id in excluded:
+        grouped.pop(object_id, None)
+        subjects.pop(object_id, None)
     info = {
         "available": True,
         "approved_matches": sum(len(rows) for rows in grouped.values()),
         "matched_objects": len(grouped),
+        "active_exclusions": len(excluded),
         "ignored_stale_targets": ignored,
         "effect": (
             "approved meanings may select/rank an exact catalog object; "
-            "structural confidence and relationship evidence are unchanged"),
+            "approved exclusions veto an object; structural confidence and "
+            "relationship evidence are unchanged"),
     }
-    return grouped, list(subjects.values()), info
+    return grouped, list(subjects.values()), excluded, info
 
 
 def _attach_approved_context(
@@ -336,8 +371,23 @@ def _attach_approved_context(
     if not isinstance(result, dict) or result.get("found") is not True:
         return result
     subject = _exact_metadata_subject(result, source)
+    active_rules = store.active_rules(str(subject["object_id"]))
+    exclusions = [row for row in active_rules if row["status"] == "excluded"]
+    if exclusions:
+        result["selection_status"] = "excluded_by_operator"
+        result["selection_allowed"] = False
+        result["operator_exclusions"] = [
+            _exclusion_annotation(row) for row in exclusions
+        ]
+        result["source_knowledge_note"] = (
+            "This object may be inspected structurally, but it is excluded "
+            "from record profiling, comparison, recommendation, and SQL "
+            "answers until an operator revokes the exclusion.")
+        return result
     approved = []
-    for row in store.approved_for_object(str(subject["object_id"])):
+    for row in active_rules:
+        if row["status"] != "approved":
+            continue
         try:
             validate_catalog_aliases(
                 catalog, source, str(subject["object_id"]),
@@ -803,7 +853,7 @@ def search_metadata(query: str, source: str = "", kinds: str = "",
             native_forms = {physical, f"{schema}.{physical}", *logical}
             if requested_forms & native_forms:
                 native_exact_ids.add(str(item.get("object_id") or ""))
-        approved, extra_subjects, knowledge_info = (
+        approved, extra_subjects, excluded, knowledge_info = (
             _approved_search_candidates(catalog, name, query))
         wanted_kinds = {
             token.lower() for token in str(kinds or "").replace(",", " ").split()
@@ -861,6 +911,39 @@ def search_metadata(query: str, source: str = "", kinds: str = "",
             if object_id not in known_ids:
                 matches.append(subject)
                 known_ids.add(object_id)
+
+        suppressed = []
+        selectable = []
+        for item in matches:
+            object_id = str(item.get("object_id") or "") \
+                if isinstance(item, dict) else ""
+            rules = excluded.get(object_id, [])
+            if rules:
+                suppressed.append({
+                    "object_id": object_id,
+                    "source": name,
+                    "schema": item.get("schema"),
+                    "kind": item.get("kind"),
+                    "physical_object": item.get("physical_object"),
+                    "operator_exclusions": [
+                        _exclusion_annotation(row) for row in rules
+                    ],
+                })
+                approved.pop(object_id, None)
+                continue
+            selectable.append(item)
+        matches = selectable
+        if suppressed:
+            knowledge_info["suppressed_matches"] = len(suppressed)
+            knowledge_info["selection_rule"] = (
+                "suppressed objects are not candidates and may not be queried "
+                "for answers")
+            result["excluded_by_operator"] = suppressed
+            if not matches:
+                result["detail"] = (
+                    "Matching catalog objects were explicitly excluded by an "
+                    "operator. No selectable record was returned; search for "
+                    "an alternative or revoke the exclusion if it is obsolete.")
 
         if metadata_reranker.enabled:
             ranked = metadata_reranker.rerank(query, matches)
@@ -1017,12 +1100,18 @@ def propose_metadata_meaning(
     meaning: str,
     aliases: str = "",
     source: str = "",
+    selection: str = "prefer",
 ) -> dict:
-    """PROPOSE a durable business meaning for one exact table/view.
+    """PROPOSE a durable selection rule for one exact table/view.
 
     Use only when the user explicitly names and teaches/corrects the object.
     First call get_metadata_context, then pass its exact schema.object as
-    identifier. aliases is optional comma-separated business wording. This
+    identifier. aliases is optional comma-separated business wording.
+    selection=prefer makes the approved meaning a discovery pointer;
+    selection=exclude makes approval a hard "do not use for answers" veto.
+    Use exclude for junk, obsolete, duplicate, or non-reporting staging
+    objects, but not merely because a valid interface table is called staging.
+    This
     writes only a PENDING entry to the selected source's private local review
     queue; it does not change that database, search ranking, context, joins or
     the prompt until a host operator approves it. Never use it for inferred
@@ -1044,6 +1133,7 @@ def propose_metadata_meaning(
             meaning=meaning,
             aliases=alias_list,
             origin="conversation",
+            selection=selection,
         )
         status = str(proposal.get("status") or "pending")
         proposal_id = str(proposal.get("id") or "")
@@ -1051,13 +1141,15 @@ def propose_metadata_meaning(
             **proposal,
             "proposal_id": proposal_id,
             "source_database": name,
-            "retrieval_active": status == "approved",
+            "retrieval_active": status in {"approved", "excluded"},
             "review_command": (
                 "python -m pstb.source_knowledge --source "
                 f"{shlex.quote(name)} --approve {proposal_id}"),
             "note": (
-                "This exact proposal is already operator-approved and active."
-                if status == "approved" else
+                ("This object is already operator-excluded from answers."
+                 if status == "excluded" else
+                 "This exact proposal is already operator-approved and active.")
+                if status in {"approved", "excluded"} else
                 "Submitted for operator review. It is pending and has no "
                 "effect on retrieval, context, prompts, relationships or SQL."),
         }
@@ -1662,8 +1754,10 @@ def join_path(from_record: str, to_record: str, source: str = "") -> dict:
             return _sourced(
                 name, "join_path", from_record=from_record,
                 to_record=to_record)
+        exclusions = record_exclusions.for_source(name)
         result = catalog.relationship_path(
-            from_object=from_record, to_object=to_record, source=name)
+            from_object=from_record, to_object=to_record, source=name,
+            excluded_object_ids=[row.get("object_id") for row in exclusions])
         result["source_database"] = name
         return result
 

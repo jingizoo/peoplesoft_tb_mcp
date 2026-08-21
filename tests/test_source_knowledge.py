@@ -28,6 +28,7 @@ from pstb.metadata import (
     source_fingerprint,
 )
 from pstb.source_knowledge import (
+    SourceExclusionIndex,
     SourceKnowledge,
     SourceKnowledgeError,
     _catalog_identity,
@@ -367,8 +368,129 @@ class SourceKnowledgeTests(unittest.TestCase):
         self.assertEqual(self.p2go.search("quokka"), [])
         self.assertEqual(self.p2go.resolve_alias("quokka queue"), [])
         self.assertEqual(self.p2go.summary()["counts"], {
-            "pending": 0, "approved": 0, "rejected": 1, "revoked": 1,
+            "pending": 0, "approved": 0, "excluded": 0,
+            "rejected": 1, "revoked": 1,
         })
+
+    def test_approved_do_not_use_lesson_is_a_veto_not_positive_vocabulary(self):
+        proposal = self._propose(
+            self.p2go, "JOB_HDR",
+            "Do not use this record for answers; it is a junk staging copy",
+            ["job scratch"],
+        )
+        active = self._approve(self.p2go, proposal)
+
+        self.assertEqual(active["status"], "excluded")
+        self.assertEqual(active["selection_effect"], "exclude")
+        self.assertEqual(self.p2go.search("junk staging"), [])
+        self.assertEqual(self.p2go.resolve_alias("job scratch"), [])
+        self.assertEqual(self.p2go.approved_for_object(proposal["object_id"]), [])
+        self.assertEqual(
+            [row["object"] for row in
+             self.p2go.exclusions_for_object(proposal["object_id"])],
+            ["JOB_HDR"],
+        )
+        self.assertEqual(self.p2go.summary()["active_exclusions"], 1)
+
+    def test_explicit_exclusion_selection_is_persisted_without_schema_migration(self):
+        proposal = self.p2go.propose(
+            object_id="object:p2go:main:job_hdr", schema="main",
+            object_name="JOB_HDR", object_kind="table",
+            meaning="Obsolete scratch copy retained for audit",
+            aliases=(), selection="exclude",
+        )
+        self.assertEqual(proposal["status"], "pending")
+        self.assertEqual(proposal["selection_effect"], "exclude")
+        self.assertIn("Do not use this record", proposal["meaning"])
+        self._approve(self.p2go, proposal)
+        self.assertEqual(self.p2go.get(proposal["id"])["status"], "excluded")
+
+    def test_exclusion_index_refreshes_after_atomic_approval(self):
+        index = SourceExclusionIndex(self.cfg)
+        self.assertEqual(index.for_source("p2go"), [])
+        proposal = self._propose(
+            self.p2go, "JOB_HDR", "Never query this table; obsolete copy")
+        self._approve(self.p2go, proposal)
+        rows = index.for_source("p2go")
+        self.assertEqual([row["object"] for row in rows], ["JOB_HDR"])
+        self.assertIn("obsolete copy", rows[0]["reason"])
+
+    def test_server_search_and_context_never_offer_an_excluded_native_object(self):
+        from pstb import server
+
+        catalog = self._build_p2go_catalog()
+        subject = catalog.context(
+            "main.JOB_HDR", source="p2go", limit=10)["subject"]
+        proposal = self.p2go.propose(
+            object_id=subject["object_id"], schema=subject["schema"],
+            object_name=subject["physical_object"], object_kind=subject["kind"],
+            meaning="Do not use this table for answers; obsolete staging copy",
+        )
+        self.p2go.decide(
+            proposal["id"], approve=True, decided_by="test operator",
+            current_object=_catalog_identity(catalog, "p2go", proposal))
+        with (
+            patch.object(server, "_metadata_for_source",
+                         return_value=("p2go", catalog)),
+            patch.object(server, "_source_knowledge_for_source",
+                         return_value=self.p2go),
+            patch.object(server, "metadata_reranker",
+                         SimpleNamespace(enabled=False)),
+        ):
+            searched = server.search_metadata("JOB_HDR", source="p2go")
+            context = server.get_metadata_context(
+                "main.JOB_HDR", source="p2go")
+
+        self.assertNotIn(
+            "JOB_HDR",
+            [row.get("physical_object") for row in searched["matches"]],
+        )
+        self.assertEqual(
+            searched["excluded_by_operator"][0]["physical_object"], "JOB_HDR")
+        self.assertEqual(context["selection_status"], "excluded_by_operator")
+        self.assertFalse(context["selection_allowed"])
+
+    def test_source_bound_sql_guard_blocks_excluded_table_before_execution(self):
+        from pstb.engine import EngineError, TBEngine
+
+        proposal = self._propose(
+            self.p2go, "JOB_HDR", "Do not query this table; junk copy")
+        self._approve(self.p2go, proposal)
+        bound = Config.sample(self.root)
+        bound.db = self.cfg.sources["p2go"]
+        db = Database(bound)
+        try:
+            engine = TBEngine(db, bound)
+            engine.attach_record_exclusions(
+                SourceExclusionIndex(self.cfg), source="p2go")
+            with self.assertRaisesRegex(EngineError, "explicitly excluded"):
+                engine.run_sql(
+                    "SELECT JOB_ID FROM JOB_HDR WHERE JOB_ID = -1", max_rows=1)
+        finally:
+            db.close()
+
+    def test_source_bound_join_planning_refuses_an_excluded_endpoint(self):
+        from pstb import server
+
+        catalog = self._build_p2go_catalog()
+        subject = catalog.context(
+            "main.JOB_HDR", source="p2go", limit=10)["subject"]
+        proposal = self.p2go.propose(
+            object_id=subject["object_id"], schema=subject["schema"],
+            object_name=subject["physical_object"], object_kind="table",
+            meaning="Do not use this table; obsolete staging copy",
+        )
+        self.p2go.decide(
+            proposal["id"], approve=True, decided_by="test operator",
+            current_object=_catalog_identity(catalog, "p2go", proposal))
+        with patch.object(
+                server, "_metadata_for_source",
+                return_value=("p2go", catalog)), patch.object(
+                server, "record_exclusions", SourceExclusionIndex(self.cfg)):
+            result = server.join_path(
+                "JOB_HDR", "JOB_LINE", source="p2go")
+        self.assertIn("error", result)
+        self.assertIn("explicitly excluded", result["error"])
 
     def test_approval_requires_the_current_exact_catalog_identity(self):
         proposal = self._propose(

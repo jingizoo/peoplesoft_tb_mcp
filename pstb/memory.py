@@ -31,6 +31,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from .record_governance import selection_effect
+
 # Categories exist so the prompt can present them meaningfully and so an
 # operator reviewing the file can tell a naming alias from an accounting rule.
 KINDS = {
@@ -166,15 +168,51 @@ class SiteMemory:
         want = (table or "").strip().upper()
         if want.startswith("PS_"):
             want = want[3:]
+        data = self._load()
+        if data.get("load_error"):
+            raise MemoryError_(
+                "site memory is unreadable; record selection governance "
+                "cannot be applied safely")
         out = []
-        for f in self._load()["facts"]:
+        for f in data["facts"]:
             if f.get("kind") != "record" or f.get("status") != "approved":
+                continue
+            if selection_effect(f.get("detail") or f.get("text")) == "exclude":
                 continue
             rec = str(f.get("record") or "")
             if want and rec != want and rec != f"PS_{want}" \
                     and rec.removeprefix("PS_") != want:
                 continue
             out.append(f)
+        return out
+
+    def record_exclusions(self, table: str = "") -> list:
+        """Approved, explicit record vetoes, optionally for one table.
+
+        Older deployments stored these as ordinary ``record`` facts.  We
+        interpret only unmistakable phrases such as "do not use"; a factual
+        description containing the word "staging" remains a positive pointer.
+        """
+        data = self._load()
+        if data.get("load_error"):
+            raise MemoryError_(
+                "site memory is unreadable; record exclusions cannot be "
+                "verified, so ad-hoc record access is unavailable")
+        want = (table or "").strip().upper()
+        if want.startswith("PS_"):
+            want = want[3:]
+        out = []
+        for fact in data["facts"]:
+            if (fact.get("kind") != "record"
+                    or fact.get("status") != "approved"
+                    or selection_effect(
+                        fact.get("detail") or fact.get("text")) != "exclude"):
+                continue
+            rec = str(fact.get("record") or "").upper()
+            if want and rec != want and rec != f"PS_{want}" \
+                    and rec.removeprefix("PS_") != want:
+                continue
+            out.append({**fact, "selection_effect": "exclude"})
         return out
 
     def search_record_facts(self, query: str) -> list:
@@ -206,8 +244,24 @@ class SiteMemory:
                  "interpret the question — a term here means what it says. "
                  "They are NOT data: if a tool result disagrees with a fact "
                  "below, the tool result is correct and the fact is stale."]
+        exclusions = {
+            fact.get("id") for fact in facts
+            if fact.get("kind") == "record" and selection_effect(
+                fact.get("detail") or fact.get("text")) == "exclude"
+        }
+        if exclusions:
+            lines.extend([
+                "",
+                "### Operator record exclusions",
+                "These are hard selection vetoes. Do not search, profile, "
+                "compare, recommend, or query these records for an answer.",
+            ])
+            for fact in facts:
+                if fact.get("id") in exclusions:
+                    lines.append(f"- {fact['text']}")
         for fact in facts:
-            lines.append(f"- ({fact['kind']}) {fact['text']}")
+            if fact.get("id") not in exclusions:
+                lines.append(f"- ({fact['kind']}) {fact['text']}")
         return "\n".join(lines)
 
 

@@ -173,9 +173,14 @@ class SourceEngineConfigTests(unittest.TestCase):
         primary = FakeOracle(primary_cfg)
         p2go = FakeOracle(source_cfg)
         engine = TBEngine(primary, primary_cfg)
-        engine.registry = SimpleNamespace(get=lambda name: p2go)
+        engine.registry = SimpleNamespace(
+            get=lambda name: p2go,
+            resolve_name=lambda name: "p2go" if name.lower() == "p2go" else name,
+        )
 
         child = engine.for_source("p2go")
+        self.assertIs(child, engine.for_source("P2GO"))
+        self.assertEqual(child._source_name, "p2go")
         self.assertIs(child.cfg, source_cfg)
         self.assertTrue(child._table_exists("P2_INVOICE"))
         self.assertEqual(p2go.calls[-1]["params"]["o"], "P2OWNER")

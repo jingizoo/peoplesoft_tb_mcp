@@ -282,6 +282,12 @@ passwordless remote exception exists for isolated testing. It is explicitly
 unauthenticated, has no Host-allowlist or timeout requirement, and remains on
 until disabled and restarted. See
 [docs/SETUP.md](docs/SETUP.md#temporary-passwordless-metadata-approval-from-a-remote-browser).
+The same drawer can mark a junk, obsolete, duplicate, or non-reporting staging
+record **Exclude from answers**. Once approved, the veto is enforced in
+metadata and table search, record inspection/comparison, join and query
+planning, SQL, and batch exports without another application-database round
+trip. See
+[docs/RECORD_SELECTION.md](docs/RECORD_SELECTION.md#records-that-must-not-be-used).
 
 Optional semantic re-ranking and resumable controller workflows are described
 in [docs/AI_ORCHESTRATION.md](docs/AI_ORCHESTRATION.md).

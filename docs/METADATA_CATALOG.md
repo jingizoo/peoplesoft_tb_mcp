@@ -181,8 +181,9 @@ source-bound proposal. It is deliberately **not learned immediately**:
    and explicitly approves or rejects it; the same drawer can submit an exact
    `schema.object`, meaning and aliases directly without sending that wording
    through the chat model;
-4. only approved aliases/meanings may improve `search_metadata` or
-   `get_metadata_context` for that same source.
+4. an approved **prefer** meaning may improve `search_metadata` or
+   `get_metadata_context` for that same source; an approved **exclude** rule
+   vetoes that exact object instead.
 
 The review drawer is machine-local (opening it through an SSH tunnel still
 arrives as loopback). When business-unit security is enabled, the selected
@@ -210,6 +211,11 @@ artifact and cannot change catalog confidence, columns, keys, native foreign
 keys, view dependencies, SQL, policy, status semantics or row values.
 Pending/rejected/revoked proposals have zero retrieval effect. `join_path`
 continues to traverse only declared native FK and view-dependency evidence.
+An active exclusion is removed before semantic ranking and is enforced again
+before table browsing, description, profiling, comparison, join planning,
+optimizer planning, guarded SQL, and streamed exports. Existing approved
+wording that explicitly says “do not use” is read as an exclusion; “staging”
+alone remains descriptive rather than prohibitive.
 
 ### Minimum read-only access
 

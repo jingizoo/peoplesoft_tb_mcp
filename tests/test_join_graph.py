@@ -112,6 +112,13 @@ class GraphTests(unittest.TestCase):
         # pair would be its own outage.
         self.assertLess(len(self.graph.universe()), 200)
 
+    def test_an_excluded_record_is_never_used_as_an_intermediate(self) -> None:
+        baseline = self.graph.path("PS_LEDGER", "PS_JRNL_HEADER")
+        self.assertEqual(
+            baseline.records, ["PS_LEDGER", "PS_JRNL_LN", "PS_JRNL_HEADER"])
+        self.assertIsNone(self.graph.path(
+            "PS_LEDGER", "PS_JRNL_HEADER", exclude=["PS_JRNL_LN"]))
+
 
 class ToolTests(unittest.TestCase):
     @classmethod
