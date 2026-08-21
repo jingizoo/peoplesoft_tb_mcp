@@ -34,6 +34,7 @@ from ..vendors import VendorNetwork
 from ..qlog import FeedbackAlreadyRecorded, QuestionLog
 from ..export import ExportError, batch_hint, preview_payload
 from ..batch_export import BatchExportError, BatchExportManager
+from ..guards import CLARIFICATION_TOOL
 from ..report import ReportError, ReportRunner
 from ..security import RowSecurity, SecurityError, access_scope
 from ..wiki import WikiError, make_wiki
@@ -2594,9 +2595,9 @@ def _export_csv_for_source(canonical: str, payload: dict,
     args.pop("db", None)
 
     from ..guards import (
-    CLARIFICATION_TOOL,SOURCE_SILO_TOOLS, ScopeConflict,
-                          apply_request_scope, source_result_status,
-                          unit_access_block)
+        SOURCE_SILO_TOOLS, ScopeConflict, apply_request_scope,
+        source_result_status, unit_access_block,
+    )
     if canonical != "default":
         if tool not in SOURCE_SILO_TOOLS:
             raise HTTPException(
