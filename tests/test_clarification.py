@@ -278,6 +278,13 @@ class BrowserWiringTests(unittest.TestCase):
         block = source[start:start + 900]
         self.assertIn("CLARIFICATION_TOOL", block)
 
+    def test_gui_binds_the_clarification_tool_at_runtime(self):
+        """A textual reference is not enough: the chat callback resolves
+        this name only after a tool returns, so import-time tests missed the
+        production NameError."""
+        import pstb.gui.app as gui
+        self.assertEqual(gui.CLARIFICATION_TOOL, CLARIFICATION_TOOL)
+
 
 if __name__ == "__main__":
     unittest.main()
