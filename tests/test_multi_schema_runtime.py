@@ -455,6 +455,21 @@ class MultiSchemaRuntimeTests(unittest.TestCase):
         self.assertEqual(call["params"]["owner1"], "TUSINVC")
         self.assertNotIn("OTHER", call["params"].values())
 
+    def test_schema_bound_exclusion_does_not_hide_same_name_elsewhere(self):
+        resolver = type("Resolver", (), {
+            "for_source": staticmethod(lambda _source: [{
+                "schema": "P2GO", "object": "SHARED_NAME",
+                "reason": "obsolete copy", "proposal_id": "rule-1",
+            }])
+        })()
+        self.engine.attach_record_exclusions(resolver)
+        out = self.engine.list_tables("SHARED_NAME")
+        self.assertEqual(
+            [(row["schema_name"], row["table_name"])
+             for row in out["tables"]],
+            [("TUSINVC", "SHARED_NAME")],
+        )
+
     def test_describe_and_index_catalog_use_qualified_owner(self) -> None:
         out = self.engine.describe_table("TUSINVC.ARCHIVE_INVOICE")
         self.assertEqual(

@@ -3792,7 +3792,8 @@ class MetadataCatalog:
         return "\n".join(lines), True
 
     def relationship_path(self, from_object: str, to_object: str,
-                          source: str = "", max_hops: int = 4) -> dict:
+                          source: str = "", max_hops: int = 4,
+                          excluded_object_ids=()) -> dict:
         """Shortest proven FK/view-dependency path inside one source graph."""
         try:
             hops_cap = min(max(int(max_hops or MAX_RELATION_HOPS), 1),
@@ -3817,6 +3818,16 @@ class MetadataCatalog:
                 src = str(available[0])
             start = self._relationship_object(con, from_object, src)
             goal = self._relationship_object(con, to_object, src)
+            excluded = {str(value or "").strip()
+                        for value in (excluded_object_ids or ())
+                        if str(value or "").strip()}
+            endpoint = next((node for node in (start, goal)
+                             if str(node["id"]) in excluded), None)
+            if endpoint is not None:
+                raise MetadataError(
+                    f"Join planning refused: {endpoint['schema_name']}."
+                    f"{endpoint['name']} is explicitly excluded by an "
+                    "operator. Choose another object or revoke the exclusion.")
             snapshot = self._snapshot(con)
             if start["id"] == goal["id"]:
                 sql, _ = self._relationship_sql(start, [])
@@ -3842,6 +3853,8 @@ class MetadataCatalog:
                 graph_truncated = graph_truncated or truncated
                 for edge in neighbours:
                     nxt = edge["next"]
+                    if str(nxt["id"]) in excluded:
+                        continue
                     if nxt["id"] in visited:
                         continue
                     visited.add(nxt["id"])

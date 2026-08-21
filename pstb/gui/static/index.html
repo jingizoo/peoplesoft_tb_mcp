@@ -308,7 +308,8 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .metadata-review-intro{padding:14px 16px;border-bottom:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.55}
 .metadata-proposal-form{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink)}
 .metadata-proposal-form label{display:block;margin-top:9px;color:var(--muted);font-size:11.5px;font-weight:650}
-.metadata-proposal-form input,.metadata-proposal-form textarea{width:100%;margin-top:4px;padding:8px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--ink);font:inherit}
+.metadata-proposal-form label[hidden]{display:none}
+.metadata-proposal-form input,.metadata-proposal-form textarea,.metadata-proposal-form select{width:100%;margin-top:4px;padding:8px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--ink);font:inherit}
 .metadata-proposal-form textarea{min-height:66px;resize:vertical}
 .metadata-proposal-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:11px}
 .metadata-review-message{margin-top:9px;padding:8px 9px;border-radius:7px;background:var(--ok-soft);color:var(--ok)}
@@ -2099,6 +2100,17 @@ function renderMetadataSearch(d){
       esc(details.join(' · '))));
   }
   const rows=d.matches||[];
+  const excluded=d.excluded_by_operator||[];
+  if(excluded.length){
+    c.append(el('div','pad','<span class="badge bad">excluded by operator</span> '+
+      esc(excluded.length+' matching object'+(excluded.length===1?' was':'s were')+
+        ' removed before ranking.')));
+    c.append(genericTable(excluded.map(x=>({
+      object:[x.schema,x.physical_object].filter(Boolean).join('.'),
+      reason:((x.operator_exclusions||[])[0]||{}).reason||'operator exclusion',
+      effect:'not selectable, profiled, compared, or queried'
+    }))));
+  }
   if(!rows.length){
     c.append(el('div','pad','No indexed object matched. '+esc(d.detail||'')));
     return c;
@@ -2161,6 +2173,13 @@ function renderMetadataContext(d){
     (!o.physical_object?'<span class="badge warn">physical mapping unresolved</span>':'')+
     (o.label?'<div class="sub">'+esc(o.label)+'</div>':'')+
     '<div class="sub">'+metadataConfidence(o.confidence)+'</div>'));
+  if(d.selection_status==='excluded_by_operator'){
+    c.append(el('div','pad','<span class="badge bad">do not use for answers</span> '+
+      esc(d.source_knowledge_note||'This object is excluded by an operator.')));
+    if((d.operator_exclusions||[]).length)c.append(genericTable(
+      d.operator_exclusions.map(x=>({reason:x.reason,authority:x.authority,
+        effect:x.effect}))));
+  }
   if((d.approved_source_meanings||[]).length){
     c.append(el('h2',null,'Approved local meaning <span class="sub">object-selection pointer only</span>'));
     c.append(genericTable(d.approved_source_meanings.map(m=>({
@@ -4649,11 +4668,12 @@ function renderApprovals(d,holder,refresh){
     const row=el('div','pad');
     row.style.borderTop='1px solid var(--line)';
     const badge=item.status==='pending'?'':
-      '<span class="badge '+(item.status==='approved'?'ok':'dim')+'">'+
+      '<span class="badge '+(item.status==='approved'?'ok':item.status==='excluded'?'bad':'dim')+'">'+
       esc(item.status)+(item.decided_by?' by '+esc(item.decided_by):'')+'</span> ';
     row.innerHTML=badge+'<b>'+esc(item.subject||item.kind||'')+'</b> '+
       '<span style="color:var(--muted)">'+esc(item.queue==='memory'
-        ? 'site fact' : 'meaning \u00b7 '+(item.source||''))+'</span>'+
+        ? 'site fact' : (item.selection_effect==='exclude'?'record exclusion':'meaning')+
+          ' \u00b7 '+(item.source||''))+'</span>'+
       '<div style="margin:4px 0">'+esc(item.text||'')+'</div>'+
       ((item.aliases||[]).length
         ? '<div style="color:var(--muted);font-size:12px">aliases: '+
@@ -4663,8 +4683,9 @@ function renderApprovals(d,holder,refresh){
       '</div>';
     if(item.status==='pending'){
       const bar=el('div'); bar.style.marginTop='6px';
-      const yes=el('button','btn','Approve');
-      const no=el('button','btn ghost','Reject');
+      const yes=el('button','btn',item.selection_effect==='exclude'
+        ?'Activate exclusion':'Approve meaning');
+      const no=el('button','btn ghost','Dismiss proposal');
       no.style.marginLeft='6px';
       const say=el('span'); say.style.marginLeft='10px';
       async function decide(decision){
@@ -4689,12 +4710,34 @@ function renderApprovals(d,holder,refresh){
       yes.onclick=()=>decide('approve');
       no.onclick=()=>decide('reject');
       bar.append(yes,no,say); row.append(bar);
+    }else if(item.queue==='source_knowledge'&&
+             (item.status==='approved'||item.status==='excluded')){
+      const bar=el('div');bar.style.marginTop='6px';
+      const revoke=el('button','btn ghost',item.status==='excluded'
+        ?'Restore as a candidate':'Revoke meaning');
+      const say=el('span');say.style.marginLeft='10px';
+      revoke.onclick=async()=>{
+        revoke.disabled=true;say.innerHTML='<span class="spin"></span>';
+        try{
+          await api('/api/approvals/decide',{method:'POST',
+            headers:{'Content-Type':'application/json',
+              'X-PSTB-Approval-Request':'metadata-review'},
+            body:JSON.stringify({queue:item.queue,id:item.id,
+              source:item.source||'',decision:'revoke'})});
+          refresh();refreshApprovalBadge();
+        }catch(e){
+          say.innerHTML='<span class="badge bad">'+esc(errText(e))+'</span>';
+          revoke.disabled=false;
+        }
+      };
+      bar.append(revoke,say);row.append(bar);
     }
     card.append(row);
   });
   card.append(el('div','pad','<span style="color:var(--muted)">Near-duplicate '+
-    'phrasings of one fact are common. Approve the clearest and reject the '+
-    'rest \u2014 each approved fact is injected separately.</span>'));
+    'phrasings of one fact are common. Approve the clearest and dismiss the '+
+    'rest. An approved exclusion is a hard veto, while an approved meaning is '+
+    'a positive discovery pointer.</span>'));
   holder.append(card);
 }
 
@@ -4735,13 +4778,19 @@ function metadataProposalUrl(source){
 function metadataProposalPanel(source,refresh,drawerGeneration){
   const intro=el('div','metadata-review-intro');
   intro.innerHTML=sourceBadgeHtml(source)+
-    '<div style="margin-top:9px">Teach one exact table or view. The wording '+
+    '<div style="margin-top:9px">Teach or exclude one exact table or view. The wording '+
     'goes directly to this database\u2019s private proposal queue; it is '+
     '<b>not sent through the chat model</b> and remains pending and inactive until approved. '+
-    'Meanings help semantic table selection only; they never create joins, SQL '+
-    'rules, row values, or financial evidence.</div>';
+    'A meaning helps semantic selection; an exclusion removes the object from '+
+    'discovery and blocks profiling and SQL. Neither creates joins, SQL rules, '+
+    'row values, or financial evidence.</div>';
   const form=el('form','metadata-proposal-form');
-  form.append(el('b',null,'Add a table or view meaning'));
+  form.append(el('b',null,'Add a table or view rule'));
+  const useLabel=el('label',null,'How should this object be used?');
+  const useSelect=document.createElement('select');useSelect.name='selection';
+  useSelect.innerHTML='<option value="prefer">Prefer for matching questions</option>'+
+    '<option value="exclude">Exclude from answers (junk, obsolete, non-reporting staging)</option>';
+  useLabel.append(useSelect);form.append(useLabel);
   const fields=[
     ['identifier','Exact schema.object','P2GO.JOB_HDR','input'],
     ['meaning','Short business meaning','Inbound integration job headers','textarea'],
@@ -4753,22 +4802,40 @@ function metadataProposalPanel(source,refresh,drawerGeneration){
     const control=document.createElement(kind);control.name=name;
     control.placeholder=placeholder;control.autocomplete='off';control.maxLength=500;
     lab.append(control);form.append(lab);controls[name]=control;
+    controls[name+'Label']=lab;
   });
+  controls.selection=useSelect;
   const actions=el('div','metadata-proposal-actions');
-  const submit=el('button','btn compact','Submit for review');submit.type='submit';
+  const submit=el('button','btn compact','Submit meaning for review');submit.type='submit';
   const status=el('div','metadata-review-error');
   actions.append(submit);form.append(actions,status);
+  function syncSelection(){
+    const excluding=controls.selection.value==='exclude';
+    submit.textContent=excluding?'Submit exclusion for review':'Submit meaning for review';
+    controls.aliases.disabled=excluding;
+    if(excluding)controls.aliases.value='';
+    controls.aliasesLabel.hidden=excluding;
+    controls.meaningLabel.firstChild.textContent=excluding
+      ?'Reason for exclusion'
+      :'Short business meaning';
+    controls.meaning.placeholder=excluding
+      ?'Why this object must not be used (for example, obsolete scratch copy)'
+      :'Inbound integration job headers';
+  }
+  controls.selection.onchange=syncSelection;syncSelection();
   form.onsubmit=async event=>{
     event.preventDefault();status.textContent='';submit.disabled=true;
     try{
       const data=await api(metadataProposalUrl(source),{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({identifier:controls.identifier.value,
-          meaning:controls.meaning.value,aliases:controls.aliases.value})});
+          meaning:controls.meaning.value,aliases:controls.aliases.value,
+          selection:controls.selection.value})});
       if(!drawerIsCurrent(drawerGeneration))return;
       status.className='metadata-review-message';
       status.textContent=data.note||'Submitted as pending for operator review.';
       controls.identifier.value=controls.meaning.value=controls.aliases.value='';
+      controls.selection.value='prefer';syncSelection();
       await refresh();refreshApprovalBadge();
     }catch(e){
       status.className='metadata-review-error';status.textContent=errText(e);

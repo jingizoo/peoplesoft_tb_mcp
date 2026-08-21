@@ -506,6 +506,13 @@ selector**. The testing exception has no timeout; afterwards set
 `allow_unauthenticated_remote_approvals: false` and restart. A configured
 `PSTB_AUTH_TOKEN`, if present, is never bypassed.
 
+The form also has **Exclude from answers** for an exact junk, obsolete,
+duplicate, or non-reporting staging object. Approve that proposal to remove the
+record from discovery and block profiling, planning, SQL, and batch exports.
+Use **Restore as a candidate** in the decision history if the exclusion later
+becomes obsolete. A table described only as “staging” is not suppressed; the
+exclusion must be explicit.
+
 Requests carrying a proxy's `X-Forwarded-For` are refused in both modes,
 and in loopback mode an unexpected `Host` header is refused as well: a page
 on the open web can otherwise resolve its own hostname to 127.0.0.1 and

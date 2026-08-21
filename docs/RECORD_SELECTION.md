@@ -169,6 +169,36 @@ Every surface that shows one says so, and the columns always come from the
 catalog. Reject a pending proposal—or remove an obsolete approved one—with
 `python -m pstb.memory`; it then has no retrieval effect.
 
+## Records that must not be used
+
+Approval answers "is this statement correct?"; it does not always mean
+"promote this table". In **Metadata meanings**, choose one of two explicit
+selection effects:
+
+- **Prefer for matching questions** adds governed business vocabulary.
+- **Exclude from answers** creates a hard veto for a junk, obsolete, duplicate,
+  scratch, or non-reporting staging object.
+
+After an exclusion is approved, the object is removed from `search_metadata`,
+`search_records`, and `list_tables`; omitted from `compare_records` and join
+paths; and refused before `describe_record`, `describe_table`,
+`profile_record`, `explain_query`, or `run_sql` can inspect it. The tool result
+names the operator exclusion instead of letting the model silently choose the
+next similar name. The same check covers interactive results and large CSV
+exports.
+
+Existing approved lessons beginning with an explicit instruction such as
+"don't use", "do not query", or "never select" are recognized as exclusions
+automatically. The word **staging by itself is not an exclusion**: an interface
+staging table may be exactly the record an operational question needs.
+
+Enforcement reads a private, source-bound local index cached by the sidecar's
+file signature. It adds no Oracle query and cannot cross from one configured
+database workspace into another. A local operator can use **Restore as a
+candidate** in the review history (or revoke the proposal with
+`python -m pstb.source_knowledge --source <name> --revoke <id>`) when the veto
+is no longer valid.
+
 ## Planning a join before running it
 
 Large-table queries on a real instance time out rather than erroring, and a

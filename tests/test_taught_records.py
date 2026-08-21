@@ -29,6 +29,7 @@ from pstb.config import load_config  # noqa: E402
 from pstb.db import Database  # noqa: E402
 from pstb.engine import TBEngine  # noqa: E402
 from pstb.memory import MemoryError_, SiteMemory  # noqa: E402
+from pstb.record_governance import is_explicit_exclusion  # noqa: E402
 
 
 class TaughtRecordTests(unittest.TestCase):
@@ -154,6 +155,46 @@ class TaughtRecordTests(unittest.TestCase):
         self.assertEqual(self.memory.record_facts("XX_WRONG"), [])
         self.assertEqual(self.engine.search_records("does not hold")["records"],
                          [])
+
+    def test_approved_do_not_use_fact_suppresses_and_blocks_the_record(self):
+        self.teach(
+            "PS_ITEM: Don't use this record for answers; it is a junk copy")
+        found = self.engine.search_records("item")
+        self.assertNotIn(
+            "ITEM", [row["record"] for row in found["records"]])
+        self.assertGreaterEqual(
+            found["selection_governance"]["excluded_count"], 1)
+        self.assertEqual(self.memory.record_facts("PS_ITEM"), [])
+        self.assertTrue(self.memory.record_exclusions("PS_ITEM"))
+        with self.assertRaisesRegex(Exception, "explicitly excluded"):
+            self.engine.run_sql(
+                "SELECT ITEM FROM PS_ITEM WHERE BUSINESS_UNIT = 'US001'",
+                max_rows=1,
+            )
+        with self.assertRaisesRegex(Exception, "explicitly excluded"):
+            self.engine.profile_record("PS_ITEM")
+        with self.assertRaisesRegex(Exception, "explicitly excluded"):
+            self.engine.describe_record("PS_ITEM")
+        with self.assertRaisesRegex(Exception, "explicitly excluded"):
+            self.engine.describe_table("PS_ITEM")
+        with self.assertRaisesRegex(Exception, "explicitly excluded"):
+            self.engine.join_path("PS_ITEM", "PS_CUSTOMER")
+        listed = self.engine.list_tables("%ITEM%")
+        names = [row["table_name"] for row in listed["tables"]]
+        self.assertNotIn("PS_ITEM", names)
+        self.assertIn("PS_PAYMENT_ITEM", names)
+
+    def test_the_existing_dont_apostrophe_typo_is_still_an_exclusion(self):
+        self.assertTrue(is_explicit_exclusion(
+            "Dont' use this record as it is just junk or staging"))
+
+    def test_staging_description_alone_remains_a_positive_pointer(self):
+        self.teach("XX_REBATE_ACCR: custom rebate accrual staging table")
+        self.assertEqual(self.memory.record_exclusions("XX_REBATE_ACCR"), [])
+        self.assertEqual(
+            self.engine.search_records("rebate accrual")["records"][0]["record"],
+            "XX_REBATE_ACCR",
+        )
 
     def test_discovery_works_when_no_memory_is_attached(self) -> None:
         # The engine is constructed without memory in scripts and tests; record

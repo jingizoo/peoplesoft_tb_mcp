@@ -190,6 +190,8 @@ class TBEngine:
         # Set by the server: named extra databases for ad-hoc questions.
         self.registry = None
         self._source_engines: dict = {}
+        self._source_name = "default"
+        self._record_exclusion_resolver = None
         self.cfg = cfg
         self._setid_cache: dict[tuple[str, str], str] = {}
         self._eff_defaults: Optional[dict] = None
@@ -3543,6 +3545,10 @@ class TBEngine:
             from .db import DbError
             raise DbError("No extra sources are configured; add them under "
                           "'sources:' in config.yaml.")
+        if hasattr(self.registry, "resolve_name"):
+            name = self.registry.resolve_name(name)
+        if name == "default":
+            return self
         if name not in self._source_engines:
             source_db = self.registry.get(name)
             # Database owns the fully resolved Config for this source.  Using
@@ -3550,6 +3556,8 @@ class TBEngine:
             # ALL_OBJECTS for the PeopleSoft owner even while queries execute
             # through (for example) the P2Go connection and schema.
             eng = TBEngine(source_db, source_db.cfg)
+            eng._source_name = name
+            eng._record_exclusion_resolver = self._record_exclusion_resolver
             self._source_engines[name] = eng
         return self._source_engines[name]
 
@@ -3573,6 +3581,15 @@ class TBEngine:
             raise EngineError(
                 "join_path needs from_record and to_record. Use "
                 "search_records to find record names.")
+        extra = [str(name or "").strip().upper() for name in (through or ())
+                 if str(name or "").strip()]
+        rules = self._record_exclusion_rows()
+        self._require_records_allowed(
+            [start, goal, *extra], action="Join planning", rules=rules)
+        forbidden = {
+            form for rule in rules
+            for form in self._record_name_forms(rule.get("object"))
+        }
         graph = self._record_graph()
         for name in (start, goal):
             if not self.db.columns(name):
@@ -3580,10 +3597,10 @@ class TBEngine:
                     f"{name} is not readable here — check the name with "
                     "search_records, or the SELECT grant with "
                     "describe_table.")
-        path = graph.path(start, goal, extra=[t.upper() for t in
-                                             (through or ()) if t])
+        path = graph.path(start, goal, extra=extra, exclude=forbidden)
         if path is None:
-            reachable = [h.right for h in graph.paths_from(start)][:8]
+            reachable = [h.right for h in graph.paths_from(
+                start, extra=extra, exclude=forbidden)][:8]
             return {
                 "from": start, "to": goal, "found": False,
                 "relationship_evidence_classes": [
@@ -3638,7 +3655,12 @@ class TBEngine:
             raise EngineError(f"Statement rejected — contains {m.group(1).upper()}")
         self._require_local_database_refs(scrubbed)
         self._require_allowed_schema_refs(scrubbed)
-        refs = sorted(self._table_refs(scrubbed))
+        ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
+        refs = sorted(
+            ref for ref in self._table_refs(scrubbed)
+            if self._table_target(ref)[1].upper() not in ctes
+            and self._table_target(ref)[1].upper() != "DUAL")
+        self._require_records_allowed(refs, action="Query planning")
         unqualified = [r for r in refs if "." not in r]
         if self.db.prefix:
             s = self._qualify_tables(s, unqualified)
@@ -3841,6 +3863,107 @@ class TBEngine:
         people here have taught it about their own tables."""
         self._memory = memory
 
+    def attach_record_exclusions(self, resolver, source: str = "default") -> None:
+        """Attach the source-bound operator veto index used by ad-hoc tools.
+
+        The resolver reads only a local private sidecar.  It never queries the
+        application database, so enforcing a veto adds no Oracle round trip.
+        Child engines inherit it in ``for_source`` with their canonical source
+        name, preventing one database's exclusions from crossing into another.
+        """
+        self._record_exclusion_resolver = resolver
+        self._source_name = str(source or "default").strip() or "default"
+        for name, child in self._source_engines.items():
+            child._record_exclusion_resolver = resolver
+            child._source_name = name
+
+    @staticmethod
+    def _record_name_forms(value: object) -> set[str]:
+        name = str(value or "").strip().upper().split(".")[-1]
+        if not name:
+            return set()
+        logical = name[3:] if name.startswith("PS_") else name
+        return {name, logical, f"PS_{logical}"}
+
+    def _record_exclusion_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        memory = getattr(self, "_memory", None)
+        if memory is not None:
+            try:
+                for fact in memory.record_exclusions():
+                    rows.append({
+                        "source_database": "default",
+                        "schema": "",
+                        "object": fact.get("record"),
+                        "reason": fact.get("detail") or fact.get("text"),
+                        "proposal_id": fact.get("id"),
+                        "authority": "operator-approved site memory",
+                    })
+            except Exception as exc:
+                raise EngineError(
+                    "Record selection governance could not read site memory; "
+                    "the query was not sent to the database. Repair or restore "
+                    f"the private memory file, then retry. ({exc})") from exc
+        resolver = self._record_exclusion_resolver
+        if resolver is not None:
+            try:
+                source_rows = (resolver.for_source(self._source_name)
+                               if hasattr(resolver, "for_source")
+                               else resolver(self._source_name))
+                rows.extend(dict(row) for row in (source_rows or []))
+            except Exception as exc:
+                raise EngineError(
+                    "Record selection governance could not verify the private "
+                    "source exclusions; the query was not sent to the database. "
+                    f"Repair the source-knowledge sidecar and retry. ({exc})") \
+                    from exc
+        return rows
+
+    def _record_exclusions_for(self, records, *, rules=None) -> list[dict]:
+        targets = []
+        for record in records or []:
+            owner, table = self._table_target(str(record))
+            targets.append((str(record), owner.upper(),
+                            self._record_name_forms(table)))
+        if not targets:
+            return []
+        blocked = []
+        active_rules = self._record_exclusion_rows() if rules is None else rules
+        for rule in active_rules:
+            rule_schema = str(rule.get("schema") or "").strip().upper()
+            rule_forms = self._record_name_forms(rule.get("object"))
+            for original, owner, target_forms in targets:
+                if (rule_forms & target_forms
+                        and (not rule_schema or not owner
+                             or rule_schema == owner)):
+                    blocked.append({
+                        "record": original,
+                        "reason": " ".join(
+                            str(rule.get("reason") or "").split())[:400],
+                        "authority": rule.get("authority"),
+                        "proposal_id": rule.get("proposal_id"),
+                    })
+                    break
+        unique = {}
+        for row in blocked:
+            unique[(str(row.get("record") or "").upper(),
+                    str(row.get("proposal_id") or row.get("reason") or ""))] = row
+        return list(unique.values())
+
+    def _require_records_allowed(self, records, *, action: str,
+                                 rules=None) -> None:
+        blocked = self._record_exclusions_for(records, rules=rules)
+        if not blocked:
+            return
+        detail = "; ".join(
+            f"{row['record']}: {row.get('reason') or 'excluded by an operator'}"
+            for row in blocked[:6])
+        raise EngineError(
+            f"{action} refused before database access: {detail}. These records "
+            "are explicitly excluded from answers. Choose another catalog "
+            "object, or have an operator revoke the exclusion in Metadata "
+            "meanings if it is no longer valid.")
+
     def _taught(self, table: str = "") -> list:
         mem = getattr(self, "_memory", None)
         if mem is None:
@@ -3943,11 +4066,18 @@ class TBEngine:
         ctes = {c.upper() for c in self._CTE_RE.findall(scrubbed)}
         problems, unqualified = [], []
         refs = self._table_refs(scrubbed)
-        for ref in refs:
+        target_refs = [
+            ref for ref in refs
+            if self._table_target(ref)[1].upper() not in ctes
+            and self._table_target(ref)[1].upper() != "DUAL"
+        ]
+        # Vetoes are local and cheaper than even a catalog round trip. Apply
+        # them before existence checks so a forbidden table is not inspected
+        # merely to prove that it exists.
+        self._require_records_allowed(
+            target_refs, action="Ad-hoc SQL query")
+        for ref in target_refs:
             parsed = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(ref)
-            _, bare = self._table_target(ref)
-            if bare.upper() in ctes or bare.upper() == "DUAL":
-                continue
             if not self._table_exists(ref):
                 sugg = self._suggest_tables(ref)
                 problems.append(
@@ -4089,7 +4219,7 @@ class TBEngine:
                              else len(rows)),
                "truncated": truncated,
                "sql_executed": s,
-               "target_owners": self._target_owners(refs)}
+               "target_owners": self._target_owners(target_refs)}
         if streamed_count is not None:
             out["batch_streamed"] = True
         if partition_info:
@@ -4197,7 +4327,12 @@ class TBEngine:
             pass
         bare = rec[3:] if rec.startswith("PS_") else rec
         try:
-            candidates = self.list_tables(bare).get("tables") or []
+            # Identity resolution must see the COMPLETE catalog.  Applying
+            # selection governance here can turn an ambiguous logical name
+            # into a different unique suffix (excluding PS_ITEM once made
+            # ITEM resolve as PS_PAYMENT_ITEM).  Resolve first, then enforce
+            # the exact identity at the caller boundary.
+            candidates = self._list_tables_raw(bare).get("tables") or []
         except Exception:
             candidates = []
         suffixes = []
@@ -4409,6 +4544,17 @@ class TBEngine:
             entry["taught_status"] = fact.get("status")
 
         out = list(candidates.values())
+        excluded = self._record_exclusions_for(
+            [entry.get("table") or entry.get("record") for entry in out])
+        excluded_forms = {
+            form
+            for row in excluded
+            for form in self._record_name_forms(row.get("record"))
+        }
+        if excluded_forms:
+            out = [entry for entry in out if not (
+                self._record_name_forms(entry.get("table")) |
+                self._record_name_forms(entry.get("record"))) & excluded_forms]
         # Probe only the candidates a caller might see.  Optimizer statistics
         # are cheap, but one catalog round trip per result still adds up on a
         # 100-result discovery call.
@@ -4438,6 +4584,14 @@ class TBEngine:
             "count": len(out[:cap]),
             "source": source,
             "notes": notes,
+            "selection_governance": {
+                "excluded_count": len(excluded),
+                "excluded_records": excluded,
+                "effect": (
+                    "operator exclusions were removed before ranking and may "
+                    "not be queried for answers") if excluded else
+                    "no matching operator record exclusion was active",
+            },
             "note": (
                 "Query these with run_sql using the 'table' value (the "
                 "physical object). 'record' is the PeopleTools record name. "
@@ -4457,12 +4611,17 @@ class TBEngine:
         from .profiles import RecordProfiler
 
         rec = (table or "").strip()
+        original = rec
+        if rec:
+            self._require_records_allowed([rec], action="Record profiling")
         # Accept a PeopleTools record name as readily as a physical table.
         if rec and not rec.upper().startswith("PS") and not self._table_exists(rec):
             try:
                 rec = self.describe_record(rec).get("table") or rec
             except EngineError:
                 pass
+        if rec and rec.upper() != original.upper():
+            self._require_records_allowed([rec], action="Record profiling")
         try:
             return RecordProfiler(self.db, self.cfg).profile(
                 rec, sample_rows=None if sample_rows < 0 else sample_rows)
@@ -4476,8 +4635,21 @@ class TBEngine:
             raise EngineError("Raw SQL tools are disabled")
         from .profiles import RecordProfiler
 
+        requested = [str(table or "").strip() for table in (tables or [])
+                     if str(table or "").strip()]
+        excluded = self._record_exclusions_for(requested)
+        excluded_forms = {
+            form for row in excluded
+            for form in self._record_name_forms(row.get("record"))
+        }
+        requested = [name for name in requested
+                     if not self._record_name_forms(name) & excluded_forms]
+        if not requested and excluded:
+            self._require_records_allowed(
+                [row.get("record") for row in excluded],
+                action="Record comparison")
         resolved = []
-        for table in (tables or []):
+        for table in requested:
             name = str(table or "").strip()
             if not name:
                 continue
@@ -4488,9 +4660,27 @@ class TBEngine:
                 resolved.append(self.describe_record(name).get("table") or name)
             except EngineError:
                 resolved.append(name)
+        resolved_excluded = self._record_exclusions_for(resolved)
+        excluded.extend(resolved_excluded)
+        excluded_forms |= {
+            form for row in resolved_excluded
+            for form in self._record_name_forms(row.get("record"))
+        }
+        allowed = [name for name in resolved
+                   if not self._record_name_forms(name) & excluded_forms]
+        if not allowed:
+            self._require_records_allowed(
+                resolved, action="Record comparison")
         try:
-            return RecordProfiler(self.db, self.cfg).compare(
-                resolved, sample_rows=None if sample_rows < 0 else sample_rows)
+            result = RecordProfiler(self.db, self.cfg).compare(
+                allowed, sample_rows=None if sample_rows < 0 else sample_rows)
+            if excluded:
+                result["excluded_records"] = excluded
+                result["selection_note"] = (
+                    "Operator-excluded records were not sampled or ranked. "
+                    "They cannot be used for answers unless the exclusion is "
+                    "revoked.")
+            return result
         except ValueError as e:
             raise EngineError(str(e))
 
@@ -4501,6 +4691,7 @@ class TBEngine:
         rec = asked
         if not rec:
             raise EngineError("describe_record needs a record name")
+        self._require_records_allowed([rec], action="Record description")
         # A physical object may be company-prefixed or explicitly overridden.
         # Search metadata before stripping the delivered PS_ convention.
         out: dict = {"record": rec}
@@ -4534,6 +4725,9 @@ class TBEngine:
         except DbError:
             pass
         table = out.get("table") or self._physical_name(rec, "")
+        if table and table.upper() != asked:
+            self._require_records_allowed(
+                [table], action="Record description")
         if not table and self._table_exists(asked):
             table = asked
             out["record_resolution"] = (
@@ -4562,7 +4756,8 @@ class TBEngine:
             out["columns_error"] = str(e)
         return out
 
-    def list_tables(self, pattern: str = "") -> dict:
+    def _list_tables_raw(self, pattern: str = "") -> dict:
+        """Unfiltered catalog inventory for internal identity resolution."""
         if not self.cfg.tools.allow_raw_sql:
             raise EngineError("Raw SQL tools are disabled")
         pat = (pattern or "").strip().upper().replace("*", "%") or "%"
@@ -4571,8 +4766,40 @@ class TBEngine:
         params = {"pat": pat if self.db.dialect != "sqlite" else pat.upper()}
         if self.db.dialect == "sqlite":
             params["pat"] = pat  # sqlite LIKE is case-insensitive for ASCII
-        rows, truncated = self.db.query(q.table_list(self.db, params), params, max_rows=200)
+        rows, truncated = self.db.query(
+            q.table_list(self.db, params), params, max_rows=200)
         return {"tables": rows, "count": len(rows), "truncated": truncated}
+
+    def list_tables(self, pattern: str = "") -> dict:
+        raw = self._list_tables_raw(pattern)
+        rows = raw["tables"]
+        truncated = raw["truncated"]
+        targets = [
+            ((f"{row.get('schema_name')}.{row.get('table_name')}"
+              if row.get("schema_name") else str(row.get("table_name") or "")))
+            for row in rows if row.get("table_name")
+        ]
+        exclusions = self._record_exclusions_for(targets)
+        blocked_targets = {
+            str(row.get("record") or "").strip().upper()
+            for row in exclusions
+        }
+        if blocked_targets:
+            rows = [row for row in rows if (
+                f"{row.get('schema_name')}.{row.get('table_name')}"
+                if row.get("schema_name") else str(row.get("table_name") or "")
+            ).strip().upper() not in blocked_targets]
+        return {
+            "tables": rows, "count": len(rows), "truncated": truncated,
+            "selection_governance": {
+                "excluded_count": len(exclusions),
+                "excluded_records": exclusions,
+                "effect": (
+                    "operator exclusions were removed from table browsing"
+                    if exclusions else
+                    "no matching operator record exclusion was active"),
+            },
+        }
 
     def describe_table(self, table_name: str) -> dict:
         if not self.cfg.tools.allow_raw_sql:
@@ -4582,6 +4809,10 @@ class TBEngine:
             sql = q.table_describe(self.db, (table_name or "").strip(), params)
         except ValueError as e:
             raise EngineError(str(e))
+        # Preserve the catalog helper's established owner-boundary refusal,
+        # then apply the local selection veto before the first DB read.
+        self._require_records_allowed(
+            [table_name], action="Table description")
         rows, _ = self.db.query(sql, params, max_rows=500)
         if self.db.dialect == "sqlite":
             rows = [
