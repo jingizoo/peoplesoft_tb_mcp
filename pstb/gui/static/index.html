@@ -4770,6 +4770,126 @@ async function loadApprovals(holder,source,drawerGeneration){
   }
 }
 
+/* What the agent could not answer, matched to what could have answered
+   it. Machinery computed everything on this card — which phrases failed,
+   how often, which live tables plausibly answer them — and the operator
+   authors the meaning. "Propose" posts through the SAME endpoint the
+   hand-typed drawer uses: catalog-validated, PENDING, inert until
+   approved in the queue above. */
+function renderCoverageGaps(d,holder){
+  const card=el('div','card');
+  card.setAttribute('data-coverage','1');
+  const gaps=(d&&d.gaps)||[];
+  card.append(el('h2',null,'What the agent could not answer '+
+    (gaps.length?'<span class="badge warn">'+gaps.length+' repeated gap'+
+      (gaps.length===1?'':'s')+'</span>'
+    :'<span class="badge ok">no repeated gaps</span>')+
+    '<span class="sub">mined from failed questions; nothing here changes '+
+    'anything until a proposal is approved</span>'));
+  if(!gaps.length){
+    card.append(el('div','pad',esc((d&&d.note)||
+      'No failed questions have been logged yet.')));
+    holder.append(card); return;
+  }
+  gaps.forEach(g=>{
+    const row=el('div','pad');
+    row.style.borderTop='1px solid var(--line)';
+    const kind=g.gap_kind==='named_object'
+      ?'<span class="badge warn">named table, no meaning</span>'
+      :(g.gap_kind==='no_candidates'
+        ?'<span class="badge dim">no catalog match</span>':'');
+    row.innerHTML='<b>'+esc(g.term)+'</b> '+kind+
+      ' <span style="color:var(--muted)">failed in '+g.distinct_questions+
+      ' question'+(g.distinct_questions===1?'':'s')+
+      (g.occurrences>g.distinct_questions?' ('+g.occurrences+' asks)':'')+
+      '</span>'+
+      '<div style="color:var(--muted);font-size:12px;margin:3px 0">“'+
+      esc(g.sample_question||'')+'”</div>';
+    (g.candidates||[]).forEach(c=>{
+      const line=el('div');
+      line.style.margin='4px 0 4px 14px';
+      const live=c.liveness==='populated'
+        ?'<span class="badge ok">'+(c.row_estimate!=null
+          ?Number(c.row_estimate).toLocaleString()+' rows':'live')+'</span>'
+        :(c.liveness==='empty'?'<span class="badge dim">empty</span>'
+          :'<span class="badge warn">unmeasured</span>');
+      line.innerHTML='<code>'+esc(c.identifier)+'</code> '+live+
+        (c.label?' <span style="color:var(--muted)">'+esc(c.label)+'</span>':'')+
+        (c.prefer_instead?' <span class="badge warn">prefer '+
+          esc(c.prefer_instead)+'</span>':'')+
+        /* The profiler's caveat is the evidence the person authoring a
+           meaning needs most — "statistics say zero rows but 912 changes
+           followed" must not be flattened into a bare badge. */
+        (c.caveat?'<div style="color:var(--muted);font-size:11.5px;margin:2px 0 0 2px">'+
+          esc(c.caveat)+'</div>':'');
+      const btn=el('button','csvbtn','Propose meaning…');
+      btn.type='button'; btn.style.marginLeft='8px';
+      btn.onclick=()=>{
+        if(line.querySelector('.gapform')){return;}
+        const form=el('div','gapform');
+        form.style.margin='6px 0 2px 0';
+        const meaning=document.createElement('input');
+        meaning.type='text'; meaning.placeholder=
+          'One-line business meaning (a person writes this part)';
+        meaning.style.width='min(420px,90%)';
+        const aliasBox=document.createElement('input');
+        aliasBox.type='text';
+        aliasBox.value=(g.gap_kind==='named_object'?'':g.term);
+        aliasBox.placeholder='aliases, comma-separated (optional)';
+        aliasBox.style.width='min(260px,60%)';
+        aliasBox.style.marginLeft='6px';
+        aliasBox.title='Prefilled with the failed phrase; edit it if the '+
+          'proposal is refused for an alias conflict.';
+        const go=el('button','csvbtn','Submit for review');
+        go.type='button'; go.style.marginLeft='6px';
+        const say=el('span'); say.style.marginLeft='8px';
+        go.onclick=async()=>{
+          go.disabled=true; say.innerHTML='<span class="spin"></span>';
+          try{
+            await api(metadataProposalUrl(d.source||'default'),{
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({identifier:c.identifier,
+                meaning:meaning.value,
+                aliases:aliasBox.value})});
+            say.innerHTML='<span class="badge ok">submitted for review</span>';
+            refreshApprovalBadge();
+          }catch(e){
+            go.disabled=false;
+            say.innerHTML='<span class="badge bad">'+esc(errText(e))+'</span>';
+          }
+        };
+        form.append(meaning,aliasBox,go,say);
+        line.append(form);
+        meaning.focus();
+      };
+      line.append(btn);
+      row.append(line);
+    });
+    card.append(row);
+  });
+  card.append(el('div','pad',
+    '<span class="sub">'+esc((d&&d.note)||'')+'</span>'));
+  holder.append(card);
+}
+async function loadCoverageGaps(holder,source){
+  const existing=holder.querySelector('[data-coverage]');
+  const box=el('div'); box.setAttribute('data-coverage','1');
+  if(existing) existing.replaceWith(box); else holder.append(box);
+  try{
+    const d=await api('/api/coverage-gaps?source='+
+      encodeURIComponent(source||'default'));
+    renderCoverageGaps(d,box);
+  }catch(e){
+    const c=el('div','card');
+    c.append(el('h2',null,'What the agent could not answer'));
+    c.append(el('div','pad',e.status===403
+      ? '<span class="badge warn">operator access required</span> '+esc(errText(e))
+      : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
+    box.append(c);
+  }
+}
+
 function metadataProposalUrl(source){
   const d=descriptorForSource(source);
   if(!d)throw new Error('Unknown database workspace '+String(source||''));
@@ -4917,6 +5037,7 @@ async function viewDiag(){
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
       await loadApprovals(holder,ACTIVE_CHAT_SOURCE);
+      await loadCoverageGaps(holder,ACTIVE_CHAT_SOURCE);
       try{
         holder.append(renderQlogReport(await api('/api/question-report')));
       }catch(e2){

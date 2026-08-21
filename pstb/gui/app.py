@@ -444,6 +444,7 @@ _OPEN_PATHS = frozenset({
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
                        "/api/chat/reset", "/api/question-report",
                        "/api/question-review", "/api/approvals",
+                       "/api/coverage-gaps",
                        "/api/batch-exports")
 
 
@@ -2039,6 +2040,78 @@ def _require_remote_approval_post_contract(request: Request) -> None:
         raise HTTPException(
             status_code=403,
             detail="approval decisions require the same browser origin")
+
+
+def _coverage_turns() -> list:
+    """Turn records for demand mining, via the same loader the report uses."""
+    from .. import qlog_report as _qr
+    if not qlog.path:
+        return []
+    turns, _ = _qr.load(qlog)
+    return turns
+
+
+def _coverage_catalog(canonical: str):
+    """The offline catalog for one source, built exactly as approval does."""
+    from ..metadata import (MetadataCatalog, source_catalog_path,
+                            source_fingerprint)
+    return MetadataCatalog(
+        source_catalog_path(cfg, canonical), source=canonical,
+        expected_fingerprint=source_fingerprint(cfg, canonical))
+
+
+@app.get("/api/coverage-gaps")
+def coverage_gaps_endpoint(request: Request = None, source: str = "default"):
+    """What the agent could not answer, matched to what could answer it.
+
+    Operator diagnostics behind the same machine-local gate as the
+    question report: the worklist quotes (redacted, truncated) user
+    questions, which a shared-VPN reader has no business seeing.
+
+    Every row is evidence, not action: acting on one goes through the
+    existing metadata-proposal endpoint, whose catalog validation and
+    PENDING-until-approved semantics are unchanged. Machinery computes
+    which phrases failed and which live tables plausibly answer them; a
+    person authors the meaning.
+    """
+    _require_question_log_operator(request)
+    from .. import demand
+    canonical = (engine.registry.resolve_name(source)
+                 if engine.registry is not None else "default")
+    known = (list(engine.registry.names())
+             if engine.registry is not None else ["default"])
+    if canonical not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown source {source!r}; choose one of "
+                   f"{', '.join(known)}")
+    turns = _coverage_turns()
+    if not turns:
+        return {"source": canonical, "gaps": [],
+                "note": "question logging is not configured or has no "
+                        "turns yet; the worklist mines logged failures"}
+    try:
+        catalog = _coverage_catalog(canonical)
+    except Exception as exc:                     # noqa: BLE001
+        return {"source": canonical, "gaps": [],
+                "note": f"the metadata catalog for {canonical!r} is not "
+                        f"readable ({exc}); build it, then this worklist "
+                        "can match failed phrases to tables"}
+
+    def search(term):
+        # No kinds filter, deliberately twice over: the model's own
+        # search_metadata passes none, and the filter applies to the node
+        # that HOLDS the matched text -- it would amputate the column- and
+        # label-mediated routes to tables that badly named schemas depend
+        # on, and raise outright on a catalog containing no views. Search
+        # already resolves any hit to its owning table or view.
+        return catalog.search(term, source=canonical, limit=8)
+
+    def usefulness(identifier):
+        result = catalog.context(identifier, source=canonical, limit=5)
+        return (result or {}).get("usefulness") or {}
+
+    return demand.coverage_gaps(turns, search, usefulness, source=canonical)
 
 
 @app.get("/api/question-report")
