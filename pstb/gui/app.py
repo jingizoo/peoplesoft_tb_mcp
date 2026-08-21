@@ -2567,7 +2567,8 @@ def _export_csv_for_source(canonical: str, payload: dict,
             )
     args.pop("db", None)
 
-    from ..guards import (SOURCE_SILO_TOOLS, ScopeConflict,
+    from ..guards import (
+    CLARIFICATION_TOOL,SOURCE_SILO_TOOLS, ScopeConflict,
                           apply_request_scope, source_result_status,
                           unit_access_block)
     if canonical != "default":
@@ -3459,7 +3460,12 @@ async def chat(payload: dict, request: Request = None):
                 _activity_add(session_id, turn_token, {
                     "status": "done" if ok else "failed",
                     "tool": name, "ms": ms})
-                if ok and isinstance(out, str):
+                if ok and isinstance(out, str) and name != CLARIFICATION_TOOL:
+                    # A clarification's output is the question echoed back.
+                    # Letting it join the grounding payloads would ground
+                    # any figure it carries -- including for NEXT turns via
+                    # provider_entry.payloads, where a withheld question
+                    # would still have donated its numbers.
                     provider_entry.payloads.append((name, out))
                     del provider_entry.payloads[:-12]
                     turn_payloads.append((name, out))

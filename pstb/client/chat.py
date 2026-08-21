@@ -25,6 +25,8 @@ from mcp.client.stdio import stdio_client
 
 from ..config import Config, load_config
 from ..guards import (
+    CLARIFICATION_TOOL,
+    clarification_violation,
     FINANCIAL_EVIDENCE_TOOLS,
     POLICY_EVIDENCE_TOOLS,
     SOURCE_SILO_PROPOSAL_TOOLS,
@@ -444,6 +446,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
     crosses_units = spans_business_units(user_text, known_units, selected_unit)
     bu_override = crosses_units
     turn_results: dict = {}
+    # Set when the model ends the turn with ask_user: the structured
+    # question it wants to hand back instead of an answer. One per turn --
+    # the first captured wins and the loop stops.
+    clarification: dict | None = None
     # One pointer per turn, not one per tool that noticed the same
     # thing: aging and the 360 both spot an unapplied deposit.
     observed_seen: set = set()
@@ -791,6 +797,26 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                         else:
                             last_policy_problem = (problem or blocked
                                                    or "wiki lookup failed")
+                elif call.name == CLARIFICATION_TOOL:
+                    # A question is not evidence: it must not set db_ok,
+                    # cover a domain, or join the grounding payloads --
+                    # otherwise the figures it echoes would ground
+                    # themselves.
+                    if ok and clarification is None:
+                        try:
+                            parsed = json.loads(out)
+                            candidate = (parsed or {}).get("clarification")
+                        except (json.JSONDecodeError, TypeError):
+                            candidate = None
+                        if (isinstance(candidate, dict)
+                                and str(candidate.get("question") or "").strip()
+                                and isinstance(candidate.get("options"), list)
+                                and 2 <= len(candidate["options"]) <= 6):
+                            clarification = {
+                                "question": str(candidate["question"]).strip(),
+                                "options": [str(o) for o in
+                                            candidate["options"]],
+                            }
                 else:
                     if ok:
                         db_ok = True
@@ -827,7 +853,7 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                     allowed_schemas=(source_context or {}).get(
                         "schema_allowlist") or (),
                 ))
-                if ok:
+                if ok and call.name != CLARIFICATION_TOOL:
                     # Successful results get an id (r1, r2, ...) the model
                     # can REFERENCE in later rounds instead of retyping the
                     # values — see resolve_result_refs.
@@ -859,6 +885,10 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
                 results_by_index[index] = ToolResult(
                     call_id=call.id, name=call.name, content=out
                 )
+        if clarification is not None:
+            # The whole point of ask_user is that the USER speaks next.
+            # Results are not sent back to the model; the loop ends here.
+            break
         results = [results_by_index[i] for i in range(len(resp.tool_calls))]
         resp = await asyncio.to_thread(provider.send_tool_results, results)
     else:
@@ -868,7 +898,44 @@ async def agent_turn(provider: LLMProvider, session: ClientSession,
 
     relevant_financial_db_ok = has_relevant_financial_evidence()
     gate_replaced_answer = False
-    if scope_blocked:
+    if clarification is not None:
+        # The turn's output IS the question. Rendered as text here so the
+        # terminal surface works unchanged; the GUI additionally reads the
+        # structured form off the ask_user call and draws the options as
+        # buttons.
+        answer = "\n".join(
+            [clarification["question"], ""]
+            + [f"{i}. {option}"
+               for i, option in enumerate(clarification["options"], 1)])
+        # A question asserts nothing, which is why it may pass the evidence
+        # gate below -- and exactly why it is the hole a figure would be
+        # smuggled through. Same figure machinery as the number guard, but
+        # strict about the no-payload case: with nothing to ground against,
+        # any amount-shaped figure is invented. Years, periods and account
+        # numbers stay exempt; "FY2025 or FY2026?" is the canonical
+        # legitimate question.
+        violation = clarification_violation(
+            answer, list(turn_payloads) + list(prior_payloads or []))
+        if violation:
+            answer = (
+                "I withheld that clarifying question: " + violation + ". "
+                "A question may not carry figures no tool produced. Ask "
+                "again and I will query the data first."
+            )
+            gate_replaced_answer = True
+            clarification = None
+            logged_calls.append({"tool": "_clarify_guard", "ok": False,
+                                 "refusal_category": "tool_error",
+                                 "result_completeness": {
+                                     "status": "refused"}})
+    clarify_active = clarification is not None
+    if clarify_active or gate_replaced_answer:
+        # An admissible question ends the gate discussion (the turn makes
+        # no claim), and a WITHHELD question is already the final word --
+        # the domain gate below must not replace the withholding message
+        # with its own refusal, which would hide why the turn really died.
+        pass
+    elif scope_blocked:
         answer = (
             "Choose a PeopleSoft business unit and ledger before I query "
             "financial data. No configured default scope was used."
