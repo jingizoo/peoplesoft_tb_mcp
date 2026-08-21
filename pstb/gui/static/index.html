@@ -230,6 +230,13 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .msg.bot code{background:var(--bg);border:1px solid var(--line);border-radius:4px;
   padding:0 4px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
 .msg.bot .ans-gap{height:6px}
+.ans-tablewrap{overflow-x:auto;margin:6px 0}
+.ans-table{border-collapse:collapse;font-size:12.5px;min-width:60%}
+.ans-table th,.ans-table td{padding:5px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+.ans-table th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10.5px;letter-spacing:.05em}
+.ans-table td.num,.ans-table th.num{text-align:right;font-variant-numeric:tabular-nums}
+.clarify{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px}
+.clarify button{cursor:pointer}
 .tool-card.flash>summary{animation:cardflash 1.2s ease}
 @keyframes cardflash{0%{background:var(--accent-soft)}100%{background:var(--bg)}}
 .viz{margin:6px 0 2px}
@@ -1001,12 +1008,55 @@ function showScopeChooser(){
    structure, and every grounded number becomes a link that opens the
    exact source card it came from. All deterministic string work over
    ALREADY-ESCAPED text — the model cannot inject markup through it. */
+/* A pipe-table line the model wrote in its answer. Before this, mdLite
+   turned each one into a plain <div>, so secondary-workspace answers —
+   which have no curated card and live entirely in prose — showed literal
+   | characters. "the output is not formatted" was exactly this. */
+function isPipeRow(ln){
+  const t=ln.trim();
+  return t.length>1&&t.startsWith('|')&&t.endsWith('|')&&t.indexOf('|',1)>0;
+}
+function isPipeRule(ln){
+  return /^\s*\|?[\s:|-]+\|?\s*$/.test(ln)&&ln.indexOf('-')>=0;
+}
+function pipeCells(ln){
+  const t=ln.trim().replace(/^\|/,'').replace(/\|$/,'');
+  return t.split('|').map(c=>c.trim());
+}
+/* Numeric cells right-align; amount-shaped ones (decimals or thousands
+   groups) reformat through the same money() every curated card uses.
+   Years and bare ids ("2026", "US001") are left exactly as written. */
+function tableCell(tag,v){
+  const raw=String(v??'');
+  const bare=raw.replace(/,/g,'');
+  const numeric=/^-?\d+(\.\d+)?$/.test(bare)&&bare!=='';
+  const amountish=numeric&&(/\./.test(raw)||/\d,\d{3}/.test(raw));
+  const shown=amountish?money(parseFloat(bare)):raw;
+  return '<'+tag+(numeric?' class="num"':'')+'>'+shown+'</'+tag+'>';
+}
+function pipeTable(header,rows){
+  let html='<div class="ans-tablewrap"><table class="ans-table"><thead><tr>'+
+    header.map(h=>tableCell('th',h)).join('')+'</tr></thead><tbody>';
+  for(const r of rows){
+    html+='<tr>'+header.map((_,i)=>tableCell('td',r[i]??'')).join('')+'</tr>';
+  }
+  return html+'</tbody></table></div>';
+}
 function mdLite(escaped){
   const lines=String(escaped).split('\n');
   let out=[], list=null;
   const flush=()=>{ if(list){ out.push('</'+list+'>'); list=null; } };
-  for(const ln of lines){
+  for(let li=0; li<lines.length; li++){
+    const ln=lines[li];
     let m;
+    if(isPipeRow(ln)&&li+1<lines.length&&isPipeRule(lines[li+1])){
+      flush();
+      const header=pipeCells(ln); const rows=[];
+      let j=li+2;
+      while(j<lines.length&&isPipeRow(lines[j])){rows.push(pipeCells(lines[j]));j++;}
+      out.push(pipeTable(header,rows));
+      li=j-1; continue;
+    }
     if((m=ln.match(/^\s*[-*\u2022]\s+(.*)$/))){
       if(list!=='ul'){ flush(); out.push('<ul>'); list='ul'; }
       out.push('<li>'+m[1]+'</li>');
@@ -2564,6 +2614,17 @@ function renderToolBody(name,data,args){
     if(name==='wiki_lookup') return renderWikiPassages(data);
     if(name==='get_top_billing_customers') return renderTopBilling(data);
     if(name==='run_playbook') return renderPlaybook(data);
+    if(name==='ask_user'){
+      const c=el('div','card');
+      c.append(el('h2',null,'Clarification requested'));
+      const clar=(data||{}).clarification||{};
+      const b=el('div','pad');
+      b.innerHTML='<b>'+esc(clar.question||'')+'</b>'+
+        '<div style="margin-top:4px;color:var(--muted)">'+
+        (clar.options||[]).map(esc).join(' \u00b7 ')+'</div>';
+      c.append(b);
+      return c;
+    }
     if(name==='run_sql') return renderSql(data);
     if(name==='search_metadata') return renderMetadataSearch(data);
     if(name==='get_metadata_context') return renderMetadataContext(data);
@@ -5341,6 +5402,25 @@ async function send(messageOverride,appendUser){
         acts.append(both);
       }
       b.append(acts);
+      /* A turn that ended in ask_user hands the user a choice. The
+         structured form rides on the tool call itself, so the buttons are
+         built from what the SERVER accepted — never re-parsed from the
+         model's prose. Clicking one sends that option as the next
+         message, exactly as if it had been typed. */
+      const ask=[...(j.tool_calls||[])].reverse().find(c=>
+        c.tool==='ask_user'&&c.ok!==false&&c.result&&c.result.clarification);
+      if(ask){
+        const clar=ask.result.clarification;
+        const chips=el('div','clarify');
+        (clar.options||[]).slice(0,6).forEach(option=>{
+          const chip=el('button','csvbtn',esc(String(option)));
+          chip.type='button';
+          chip.onclick=()=>{ chips.querySelectorAll('button').forEach(x=>x.disabled=true);
+                             send(String(option),true); };
+          chips.append(chip);
+        });
+        b.append(chips);
+      }
       msgs.append(b);
       renderFollowUps(msgs,j.suggestions);
     }

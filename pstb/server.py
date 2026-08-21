@@ -388,6 +388,51 @@ def _sourced(source: str, method: str, /, **kw) -> dict:
 
 
 @mcp.tool()
+def ask_user(question: str, options: str = "") -> dict:
+    """END this turn by asking the user ONE question with concrete choices.
+
+    Use ONLY when a required choice is genuinely the user's: a parameter is
+    ambiguous and tools in THIS conversation (or the user's own words)
+    produced 2-6 concrete candidates -- which business unit of the several
+    they can see, which fiscal year, which of the near-duplicate tables.
+    options is comma-separated and every option must come from data or the
+    user's message, never invented. Never use it to stall, never twice in a
+    turn, never when one more discovery call would answer it yourself, and
+    the question must contain no financial figures. After calling, STOP:
+    the turn ends and the user replies.
+    """
+    text = " ".join(str(question or "").split())
+    if not text:
+        raise ValueError("a clarification needs the question itself")
+    if len(text) > 300:
+        raise ValueError(
+            "a clarification question is one sentence, not a briefing; "
+            "state the ambiguity in under 300 characters")
+    parts = [" ".join(part.split()) for part in
+             str(options or "").split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) < 2:
+        raise ValueError(
+            "a clarification offers a real choice: give 2-6 comma-separated "
+            "options drawn from tool results or the user's own words")
+    if len(parts) > 6:
+        raise ValueError(
+            "more than 6 options is a listing, not a question; narrow it "
+            "or show the candidates in a normal answer instead")
+    overlong = [part for part in parts if len(part) > 80]
+    if overlong:
+        raise ValueError(
+            f"option {overlong[0][:40]!r}... is longer than 80 characters; "
+            "options are labels, not explanations")
+    return {
+        "clarification": {"question": text, "options": parts},
+        "turn_ends": True,
+        "note": ("The turn ends here. Do not call further tools and do not "
+                 "answer the original question; the user will choose."),
+    }
+
+
+@mcp.tool()
 def get_trial_balance(
     business_unit: str = "",
     fiscal_year: int = 0,

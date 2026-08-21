@@ -155,7 +155,14 @@ SOURCE_SILO_TOOLS = frozenset({
 # route's positive allowlist, and exporting a result must never acquire a
 # local-write capability merely because chat gained one.
 SOURCE_SILO_PROPOSAL_TOOLS = frozenset({"propose_metadata_meaning"})
-SOURCE_SILO_CHAT_TOOLS = SOURCE_SILO_TOOLS | SOURCE_SILO_PROPOSAL_TOOLS
+# The one tool that ENDS a turn instead of answering it: the model hands
+# the user a question with concrete options. Chat-only, and deliberately
+# absent from SOURCE_SILO_TOOLS -- that set is also the export route's
+# positive allowlist, and an export must never end in a question.
+CLARIFICATION_TOOL = "ask_user"
+
+SOURCE_SILO_CHAT_TOOLS = (SOURCE_SILO_TOOLS | SOURCE_SILO_PROPOSAL_TOOLS
+                          | {CLARIFICATION_TOOL})
 
 # These names look like generic database discovery, but their implementations
 # are deliberately tied to the primary PeopleSoft engine or to a global
@@ -3064,6 +3071,46 @@ def payload_numbers(payloads) -> set:
     set it returns; provenance is additive, not a migration.
     """
     return set(tagged_payload_numbers(payloads))
+
+
+def clarification_violation(question: str, payloads) -> str:
+    """Why this clarification may not be shown, or "" when it may.
+
+    A clarification turn is exempt from the evidence gate -- a question
+    asserts nothing, so demanding evidence for it would kill the feature.
+    That exemption is exactly the hole a confident model would smuggle a
+    figure through: "your balance is 4,212,340.55 -- want the detail?" is
+    an unevidenced answer wearing a question mark. So the exemption is
+    conditional, and the condition reuses the same figure machinery as the
+    number guard: every amount-shaped figure in the question must exist in
+    a tool payload from this conversation.
+
+    Stricter than ungrounded_figures in one deliberate way: with no
+    payloads at all, that guard has nothing to compare against and stays
+    quiet, which is correct for answers (the domain gate already refused
+    them) but would let a paymentless turn ask a figure-bearing question.
+    Here, no payloads means no figures are grounded, so any non-exempt
+    figure is a violation. Years, fiscal periods, account numbers and
+    percentages stay exempt -- "FY2025 or FY2026?" is the canonical
+    legitimate clarification.
+    """
+    text = str(question or "")
+    grounded = payload_numbers(payloads)
+    exempt_spans = [m.span() for m in _FIGURE_EXEMPT.finditer(text)]
+
+    def inside_exempt(span) -> bool:
+        return any(a <= span[0] and span[1] <= b for a, b in exempt_spans)
+
+    for match in _FIGURE.finditer(text):
+        if inside_exempt(match.span()):
+            continue
+        key = _numeric_key(match.group(0))
+        if key in grounded or key.lstrip("-") in {
+                g.lstrip("-") for g in grounded}:
+            continue
+        return (f"the question states {match.group(0)}, which no tool "
+                "result in this conversation produced")
+    return ""
 
 
 def ungrounded_figures(answer: str, payloads) -> list:
