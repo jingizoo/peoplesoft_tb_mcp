@@ -124,6 +124,10 @@ FINANCIAL_EVIDENCE_TOOLS = {
 _SOURCE_SCOPED_TOOLS = (
     "run_sql", "explain_query", "join_path", "search_records",
     "profile_record", "compare_records", "list_tables", "describe_table",
+    # Review finding: admitted to the silo allowlist without joining this
+    # tuple, the health tool took no source injection and no conflict
+    # check -- a p2go conversation could ask for default-database health.
+    "get_table_health",
     # These read the offline multi-source catalog rather than a live DB, but
     # source is the same namespace boundary. A P2Go chat must not discover a
     # default-database object and then present it as P2Go context.

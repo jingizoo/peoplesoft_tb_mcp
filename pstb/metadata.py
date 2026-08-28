@@ -2477,7 +2477,10 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
     edges = 0
     collected: dict = {}
     for pair in pairs:
-        if probes + 2 > budget:
+        if probes + 4 > budget:
+            # A pair costs up to FOUR queries (two per direction); the old
+            # +2 reservation let the final pair overshoot the documented
+            # hard cap.
             state.limit(source, "value_joins", budget, probes)
             break
         left, right = pair["left"], pair["right"]
@@ -2490,6 +2493,11 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
             continue
         f_conf, f_pct = relmine.classify_overlap(
             forward.get("sampled", 0), forward.get("contained", 0))
+        if forward.get("sampled", 0) < 20:
+            # Below classify_overlap's minimum nothing will be claimed in
+            # either direction (both sides sample the same value space);
+            # the reverse probe would be two guaranteed-wasted queries.
+            continue
         try:
             backward = relmine.probe_containment(
                 db, right, left, sample_rows=sample_rows)
@@ -2515,15 +2523,20 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
             key = (child["node_id"], parent["node_id"])
             entry = collected.setdefault(key, {
                 "confidence": conf, "pairs": [], "evidence": [],
-                "cardinality": ("one_to_one" if mutual else "many_to_one"),
             })
             if conf == "likely":
                 entry["confidence"] = "likely"
+            # Mutuality and confidence are PER PAIR: the first pair's
+            # direction result must not stamp the whole edge, and a
+            # "possible" pair must stay visibly possible even when it
+            # rides an edge whose headline confidence is "likely".
             entry["pairs"].append({
                 "column": child["column"],
                 "referenced_column": parent["column"],
                 "overlap_pct": pct,
                 "sampled": probe.get("sampled", 0),
+                "confidence": conf,
+                "mutual": mutual,
             })
             entry["evidence"].append(
                 f"{probe.get('contained', 0)}/{probe.get('sampled', 0)} "
@@ -2544,7 +2557,13 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
                 "overlap_pct": max(pair["overlap_pct"]
                                    for pair in entry["pairs"]),
                 "sampled": max(pair["sampled"] for pair in entry["pairs"]),
-                "cardinality": entry["cardinality"],
+                # one_to_one only when EVERY merged pair was contained in
+                # both directions; anything less is many_to_one however
+                # the pairs happened to be ordered.
+                "cardinality": ("one_to_one"
+                                if all(pair.get("mutual")
+                                       for pair in entry["pairs"])
+                                else "many_to_one"),
                 "measured": True,
             })
         edges += 1
@@ -3969,6 +3988,7 @@ class MetadataCatalog:
                     "evidence": row["edge_evidence"],
                     "overlap_pct": attrs.get("overlap_pct"),
                     "sampled": attrs.get("sampled"),
+                    "measurements": attrs.get("measurements") or [],
                     "cardinality": attrs.get("cardinality"),
                     "caveat": (
                         "MEASURED, not declared: this relationship was "
@@ -4104,49 +4124,62 @@ class MetadataCatalog:
                     "queryable_join": True, "snapshot": snapshot,
                 }
 
-            queue = deque([(start, [])])
-            visited = {start["id"]}
             graph_truncated = False
+            visited: set = set()
             found_path: list[dict] | None = None
-            while queue and found_path is None:
-                node, path = queue.popleft()
-                if len(path) >= hops_cap:
-                    continue
-                neighbours, truncated = self._relationship_neighbours(
-                    con, node, src)
-                graph_truncated = graph_truncated or truncated
-                for edge in neighbours:
-                    nxt = edge["next"]
-                    if str(nxt["id"]) in excluded:
+            # Two passes, declared first. A search that mixed the classes
+            # let a 1-hop MEASURED edge shadow a 2-hop declared path --
+            # destroying the JOIN SQL and the intent evidence the declared
+            # path carries. Measurement is only consulted when declaration
+            # has nothing.
+            for admit_measured in (False, True):
+                queue = deque([(start, [])])
+                visited = {start["id"]}
+                while queue and found_path is None:
+                    node, path = queue.popleft()
+                    if len(path) >= hops_cap:
                         continue
-                    if nxt["id"] in visited:
-                        continue
-                    visited.add(nxt["id"])
-                    hop = {
-                        "from": {"source": src,
-                                 "schema": node["schema_name"],
-                                 "kind": node["kind"],
-                                 "object": node["name"]},
-                        "to": {key: value for key, value in nxt.items()
-                               if key != "id"},
-                        **{key: value for key, value in edge.items()
-                           if key != "next"},
-                    }
-                    candidate = [*path, hop]
-                    if nxt["id"] == goal["id"]:
-                        found_path = candidate
-                        break
-                    if len(visited) >= MAX_RELATION_VISITED:
-                        graph_truncated = True
-                        queue.clear()
-                        break
-                    # Convert the compact node mapping back to the row-like
-                    # keys the neighbour reader consumes.
-                    node_row = con.execute(
-                        "SELECT * FROM nodes WHERE id=?", (nxt["id"],)
-                    ).fetchone()
-                    if node_row is not None:
-                        queue.append((node_row, candidate))
+                    neighbours, truncated = self._relationship_neighbours(
+                        con, node, src)
+                    graph_truncated = graph_truncated or truncated
+                    for edge in neighbours:
+                        if (not admit_measured
+                                and edge.get("relationship")
+                                == "value_overlap"):
+                            continue
+                        nxt = edge["next"]
+                        if str(nxt["id"]) in excluded:
+                            continue
+                        if nxt["id"] in visited:
+                            continue
+                        visited.add(nxt["id"])
+                        hop = {
+                            "from": {"source": src,
+                                     "schema": node["schema_name"],
+                                     "kind": node["kind"],
+                                     "object": node["name"]},
+                            "to": {key: value for key, value in nxt.items()
+                                   if key != "id"},
+                            **{key: value for key, value in edge.items()
+                               if key != "next"},
+                        }
+                        candidate = [*path, hop]
+                        if nxt["id"] == goal["id"]:
+                            found_path = candidate
+                            break
+                        if len(visited) >= MAX_RELATION_VISITED:
+                            graph_truncated = True
+                            queue.clear()
+                            break
+                        # Convert the compact node mapping back to the
+                        # row-like keys the neighbour reader consumes.
+                        node_row = con.execute(
+                            "SELECT * FROM nodes WHERE id=?", (nxt["id"],)
+                        ).fetchone()
+                        if node_row is not None:
+                            queue.append((node_row, candidate))
+                if found_path is not None:
+                    break
 
             if found_path is None:
                 return {
@@ -4161,9 +4194,11 @@ class MetadataCatalog:
                     "graph_truncated": graph_truncated,
                     "snapshot": snapshot,
                     "detail": (
-                        "No path of native foreign keys or view dependencies "
-                        f"was found within {hops_cap} hops. Matching column "
-                        "names alone are not promoted to relationships."
+                        "No path of native foreign keys, view dependencies, "
+                        "or measured value-overlap joins was found within "
+                        f"{hops_cap} hops. Matching column names alone are "
+                        "not promoted to relationships; measured joins come "
+                        "only from sampled value containment."
                         + (" The bounded traversal was truncated; absence is "
                            "inconclusive." if graph_truncated else "")),
                 }
@@ -4182,10 +4217,16 @@ class MetadataCatalog:
                 "graph_truncated": graph_truncated,
                 "snapshot": snapshot,
                 "basis": (
-                    "Only database-native foreign keys and view-dependency "
-                    "edges from this source artifact were traversed. "
-                    "Foreign-key column pairs are literal catalog evidence; "
-                    "view lineage does not claim join columns."),
+                    ("This path includes MEASURED value-overlap hops: "
+                     "inferred from sampled value containment, labeled on "
+                     "each hop, and never compiled into join SQL. Declared "
+                     "paths were searched first and none existed."
+                     if any(hop.get("relationship") == "value_overlap"
+                            for hop in found_path) else
+                     "Only database-native foreign keys and view-dependency "
+                     "edges from this source artifact were traversed. "
+                     "Foreign-key column pairs are literal catalog evidence; "
+                     "view lineage does not claim join columns.")),
             }
         finally:
             con.close()

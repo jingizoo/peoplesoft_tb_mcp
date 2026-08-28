@@ -2668,6 +2668,12 @@ function renderToolBody(name,data,args){
         c.append(t);
       }
       const d2=(data||{}).duplicate_keys||{};
+      if(!d2.checked&&(d2.skipped||d2.error)){
+        const line=el('div','pad');
+        line.innerHTML='<b>Duplicate keys</b> '+
+          '<span class="badge warn">'+esc(d2.skipped||d2.error)+'</span>';
+        c.append(line);
+      }
       if(d2.checked){
         const line=el('div','pad');
         const n=d2.duplicate_groups;
@@ -2680,13 +2686,23 @@ function renderToolBody(name,data,args){
       }
       (data.relationships||[]).forEach(r=>{
         const line=el('div','pad');
-        const orphan=(r.orphans_in_sample||0)>0
-          ?'<span class="badge bad">'+r.orphans_in_sample+' orphan'+
-            (r.orphans_in_sample===1?'':'s')+' / '+r.sampled+' sampled</span>'
-          :(r.error?'<span class="badge warn">'+esc(r.error)+'</span>'
-            :'<span class="badge ok">0 orphans / '+(r.sampled||0)+' sampled</span>');
+        /* Distinct-VALUE vocabulary on purpose: 7/200 is a share of
+           sampled values, not rows. And a probe that sampled nothing is
+           NEUTRAL, never a green pass — 0/0 proves only that nothing was
+           measured. */
+        const orphan=r.skipped
+          ?'<span class="badge dim">'+esc(r.skipped)+'</span>'
+          :(r.error
+            ?'<span class="badge warn">'+esc(r.error)+'</span>'
+            :(!r.sampled_distinct
+              ?'<span class="badge dim">no non-null values sampled — nothing measured</span>'
+              :((r.orphaned_distinct||0)>0
+                ?'<span class="badge bad">'+r.orphaned_distinct+' orphaned value'+
+                  (r.orphaned_distinct===1?'':'s')+' / '+r.sampled_distinct+' sampled</span>'
+                :'<span class="badge ok">0 orphaned values / '+r.sampled_distinct+' sampled</span>')));
         line.innerHTML='<b>'+esc(r.via||'')+'</b> \u2192 <code>'+esc(r.parent||'')+
           '</code> '+orphan+
+          (r.probed_pair?' <span class="sub">'+esc(r.probed_pair)+'</span>':'')+
           (r.relationship==='value_overlap'
             ?' <span class="badge warn" title="'+esc(r.caveat||'')+'">measured join</span>':'')+
           '';

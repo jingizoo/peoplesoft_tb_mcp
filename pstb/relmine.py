@@ -195,15 +195,39 @@ def classify_overlap(sampled: int, contained: int, *,
     return "", round(pct, 4)
 
 
+def bounded_select(dialect: str, inner: str, cap: int) -> str:
+    """``inner`` capped to ``cap`` rows in the current dialect's syntax.
+
+    SQL Server has no LIMIT; emitting one produced invalid T-SQL from
+    both new query builders (review finding). The OFFSET/FETCH form
+    needs an ORDER BY, and (SELECT NULL) is the standard no-order anchor.
+    """
+    d = str(dialect or "").lower()
+    n = max(int(cap), 1)
+    if d == "oracle":
+        return f"{inner} FETCH FIRST {n} ROWS ONLY"
+    if d == "sqlserver":
+        return (f"{inner} ORDER BY (SELECT NULL) "
+                f"OFFSET 0 ROWS FETCH NEXT {n} ROWS ONLY")
+    return f"{inner} LIMIT {n}"
+
+
 def probe_containment(db, child: Mapping, parent: Mapping, *,
                       sample_rows: int = 100) -> dict:
     """One direction: are child's values present among parent's?
 
-    Two bounded queries, never a scan of either full table:
-    1. DISTINCT sample of the child column (LIMIT / FETCH FIRST).
-    2. COUNT of how many of those sampled values exist in the parent
-       column, bound as named IN-list parameters — values transit the
-       connection and are never retained.
+    Two queries whose READS are bounded on the inside, not just whose
+    outputs are capped (review finding: 'SELECT DISTINCT col ... FETCH
+    FIRST 100' must read the whole table before Oracle's stop key when
+    the column is low-cardinality — the cap has to sit under the
+    DISTINCT, not over it):
+    1. DISTINCT over a bounded inner read of the child column.
+    2. COUNT DISTINCT over a bounded inner read of the parent rows
+       matching the sampled values, bound as named IN-list parameters —
+       values transit the connection and are never retained.
+    A sample below classify_overlap's minimum is returned as-is; callers
+    skip the reverse probe rather than spend two more queries on a
+    result the classifier will refuse anyway.
     """
     dialect = str(getattr(db, "dialect", "")).lower()
     # Identifiers come from the catalog, which read them from the
@@ -222,24 +246,32 @@ def probe_containment(db, child: Mapping, parent: Mapping, *,
     parent_col = str(parent["column"])
     parent_table = f'{parent["schema"]}.{parent["table"]}' \
         if parent.get("schema") else str(parent["table"])
-    # The cap is inlined as a validated integer, not bound: whether a
-    # bind is legal inside FETCH FIRST varies by driver version, and a
-    # sampling cap is configuration, not data.
+    # Caps are inlined as validated integers, not bound: whether a bind
+    # is legal inside FETCH FIRST varies by driver version, and a
+    # sampling cap is configuration, not data. The inner read is bounded
+    # at 50x the sample so a repetitive column still yields distincts
+    # without the read ever being unbounded.
     cap = max(int(sample_rows), 1)
-    limit = (f"FETCH FIRST {cap} ROWS ONLY" if dialect == "oracle"
-             else f"LIMIT {cap}")
+    inner = bounded_select(
+        dialect,
+        f"SELECT {child_col} AS v FROM {child_table} "
+        f"WHERE {child_col} IS NOT NULL",
+        cap * 50)
     rows, _ = db.query(
-        f"SELECT DISTINCT {child_col} AS v FROM {child_table} "
-        f"WHERE {child_col} IS NOT NULL {limit}",
+        f"SELECT DISTINCT v FROM ({inner}) s",
         {}, max_rows=cap)
     values = [row.get("v") for row in rows if row.get("v") is not None]
     if not values:
         return {"sampled": 0, "contained": 0}
     binds = {f"v{i}": value for i, value in enumerate(values)}
     placeholders = ",".join(f":v{i}" for i in range(len(values)))
-    counted, _ = db.query(
-        f"SELECT COUNT(DISTINCT {parent_col}) AS n FROM {parent_table} "
+    parent_inner = bounded_select(
+        dialect,
+        f"SELECT {parent_col} AS v FROM {parent_table} "
         f"WHERE {parent_col} IN ({placeholders})",
+        len(values) * 50)
+    counted, _ = db.query(
+        f"SELECT COUNT(DISTINCT v) AS n FROM ({parent_inner}) s",
         binds, max_rows=1)
     contained = int((counted[0].get("n") if counted else 0) or 0)
     return {"sampled": len(values), "contained": contained}
