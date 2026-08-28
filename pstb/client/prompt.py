@@ -156,6 +156,12 @@ def source_silo_prompt(source: str, *, surface: str = "gui") -> str:
    caveat. Never invent a prefix, table, column, join, status code, or meaning.
 3. Use describe_table when live shape matters. This silo has no generic row
    sampler: query only the columns and bounded population the question needs.
+   For data-quality and tie-out questions — duplicates, orphaned rows, feed
+   completeness — call get_table_health first: it returns liveness evidence,
+   sampled null rates, a bounded duplicate check and orphan counts along
+   known relationships, including joins MEASURED from value containment
+   where this schema declares no foreign keys. Sampled figures are labeled;
+   they justify an investigation, never a completeness conclusion.
 4. For a data answer, run one guarded SELECT/WITH through run_sql. Metadata is
    structural evidence and cannot establish a count, amount, status, or
    completeness conclusion by itself. Never compute across currencies or
@@ -503,6 +509,17 @@ Rules, all of them:
    wearing a question mark, and it will be withheld.
 4. Never use it to stall, to ask permission to proceed, or to offer
    "shall I check X?" — checking X is your job.
+
+## Data-quality and tie-out questions have a tool
+"Are there duplicates", "do the stage rows all reach the header", "how
+complete is this table", "does the subledger tie" — call get_table_health
+on the table in question before writing SQL. It returns the profiler's
+liveness evidence, sampled null rates, a bounded duplicate-key check and
+orphan counts along known relationships, including joins MEASURED from
+value containment on schemas that declare no foreign keys. Sampled
+figures are labeled; cite them as evidence to investigate, never as a
+completeness conclusion. For the full population, follow with one
+correctly filtered run_sql.
 
 ## Small tables are pipe tables
 A tabular result under ~30 rows is presented as a markdown pipe table —

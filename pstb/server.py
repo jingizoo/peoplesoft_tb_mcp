@@ -437,6 +437,201 @@ def _sourced(source: str, method: str, /, **kw) -> dict:
     return out
 
 
+def _table_health(table: str, source: str) -> dict:
+    """The health engine behind get_table_health; see the tool docstring."""
+    from . import relmine
+
+    name, catalog = _metadata_for_source(source)
+    context = catalog.context(table, source=name, limit=20)
+    if not isinstance(context, dict) or context.get("found") is not True \
+            or context.get("ambiguous"):
+        return {
+            "source_database": name,
+            "error": str((context or {}).get("detail")
+                         or "the catalog did not resolve one exact object"),
+            "candidates": (context or {}).get("candidates") or [],
+        }
+    subject = context.get("subject") or {}
+    schema = str(subject.get("schema") or "")
+    physical = str(subject.get("physical_object") or "")
+    kind = str(subject.get("kind") or "").lower()
+    useful = context.get("usefulness") or {}
+    qualified = f"{schema}.{physical}" if schema else physical
+
+    for part in (schema, physical):
+        if part and not relmine._SAFE_IDENT.fullmatch(part):
+            return {"source_database": name,
+                    "error": f"unsafe identifier {part[:40]!r}"}
+
+    bound = engine.for_source(source)
+    db = bound.db
+    dialect = str(getattr(db, "dialect", "")).lower()
+
+    def bounded(inner: str, cap: int) -> str:
+        if dialect == "oracle":
+            return f"{inner} FETCH FIRST {int(cap)} ROWS ONLY"
+        return f"{inner} LIMIT {int(cap)}"
+
+    caveats: list[str] = []
+    estimate = useful.get("row_estimate")
+    large = isinstance(estimate, (int, float)) and estimate > 2_000_000
+    if large:
+        caveats.append(
+            f"the profiler estimates {int(estimate):,} rows; exact "
+            "duplicate counting was skipped to avoid a full scan — "
+            "null rates and orphan checks are sampled either way")
+
+    # ---- columns worth checking: key-shaped first, then declared order
+    columns = []
+    for column in context.get("columns") or []:
+        cname = str(column.get("name") or "")
+        if cname and relmine._SAFE_IDENT.fullmatch(cname):
+            columns.append(cname)
+    key_first = sorted(
+        columns, key=lambda c: (not relmine.is_key_shaped(c),
+                                columns.index(c)))[:12]
+
+    # ---- null rates over a bounded sample (one query, never a scan)
+    null_rates: list[dict] = []
+    sampled_rows = 0
+    if key_first and kind in ("table", "view"):
+        selects = ", ".join(
+            f"COUNT({c}) AS nn_{i}" for i, c in enumerate(key_first))
+        try:
+            rows, _ = db.query(
+                f"SELECT COUNT(*) AS n, {selects} FROM "
+                f"({bounded(f'SELECT * FROM {qualified}', 5000)}) t",
+                {}, max_rows=1)
+            row = rows[0] if rows else {}
+            sampled_rows = int(row.get("n") or 0)
+            for i, column in enumerate(key_first):
+                non_null = int(row.get(f"nn_{i}") or 0)
+                nulls = max(sampled_rows - non_null, 0)
+                null_rates.append({
+                    "column": column, "nulls": nulls,
+                    "null_pct": (round(nulls / sampled_rows, 4)
+                                 if sampled_rows else None)})
+        except DbError as exc:
+            caveats.append(f"null-rate sample failed: {exc}")
+    if sampled_rows:
+        caveats.append(
+            f"null rates are measured over the first {sampled_rows:,} "
+            "rows the database returned, not the full population")
+
+    # ---- duplicate candidate keys (exact but bounded; skipped when large)
+    duplicates: dict = {"checked": False}
+    unique_cols: list[str] = []
+    basis = ""
+    for index in context.get("indexes") or []:
+        if index.get("unique") and index.get("columns"):
+            unique_cols = [str(c) for c in index["columns"]][:3]
+            basis = f"declared unique index {index.get('name')}"
+            break
+    if not unique_cols:
+        unique_cols = [c for c in key_first
+                       if relmine.is_key_shaped(c)][:3]
+        basis = "heuristic key-shaped columns"
+    unique_cols = [c for c in unique_cols
+                   if relmine._SAFE_IDENT.fullmatch(c)]
+    if unique_cols and kind == "table" and not large:
+        group = ", ".join(unique_cols)
+        try:
+            rows, _ = db.query(
+                "SELECT COUNT(*) AS g FROM ("
+                + bounded(
+                    f"SELECT 1 AS x FROM {qualified} GROUP BY {group} "
+                    "HAVING COUNT(*) > 1", 51)
+                + ") d", {}, max_rows=1)
+            groups = int((rows[0].get("g") if rows else 0) or 0)
+            duplicates = {
+                "checked": True, "key_columns": unique_cols,
+                "basis": basis,
+                "duplicate_groups": ("50+" if groups > 50 else groups)}
+        except DbError as exc:
+            duplicates = {"checked": False, "key_columns": unique_cols,
+                          "basis": basis, "error": str(exc)}
+
+    # ---- referential integrity along known relationships
+    relationships: list[dict] = []
+    ring = catalog.relationships_of(qualified, source=name)
+    for edge in (ring.get("relationships") or []):
+        if len(relationships) >= 3:
+            break
+        if edge.get("direction") != "references":
+            continue
+        pairs = edge.get("column_pairs") or []
+        if len(pairs) != 1:
+            continue
+        left = str(pairs[0].get("left_column") or "")
+        right = str(pairs[0].get("right_column") or "")
+        target = edge.get("next") or {}
+        entry = {
+            "parent": ".".join(p for p in (target.get("schema"),
+                                           target.get("object")) if p),
+            "via": f"{left} -> {right}",
+            "relationship": edge.get("relationship"),
+            "confidence": edge.get("confidence"),
+        }
+        if edge.get("relationship") == "value_overlap":
+            entry["caveat"] = (
+                "this relationship is MEASURED from value containment, "
+                "not declared; treat orphan counts as evidence to "
+                "investigate, not as a broken constraint")
+        try:
+            probe = relmine.probe_containment(
+                db,
+                {"schema": schema, "table": physical, "column": left},
+                {"schema": target.get("schema"),
+                 "table": target.get("object"), "column": right},
+                sample_rows=200)
+            sampled = int(probe.get("sampled") or 0)
+            contained = int(probe.get("contained") or 0)
+            entry["sampled"] = sampled
+            entry["orphans_in_sample"] = max(sampled - contained, 0)
+            entry["orphan_pct"] = (round((sampled - contained) / sampled, 4)
+                                   if sampled else None)
+        except DbError as exc:
+            entry["error"] = str(exc)
+        relationships.append(entry)
+
+    return {
+        "source_database": name,
+        "object": {"schema": schema, "name": physical, "kind": kind},
+        "profile": {
+            "liveness": useful.get("liveness"),
+            "row_estimate": useful.get("row_estimate"),
+            "value_score": useful.get("value_score"),
+            "caveat": useful.get("caveat") or "",
+        },
+        "null_rates": null_rates,
+        "sampled_rows": sampled_rows,
+        "duplicate_keys": duplicates,
+        "relationships": relationships,
+        "caveats": caveats,
+        "note": (
+            "Counts and percentages only — no row values leave the "
+            "database. Sampled figures are labeled; they support an "
+            "investigation, never a completeness conclusion."),
+    }
+
+
+@mcp.tool()
+def get_table_health(table: str, source: str = "") -> dict:
+    """Data-quality and referential-integrity evidence for ONE table/view,
+    in any workspace. Use for reconciliation- and audit-shaped questions:
+    "do the stage rows all reach the header", "are there duplicate
+    vouchers", "how complete is this feed table". Returns the profiler's
+    liveness/row evidence, sampled null rates for key-shaped columns, a
+    bounded duplicate-key check, and orphan counts along KNOWN
+    relationships -- declared foreign keys first, then joins MEASURED from
+    value containment (labeled, with their overlap evidence; measurement
+    is not declaration). Counts and percentages only: no row values are
+    returned, sampled figures are labeled sampled, and nothing here is a
+    completeness conclusion on its own. table: exact name or schema.name.
+    source: which database; required scope rules match describe_table."""
+    return _safe(_table_health, table=table, source=source)
+
+
 @mcp.tool()
 def ask_user(question: str, options: str = "") -> dict:
     """END this turn by asking the user ONE question with concrete choices.

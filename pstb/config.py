@@ -205,6 +205,14 @@ class MetadataCatalogCfg:
     max_peopletools_rows: int = 500_000
     query_page_size: int = 5_000
     stale_after_hours: int = 168
+    # Value-overlap join mining: bounded probes that measure undeclared
+    # relationships from data containment. Off only if a site objects to
+    # any sampled reads during a catalog build.
+    mine_value_joins: bool = True
+    mine_max_tables: int = 40
+    mine_max_pairs: int = 120
+    mine_sample_rows: int = 100
+    mine_max_probes: int = 240
 
 
 @dataclass

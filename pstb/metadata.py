@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import profiling
+from . import profiling, relmine
 from .config import normalize_db_schemas
 from .db import DbError
 
@@ -524,6 +524,13 @@ class MetadataBuildLimits:
     max_peopletools_rows: int = 500_000
     query_page_size: int = 5_000
     stale_after_hours: int = 168
+    # Value-overlap join mining (relmine). Bounded by construction: probes
+    # are two small queries per pair and the budget is a hard ceiling.
+    mine_value_joins: bool = True
+    mine_max_tables: int = 40
+    mine_max_pairs: int = 120
+    mine_sample_rows: int = 100
+    mine_max_probes: int = 240
 
     @classmethod
     def from_config(cls, cfg=None, **overrides):
@@ -2400,6 +2407,155 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
     return "complete"
 
 
+def _collect_value_joins(state: _Writer, source: str, db) -> str:
+    """Mine undeclared joins by measuring value containment (relmine).
+
+    Runs after the profiler on purpose: candidates are restricted to
+    tables the profiler measured POPULATED and that no shadow edge
+    redirects, so probes are never spent on dead copies. Everything else
+    -- pair generation, thresholds, the identifier gate -- lives in
+    pstb/relmine.py as pure logic; this collector only feeds it the
+    artifact and the connection, under a hard probe budget.
+    """
+    limits = state.limits
+    if not getattr(limits, "mine_value_joins", True):
+        return "disabled"
+    con = state.con
+
+    shadows = {row[0] for row in con.execute(
+        "SELECT src FROM edges WHERE kind='shadow_of'")}
+    tables = []
+    for row in con.execute(
+            "SELECT node_id, schema_name, name, value_score "
+            "FROM object_profiles WHERE source=? AND kind='table' "
+            "AND liveness='populated' ORDER BY value_score DESC LIMIT ?",
+            (source, int(getattr(limits, "mine_max_tables", 40)))):
+        if row["node_id"] in shadows:
+            continue
+        columns = [
+            {"name": c["name"], "data_type": _json(c["attrs"]).get("data_type")}
+            for c in con.execute(
+                "SELECT n.name AS name, n.attrs AS attrs FROM edges e "
+                "JOIN nodes n ON n.id=e.dst WHERE e.src=? "
+                "AND e.kind='object_has_column'", (row["node_id"],))]
+        tables.append({"schema": row["schema_name"], "name": row["name"],
+                       "node_id": row["node_id"],
+                       "value_score": row["value_score"],
+                       "columns": columns})
+    if len(tables) < 2:
+        return "not_enough_tables"
+
+    # Declared FK column pairs, both orders: the miner answers only where
+    # the schema is silent.
+    declared = set()
+    for row in con.execute(
+            "SELECT o.schema_name AS ls, o.name AS lt, f.attrs AS attrs, "
+            "n.schema_name AS rs, n.name AS rt "
+            "FROM edges oc JOIN nodes c ON c.id=oc.dst "
+            "JOIN edges f ON f.src=c.id JOIN nodes n ON n.id=f.dst "
+            "JOIN nodes o ON o.id=oc.src "
+            "WHERE oc.kind='object_has_constraint' "
+            "AND f.kind='foreign_key_references_object'"):
+        for pair in (_json(row["attrs"]).get("column_pairs") or []):
+            left = (str(row["ls"] or "").upper(), str(row["lt"] or "").upper(),
+                    str(pair.get("column") or "").upper())
+            right = (str(row["rs"] or "").upper(),
+                     str(row["rt"] or "").upper(),
+                     str(pair.get("referenced_column") or "").upper())
+            declared.add(left + right)
+            declared.add(right + left)
+
+    pairs = relmine.candidate_pairs(
+        tables, declared=declared,
+        max_pairs=int(getattr(limits, "mine_max_pairs", 120)))
+    if not pairs:
+        return "no_candidates"
+
+    budget = int(getattr(limits, "mine_max_probes", 240))
+    sample_rows = int(getattr(limits, "mine_sample_rows", 100))
+    probes = 0
+    edges = 0
+    collected: dict = {}
+    for pair in pairs:
+        if probes + 2 > budget:
+            state.limit(source, "value_joins", budget, probes)
+            break
+        left, right = pair["left"], pair["right"]
+        try:
+            forward = relmine.probe_containment(
+                db, left, right, sample_rows=sample_rows)
+            probes += 2
+        except DbError:
+            probes += 2
+            continue
+        f_conf, f_pct = relmine.classify_overlap(
+            forward.get("sampled", 0), forward.get("contained", 0))
+        try:
+            backward = relmine.probe_containment(
+                db, right, left, sample_rows=sample_rows)
+            probes += 2
+        except DbError:
+            backward = {"sampled": 0, "contained": 0}
+            probes += 2
+        b_conf, b_pct = relmine.classify_overlap(
+            backward.get("sampled", 0), backward.get("contained", 0))
+        if not f_conf and not b_conf:
+            continue
+        mutual = bool(f_conf and b_conf)
+        # child -> parent for each containment direction that held; a
+        # mutual containment is one relation marked one_to_one. Collected
+        # per table pair rather than written immediately: the edges table
+        # keys on (src, dst, kind), so a second measured column pair
+        # between the same two tables would be silently discarded by the
+        # ON CONFLICT clause — evidence lost with no trace.
+        emit = [(left, right, f_conf, f_pct, forward)] if f_conf else []
+        if b_conf and not mutual:
+            emit.append((right, left, b_conf, b_pct, backward))
+        for child, parent, conf, pct, probe in emit:
+            key = (child["node_id"], parent["node_id"])
+            entry = collected.setdefault(key, {
+                "confidence": conf, "pairs": [], "evidence": [],
+                "cardinality": ("one_to_one" if mutual else "many_to_one"),
+            })
+            if conf == "likely":
+                entry["confidence"] = "likely"
+            entry["pairs"].append({
+                "column": child["column"],
+                "referenced_column": parent["column"],
+                "overlap_pct": pct,
+                "sampled": probe.get("sampled", 0),
+            })
+            entry["evidence"].append(
+                f"{probe.get('contained', 0)}/{probe.get('sampled', 0)} "
+                f"sampled distinct values of {child['column']} present "
+                f"in {parent['column']}")
+    for (child_id, parent_id), entry in collected.items():
+        state.edge(
+            child_id, parent_id, "value_overlap_join",
+            confidence=entry["confidence"], collector="relmine",
+            authority="derived",
+            evidence="value containment: " + "; ".join(entry["evidence"]),
+            attrs={
+                "column_pairs": [
+                    {"column": pair["column"],
+                     "referenced_column": pair["referenced_column"]}
+                    for pair in entry["pairs"]],
+                "measurements": entry["pairs"],
+                "overlap_pct": max(pair["overlap_pct"]
+                                   for pair in entry["pairs"]),
+                "sampled": max(pair["sampled"] for pair in entry["pairs"]),
+                "cardinality": entry["cardinality"],
+                "measured": True,
+            })
+        edges += 1
+    if edges:
+        state.note(source, "value_joins",
+                   f"{edges} undeclared join(s) measured from value "
+                   "containment; each is derived evidence, not a declared "
+                   "constraint", ok=True)
+    return "complete" if edges else "no_overlaps"
+
+
 def _collect_peopletools(state: _Writer, source: str, db) -> str:
     limits = state.limits
     rec_cols = _pt_columns(db, "PSRECDEFN")
@@ -2839,6 +2995,16 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                     state.note(source, "profile",
                                f"objects were not ranked ({exc}); the "
                                "catalog itself is unaffected",
+                               ok=False, partial=True)
+                # Join mining is likewise an enhancement, guarded so it can
+                # never cost the caller the catalog. It reads the profiles
+                # the previous step wrote.
+                try:
+                    _collect_value_joins(state, source, db)
+                except Exception as exc:      # noqa: BLE001
+                    state.note(source, "value_joins",
+                               f"undeclared joins were not mined ({exc}); "
+                               "the catalog itself is unaffected",
                                ok=False, partial=True)
                 configured_schemas = list(_configured_schemas(db))
                 if configured_schemas:
@@ -3761,10 +3927,65 @@ class MetadataCatalog:
                                    "authority": row["edge_authority"]},
                 })
 
+        # Mined value-overlap joins, both directions. They rank BELOW
+        # declared constraints and view lineage in the sort key: a
+        # measured containment is evidence, a declared key is intent, and
+        # a path through intent must win when both exist. The caveat
+        # rides on every hop so no consumer mistakes one for the other.
+        for direction, where, bind in (
+                ("references", "E.src=?", "E.dst=N.id"),
+                ("referenced_by", "E.dst=?", "E.src=N.id")):
+            mined = con.execute(
+                "SELECT E.confidence AS edge_confidence,"
+                "E.evidence AS edge_evidence,E.collector AS edge_collector,"
+                "E.authority AS edge_authority,E.attrs AS edge_attrs,"
+                "N.id AS next_id,N.source AS next_source,"
+                "N.schema_name AS next_schema,N.kind AS next_kind,"
+                "N.name AS next_name FROM edges E JOIN nodes N "
+                f"ON {bind} WHERE {where} AND E.kind='value_overlap_join' "
+                "AND N.source=? AND N.kind IN ('table','view') "
+                "ORDER BY N.schema_name,N.name LIMIT ?",
+                (node["id"], source, limit)).fetchall()
+            for row in mined:
+                attrs = _json(row["edge_attrs"])
+                raw_pairs = attrs.get("column_pairs") or []
+                if direction == "referenced_by":
+                    raw_pairs = [{
+                        "column": pair.get("referenced_column"),
+                        "referenced_column": pair.get("column"),
+                    } for pair in raw_pairs]
+                found.append({
+                    "next": self._relation_node(row),
+                    "relationship": "value_overlap",
+                    "direction": direction,
+                    "constraint": None,
+                    "column_pairs": [{
+                        "left_column": pair.get("column"),
+                        "right_column": pair.get("referenced_column"),
+                        "ordinal": 1,
+                    } for pair in raw_pairs],
+                    "column_pairs_complete": True,
+                    "confidence": row["edge_confidence"],
+                    "evidence": row["edge_evidence"],
+                    "overlap_pct": attrs.get("overlap_pct"),
+                    "sampled": attrs.get("sampled"),
+                    "cardinality": attrs.get("cardinality"),
+                    "caveat": (
+                        "MEASURED, not declared: this relationship was "
+                        "inferred from sampled value containment. Strong "
+                        "evidence of a reference; no evidence of intent."),
+                    "provenance": {"collector": row["edge_collector"],
+                                   "evidence": row["edge_evidence"],
+                                   "authority": row["edge_authority"]},
+                })
+
         truncated = len(found) > MAX_RELATIONS_PER_NODE
-        # Native FKs precede view lineage; then deterministic object order.
+        # Declared intent first, lineage second, measurement last; then
+        # deterministic object order. A path through a declared key must
+        # win whenever one exists.
+        rank = {"foreign_key": 0, "view_dependency": 1, "value_overlap": 2}
         found.sort(key=lambda item: (
-            item["relationship"] != "foreign_key",
+            rank.get(item["relationship"], 3),
             item["next"]["schema"] or "", item["next"]["object"]))
         return found[:MAX_RELATIONS_PER_NODE], truncated
 
@@ -3790,6 +4011,49 @@ class MetadataCatalog:
             lines.append(
                 f"  JOIN {qualified(hop['to'])} T{position} ON {on}")
         return "\n".join(lines), True
+
+    def relationships_of(self, identifier: str, source: str = "") -> dict:
+        """One bounded ring of an object's relationships, all classes.
+
+        Declared foreign keys, view lineage, and mined value-overlap
+        joins, each labeled with its relationship class, confidence and
+        evidence -- callers that must not confuse measurement with
+        declaration (table health's orphan check, most of all) filter on
+        the class rather than guessing from confidence strings.
+        """
+        if not self.available():
+            return self._unavailable(self.path)
+        try:
+            con = self._open()
+        except MetadataError as exc:
+            return self._unavailable(self.path, str(exc))
+        try:
+            src = self._validate_source(con, source)
+            if not src:
+                available = [row[0] for row in con.execute(
+                    "SELECT name FROM sources ORDER BY name")]
+                if len(available) != 1:
+                    raise MetadataError(
+                        "relationships_of needs source= for a legacy "
+                        "multi-source artifact")
+                src = str(available[0])
+            node = self._relationship_object(con, identifier, src)
+            neighbours, truncated = self._relationship_neighbours(
+                con, node, src)
+            return {
+                "available": True, "found": True,
+                "source_database": src,
+                "object": self._node(node),
+                "relationships": neighbours,
+                "truncated": truncated,
+                "snapshot": self._snapshot(con),
+            }
+        except MetadataError as exc:
+            return {"available": True, "found": False,
+                    "source_database": source or None,
+                    "detail": str(exc), "relationships": []}
+        finally:
+            con.close()
 
     def relationship_path(self, from_object: str, to_object: str,
                           source: str = "", max_hops: int = 4,
@@ -3891,7 +4155,7 @@ class MetadataCatalog:
                     "from": self._node(start), "to": self._node(goal),
                     "hops": [], "hop_count": None,
                     "relationship_evidence_classes": [
-                        "foreign_key", "view_dependency"],
+                        "foreign_key", "view_dependency", "value_overlap"],
                     "searched_hops": hops_cap,
                     "visited_objects": len(visited),
                     "graph_truncated": graph_truncated,
