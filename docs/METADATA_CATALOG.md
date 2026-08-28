@@ -387,14 +387,26 @@ Tier 1 comes from view definitions, which are read and discarded. A view is
 often the only place a cryptically named schema writes down its own meaning,
 so two things are extracted and nothing else: join predicates between two
 qualified columns, and column aliases (`C1 AS INVOICE_NUMBER` becomes a
-searchable term on that column). Literals and comments are stripped before
-anything is matched, so a threshold or a status value in a `WHERE` clause
-cannot reach the artifact; expressions never name a column, because
+searchable term on that column). Expressions never name a column, because
 `SUM(C4) AS TOTAL_DUE` describes a computation and calling it a name for
 `C4` would be false. Both column names in a harvested join must exist on the
 objects named — on Oracle a long definition arrives through a `VARCHAR2`
 projection and is truncated, and a predicate cut mid-identifier would
-otherwise mint an edge on a column that does not exist.
+otherwise mint an edge on a column that does not exist. A composite join is
+one edge carrying every column of the condition; where a predicate had to be
+dropped, the edge says the condition is incomplete rather than presenting the
+survivors as the whole join.
+
+Literals and comments are removed by a single left-to-right scanner, not by
+ordered substitutions, because no ordering of independent substitutions is
+correct: strip comments first and a string containing `--` swallows real
+code; strip strings first and a quote inside a comment desynchronises
+everything after it. The scanner tracks which construct it is inside, so it
+also handles Oracle's alternative quoting (`q'[ ... ]'`, whose contents may
+include apostrophes) and passes double-quoted identifiers through verbatim —
+`"odd--name"` is code, not a comment. An unterminated literal or comment
+yields **nothing at all** from that definition: past it, text cannot be told
+from code, and guessing is precisely how a value becomes a join operand.
 
 ## Configuration and limits
 
