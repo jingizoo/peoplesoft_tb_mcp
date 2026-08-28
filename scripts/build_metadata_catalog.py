@@ -87,6 +87,15 @@ def main(argv=None) -> int:
     parser.add_argument("--max-dependencies", type=int, default=None)
     parser.add_argument("--max-peopletools-rows", type=int, default=None)
     parser.add_argument("--page-size", type=int, default=None)
+    parser.add_argument("--max-view-definitions", type=int, default=None)
+    # The one collector whose cost on a large Oracle instance has not been
+    # measured: it reads view text, and view counts vary by orders of
+    # magnitude between instances. An operator who finds it expensive
+    # needs to switch it off for a build without editing configuration.
+    parser.add_argument(
+        "--no-view-vocabulary", action="store_true",
+        help="skip reading view definitions for declared joins and column "
+             "vocabulary")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -144,10 +153,13 @@ def main(argv=None) -> int:
             ("max_constraint_columns", "max_constraint_columns"),
             ("max_dependencies", "max_dependencies"),
             ("max_peopletools_rows", "max_peopletools_rows"),
+            ("max_view_definitions", "max_view_definitions"),
             ("page_size", "query_page_size")):
         value = getattr(args, arg_name)
         if value is not None:
             overrides[limit_name] = value
+    if args.no_view_vocabulary:
+        overrides["harvest_view_vocabulary"] = 0
     try:
         limits = MetadataBuildLimits.from_config(
             cfg.metadata_catalog, **overrides)
@@ -165,7 +177,9 @@ def main(argv=None) -> int:
         f"{limits.max_constraint_columns:,} constraint columns/source; "
         f"{limits.max_dependencies:,} dependencies/source; "
         f"{limits.max_peopletools_rows:,} rows/PeopleTools layer; "
-        f"{limits.query_page_size:,}/page", args.quiet)
+        + (f"{limits.max_view_definitions:,} view definitions/source; "
+           if limits.harvest_view_vocabulary else "view vocabulary off; ")
+        + f"{limits.query_page_size:,}/page", args.quiet)
 
     failures = []
     built = []

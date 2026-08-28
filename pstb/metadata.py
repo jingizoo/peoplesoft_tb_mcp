@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import profiling, relmine
+from . import profiling, relmine, viewharvest
 from .config import normalize_db_schemas
 from .db import DbError
 
@@ -42,6 +42,15 @@ SOURCE_CATALOG_DIR = "metadata_catalogs"
 MAX_RESULT_CAP = 100
 MAX_RELATION_HOPS = 4
 MAX_RELATION_VISITED = 500
+# How far a relationship is from a guarantee. 0 is something the
+# database itself holds to; 1 is something a person wrote down and
+# nothing enforces; 2 is something only measurement suggests. The
+# path-finder exhausts one tier before consulting the next, and the
+# neighbour ring orders by the same idea.
+_EVIDENCE_TIER = {
+    "same_object": 0, "foreign_key": 0, "view_dependency": 0,
+    "view_declared_join": 1, "value_overlap": 2,
+}
 MAX_RELATIONS_PER_NODE = 200
 
 HARD_MAX_OBJECTS = 1_000_000
@@ -52,6 +61,7 @@ HARD_MAX_CONSTRAINT_COLUMNS = 5_000_000
 HARD_MAX_DEPENDENCIES = 2_000_000
 HARD_MAX_PEOPLETOOLS_ROWS = 5_000_000
 HARD_MAX_PAGE_SIZE = 25_000
+HARD_MAX_VIEW_DEFINITIONS = 50_000
 
 _IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_$#]{1,}")
@@ -531,6 +541,13 @@ class MetadataBuildLimits:
     mine_max_pairs: int = 120
     mine_sample_rows: int = 100
     mine_max_probes: int = 240
+    # View vocabulary harvesting. Definitions are READ and dropped, but
+    # they are read into memory first: an Oracle VARCHAR2 projection is
+    # up to 4,000 characters, so this cap is a memory budget as much as
+    # a work budget. 5,000 definitions is a few tens of megabytes at the
+    # worst case and covers a scoped custom schema many times over.
+    harvest_view_vocabulary: bool = True
+    max_view_definitions: int = 5_000
 
     @classmethod
     def from_config(cls, cfg=None, **overrides):
@@ -559,6 +576,8 @@ class MetadataBuildLimits:
             ("max_peopletools_rows", self.max_peopletools_rows,
              HARD_MAX_PEOPLETOOLS_ROWS),
             ("query_page_size", self.query_page_size, HARD_MAX_PAGE_SIZE),
+            ("max_view_definitions", self.max_view_definitions,
+             HARD_MAX_VIEW_DEFINITIONS),
         ):
             if value < 1 or value > ceiling:
                 raise MetadataError(
@@ -2499,6 +2518,191 @@ def _collect_profile(state: _Writer, source: str, db,
     return "complete"
 
 
+def _view_definitions(db, owners: tuple, cap: int) -> tuple[list, str]:
+    """(rows, evidence) of bounded view text, or ([], why) when unreadable.
+
+    The text is READ and never retained: the caller extracts structure
+    and drops it. Oracle's ALL_VIEWS.TEXT is a LONG, which many drivers
+    refuse to stream; TEXT_VC is the VARCHAR2 projection of the same
+    definition and is what a bounded read wants. Where it is absent (an
+    older release) the harvest is skipped with the reason rather than
+    falling back to LONG and hoping.
+    """
+    dialect = str(getattr(db, "dialect", "")).lower()
+    if dialect == "sqlite":
+        rows, _ = db.query(
+            "SELECT 'MAIN' AS schema_name, name AS view_name, sql AS text "
+            "FROM sqlite_master WHERE type='view' AND sql IS NOT NULL",
+            {}, max_rows=cap)
+        return list(rows), "sqlite_master.sql"
+    if dialect == "oracle":
+        params: dict = {}
+        scope = _owner_scope("OWNER", owners, params) if owners else ""
+        where = f"WHERE {scope} AND " if scope else "WHERE "
+        try:
+            rows, _ = db.query(
+                "SELECT OWNER AS schema_name, VIEW_NAME AS view_name, "
+                "TEXT_VC AS text FROM ALL_VIEWS "
+                f"{where}TEXT_VC IS NOT NULL", params, max_rows=cap)
+            return list(rows), "ALL_VIEWS.TEXT_VC"
+        except DbError as exc:
+            return [], f"ALL_VIEWS.TEXT_VC is not readable ({exc})"
+    return [], f"no view-definition source for dialect {dialect!r}"
+
+
+def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
+    """Harvest what a view's author knew: declared joins, and vocabulary.
+
+    A view is the one place a badly named schema writes down its own
+    meaning. Two things are taken and nothing else:
+
+    * JOIN predicates a person asserted. These are INTENT -- weaker than
+      a foreign key the database enforces, stronger than containment
+      measured from data -- so they rank between the two and are never
+      presented as a constraint.
+    * Column aliases. `C1 AS INVOICE_NUMBER` is a name for a column,
+      written by somebody who knew, and it becomes a searchable term on
+      that column so a question in business words can reach it.
+
+    The definition text itself is never stored, and literals are
+    stripped before extraction, so a threshold or a status value in a
+    WHERE clause cannot ride into the artifact.
+    """
+    limits = state.limits
+    con = state.con
+    if not getattr(limits, "harvest_view_vocabulary", True):
+        state.note(source, "view_vocabulary",
+                   "view vocabulary harvesting is switched off; declared "
+                   "joins and column names in view definitions were not "
+                   "read", ok=True, partial=True)
+        return "disabled"
+    cap = max(int(getattr(limits, "max_view_definitions", 5_000)), 1)
+    try:
+        rows, evidence = _view_definitions(
+            db, _configured_schemas(db), cap)
+    except Exception as exc:                  # noqa: BLE001
+        state.note(source, "view_vocabulary",
+                   f"view definitions were not read ({exc}); declared "
+                   "joins and column vocabulary were not harvested",
+                   ok=False, partial=True)
+        return "unreadable"
+    if not rows:
+        state.note(source, "view_vocabulary",
+                   f"no view definitions were harvested ({evidence})",
+                   ok=True, partial=False)
+        return "no_views"
+
+    objects = {}
+    for row in con.execute(
+            "SELECT id, schema_name, name FROM nodes "
+            "WHERE source=? AND kind IN ('table','view')", (source,)):
+        objects[(_u(row["schema_name"]), _u(row["name"]))] = row["id"]
+        objects.setdefault(("", _u(row["name"])), row["id"])
+
+    columns = {}
+    for row in con.execute(
+            "SELECT e.src AS owner_id, n.name AS name, n.id AS id "
+            "FROM edges e JOIN nodes n ON n.id = e.dst "
+            "WHERE e.kind='object_has_column' AND n.source=?", (source,)):
+        columns[(row["owner_id"], _u(row["name"]))] = row["id"]
+
+    def resolve(schema: str, obj: str):
+        return (objects.get((_u(schema), _u(obj)))
+                or objects.get(("", _u(obj))))
+
+    joins = 0
+    terms = 0
+    skipped_unresolved = 0
+    for row in rows:
+        view_schema = _u(row.get("schema_name")) or "MAIN"
+        view_name = _u(row.get("view_name"))
+        text = row.get("text")
+        if not view_name or not isinstance(text, str) or not text.strip():
+            continue
+        view_id = resolve(view_schema, view_name)
+        aliases = viewharvest.table_aliases(text)
+
+        for pair in viewharvest.join_predicates(text, aliases):
+            left = resolve(pair["left_schema"] or view_schema,
+                           pair["left_object"])
+            right = resolve(pair["right_schema"] or view_schema,
+                            pair["right_object"])
+            if left is None or right is None or left == right:
+                # A join naming an object outside this catalog cannot be
+                # attributed, and attributing it to the wrong object is
+                # exactly the false relationship this refuses to invent.
+                skipped_unresolved += 1
+                continue
+            if (columns.get((left, _u(pair["left_column"]))) is None
+                    or columns.get((right,
+                                    _u(pair["right_column"]))) is None):
+                # Both column names must exist on the objects named. On
+                # Oracle a long definition arrives through a VARCHAR2
+                # projection and is TRUNCATED, so a predicate can be cut
+                # mid-identifier: `A.C2 = B.C1` becomes `A.C2 = B.C`,
+                # which still parses and would mint an edge on a column
+                # that does not exist. Nothing downstream would catch it.
+                skipped_unresolved += 1
+                continue
+            state.edge(
+                left, right, "view_declared_join",
+                confidence="declared", collector="view_vocabulary",
+                authority="declared",
+                evidence=(f"joined in view {view_name} on "
+                          f"{pair['left_column']} = {pair['right_column']}"),
+                attrs={
+                    "column_pairs": [{
+                        "column": pair["left_column"],
+                        "referenced_column": pair["right_column"]}],
+                    "declared_in_view": view_name,
+                    "enforced": False,
+                })
+            joins += 1
+
+        for entry in viewharvest.column_vocabulary(text, aliases):
+            owner = resolve(entry["schema"] or view_schema, entry["object"])
+            if owner is None:
+                continue
+            column_id = columns.get((owner, _u(entry["column"])))
+            if column_id is None:
+                continue
+            words = viewharvest.readable_words(entry["means"])
+            if not words:
+                continue
+            # A searchable term on the COLUMN, attributed to the view
+            # that said it. Nothing here changes what the column is; it
+            # changes only whether a question in business words can
+            # find it.
+            state.term(column_id, f"view {view_name}", entry["means"])
+            if words != entry["means"].lower():
+                state.term(column_id, f"view {view_name}", words)
+            state.alias(source, entry["means"], owner, "view vocabulary")
+            terms += 1
+
+    if joins or terms:
+        state.note(
+            source, "view_vocabulary",
+            f"{joins} join(s) a view author declared and {terms} column "
+            f"name(s) they wrote down, harvested from {evidence}; the "
+            "definitions themselves are not stored", ok=True)
+    if len(rows) >= cap:
+        # Reading exactly the cap means there were probably more. A
+        # partial harvest is fine; a partial harvest presented as the
+        # whole schema's vocabulary is not.
+        state.note(
+            source, "view_vocabulary",
+            f"only the first {cap:,} view definitions were read "
+            "(metadata_catalog.max_view_definitions); joins and column "
+            "names declared in the rest were not harvested",
+            ok=True, partial=True)
+    if skipped_unresolved:
+        state.note(
+            source, "view_vocabulary",
+            f"{skipped_unresolved} view join(s) named an object outside "
+            "this catalog and were not attributed", ok=True, partial=True)
+    return "complete" if (joins or terms) else "nothing_declared"
+
+
 def _collect_value_joins(state: _Writer, source: str, db) -> str:
     """Mine undeclared joins by measuring value containment (relmine).
 
@@ -2548,6 +2752,22 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
             "JOIN nodes o ON o.id=oc.src "
             "WHERE oc.kind='object_has_constraint' "
             "AND f.kind='foreign_key_references_object'"):
+        for pair in (_json(row["attrs"]).get("column_pairs") or []):
+            left = (str(row["ls"] or "").upper(), str(row["lt"] or "").upper(),
+                    str(pair.get("column") or "").upper())
+            right = (str(row["rs"] or "").upper(),
+                     str(row["rt"] or "").upper(),
+                     str(pair.get("referenced_column") or "").upper())
+            declared.add(left + right)
+            declared.add(right + left)
+    # A join a view author wrote down is already an assertion about this
+    # pair; measuring it again would spend probes to add a weaker second
+    # opinion. Same rule the foreign keys get.
+    for row in con.execute(
+            "SELECT l.schema_name AS ls, l.name AS lt, r.schema_name AS rs, "
+            "r.name AS rt, e.attrs AS attrs FROM edges e "
+            "JOIN nodes l ON l.id=e.src JOIN nodes r ON r.id=e.dst "
+            "WHERE e.kind='view_declared_join' AND l.source=?", (source,)):
         for pair in (_json(row["attrs"]).get("column_pairs") or []):
             left = (str(row["ls"] or "").upper(), str(row["lt"] or "").upper(),
                     str(pair.get("column") or "").upper())
@@ -3129,6 +3349,15 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                 # Join mining is likewise an enhancement, guarded so it can
                 # never cost the caller the catalog. It reads the profiles
                 # the previous step wrote.
+                # Before the miner: a join a person declared makes
+                # measuring that same pair redundant.
+                try:
+                    _collect_view_vocabulary(state, source, db)
+                except Exception as exc:      # noqa: BLE001
+                    state.note(source, "view_vocabulary",
+                               f"view vocabulary was not harvested ({exc}); "
+                               "the catalog itself is unaffected",
+                               ok=False, partial=True)
                 try:
                     _collect_value_joins(state, source, db)
                 except Exception as exc:      # noqa: BLE001
@@ -4057,6 +4286,57 @@ class MetadataCatalog:
                                    "authority": row["edge_authority"]},
                 })
 
+        # Joins a view author declared. Intent, like a foreign key, but
+        # unenforced: the database never checked it and never will. It
+        # therefore ranks below a constraint and above measurement, and
+        # like measurement it never compiles into join SQL -- a view's
+        # assertion is evidence about the world, not a guarantee from it.
+        for direction, where, bind in (
+                ("references", "E.src=?", "E.dst=N.id"),
+                ("referenced_by", "E.dst=?", "E.src=N.id")):
+            declared = con.execute(
+                "SELECT E.confidence AS edge_confidence,"
+                "E.evidence AS edge_evidence,E.collector AS edge_collector,"
+                "E.authority AS edge_authority,E.attrs AS edge_attrs,"
+                "N.id AS next_id,N.source AS next_source,"
+                "N.schema_name AS next_schema,N.kind AS next_kind,"
+                "N.name AS next_name FROM edges E JOIN nodes N "
+                f"ON {bind} WHERE {where} AND E.kind='view_declared_join' "
+                "AND N.source=? AND N.kind IN ('table','view') "
+                "ORDER BY N.schema_name,N.name LIMIT ?",
+                (node["id"], source, limit)).fetchall()
+            for row in declared:
+                attrs = _json(row["edge_attrs"])
+                raw_pairs = attrs.get("column_pairs") or []
+                if direction == "referenced_by":
+                    raw_pairs = [{
+                        "column": pair.get("referenced_column"),
+                        "referenced_column": pair.get("column"),
+                    } for pair in raw_pairs]
+                found.append({
+                    "next": self._relation_node(row),
+                    "relationship": "view_declared_join",
+                    "direction": direction,
+                    "constraint": None,
+                    "column_pairs": [{
+                        "left_column": pair.get("column"),
+                        "right_column": pair.get("referenced_column"),
+                        "ordinal": 1,
+                    } for pair in raw_pairs],
+                    "column_pairs_complete": True,
+                    "confidence": row["edge_confidence"],
+                    "evidence": row["edge_evidence"],
+                    "declared_in_view": attrs.get("declared_in_view"),
+                    "caveat": (
+                        "DECLARED BY A VIEW AUTHOR, not enforced by the "
+                        "database: a person asserted this join in "
+                        f"{attrs.get('declared_in_view')}. Strong evidence "
+                        "of intent; no guarantee of integrity."),
+                    "provenance": {"collector": row["edge_collector"],
+                                   "evidence": row["edge_evidence"],
+                                   "authority": row["edge_authority"]},
+                })
+
         # Mined value-overlap joins, both directions. They rank BELOW
         # declared constraints and view lineage in the sort key: a
         # measured containment is evidence, a declared key is intent, and
@@ -4114,7 +4394,10 @@ class MetadataCatalog:
         # Declared intent first, lineage second, measurement last; then
         # deterministic object order. A path through a declared key must
         # win whenever one exists.
-        rank = {"foreign_key": 0, "view_dependency": 1, "value_overlap": 2}
+        # Enforced intent, then asserted intent, then lineage, then
+        # measurement. Each tier is weaker evidence than the one above it.
+        rank = {"foreign_key": 0, "view_declared_join": 1,
+                "view_dependency": 2, "value_overlap": 3}
         found.sort(key=lambda item: (
             rank.get(item["relationship"], 3),
             item["next"]["schema"] or "", item["next"]["object"]))
@@ -4238,12 +4521,14 @@ class MetadataCatalog:
             graph_truncated = False
             visited: set = set()
             found_path: list[dict] | None = None
-            # Two passes, declared first. A search that mixed the classes
-            # let a 1-hop MEASURED edge shadow a 2-hop declared path --
-            # destroying the JOIN SQL and the intent evidence the declared
-            # path carries. Measurement is only consulted when declaration
-            # has nothing.
-            for admit_measured in (False, True):
+            # One pass per evidence tier, strongest first. A search that
+            # mixed the classes let a 1-hop weaker edge shadow a 2-hop
+            # stronger path -- destroying the JOIN SQL and the intent
+            # evidence the stronger path carries. Shortest-path is the
+            # right tie-break only WITHIN a tier; across tiers it trades
+            # a guarantee for a hop, so each tier is exhausted before the
+            # next is consulted.
+            for max_tier in (0, 1, 2):
                 queue = deque([(start, [])])
                 visited = {start["id"]}
                 while queue and found_path is None:
@@ -4254,10 +4539,9 @@ class MetadataCatalog:
                         con, node, src)
                     graph_truncated = graph_truncated or truncated
                     for edge in neighbours:
-                        if (not admit_measured
-                                and edge.get("relationship")
-                                == "value_overlap"):
-                            continue
+                        if _EVIDENCE_TIER.get(
+                                edge.get("relationship"), 2) > max_tier:
+                            continue    # a weaker tier waits its turn
                         nxt = edge["next"]
                         if str(nxt["id"]) in excluded:
                             continue
@@ -4299,7 +4583,8 @@ class MetadataCatalog:
                     "from": self._node(start), "to": self._node(goal),
                     "hops": [], "hop_count": None,
                     "relationship_evidence_classes": [
-                        "foreign_key", "view_dependency", "value_overlap"],
+                        "foreign_key", "view_declared_join",
+                        "view_dependency", "value_overlap"],
                     "searched_hops": hops_cap,
                     "visited_objects": len(visited),
                     "graph_truncated": graph_truncated,
@@ -4328,7 +4613,15 @@ class MetadataCatalog:
                 "graph_truncated": graph_truncated,
                 "snapshot": snapshot,
                 "basis": (
-                    ("This path includes MEASURED value-overlap hops: "
+                    ("This path includes joins a VIEW AUTHOR DECLARED: "
+                     "asserted by a person in a view definition, never "
+                     "enforced by the database, and never compiled into "
+                     "join SQL. Foreign keys were searched first."
+                     if any(hop.get("relationship") == "view_declared_join"
+                            for hop in found_path)
+                     and not any(hop.get("relationship") == "value_overlap"
+                                 for hop in found_path) else
+                     "This path includes MEASURED value-overlap hops: "
                      "inferred from sampled value containment, labeled on "
                      "each hop, and never compiled into join SQL. Declared "
                      "paths were searched first and none existed."
