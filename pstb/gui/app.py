@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import json
+import hmac
 import os
 import re
 import sys
@@ -423,7 +424,8 @@ async def _access_guard(request, call_next):
             request.scope):
         response.set_cookie(
             localguard.TOKEN_COOKIE, localguard.POLICY.token,
-            httponly=True, samesite="strict", path="/")
+            httponly=True,
+            secure=localguard.POLICY.trusted_proxy, samesite="strict", path="/")
     localguard.apply_security_headers(response.headers)
     return response
 
@@ -1820,6 +1822,7 @@ def signin(payload: dict, request: Request = None):
     # Session-scoped: closing the browser ends it, like the console's
     # confirmation. httponly so page script cannot read or forge it.
     response.set_cookie(USER_COOKIE, access.oprid, httponly=True,
+                        secure=localguard.POLICY.trusted_proxy,
                         samesite="strict", path="/")
     return response
 
@@ -1950,20 +1953,57 @@ def _is_unverified_remote_approval_request(request: Request) -> bool:
         == "unverified_remote")
 
 
+def _operator_token() -> str:
+    """The configured operator key, or "" when none is set.
+
+    Read per call, not at import: a rotated key must take effect without a
+    restart, and an INVALID key fails closed as "not configured" rather
+    than being half-honoured with whatever characters survived.
+    """
+    token = (os.environ.get("PSTB_OPERATOR_TOKEN") or "").strip()
+    if token and not re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", token):
+        return ""
+    return token
+
+
 def _require_question_log_operator(request: Request) -> None:
     """Protect question diagnostics/review without trusting the OPRID alone.
 
     The PeopleSoft user-id chooser is explicitly not authentication.  The
-    operator dashboard therefore remains machine-local (an SSH tunnel arrives
-    as loopback) even when the rest of the app is shared on a VPN.
+    operator dashboard therefore remains machine-local (an SSH tunnel
+    arrives as loopback) even when the rest of the app is shared on a VPN
+    -- except behind a managed load balancer, where loopback NEVER happens
+    and no one could ever approve anything. There, a dedicated operator
+    key (PSTB_OPERATOR_TOKEN, presented as X-PSTB-Operator) substitutes: a
+    second secret, deliberately distinct from the page token every
+    colleague holds, because reading dashboards and approving durable
+    knowledge are different privileges.
     """
     if (request is None
             or not localguard.peer_is_loopback(request.scope.get("client"))):
-        raise HTTPException(
-            status_code=403,
-            detail="Question-log diagnostics are machine-local. "
-                   f"Run  {tunnel_hint()}  then open "
-                   f"http://localhost:{_SERVED_PORT} and use this page there.")
+        expected = _operator_token()
+        header_bag = getattr(request, "headers", None) \
+            if request is not None else None
+        presented = str((header_bag.get("x-pstb-operator") or "")
+                        if header_bag is not None else "")
+        if request is not None and expected and hmac.compare_digest(
+                presented.encode("latin-1", "replace"),
+                expected.encode("latin-1", "replace")):
+            pass                              # operator key accepted
+        elif localguard.POLICY.trusted_proxy:
+            raise HTTPException(
+                status_code=403,
+                detail="Operator surfaces need the operator key on this "
+                       "deployment: set PSTB_OPERATOR_TOKEN on the service "
+                       "and enter the key under Diagnostics. There is no "
+                       "machine-local path behind a load balancer.")
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Question-log diagnostics are machine-local. "
+                       f"Run  {tunnel_hint()}  then open "
+                       f"http://localhost:{_SERVED_PORT} and use this page "
+                       "there.")
     if row_security.enabled:
         access = access_for_request(request)
         if access is None or not getattr(access, "privileged", False):
@@ -1986,6 +2026,22 @@ def _require_approval_operator(request: Request) -> None:
         _require_question_log_operator(request)
         if request is not None:
             request.scope["pstb.approval_mode"] = "local"
+        return
+    # The operator key is a local-equivalent identity: behind a balancer
+    # it is the ONLY way any approval can ever be decided, and the review
+    # that found this gap put it plainly — colleagues could still SUBMIT
+    # proposals, so the queue filled and could never be emptied.
+    # _require_question_log_operator performs the constant-time key check
+    # (and the row-security privileged check after it).
+    expected = _operator_token()
+    header_bag = getattr(request, "headers", None)
+    presented = str((header_bag.get("x-pstb-operator") or "")
+                    if header_bag is not None else "")
+    if expected and hmac.compare_digest(
+            presented.encode("latin-1", "replace"),
+            expected.encode("latin-1", "replace")):
+        _require_question_log_operator(request)
+        request.scope["pstb.approval_mode"] = "local"
         return
     if not _unauthenticated_remote_approvals_active():
         raise HTTPException(
@@ -3904,8 +3960,10 @@ def main() -> None:
     ap.add_argument("--host", default="0.0.0.0",
                     help="bind address (default 0.0.0.0, reachable on the "
                          "network). Use 127.0.0.1 for this machine only.")
-    ap.add_argument("--port", type=int, default=8016,
-                    help="port to listen on (default 8016)")
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("PORT") or 8016),
+                    help="port to listen on (default $PORT or 8016; Cloud "
+                         "Run and friends inject PORT)")
     ap.add_argument("--open", action="store_true", help="open a browser window")
     ap.add_argument(
         "--share", action="store_true",
@@ -3987,8 +4045,11 @@ def main() -> None:
                 "locks out the people it was minted for.\n  Generate one: "
                 "python3 -c \"import secrets; "
                 "print(secrets.token_urlsafe(24))\"\n")
+    trusted_proxy = (os.environ.get("PSTB_TRUSTED_PROXY") or "").strip() \
+        in ("1", "true", "yes")
     localguard.configure(args.host, token, args.allow_host,
-                         unauthenticated=not loopback and not token)
+                         unauthenticated=not loopback and not token,
+                         trusted_proxy=trusted_proxy)
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
@@ -4018,7 +4079,12 @@ def main() -> None:
         # Printed INSIDE a URL, because a token someone has to assemble by
         # hand is a token someone emails around in plain text instead.
         print(f"\n  Shared mode: every request needs this token.")
-        print(f"      {reachable}/?token={token}")
+        if localguard.POLICY.trusted_proxy:
+            print("      (token not printed: this deployment's logs are "
+                  "persisted by the platform; colleagues receive it from "
+                  "the secret store and send it as a Bearer header)")
+        else:
+            print(f"      {reachable}/?token={token}")
         print("  Anyone with that link has full read access to the ledger.")
         print("  The configuration console stays machine-local: /console "
               "answers only from this host (SSH tunnel), token or not.")
@@ -4044,7 +4110,8 @@ def main() -> None:
         import threading
         import webbrowser
 
-        opening = f"{url}/?token={token}" if token else url
+        opening = (f"{url}/?token={token}"
+                   if token and not localguard.POLICY.trusted_proxy else url)
         threading.Timer(1.0, lambda: webbrowser.open(opening)).start()
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level="warning", proxy_headers=False)

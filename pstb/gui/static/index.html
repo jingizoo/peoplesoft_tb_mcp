@@ -524,12 +524,22 @@ function isLiveSiloTurn(silo,sessionId,generation){
 }
 
 const REQ_TIMEOUT_MS=180000;
+/* Behind a load balancer there is no machine-local path, so operator
+   surfaces unlock with a key instead (PSTB_OPERATOR_TOKEN server-side).
+   sessionStorage on purpose: the key dies with the tab, is never written
+   to disk, and never rides in a URL. */
+function operatorKey(){ try{return sessionStorage.getItem('pstb-operator')||'';}catch(e){return '';} }
+function setOperatorKey(v){ try{ v?sessionStorage.setItem('pstb-operator',v)
+                                  :sessionStorage.removeItem('pstb-operator'); }catch(e){} }
 async function api(path,opts){
   // A hung database query must surface as an error, not an endless spinner.
   const ctl=new AbortController();
   const timer=setTimeout(()=>ctl.abort(),REQ_TIMEOUT_MS);
   let r;
-  try{ r=await fetch(path,Object.assign({signal:ctl.signal},opts||{})); }
+  const o=Object.assign({signal:ctl.signal},opts||{});
+  const opKey=operatorKey();
+  if(opKey){ o.headers=Object.assign({},o.headers,{'X-PSTB-Operator':opKey}); }
+  try{ r=await fetch(path,o); }
   catch(e){
     clearTimeout(timer);
     if(e.name==='AbortError')
@@ -4834,6 +4844,7 @@ async function loadApprovals(holder,source,drawerGeneration){
     c.append(el('div','pad',e.status===403
       ? '<span class="badge warn">operator access required</span> '+esc(errText(e))
       : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
+    if(e.status===403) c.append(operatorUnlock(()=>loadApprovals(holder,source,drawerGeneration)));
     box.append(c);
   }
 }
@@ -4954,8 +4965,26 @@ async function loadCoverageGaps(holder,source){
     c.append(el('div','pad',e.status===403
       ? '<span class="badge warn">operator access required</span> '+esc(errText(e))
       : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
+    if(e.status===403) c.append(operatorUnlock(()=>loadCoverageGaps(holder,source)));
     box.append(c);
   }
+}
+
+/* One unlock control for every operator card: enter the key, retry the
+   panel. Entering a wrong key just yields the same 403 card back. */
+function operatorUnlock(retry){
+  const row=el('div','pad');
+  const input=document.createElement('input');
+  input.type='password';
+  input.placeholder='Operator key';
+  input.autocomplete='off';
+  input.style.width='min(260px,70%)';
+  const go=el('button','csvbtn','Unlock');
+  go.type='button'; go.style.marginLeft='6px';
+  go.onclick=()=>{ setOperatorKey(input.value.trim()); retry(); };
+  input.addEventListener('keydown',ev=>{ if(ev.key==='Enter') go.onclick(); });
+  row.append(input,go);
+  return row;
 }
 
 function metadataProposalUrl(source){

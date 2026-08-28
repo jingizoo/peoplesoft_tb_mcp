@@ -38,6 +38,7 @@ oracle = ["oracledb>=2.4,<4.0"]
 sqlserver = ["pyodbc>=5.1,<6.0"]
 
 [project.scripts]
+pstb-mcp-http = "pstb.mcp_http:main"
 pstb-server = "pstb.server:main"
 pstb-chat = "pstb.client.chat:main"
 pstb-gui = "pstb.gui.app:main"

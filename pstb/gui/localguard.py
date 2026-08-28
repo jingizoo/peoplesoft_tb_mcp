@@ -131,10 +131,23 @@ class Policy:
     # fell into. That is the distinction #108 was reaching for; requiring a
     # token was the wrong way to enforce it.
     unauthenticated: bool = False
+    # Behind a managed load balancer (Cloud Run's front end, an ALB) the
+    # forwarded headers are INJECTED BY THE PLATFORM, not forged by a
+    # client -- refusing them refuses every request the platform can
+    # deliver. trusted_proxy says "the thing talking to my socket is the
+    # balancer": forwarded headers pass, and the peer address is never
+    # treated as an identity again (no loopback privileges exist).
+    trusted_proxy: bool = False
 
     def __post_init__(self) -> None:
         if self.shared and not self.token and not self.unauthenticated:
             raise ValueError(_NEEDS_TOKEN)
+        if self.trusted_proxy and (not self.shared or not self.token):
+            raise ValueError(
+                "trusted_proxy is for a managed balancer in front of a "
+                "routable bind, and the balancer forwards ANYONE -- the "
+                "token is the only control left. Set PSTB_AUTH_TOKEN and "
+                "bind 0.0.0.0, or drop PSTB_TRUSTED_PROXY.")
         if self.hosts is None and not self.shared:
             # hosts=None means "accept any Host name", which is only safe
             # when a token is the control in its place. Outside shared
@@ -152,7 +165,8 @@ POLICY = Policy()
 
 def configure(host: str, token: str = "",
               allowed_hosts: Iterable[str] = (),
-              unauthenticated: bool = False) -> Policy:
+              unauthenticated: bool = False,
+              trusted_proxy: bool = False) -> Policy:
     """Install the policy for this process and return it.
 
     A routable bind needs either a token or an explicit
@@ -171,7 +185,8 @@ def configure(host: str, token: str = "",
     else:
         hosts = None      # any name — we do not know what colleagues type
     POLICY = Policy(hosts=hosts, token=token, shared=shared,
-                    unauthenticated=bool(shared and not token))
+                    unauthenticated=bool(shared and not token),
+                    trusted_proxy=bool(trusted_proxy))
     return POLICY
 
 
@@ -202,6 +217,16 @@ def host_matches(raw: str, policy: Optional[Policy] = None) -> bool:
 
 
 def peer_is_loopback(client) -> bool:
+    """Is this peer the machine itself — and may that still mean anything?
+
+    Behind a trusted proxy the answer is NO by definition, whatever the
+    socket says: the platform may dial the container any way it likes,
+    and a future runtime that happens to connect over 127.0.0.1 must not
+    thereby inherit the console and every machine-local privilege. Peer
+    identity is void in that mode; keys are the only identities left.
+    """
+    if POLICY.trusted_proxy:
+        return False
     """Did this connection actually come from this machine?
 
     ``client`` is ASGI ``scope["client"]``. Checked rather than the BIND:
@@ -272,7 +297,9 @@ def token_ok(presented: str, policy: Optional[Policy] = None) -> bool:
     expected = (policy or POLICY).token
     if not expected:
         return True
-    return hmac.compare_digest(str(presented or ""), expected)
+    return hmac.compare_digest(
+        str(presented or "").encode("latin-1", "replace"),
+        expected.encode("latin-1", "replace"))
 
 
 def token_in_query(scope) -> bool:
@@ -286,6 +313,12 @@ def token_in_query(scope) -> bool:
 def apply_security_headers(headers) -> None:
     for key, value in _SECURITY_HEADERS.items():
         headers.setdefault(key, value)
+    if POLICY.trusted_proxy:
+        # The balancer terminates TLS; the browser origin is https. HSTS
+        # closes the typed-http first visit an on-path attacker would
+        # otherwise intercept before the redirect.
+        headers.setdefault("Strict-Transport-Security",
+                           "max-age=31536000; includeSubDomains")
 
 
 # The CLI default, and the fallback when a scope carries no server address.
@@ -329,18 +362,31 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     policy = policy or POLICY
     headers = {k.decode("latin-1").lower(): v.decode("latin-1")
                for k, v in scope.get("headers") or []}
+    if policy.trusted_proxy and token_in_query(scope):
+        # The ALB and the platform both log request URLs. On a bare VPN
+        # host the pasted ?token= link was a deliberate local trade-off;
+        # here it would land the only remaining credential in a log store
+        # with its own audience and retention.
+        return 401, (
+            "This deployment does not accept the token in the URL: the "
+            "load balancer logs request URLs, and the token is the access "
+            "control. Send it as an Authorization: Bearer header once and "
+            "the cookie takes over.")
     if not policy.shared and not peer_is_loopback(scope.get("client")):
         return 403, ("This server answers only on the loopback interface. "
                      "Reach it through an SSH tunnel: "
                      f"{tunnel_command(served_port(scope))}")
-    for name in _FORWARDED:
-        if name in headers:
-            return 400, (
-                f"Refusing a request carrying {name}. A browser talking "
-                "straight to this server never sends it, so either an "
-                "unsupported proxy is in front of this server or the client "
-                "address is being forged. This app trusts the real peer "
-                "address only.")
+    if not policy.trusted_proxy:
+        for name in _FORWARDED:
+            if name in headers:
+                return 400, (
+                    f"Refusing a request carrying {name}. A browser talking "
+                    "straight to this server never sends it, so either an "
+                    "unsupported proxy is in front of this server or the "
+                    "client address is being forged. This app trusts the "
+                    "real peer address only. (A managed load balancer "
+                    "deployment sets PSTB_TRUSTED_PROXY=1, where the token "
+                    "is the control instead.)")
     if not host_matches(headers.get("host", ""), policy):
         if policy.shared:
             # The loopback advice is wrong in shared mode — the caller is
@@ -377,6 +423,13 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
         if ((path == "/console" or path.startswith("/console/")
              or path.startswith("/api/console"))
                 and not peer_is_loopback(scope.get("client"))):
+            if policy.trusted_proxy:
+                return 403, (
+                    "The configuration console is disabled on load-"
+                    "balancer deployments: there is no machine-local path "
+                    "behind one, and configuration belongs to the deploy "
+                    "environment (env vars and the platform's secret "
+                    "store) there.")
             return 403, (
                 "The configuration console answers only from the machine "
                 "itself, even in shared mode. Reach it through an SSH "
