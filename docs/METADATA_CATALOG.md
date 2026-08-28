@@ -365,6 +365,37 @@ returned source and qualified physical object to live tools exactly as
 reported. Every metadata tool result also carries top-level
 `source_database`; a source-silo chat rejects a missing or different value.
 
+### How strongly a join is known
+
+`join_path` walks four classes of relationship, and it does not mix them.
+Each tier is exhausted before the next is consulted, because shortest-path
+is the right tie-break only *within* a tier — across tiers it trades a
+guarantee for a hop:
+
+| Tier | Class | What it is | Compiles to join SQL |
+|---|---|---|:-:|
+| 0 | `foreign_key`, `view_dependency`, `same_object` | The database itself holds to it | yes (`foreign_key`) |
+| 1 | `view_declared_join` | A person wrote the join in a view definition; nothing enforces it | no |
+| 2 | `value_overlap` | Only measurement suggests it: sampled values line up | no |
+
+Only an enforced key becomes join SQL. A tier-1 or tier-2 hop is reported
+with its evidence and a caveat naming what it is not — a view author's
+assertion is strong evidence of intent and no guarantee of integrity, and a
+containment measurement is evidence of a reference and no evidence of intent.
+
+Tier 1 comes from view definitions, which are read and discarded. A view is
+often the only place a cryptically named schema writes down its own meaning,
+so two things are extracted and nothing else: join predicates between two
+qualified columns, and column aliases (`C1 AS INVOICE_NUMBER` becomes a
+searchable term on that column). Literals and comments are stripped before
+anything is matched, so a threshold or a status value in a `WHERE` clause
+cannot reach the artifact; expressions never name a column, because
+`SUM(C4) AS TOTAL_DUE` describes a computation and calling it a name for
+`C4` would be false. Both column names in a harvested join must exist on the
+objects named — on Oracle a long definition arrives through a `VARCHAR2`
+projection and is truncated, and a predicate cut mid-identifier would
+otherwise mint an edge on a column that does not exist.
+
 ## Configuration and limits
 
 The shipped settings are:
@@ -380,6 +411,8 @@ metadata_catalog:
   max_peopletools_rows: 500000
   query_page_size: 5000
   stale_after_hours: 168
+  harvest_view_vocabulary: true
+  max_view_definitions: 5000
 ```
 
 Their exact scope is:
@@ -395,6 +428,8 @@ Their exact scope is:
 | `max_peopletools_rows` | 500,000 | rows per PeopleTools layer |
 | `query_page_size` | 5,000 | rows in one keyset page |
 | `stale_after_hours` | 168 | age after which readers disclose the snapshot as stale |
+| `harvest_view_vocabulary` | true | read view definitions for declared joins and column vocabulary |
+| `max_view_definitions` | 5,000 | view definitions read per selected source; a memory budget as much as a work budget, since an Oracle definition arrives as up to 4,000 characters. When the cap binds, the snapshot says so and is marked partial. |
 
 One-build overrides are available as `--max-objects`, `--max-fields`,
 `--max-indexes`, `--max-constraints`, `--max-constraint-columns`,

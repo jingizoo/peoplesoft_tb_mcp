@@ -61,7 +61,7 @@ _COMPLETENESS_STATUSES = frozenset({
 })
 _RELATION_EVIDENCE = frozenset({
     "foreign_key", "same_object", "shared_columns_and_indexes",
-    "view_dependency",
+    "value_overlap", "view_declared_join", "view_dependency",
 })
 _RELATION_CONFIDENCE = frozenset({
     "confirmed", "corroborated", "high", "inconclusive", "inferred",
