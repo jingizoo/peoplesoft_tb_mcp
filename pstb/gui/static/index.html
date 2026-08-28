@@ -2644,6 +2644,58 @@ function renderToolBody(name,data,args){
       c.append(b);
       return c;
     }
+    if(name==='get_table_health'){
+      const c=el('div','card');
+      const o=(data||{}).object||{};
+      c.append(el('h2',null,'Table health <span class="sub">'+
+        esc((o.schema?o.schema+'.':'')+(o.name||''))+'</span>'));
+      const p=(data||{}).profile||{};
+      const head=el('div','pad');
+      const live=p.liveness==='populated'
+        ?'<span class="badge ok">'+(p.row_estimate!=null
+          ?Number(p.row_estimate).toLocaleString()+' rows':'live')+'</span>'
+        :(p.liveness==='empty'?'<span class="badge dim">empty</span>'
+          :'<span class="badge warn">unmeasured</span>');
+      head.innerHTML=live+(p.caveat?' <span style="color:var(--muted);font-size:12px">'+
+        esc(p.caveat)+'</span>':'');
+      c.append(head);
+      if(Array.isArray(data.null_rates)&&data.null_rates.length){
+        const t=el('div','pad');
+        t.innerHTML='<b>Null rates</b> <span class="sub">sampled over '+
+          Number(data.sampled_rows||0).toLocaleString()+' rows</span>';
+        t.append(genericTable(data.null_rates.map(r=>({column:r.column,
+          nulls:r.nulls,null_pct:r.null_pct==null?'':(100*r.null_pct).toFixed(1)+'%'}))));
+        c.append(t);
+      }
+      const d2=(data||{}).duplicate_keys||{};
+      if(d2.checked){
+        const line=el('div','pad');
+        const n=d2.duplicate_groups;
+        line.innerHTML='<b>Duplicate keys</b> on <code>'+
+          esc((d2.key_columns||[]).join(', '))+'</code> ('+esc(d2.basis||'')+'): '+
+          (n===0?'<span class="badge ok">none</span>'
+                :'<span class="badge bad">'+esc(String(n))+' group'+
+                 (n===1?'':'s')+'</span>');
+        c.append(line);
+      }
+      (data.relationships||[]).forEach(r=>{
+        const line=el('div','pad');
+        const orphan=(r.orphans_in_sample||0)>0
+          ?'<span class="badge bad">'+r.orphans_in_sample+' orphan'+
+            (r.orphans_in_sample===1?'':'s')+' / '+r.sampled+' sampled</span>'
+          :(r.error?'<span class="badge warn">'+esc(r.error)+'</span>'
+            :'<span class="badge ok">0 orphans / '+(r.sampled||0)+' sampled</span>');
+        line.innerHTML='<b>'+esc(r.via||'')+'</b> \u2192 <code>'+esc(r.parent||'')+
+          '</code> '+orphan+
+          (r.relationship==='value_overlap'
+            ?' <span class="badge warn" title="'+esc(r.caveat||'')+'">measured join</span>':'')+
+          '';
+        c.append(line);
+      });
+      (data.caveats||[]).forEach(x=>c.append(el('div','pad',
+        '<span class="sub">'+esc(x)+'</span>')));
+      return c;
+    }
     if(name==='run_sql') return renderSql(data);
     if(name==='search_metadata') return renderMetadataSearch(data);
     if(name==='get_metadata_context') return renderMetadataContext(data);

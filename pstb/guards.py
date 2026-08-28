@@ -148,6 +148,9 @@ SOURCE_PROVENANCE_TOOLS = frozenset(_SOURCE_SCOPED_TOOLS)
 SOURCE_SILO_TOOLS = frozenset({
     "describe_metadata_catalog", "search_metadata", "get_metadata_context",
     "list_tables", "describe_table", "join_path", "explain_query", "run_sql",
+    # Counts-and-percentages data quality for one object; returns no row
+    # values, so the export route may carry its payload like any other.
+    "get_table_health",
 })
 
 # Chat may additionally submit one bounded, PENDING local annotation.  Keep

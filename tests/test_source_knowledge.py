@@ -994,9 +994,16 @@ class SourceKnowledgeTests(unittest.TestCase):
         self.assertNotIn("approved_source_meanings", declared)
 
         self.assertFalse(same_column_only["found"])
+        # The searched classes now include measured value-overlap joins
+        # (relmine). The INTENT of this test is unchanged and still holds:
+        # a shared column NAME alone never creates a path — JOB_AUDIT's
+        # JOB_ID matches JOB_HDR's by name and the path is still not
+        # found, because measurement (which was not attempted or did not
+        # clear the evidence bar here) is the only other way in, and a
+        # name is not a measurement.
         self.assertEqual(
             same_column_only["relationship_evidence_classes"],
-            ["foreign_key", "view_dependency"],
+            ["foreign_key", "view_dependency", "value_overlap"],
         )
         self.assertIn(
             "Matching column names alone are not promoted",
