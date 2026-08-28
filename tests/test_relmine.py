@@ -364,16 +364,24 @@ class TableHealthToolTests(unittest.TestCase):
         out = self._run("TU_STAGE")
         rel = out["relationships"][0]
         self.assertEqual(rel["relationship"], "value_overlap")
-        self.assertEqual(rel["orphans_in_sample"], 2)
+        self.assertEqual(rel["orphaned_distinct"], 2)
         self.assertIn("MEASURED", rel["caveat"])
+        self.assertIn("distinct sampled values", rel["rate_note"],
+                      "7/200 is a share of VALUES, not rows, and the "
+                      "payload must say so")
 
     def test_null_rates_are_sampled_and_labeled(self):
         out = self._run("TU_STAGE")
         batch = next(r for r in out["null_rates"]
                      if r["column"] == "BATCH_CD")
         self.assertEqual(batch["nulls"], 2)
-        self.assertTrue(any("not the full population" in c
+        # 72 rows < the 5000 cap: the sample IS the population, and the
+        # caveat must say so instead of falsely claiming partial coverage
+        # (review finding).
+        self.assertTrue(any("covered the whole table" in c
                             for c in out["caveats"]))
+        self.assertFalse(any("not the full population" in c
+                             for c in out["caveats"]))
 
     def test_no_row_value_appears_anywhere_in_the_payload(self):
         """Counts and percentages only: GHOST-1 is a row value and must
@@ -402,6 +410,229 @@ class TableHealthToolTests(unittest.TestCase):
         start = base_source.index("Data-quality and tie-out questions")
         self.assertIn("get_table_health", base_source[start:start + 700])
 
+
+class DeferredReviewFixTests(unittest.TestCase):
+    """Every defect the deferred 37-agent review confirmed, pinned."""
+
+    def _health_env(self, ddl, inserts=(), indexes=()):
+        temp = tempfile.TemporaryDirectory(prefix="pstb-defrev-")
+        root = Path(temp.name)
+        db_path = root / "p.db"
+        con = sqlite3.connect(db_path)
+        con.executescript(ddl)
+        for stmt, rows in inserts:
+            for row in rows:
+                con.execute(stmt, row)
+        con.commit()
+        con.close()
+        cfg = Config.sample(root)
+        cfg.db.sqlite_path = str(db_path)
+        cfg.sources = {}
+        db = Database(cfg)
+        build_catalog(root / "c.db", [("default", db)],
+                      peopletools_source="default")
+        return temp, db, MetadataCatalog(root / "c.db")
+
+    def _run(self, db, catalog, table, usefulness_override=None):
+        import pstb.server as srv
+
+        class Cat:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def context(self, *a, **k):
+                out = self._inner.context(*a, **k)
+                if usefulness_override is not None and isinstance(out, dict):
+                    out["usefulness"] = usefulness_override
+                return out
+
+            def relationships_of(self, *a, **k):
+                return self._inner.relationships_of(*a, **k)
+
+        with patch.object(srv, "_metadata_for_source",
+                          lambda s: ("default", Cat(catalog))), \
+                patch.object(srv.engine, "for_source",
+                             lambda s: type("B", (), {"db": db})()):
+            return srv._table_health(table, "")
+
+    # ── blocker: unknown size fails CLOSED ─────────────────────────────
+    def test_an_unknown_row_estimate_skips_the_exact_duplicate_check(self):
+        """An unknown estimate is not permission — on the target box most
+        tables were never analyzed, so failing open made the 2M gate
+        decorative (review blocker)."""
+        temp, db, catalog = self._health_env(
+            "CREATE TABLE T_HDR (DOC_ID TEXT);",
+            [("INSERT INTO T_HDR VALUES (?)", [(f"D{i}",) for i in range(30)])])
+        try:
+            for bad_estimate in (None, "5000000", True):
+                with self.subTest(estimate=bad_estimate):
+                    out = self._run(db, catalog, "T_HDR",
+                                    usefulness_override={
+                                        "liveness": "unknown",
+                                        "row_estimate": bad_estimate})
+                    self.assertFalse(out["duplicate_keys"].get("checked"))
+                    self.assertTrue(any("size" in c.lower()
+                                        for c in out["caveats"]))
+        finally:
+            db.close()
+            temp.cleanup()
+
+    # ── blocker: declared keys are never truncated ─────────────────────
+    def test_a_declared_unique_key_is_grouped_whole(self):
+        """Grouping by a PREFIX of a unique index manufactures duplicate
+        alarms on data the database itself enforces as unique — one
+        journal with 40 lines read as a duplicate group (review blocker)."""
+        temp, db, catalog = self._health_env(
+            """CREATE TABLE T_LN (
+                 UNIT_CD TEXT, JRNL_ID TEXT, JRNL_DT TEXT,
+                 SEQ_NO INTEGER, LINE_NO INTEGER, AMT NUMERIC);
+               CREATE UNIQUE INDEX T_LN_KEY ON T_LN
+                 (UNIT_CD, JRNL_ID, JRNL_DT, SEQ_NO, LINE_NO);""",
+            [("INSERT INTO T_LN VALUES (?,?,?,?,?,?)",
+              [("US001", "J001", "2026-01-31", 0, n, n * 10)
+               for n in range(40)])])
+        try:
+            out = self._run(db, catalog, "T_LN",
+                            usefulness_override={"liveness": "populated",
+                                                 "row_estimate": 40})
+            dup = out["duplicate_keys"]
+            self.assertTrue(dup["checked"])
+            self.assertEqual(len(dup["key_columns"]), 5,
+                             "all five key columns, not a prefix")
+            self.assertEqual(dup["duplicate_groups"], 0,
+                             "40 legal lines of one journal are not "
+                             "duplicates")
+        finally:
+            db.close()
+            temp.cleanup()
+
+    # ── major: bounded reads inside both probe queries ─────────────────
+    def test_probe_reads_are_bounded_inside_not_just_capped_outside(self):
+        """DISTINCT over an unbounded read scans the whole table before
+        the stop key on a low-cardinality column; both probe queries must
+        put the bound UNDER the aggregate (review finding)."""
+        issued = []
+
+        class Db:
+            dialect = "sqlite"
+
+            def query(self, sql, params=None, max_rows=None):
+                issued.append(" ".join(sql.split()))
+                if "COUNT" not in sql:
+                    return [{"v": f"X{i}"} for i in range(30)], False
+                return [{"n": 30}], False
+
+        relmine.probe_containment(
+            Db(), {"schema": "", "table": "C", "column": "K"},
+            {"schema": "", "table": "P", "column": "K"}, sample_rows=30)
+        sample_sql, count_sql = issued
+        self.assertRegex(sample_sql,
+                         r"DISTINCT v FROM \(SELECT .* LIMIT \d+\)",
+                         "the bound must sit under the DISTINCT")
+        self.assertRegex(count_sql,
+                         r"COUNT\(DISTINCT v\) .* FROM \(SELECT .* LIMIT \d+\)",
+                         "the parent read must be bounded inside too")
+
+    def test_sqlserver_gets_valid_tsql_bounds(self):
+        sql = relmine.bounded_select("sqlserver", "SELECT A FROM T", 10)
+        self.assertNotIn("LIMIT", sql)
+        self.assertIn("FETCH NEXT 10 ROWS ONLY", sql)
+        self.assertIn("ORDER BY (SELECT NULL)", sql)
+
+    # ── major: multi-pair edges are spent, not skipped ─────────────────
+    def test_a_merged_mined_edge_is_probed_on_its_best_pair(self):
+        temp, db, catalog = self._health_env(
+            """CREATE TABLE M_STAGE (INV_NBR TEXT, INV_REF TEXT);
+               CREATE TABLE M_HDR (INVOICE_NO TEXT PRIMARY KEY);""",
+            [("INSERT INTO M_HDR VALUES (?)",
+              [(f"I{i:04d}",) for i in range(60)]),
+             ("INSERT INTO M_STAGE VALUES (?,?)",
+              [(f"I{i:04d}", f"I{i:04d}") for i in range(50)])])
+        try:
+            out = self._run(db, catalog, "M_STAGE",
+                            usefulness_override={"liveness": "populated",
+                                                 "row_estimate": 50})
+            rel = next((r for r in out["relationships"]
+                        if r["relationship"] == "value_overlap"), None)
+            self.assertIsNotNone(
+                rel, "the merged two-pair edge must not be skipped")
+            self.assertIn("sampled_distinct", rel)
+            self.assertIn("best-measured of 2 pairs",
+                          rel.get("probed_pair", ""))
+        finally:
+            db.close()
+            temp.cleanup()
+
+    # ── major: declared 2-hop beats mined 1-hop ────────────────────────
+    def test_a_declared_chain_is_preferred_over_a_mined_shortcut(self):
+        """A 1-hop measured edge must not displace the 2-hop declared
+        path that carries JOIN SQL and intent (review finding)."""
+        temp, db, catalog = self._health_env(
+            """PRAGMA foreign_keys=ON;
+               CREATE TABLE TOP_HDR (INVOICE_NO TEXT PRIMARY KEY);
+               CREATE TABLE MID_HDR (
+                 MID_ID TEXT PRIMARY KEY,
+                 INVOICE_NO TEXT REFERENCES TOP_HDR(INVOICE_NO));
+               CREATE TABLE CHILD_LN (
+                 MID_ID TEXT REFERENCES MID_HDR(MID_ID),
+                 INV_NBR TEXT);""",
+            [("INSERT INTO TOP_HDR VALUES (?)",
+              [(f"I{i:04d}",) for i in range(50)]),
+             ("INSERT INTO MID_HDR VALUES (?,?)",
+              [(f"M{i:04d}", f"I{i:04d}") for i in range(50)]),
+             ("INSERT INTO CHILD_LN VALUES (?,?)",
+              [(f"M{i:04d}", f"I{i:04d}") for i in range(50)])])
+        try:
+            path = catalog.relationship_path("CHILD_LN", "TOP_HDR",
+                                             source="default")
+            self.assertTrue(path["found"])
+            self.assertEqual(path["relationship_evidence_classes"],
+                             ["foreign_key"],
+                             "the declared chain, not the measured "
+                             "shortcut")
+            self.assertEqual(path["hop_count"], 2)
+            self.assertTrue(path["queryable_join"],
+                            "the declared path's JOIN SQL must survive")
+        finally:
+            db.close()
+            temp.cleanup()
+
+    def test_the_measured_fallback_declares_its_basis(self):
+        temp, db, catalog = self._health_env(
+            """CREATE TABLE F_STAGE (INV_NBR TEXT);
+               CREATE TABLE F_HDR (INVOICE_NO TEXT PRIMARY KEY);""",
+            [("INSERT INTO F_HDR VALUES (?)",
+              [(f"I{i:04d}",) for i in range(60)]),
+             ("INSERT INTO F_STAGE VALUES (?)",
+              [(f"I{i:04d}",) for i in range(50)])])
+        try:
+            path = catalog.relationship_path("F_STAGE", "F_HDR",
+                                             source="default")
+            self.assertTrue(path["found"])
+            self.assertIn("MEASURED", path["basis"])
+            self.assertFalse(path["queryable_join"])
+        finally:
+            db.close()
+            temp.cleanup()
+
+    # ── major: exclusions bind the health tool ─────────────────────────
+    def test_an_excluded_record_is_refused_not_probed(self):
+        import pstb.server as srv
+        temp, db, catalog = self._health_env(
+            "CREATE TABLE X_SECRET (K_ID TEXT);",
+            [("INSERT INTO X_SECRET VALUES (?)",
+              [(f"K{i}",) for i in range(30)])])
+        try:
+            exclusion = [{"object_id": "whatever", "object": "X_SECRET",
+                          "schema": "MAIN"}]
+            with patch.object(srv.record_exclusions, "for_source",
+                              lambda s: exclusion):
+                out = self._run(db, catalog, "X_SECRET")
+            self.assertIn("error", out)
+            self.assertIn("excluded", out["error"])
+        finally:
+            db.close()
+            temp.cleanup()
 
 if __name__ == "__main__":
     unittest.main()
