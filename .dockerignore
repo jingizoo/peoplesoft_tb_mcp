@@ -1,0 +1,15 @@
+.git
+.venv
+logs/
+outputs/
+source_knowledge/
+metadata_catalog.db
+entity_graph.db
+process_graph.db
+site_memory.json
+.env
+tests/
+docs/
+scripts/
+!scripts/seed_sample_data.py
+deploy/

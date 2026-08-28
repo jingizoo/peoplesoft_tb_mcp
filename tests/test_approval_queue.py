@@ -941,7 +941,10 @@ class RefusalIsActionableTests(unittest.TestCase):
     def test_the_fallback_port_matches_what_the_cli_actually_defaults_to(self):
         app_src = Path(gui.__file__).read_text()
         flag = app_src[app_src.index('ap.add_argument("--port"'):][:160]
-        self.assertIn(f"default={gui.localguard.DEFAULT_PORT}", flag)
+        # The CLI default is now $PORT-aware (Cloud Run injects PORT);
+        # the FALLBACK must still be the port localguard's remedies name.
+        self.assertIn('os.environ.get("PORT")', flag)
+        self.assertIn(str(gui.localguard.DEFAULT_PORT), flag)
 
 
 class ApprovalDiscoverabilityPanelTests(unittest.TestCase):
