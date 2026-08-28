@@ -1760,7 +1760,8 @@ def _collect_view_dependencies(
     return count
 
 
-def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
+def _collect_native(state: _Writer, source: str, db,
+                    statistics: dict | None = None) -> tuple[int, int]:
     limits = state.limits
     objects: list[dict] = []
     after = None
@@ -1817,11 +1818,83 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
     field_overflow = False
     last_owner_id = ""
 
+    # Which objects have provably nothing in them. On the deployment this
+    # targets the column budget is the binding constraint by an order of
+    # magnitude -- 3,186,495 columns against a 500,000 cap -- so 84% of
+    # tables were getting NO columns at all, and which 84% was decided by
+    # dictionary order. Since 76,225 of 84,627 tables are measured empty,
+    # spending the budget on them starves search, the join miner's
+    # signatures and table health of the ~7,800 tables that hold data.
+    #
+    # This is a PRIORITY, not a filter: verified-empty objects are capped
+    # at a reserve rather than excluded, so a small schema still collects
+    # everything and nothing is categorically lost. And "verified" is
+    # strict -- an empty verdict contradicted by later DML (see
+    # profiling.reconcile_liveness) keeps full priority, because that
+    # table may well be live and only its statistics are stale.
+    deprioritized: set[str] = set()
+    for (owner_schema, owner_name), entry in (statistics or {}).items():
+        obj = object_keys.get((owner_schema, owner_name))
+        if obj is None:
+            continue
+        estimate = entry.get("row_estimate")
+        mods = entry.get("modified_since_stats")
+        if (isinstance(estimate, (int, float))
+                and not isinstance(estimate, bool)
+                and int(estimate) == 0
+                and (mods is not None and int(mods) == 0)):
+            deprioritized.add(obj["id"])
+    # How much budget the objects that HOLD DATA will need, so empty ones
+    # can have exactly the remainder -- no more, and no less. Where the
+    # dictionary reports column counts (Oracle's ALL_TAB_COL_STATISTICS
+    # aggregate) this is precise: everything fits => nothing is rationed,
+    # and a small schema still collects every column. Where it does not
+    # (a direct-count dialect), fall back to an adaptive threshold that
+    # only bites once the budget is genuinely half spent, which a small
+    # schema never reaches.
+    #
+    # The reserve bounds EMPTY columns specifically. Comparing against the
+    # global field counter stopped empties as soon as the live tables had
+    # spent that much, which rationed a budget that was not scarce.
+    live_projected = 0
+    counts_known = False
+    for (owner_schema, owner_name), entry in (statistics or {}).items():
+        obj = object_keys.get((owner_schema, owner_name))
+        count = entry.get("column_count")
+        if not isinstance(count, (int, float)) or isinstance(count, bool):
+            continue
+        counts_known = True
+        if obj is None or obj["id"] not in deprioritized:
+            live_projected += int(count)
+    if counts_known:
+        empty_reserve = max(limits.max_fields - live_projected, 0)
+    else:
+        empty_reserve = limits.max_fields  # adaptive path; see below
+    empty_fields = 0
+    deferred_empties = 0
+
     def add_column(schema: str, obj: str, row: dict) -> None:
         nonlocal fields
         key = (_u(schema) or "MAIN", _u(obj))
         owner = object_keys.get(key)
         if owner is None:
+            return
+        nonlocal empty_fields
+        is_empty_object = owner["id"] in deprioritized
+        # Adaptive half-budget rule when column counts are unknown: an
+        # empty object yields the floor only once the budget is genuinely
+        # half spent, so a small schema is never rationed at all.
+        starved = (empty_fields >= empty_reserve
+                   or (not counts_known
+                       and fields >= limits.max_fields // 2))
+        if is_empty_object and starved:
+            # Budget reserved for objects that hold data. The empty object
+            # keeps whatever it already collected; an empty table with a
+            # partial column list would be as false a signature as any
+            # other truncation, so it is marked too.
+            nonlocal deferred_empties
+            deferred_empties += 1
+            state.partial_columns.add(owner["id"])
             return
         if fields >= limits.max_fields:
             # The cap bites mid-stream, so the object being filled at this
@@ -1857,6 +1930,8 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
         state.alias(source, f"{owner['name']}.{name}", fid, "physical column")
         state.term(fid, "data type", attrs["data_type"])
         fields += 1
+        if is_empty_object:
+            empty_fields += 1
         nonlocal last_owner_id
         last_owner_id = owner["id"]
 
@@ -1906,6 +1981,14 @@ def _collect_native(state: _Writer, source: str, db) -> tuple[int, int]:
                 break
     if field_overflow:
         state.limit(source, "fields", limits.max_fields, fields)
+    if deferred_empties:
+        state.note(
+            source, "columns",
+            f"columns for {deferred_empties} object(s) the database "
+            "reports as empty were deferred so the field budget could "
+            "cover objects that hold data; those objects keep their "
+            "names, statistics and relationships but not a full column "
+            "list", ok=True, partial=True)
 
     index_count = 0
     index_overflow = False
@@ -2192,6 +2275,7 @@ def _table_statistics(db, owners: tuple[str, ...]) -> tuple[dict, str, bool]:
             entry = stats.setdefault(key, {"row_estimate": None,
                                            "analyzed_at": ""})
             entry["populated_columns"] = row.get("populated")
+            entry["column_count"] = row.get("col_count")
         # DML recorded since the last statistics gather. This is what makes
         # an old estimate trustworthy: a row here means changes AFTER the
         # stats; absence, on a readable view, means the verdict is CURRENT
@@ -2249,14 +2333,21 @@ def _table_statistics(db, owners: tuple[str, ...]) -> tuple[dict, str, bool]:
             except DbError:
                 continue
             value = counted[0].get("n") if counted else None
+            # modified_since_stats=0 is literally true here, not a fudge:
+            # this is a direct COUNT(*) taken during THIS build, so there
+            # is no interval between "measured" and "now" for DML to hide
+            # in. The Oracle branch cannot say that -- its NUM_ROWS may be
+            # years old -- which is why it looks to the modification log.
             stats[("MAIN", name.upper())] = {
-                "row_estimate": value, "analyzed_at": ""}
+                "row_estimate": value, "analyzed_at": "",
+                "modified_since_stats": 0}
         return stats, "SELECT COUNT(*) (sample database)", True
 
     return stats, "no optimizer statistics for this dialect", False
 
 
-def _collect_profile(state: _Writer, source: str, db) -> str:
+def _collect_profile(state: _Writer, source: str, db,
+                     prefetched: tuple | None = None) -> str:
     """Rank objects by whether they are worth reading, ignoring their names.
 
     Runs after the native collector so the shape and the reference graph
@@ -2307,8 +2398,9 @@ def _collect_profile(state: _Writer, source: str, db) -> str:
         references[row["src"]] = references.get(row["src"], 0) + 1
 
     try:
-        stats, evidence, measured = _table_statistics(
-            db, _configured_schemas(db))
+        stats, evidence, measured = (
+            prefetched if prefetched is not None
+            else _table_statistics(db, _configured_schemas(db)))
     except Exception as exc:                  # noqa: BLE001
         # A missing grant on the statistics views is common on a read-only
         # reporting account and must not fail the build: the structural
@@ -3000,7 +3092,24 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
             pt_status = "not_applicable"
             status = "complete"
             try:
-                objects, fields = _collect_native(state, source, db)
+                # Statistics are fetched ONCE, before columns, and shared
+                # with the profiler below. The column budget has to know
+                # which objects are empty BEFORE it spends itself, and
+                # asking the dictionary twice for the same answer would
+                # double the cost of the most expensive read in the build.
+                try:
+                    statistics, stats_evidence, stats_measured = \
+                        _table_statistics(db, _configured_schemas(db))
+                except Exception as exc:      # noqa: BLE001
+                    state.note(source, "statistics",
+                               f"optimizer statistics are not readable "
+                               f"({exc}); objects are collected in "
+                               "dictionary order and none is reported as "
+                               "empty", ok=False, partial=True)
+                    statistics, stats_evidence, stats_measured = (
+                        {}, "structure only", False)
+                objects, fields = _collect_native(state, source, db,
+                                                  statistics)
                 if source == peopletools_source:
                     pt_status = _collect_peopletools(state, source, db)
                 # Last, and isolated. The profiler reads shape and the
@@ -3009,7 +3118,9 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                 # statistics views -- and a ranking is an enhancement. It
                 # must never be able to cost the caller the catalog.
                 try:
-                    _collect_profile(state, source, db)
+                    _collect_profile(state, source, db,
+                                     prefetched=(statistics, stats_evidence,
+                                                 stats_measured))
                 except Exception as exc:      # noqa: BLE001
                     state.note(source, "profile",
                                f"objects were not ranked ({exc}); the "

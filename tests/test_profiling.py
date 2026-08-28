@@ -452,7 +452,12 @@ class UsefulnessReachesTheModelTests(unittest.TestCase):
     def test_an_empty_object_says_so_and_says_to_confirm(self):
         useful = self._useful("PS_QUIET")
         self.assertEqual(useful["liveness"], "empty")
-        self.assertIn("Confirm", useful["caveat"])
+        # A direct COUNT(*) taken during the build proves the emptiness is
+        # CURRENT -- there is no interval for DML to hide in -- so this
+        # dialect now earns #168's verified-current wording rather than
+        # the "confirm before relying on it" hedge that belongs to a
+        # possibly-stale optimizer statistic.
+        self.assertIn("no changes have been recorded", useful["caveat"])
 
     def test_a_populated_object_carries_its_measurement_and_its_basis(self):
         useful = self._useful("PS_VOUCHER")
@@ -754,6 +759,142 @@ class StaleEmptyEndToEndTests(unittest.TestCase):
                          "no verdict existed, so nothing was contradicted")
         self.assertIn("IN USE", useful["caveat"])
         self.assertIn("77", useful["caveat"])
+
+class LivenessGatedColumnBudgetTests(unittest.TestCase):
+    """The column budget goes to the tables that hold data.
+
+    Measured on the target instance: 3,186,495 columns against a 500,000
+    cap, so 84% of tables were getting NO columns at all -- and WHICH 84%
+    was decided by dictionary order. Since 76,225 of 84,627 tables are
+    measured empty, that budget was mostly spent on tables with nothing
+    in them, starving search, the join miner's signatures and table
+    health of the ~7,800 that matter.
+    """
+
+    def _fixture(self, empties=20, live=2, cols=4, rows=40):
+        temp = tempfile.TemporaryDirectory(prefix="pstb-budget-")
+        root = Path(temp.name)
+        db_path = root / "p.db"
+        con = sqlite3.connect(db_path)
+        spec = ", ".join(f"C{i} TEXT" for i in range(cols))
+        # A_ names sort BEFORE Z_, so dictionary order hands the budget to
+        # the empty tables first -- the shape that produced the real loss.
+        for i in range(empties):
+            con.execute(f"CREATE TABLE A_EMPTY_{i:02d} ({spec})")
+        for i in range(live):
+            con.execute(f"CREATE TABLE Z_LIVE_{i:02d} ({spec})")
+            for r in range(rows):
+                con.execute(
+                    f"INSERT INTO Z_LIVE_{i:02d} VALUES "
+                    f"({','.join('?' * cols)})", tuple([str(r)] * cols))
+        con.commit()
+        con.close()
+        cfg = Config.sample(root)
+        cfg.db.sqlite_path = str(db_path)
+        cfg.sources = {}
+        return temp, cfg, root
+
+    def _build(self, cfg, root, max_fields):
+        db = Database(cfg)
+        try:
+            build_catalog(root / f"c{max_fields}.db", [("default", db)],
+                          limits=metadata.MetadataBuildLimits(
+                              max_fields=max_fields),
+                          peopletools_source="default")
+        finally:
+            db.close()
+        con = sqlite3.connect(root / f"c{max_fields}.db")
+        try:
+            def count(like):
+                return con.execute(
+                    "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id=e.src "
+                    "WHERE e.kind='object_has_column' AND n.name LIKE ?",
+                    (like,)).fetchone()[0]
+            note = con.execute(
+                "SELECT note FROM notes WHERE layer='columns' "
+                "AND note LIKE '%deferred%'").fetchone()
+            return count("Z_LIVE%"), count("A_EMPTY%"), (note[0] if note
+                                                         else "")
+        finally:
+            con.close()
+
+    def test_a_starved_budget_still_covers_every_live_table(self):
+        """The regression this exists for: with the budget exhausted by
+        empty tables in dictionary order, live tables got nothing."""
+        temp, cfg, root = self._fixture()
+        try:
+            live, empty, note = self._build(cfg, root, max_fields=24)
+            self.assertEqual(live, 8, "every live column, budget or not")
+            self.assertGreater(empty, 0, "empties are deprioritized, not "
+                                         "excluded")
+            self.assertLess(empty, 80)
+            self.assertIn("deferred", note)
+        finally:
+            temp.cleanup()
+
+    def test_an_ample_budget_rations_nothing(self):
+        """No scarcity, no rationing: a small schema keeps every column."""
+        temp, cfg, root = self._fixture()
+        try:
+            live, empty, note = self._build(cfg, root, max_fields=200)
+            self.assertEqual(live, 8)
+            self.assertEqual(empty, 80, "88 columns, 200 budget — nothing "
+                                        "may be dropped")
+            self.assertEqual(note, "", "and nothing is claimed to be")
+        finally:
+            temp.cleanup()
+
+    def test_the_deferral_is_disclosed_never_silent(self):
+        """A thinner catalog that looks complete is the failure mode this
+        codebase exists to refuse."""
+        temp, cfg, root = self._fixture()
+        try:
+            _, _, note = self._build(cfg, root, max_fields=24)
+            self.assertIn("empty", note)
+            self.assertIn("names, statistics and relationships", note,
+                          "say what the object DOES keep")
+        finally:
+            temp.cleanup()
+
+    def test_statistics_are_read_once_for_both_consumers(self):
+        """The column budget needs liveness BEFORE it spends itself, and
+        the dictionary must not be asked twice for the same answer."""
+        source = Path(metadata.__file__).read_text()
+        body = source[source.index("def build_catalog"):]
+        self.assertEqual(body.count("_table_statistics("), 1,
+                         "one fetch, shared with the profiler")
+        self.assertIn("prefetched=(statistics", body)
+
+    def test_a_contradicted_empty_keeps_its_priority(self):
+        """Stats say empty, DML followed: that table may well be live, so
+        its columns must not be the ones sacrificed (#168 doctrine)."""
+        source = Path(metadata.__file__).read_text()
+        start = source.index("deprioritized: set[str] = set()")
+        block = source[start:start + 1200]
+        self.assertIn("modified_since_stats", block)
+        self.assertIn("int(mods) == 0", block,
+                      "only a verified-empty object may be deprioritized")
+
+    def test_unreadable_statistics_change_nothing(self):
+        """No statistics, no rationing: the build must degrade to exactly
+        the old dictionary-order behaviour, never to a thinner catalog."""
+        temp, cfg, root = self._fixture()
+        try:
+            # A TIGHT budget, where the difference is observable: with no
+            # liveness to gate on, the build cannot protect live tables --
+            # but it must not punish anything either. The budget is spent
+            # in full, exactly as it was before this change.
+            with patch.object(metadata, "_table_statistics",
+                              side_effect=RuntimeError("no grant")):
+                live, empty, note = self._build(cfg, root, max_fields=24)
+            self.assertEqual(live + empty, 24,
+                             "the whole budget is still spent; an "
+                             "ungateable build must not become a thinner "
+                             "one")
+            self.assertEqual(note, "", "nothing was deferred, so nothing "
+                                       "is claimed to be")
+        finally:
+            temp.cleanup()
 
 if __name__ == "__main__":
     unittest.main()
