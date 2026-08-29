@@ -50,6 +50,63 @@ class NoiseStrippingTests(unittest.TestCase):
         self.assertEqual([(j["left_column"], j["right_column"])
                           for j in joins], [("C2", "C1")])
 
+    def test_a_q_quoted_literal_can_neither_smuggle_nor_desync(self):
+        """Oracle's alternative quoting: q'[ ... ]' holds anything,
+        apostrophes included. A stripper that only knows '...' reads
+        `q'[don` as the literal, leaves the rest as code, and lifts a
+        join out of the INSIDE of a string. That edge then ranks at the
+        declared tier AND silences the value-overlap miner for the pair
+        -- a fabricated relationship suppressing the measurement that
+        would have contradicted it."""
+        for opener, closer in (("[", "]"), ("(", ")"), ("{", "}"),
+                               ("<", ">"), ("!", "!")):
+            sql = ("SELECT A.C1 AS INVOICE_NUMBER FROM TU_X7 A "
+                   "JOIN TU_Q2 B ON A.C1 = B.C1 "
+                   f"WHERE A.C9 = q'{opener}don't A.C7 = B.C7{closer}'")
+            self.assertEqual(
+                [(j["left_column"], j["right_column"])
+                 for j in viewharvest.join_predicates(sql)],
+                [("C1", "C1")], f"leaked through q'{opener}...{closer}'")
+
+    def test_no_ordering_of_substitutions_could_have_been_correct(self):
+        """The reason this is a scanner and not three regexes. Strip
+        comments first and a string containing `--` eats a real join;
+        strip strings first and a quote inside a comment eats the rest
+        of the text. Only knowing which construct you are inside tells
+        those apart, and both must work at once."""
+        both = ("SELECT A.C1 FROM TU_X7 A JOIN TU_Q2 B ON A.C1 = B.C1 "
+                "AND A.C8 = 'va--l'  -- it's a note\n"
+                "AND A.C5 = B.C5")
+        self.assertEqual(
+            [(j["left_column"], j["right_column"])
+             for j in viewharvest.join_predicates(both)],
+            [("C1", "C1"), ("C5", "C5")])
+
+    def test_a_quoted_identifier_is_code_and_passes_through(self):
+        """Oracle permits "odd--name". Treating its contents as a
+        comment would delete real code; treating an apostrophe inside it
+        as a string would desynchronise everything after it."""
+        text, complete = viewharvest.scrub(
+            'SELECT A."odd--name" FROM TU_X7 A WHERE A."it\'s" = 1')
+        self.assertTrue(complete)
+        self.assertIn('"odd--name"', text)
+        self.assertIn('"it\'s"', text)
+
+    def test_an_unterminated_literal_yields_nothing_at_all(self):
+        """Past an unterminated quote nothing can be classified as code
+        or as literal. There is no safe partial answer, so every
+        extractor returns empty rather than guessing."""
+        sql = ("SELECT A.C1 AS INVOICE_NUMBER FROM TU_X7 A "
+               "JOIN TU_Q2 B ON A.C1 = B.C1 WHERE A.C9 = 'oops")
+        self.assertEqual(viewharvest.scrub(sql)[1], False)
+        self.assertEqual(viewharvest.join_predicates(sql), [])
+        self.assertEqual(viewharvest.column_vocabulary(sql), [])
+        self.assertEqual(viewharvest.table_aliases(sql), {})
+        for unterminated in ("SELECT A.C1 FROM TU_X7 A /* open",
+                             "SELECT A.C1 FROM TU_X7 A WHERE X = q'[open"):
+            self.assertEqual(viewharvest.scrub(unterminated)[1], False,
+                             unterminated)
+
     def test_a_stripped_literal_cannot_glue_two_identifiers(self):
         """Replacing a literal with empty text would make A'x'.C1 read as
         A.C1 on a table that was never named."""
@@ -192,12 +249,32 @@ class HarvestEndToEndTests(unittest.TestCase):
                WHERE A.C9 = 'OPEN';
             CREATE VIEW INVOICE_STATES AS
               SELECT A.C9 AS PAYMENT_STATUS FROM TU_X7 A;
+            CREATE TABLE TU_SHARED_A (
+                SETID TEXT, BUSINESS_UNIT TEXT, AMOUNT NUMERIC);
+            CREATE TABLE TU_SHARED_B (
+                SETID TEXT, BUSINESS_UNIT TEXT, LABEL TEXT);
+            CREATE VIEW COMPOSITE_ITEMS AS
+              SELECT A.AMOUNT AS OPEN_AMOUNT
+                FROM TU_SHARED_A A JOIN TU_SHARED_B B
+                  ON A.SETID = B.SETID
+                 AND A.BUSINESS_UNIT = B.BUSINESS_UNIT;
+            CREATE VIEW RIVAL_ITEMS AS
+              SELECT A.AMOUNT AS RIVAL_AMOUNT
+                FROM TU_SHARED_A A JOIN TU_SHARED_B B
+                  ON A.SETID = B.BUSINESS_UNIT;
         """)
         for i in range(60):
             con.execute("INSERT INTO TU_X7 VALUES (?,?,?,?)",
                         (f"I{i:04d}", f"V{i % 9}", i, "OPEN"))
             con.execute("INSERT INTO TU_Q2 VALUES (?,?)",
                         (f"V{i % 9}", f"Vendor {i % 9}"))
+            # 60 distinct business units, deliberately: below the
+            # miner's 20-value minimum the pair is unminable and the
+            # silencing test would pass without silencing anything.
+            con.execute("INSERT INTO TU_SHARED_A VALUES (?,?,?)",
+                        ("SHARE", f"BU{i:03d}", i))
+            con.execute("INSERT INTO TU_SHARED_B VALUES (?,?,?)",
+                        ("SHARE", f"BU{i:03d}", f"L{i}"))
         con.commit()
         con.close()
         self.cfg = Config.sample(root)
@@ -228,7 +305,8 @@ class HarvestEndToEndTests(unittest.TestCase):
     def test_the_declared_join_becomes_a_labeled_edge(self):
         con = self._build()
         edges = [dict(r) for r in con.execute(
-            "SELECT * FROM edges WHERE kind='view_declared_join'")]
+            "SELECT * FROM edges WHERE kind='view_declared_join' "
+            "AND evidence LIKE '%OPEN_INVOICES%'")]
         con.close()
         self.assertEqual(len(edges), 1)
         edge = edges[0]
@@ -302,6 +380,102 @@ class HarvestEndToEndTests(unittest.TestCase):
         # The cap really stopped the read; it did not merely narrate one.
         self.assertNotIn("PAYMENT_STATUS", capped)
 
+    def test_a_composite_join_keeps_every_column_it_was_given(self):
+        """A composite join is ONE relationship on SEVERAL columns. An
+        edge per column meant ON CONFLICT(src,dst,kind) DO NOTHING kept
+        the first and dropped the rest, so SETID + BUSINESS_UNIT was
+        stored as SETID alone -- and reported complete. On PeopleSoft
+        SETID is a low-cardinality sharing key: that is a fan-out sold
+        as a join, on the commonest key shape in the product."""
+        con = self._build()
+        edges = [dict(r) for r in con.execute(
+            "SELECT * FROM edges WHERE kind='view_declared_join' "
+            "AND evidence LIKE '%COMPOSITE_ITEMS%'")]
+        con.close()
+        self.assertEqual(len(edges), 1)
+        attrs = json.loads(edges[0]["attrs"])
+        self.assertEqual(attrs["column_pairs"],
+                         [{"column": "SETID", "referenced_column": "SETID"},
+                          {"column": "BUSINESS_UNIT",
+                           "referenced_column": "BUSINESS_UNIT"}])
+        self.assertIs(attrs["pairs_complete"], True)
+
+        catalog = MetadataCatalog(self.catalog_path)
+        hops = [hop for hop in catalog.relationships_of(
+            "TU_SHARED_A", source="default")["relationships"]
+            if hop["relationship"] == "view_declared_join"]
+        self.assertEqual(len(hops), 1)
+        self.assertEqual(
+            [(p["left_column"], p["right_column"], p["ordinal"])
+             for p in hops[0]["column_pairs"]],
+            [("SETID", "SETID", 1), ("BUSINESS_UNIT", "BUSINESS_UNIT", 2)])
+        self.assertTrue(hops[0]["column_pairs_complete"])
+
+    def test_every_column_of_a_composite_join_silences_the_miner(self):
+        """The collapse had a second victim. The miner is silenced per
+        COLUMN PAIR, so a dropped pair was also a pair nobody suppressed
+        -- the catalog asserted the join on one column and then measured
+        the other, offering the same relationship twice under two
+        different confidences."""
+        con = self._build()
+        mined = [json.loads(r[0])["column_pairs"] for r in con.execute(
+            "SELECT e.attrs FROM edges e "
+            "JOIN nodes l ON l.id=e.src JOIN nodes r ON r.id=e.dst "
+            "WHERE e.kind='value_overlap_join' "
+            "AND l.name IN ('TU_SHARED_A','TU_SHARED_B') "
+            "AND r.name IN ('TU_SHARED_A','TU_SHARED_B')")]
+        con.close()
+        for pairs in mined:
+            for pair in pairs:
+                self.assertNotEqual(
+                    (pair["column"], pair["referenced_column"]),
+                    ("BUSINESS_UNIT", "BUSINESS_UNIT"))
+
+    def test_a_second_condition_between_the_same_objects_is_disclosed(self):
+        """Only one edge can exist per (src, dst, kind), so a second
+        view joining the same objects differently is lost. Losing it
+        silently would present one condition as the only way these
+        objects relate."""
+        catalog = MetadataCatalog(self.catalog_path)
+        self._build().close()
+        hops = [hop for hop in catalog.relationships_of(
+            "TU_SHARED_A", source="default")["relationships"]
+            if hop["relationship"] == "view_declared_join"]
+        self.assertEqual(len(hops), 1)
+        self.assertIn("other view(s) join these objects on DIFFERENT",
+                      hops[0]["caveat"])
+
+    def test_a_partly_unusable_condition_is_not_called_complete(self):
+        """Grouping created this case and therefore had to answer it. If
+        one predicate of a composite join names a column the catalog
+        does not hold, the remaining predicates are still worth having
+        -- but they are no longer the whole condition, and a caller told
+        they were complete would join on strictly fewer columns than the
+        author wrote."""
+        from pstb import metadata
+        rows = [{"schema_name": "MAIN", "view_name": "PARTIAL_VIEW",
+                 "text": "SELECT A.AMOUNT AS X FROM TU_SHARED_A A "
+                         "JOIN TU_SHARED_B B ON A.SETID = B.SETID "
+                         "AND A.BUSINESS_UNIT = B.NOT_A_COLUMN"}]
+        with unittest.mock.patch.object(
+                metadata, "_view_definitions", return_value=(rows, "test")):
+            con = self._build()
+        edges = [dict(r) for r in con.execute(
+            "SELECT * FROM edges WHERE kind='view_declared_join'")]
+        con.close()
+        self.assertEqual(len(edges), 1)
+        attrs = json.loads(edges[0]["attrs"])
+        self.assertEqual(attrs["column_pairs"],
+                         [{"column": "SETID", "referenced_column": "SETID"}])
+        self.assertIs(attrs["pairs_complete"], False)
+
+        catalog = MetadataCatalog(self.catalog_path)
+        hop = [h for h in catalog.relationships_of(
+            "TU_SHARED_A", source="default")["relationships"]
+            if h["relationship"] == "view_declared_join"][0]
+        self.assertFalse(hop["column_pairs_complete"])
+        self.assertIn("PART OF THE CONDITION IS MISSING", hop["caveat"])
+
     def test_a_truncated_definition_cannot_mint_a_phantom_column(self):
         """Oracle serves a long view definition through a VARCHAR2
         projection, so it arrives CUT. `A.C2 = B.C1` cut to `A.C2 = B.C`
@@ -313,15 +487,17 @@ class HarvestEndToEndTests(unittest.TestCase):
         rows = [{"schema_name": "MAIN", "view_name": "CUT_VIEW",
                  "text": "SELECT A.C1 FROM TU_X7 A JOIN TU_Q2 B "
                          "ON A.C2 = B.C"}]
-        before = con.execute("SELECT COUNT(*) FROM edges "
-                             "WHERE kind='view_declared_join'").fetchone()[0]
+        before = con.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind='view_declared_join' "
+            "AND evidence LIKE '%OPEN_INVOICES%'").fetchone()[0]
         con.close()
         with unittest.mock.patch.object(
                 metadata, "_view_definitions",
                 return_value=(rows, "test")):
             con = self._build()
-        after = con.execute("SELECT COUNT(*) FROM edges "
-                            "WHERE kind='view_declared_join'").fetchone()[0]
+        after = con.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind='view_declared_join' "
+            "AND evidence LIKE '%CUT_VIEW%'").fetchone()[0]
         con.close()
         self.assertEqual(before, 1)
         self.assertEqual(after, 0)

@@ -2613,6 +2613,8 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
     joins = 0
     terms = 0
     skipped_unresolved = 0
+    declared_joins: dict = {}
+    dropped_pairs: set = set()
     for row in rows:
         view_schema = _u(row.get("schema_name")) or "MAIN"
         view_name = _u(row.get("view_name"))
@@ -2622,6 +2624,12 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
         view_id = resolve(view_schema, view_name)
         aliases = viewharvest.table_aliases(text)
 
+        # Grouped by object pair, NOT emitted per predicate. A composite
+        # join is one relationship on several columns: emitting an edge
+        # per column made ON CONFLICT(src,dst,kind) DO NOTHING keep the
+        # first and drop the rest, so `A.SETID=B.SETID AND
+        # A.BUSINESS_UNIT=B.BUSINESS_UNIT` was stored as SETID alone --
+        # a fan-out on a sharing key, reported as the whole join.
         for pair in viewharvest.join_predicates(text, aliases):
             left = resolve(pair["left_schema"] or view_schema,
                            pair["left_object"])
@@ -2643,21 +2651,15 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
                 # which still parses and would mint an edge on a column
                 # that does not exist. Nothing downstream would catch it.
                 skipped_unresolved += 1
+                # The rest of this view's condition may still be usable,
+                # but it is no longer the WHOLE condition. Grouping made
+                # that distinction possible and therefore obligatory.
+                dropped_pairs.add((left, right, view_name))
                 continue
-            state.edge(
-                left, right, "view_declared_join",
-                confidence="declared", collector="view_vocabulary",
-                authority="declared",
-                evidence=(f"joined in view {view_name} on "
-                          f"{pair['left_column']} = {pair['right_column']}"),
-                attrs={
-                    "column_pairs": [{
-                        "column": pair["left_column"],
-                        "referenced_column": pair["right_column"]}],
-                    "declared_in_view": view_name,
-                    "enforced": False,
-                })
-            joins += 1
+            declared_joins.setdefault(
+                (left, right, view_name), []).append(
+                    {"column": pair["left_column"],
+                     "referenced_column": pair["right_column"]})
 
         for entry in viewharvest.column_vocabulary(text, aliases):
             owner = resolve(entry["schema"] or view_schema, entry["object"])
@@ -2685,6 +2687,42 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
             f"{joins} join(s) a view author declared and {terms} column "
             f"name(s) they wrote down, harvested from {evidence}; the "
             "definitions themselves are not stored", ok=True)
+    # One edge per pair of objects, carrying one view's WHOLE condition.
+    # Two views can join the same objects differently; the edge key is
+    # (src,dst,kind), so only one survives. The first in deterministic
+    # order is kept and the others are COUNTED on it -- a caller reading
+    # one condition must know it is one of several, or it will read the
+    # columns shown as the only way these objects relate.
+    seen_objects: dict = {}
+    for (left, right, view_name), pairs in sorted(declared_joins.items()):
+        key = frozenset((left, right))
+        if key in seen_objects:
+            seen_objects[key] += 1
+            continue
+        seen_objects[key] = 0
+    for (left, right, view_name), pairs in sorted(declared_joins.items()):
+        key = frozenset((left, right))
+        if seen_objects.get(key) is None:
+            continue
+        alternates = seen_objects.pop(key)
+        columns_listed = ", ".join(
+            f"{pair['column']} = {pair['referenced_column']}"
+            for pair in pairs)
+        state.edge(
+            left, right, "view_declared_join",
+            confidence="declared", collector="view_vocabulary",
+            authority="declared",
+            evidence=f"joined in view {view_name} on {columns_listed}",
+            attrs={
+                "column_pairs": pairs,
+                "declared_in_view": view_name,
+                "enforced": False,
+                "pairs_complete": (left, right, view_name)
+                not in dropped_pairs,
+                "alternate_conditions": alternates,
+            })
+        joins += 1
+
     if len(rows) >= cap:
         # Reading exactly the cap means there were probably more. A
         # partial harvest is fine; a partial harvest presented as the
@@ -4321,9 +4359,14 @@ class MetadataCatalog:
                     "column_pairs": [{
                         "left_column": pair.get("column"),
                         "right_column": pair.get("referenced_column"),
-                        "ordinal": 1,
-                    } for pair in raw_pairs],
-                    "column_pairs_complete": True,
+                        "ordinal": ordinal,
+                    } for ordinal, pair in enumerate(raw_pairs, 1)],
+                    # Read from the edge, never assumed. A collector that
+                    # could not capture the whole condition must be able
+                    # to say so; hardcoding True made an incomplete join
+                    # indistinguishable from a complete one.
+                    "column_pairs_complete": bool(
+                        attrs.get("pairs_complete")),
                     "confidence": row["edge_confidence"],
                     "evidence": row["edge_evidence"],
                     "declared_in_view": attrs.get("declared_in_view"),
@@ -4331,7 +4374,18 @@ class MetadataCatalog:
                         "DECLARED BY A VIEW AUTHOR, not enforced by the "
                         "database: a person asserted this join in "
                         f"{attrs.get('declared_in_view')}. Strong evidence "
-                        "of intent; no guarantee of integrity."),
+                        "of intent; no guarantee of integrity."
+                        + ("" if attrs.get("pairs_complete") else
+                           " PART OF THE CONDITION IS MISSING: at least "
+                           "one column of this join names an object or "
+                           "column not in this catalog, so the columns "
+                           "shown are incomplete.")
+                        + (f" {int(attrs.get('alternate_conditions') or 0)} "
+                           "other view(s) join these objects on DIFFERENT "
+                           "columns; the columns shown are one condition "
+                           "of several."
+                           if int(attrs.get("alternate_conditions") or 0)
+                           else "")),
                     "provenance": {"collector": row["edge_collector"],
                                    "evidence": row["edge_evidence"],
                                    "authority": row["edge_authority"]},

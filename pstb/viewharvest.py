@@ -40,10 +40,11 @@ from typing import Iterable, Mapping
 _IDENT = r'(?:"[^"]{1,128}"|[A-Za-z][A-Za-z0-9_$#]{0,127})'
 _QUALIFIED = rf"(?P<a>{_IDENT})\s*\.\s*(?P<b>{_IDENT})"
 
-_LINE_COMMENT = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
-_STRING = re.compile(r"'(?:''|[^'])*'")
 _PLACEHOLDER = " ~L~ "
+# Oracle's alternative quoting: q'[ ... ]' and friends. The delimiter is
+# whatever follows the quote, and four of them are paired.
+_Q_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">"}
+_IDENT_CHAR = re.compile(r"[A-Za-z0-9_$#]")
 
 # Words that may never be read as a table alias: the parser walks a FROM
 # clause token-wise, and treating a keyword as an alias would attach a
@@ -69,18 +70,87 @@ def _unquote(name: str) -> str:
     return text.upper()
 
 
-def strip_noise(sql: str) -> str:
-    """Comments and string literals out, before anything is matched.
+def scrub(sql: str) -> tuple:
+    """(code with every literal and comment removed, scan_completed).
 
-    Order matters and so does the placeholder: a literal replaced by
-    empty text could glue two identifiers into one that never existed,
-    and a literal left in could be matched as a join operand.
+    A single left-to-right pass, because NO ordering of independent
+    substitutions is correct. Comments-first loses a real join to a
+    string containing `--`; strings-first lets a quote inside a comment
+    swallow the rest of the text. Only a scanner that knows which
+    construct it is inside can tell those apart.
+
+    Four constructs are recognised. A double-quoted identifier passes
+    through VERBATIM -- Oracle allows `"odd--name"`, and interpreting a
+    comment or quote inside one would corrupt code that is not a
+    literal. A `--` comment runs to the newline; a `/* */` comment to
+    its terminator; a `'...'` string honours `''` escaping; and `q'X..X'`
+    honours Oracle's alternative quoting with the four paired
+    delimiters. Each removed literal becomes a placeholder rather than
+    empty text, so a literal cannot weld two identifiers into one that
+    never existed.
+
+    An unterminated construct returns completed=False. There is no
+    recovery: the remaining text cannot be classified as code or
+    literal, and guessing is exactly how a value gets read as a join
+    operand. Callers must extract NOTHING from an incomplete scan.
     """
     text = str(sql or "")
-    text = _BLOCK_COMMENT.sub(" ", text)
-    text = _LINE_COMMENT.sub(" ", text)
-    text = _STRING.sub(_PLACEHOLDER, text)
-    return text
+    out: list = []
+    index = 0
+    size = len(text)
+    while index < size:
+        char = text[index]
+        if char == '"':
+            close = text.find('"', index + 1)
+            if close < 0:
+                return "".join(out), False
+            out.append(text[index:close + 1])
+            index = close + 1
+            continue
+        if char == "-" and text.startswith("--", index):
+            newline = text.find("\n", index)
+            out.append(" ")
+            index = size if newline < 0 else newline
+            continue
+        if char == "/" and text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            if close < 0:
+                return "".join(out), False
+            out.append(" ")
+            index = close + 2
+            continue
+        if (char in "qQ" and index + 2 < size and text[index + 1] == "'"
+                and not (index and _IDENT_CHAR.fullmatch(text[index - 1]))):
+            delimiter = text[index + 2]
+            closer = _Q_CLOSERS.get(delimiter, delimiter)
+            close = text.find(closer + "'", index + 3)
+            if close < 0:
+                return "".join(out), False
+            out.append(_PLACEHOLDER)
+            index = close + 2
+            continue
+        if char == "'":
+            cursor = index + 1
+            while cursor < size:
+                if text[cursor] == "'":
+                    if text.startswith("''", cursor):
+                        cursor += 2
+                        continue
+                    break
+                cursor += 1
+            if cursor >= size:
+                return "".join(out), False
+            out.append(_PLACEHOLDER)
+            index = cursor + 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out), True
+
+
+def strip_noise(sql: str) -> str:
+    """The scrubbed code alone, for callers that already know it parsed."""
+    return scrub(sql)[0]
 
 
 def table_aliases(sql: str) -> dict:
@@ -91,7 +161,9 @@ def table_aliases(sql: str) -> dict:
     be attributed to a catalog object, so a join through it would name
     the wrong table.
     """
-    text = strip_noise(sql)
+    text, complete = scrub(sql)
+    if not complete:
+        return {}
     out: dict = {}
     pattern = re.compile(
         rf"\b(?:FROM|JOIN)\s+(?:(?P<schema>{_IDENT})\s*\.\s*)?"
@@ -121,7 +193,12 @@ def join_predicates(sql: str, aliases: Mapping | None = None) -> list:
     and because literals were replaced before matching, neither can be
     read as an operand by accident.
     """
-    text = strip_noise(sql)
+    text, complete = scrub(sql)
+    if not complete:
+        # An unterminated literal means the rest of the text cannot be
+        # told from code. Extracting from it is how a value becomes a
+        # join operand, so nothing is extracted.
+        return []
     known = dict(aliases) if aliases is not None else table_aliases(sql)
     pattern = re.compile(
         rf"{_QUALIFIED}\s*=\s*(?P<c>{_IDENT})\s*\.\s*(?P<d>{_IDENT})",
@@ -162,7 +239,9 @@ def column_vocabulary(sql: str, aliases: Mapping | None = None) -> list:
     concatenation describes a computation, not the column, and calling
     it a name for C1 would be false.
     """
-    text = strip_noise(sql)
+    text, complete = scrub(sql)
+    if not complete:
+        return []
     known = dict(aliases) if aliases is not None else table_aliases(sql)
     head = re.split(r"\bFROM\b", text, maxsplit=1, flags=re.I)
     if len(head) < 2:
