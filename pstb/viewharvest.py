@@ -45,6 +45,14 @@ _PLACEHOLDER = " ~L~ "
 # whatever follows the quote, and four of them are paired.
 _Q_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">"}
 _IDENT_CHAR = re.compile(r"[A-Za-z0-9_$#]")
+_SET_QUANTIFIER = re.compile(r"^\s*(?:DISTINCT|UNIQUE|ALL)\s+", re.I)
+# Tokens that parse as a bare identifier and are not a column of anything.
+# `NULL AS DISCOUNT_AMT` pads a UNION arm in a great deal of real view SQL;
+# read as a column it asserts that the table has one called NULL.
+_NOT_A_COLUMN = frozenset({
+    "NULL", "SYSDATE", "SYSTIMESTAMP", "CURRENT_DATE", "CURRENT_TIMESTAMP",
+    "USER", "UID", "ROWNUM", "ROWID", "LEVEL", "DUAL", "TRUE", "FALSE",
+})
 
 # Words that may never be read as a table alias: the parser walks a FROM
 # clause token-wise, and treating a keyword as an alias would attach a
@@ -247,19 +255,43 @@ def column_vocabulary(sql: str, aliases: Mapping | None = None) -> list:
     if len(head) < 2:
         return []
     select = re.split(r"\bSELECT\b", head[0], maxsplit=1, flags=re.I)
-    body = select[-1]
+    # A set quantifier binds to the SELECT, not to the first item. Left in
+    # place it makes `DISTINCT A.C1 AS INVOICE_NUMBER` fail to match and
+    # the FIRST column of every DISTINCT view is silently unlearned.
+    body = _SET_QUANTIFIER.sub("", select[-1], count=1)
+    # A column with no table prefix is ambiguous -- unless exactly one
+    # object is in scope, in which case there is nothing for it to be
+    # ambiguous WITH. That case is not an edge case: a view over a single
+    # table, renaming its columns, is the commonest shape there is, and
+    # `SELECT SETCNTRLVALUE AS BUSINESS_UNIT FROM PS_SET_CNTRL_REC` is
+    # exactly the sentence this harvest exists to read.
+    distinct_sources = set(known.values())
+    lone_source = (next(iter(distinct_sources))
+                   if len(distinct_sources) == 1 else None)
     out: list = []
     seen: set = set()
     for item in _split_select_items(body):
         match = re.fullmatch(
             rf"\s*{_QUALIFIED}\s+(?:AS\s+)?(?P<alias>{_IDENT})\s*",
             item, re.I)
-        if match is None:
-            continue                      # an expression, not a column
-        table_alias = _unquote(match.group("a"))
-        column = _unquote(match.group("b"))
+        if match is not None:
+            table_alias = _unquote(match.group("a"))
+            column = _unquote(match.group("b"))
+            target = known.get(table_alias)
+        elif lone_source is not None:
+            bare = re.fullmatch(
+                rf"\s*(?P<column>{_IDENT})\s+(?:AS\s+)?"
+                rf"(?P<alias>{_IDENT})\s*", item, re.I)
+            if bare is None:
+                continue                  # an expression, not a column
+            column = _unquote(bare.group("column"))
+            if column in _NOT_AN_ALIAS or column in _NOT_A_COLUMN:
+                continue                  # a keyword or a constant
+            match = bare
+            target = lone_source
+        else:
+            continue                      # an expression, or ambiguous
         means = _unquote(match.group("alias"))
-        target = known.get(table_alias)
         if target is None or not means or means == column:
             continue
         if means in _NOT_AN_ALIAS or means in _EMPTY_ALIASES:

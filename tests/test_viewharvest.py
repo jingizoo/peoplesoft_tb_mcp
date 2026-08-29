@@ -223,6 +223,76 @@ class VocabularyTests(unittest.TestCase):
         self.assertEqual(viewharvest.column_vocabulary(
             "SELECT A.INVOICE_NUMBER AS INVOICE_NUMBER FROM TU_X7 A"), [])
 
+    def test_one_table_in_scope_makes_a_bare_column_unambiguous(self):
+        """The shape this harvest was actually built for, and the shape it
+        could not read. Real view SQL does not alias-qualify: a view over
+        one table renaming its columns is the commonest form there is, and
+        `SELECT SETCNTRLVALUE AS BUSINESS_UNIT FROM PS_SET_CNTRL_REC` is
+        precisely the sentence a badly named schema writes down. With one
+        object in scope there is nothing for a bare column to be
+        ambiguous WITH."""
+        self.assertEqual(
+            viewharvest.column_vocabulary(
+                "SELECT SETCNTRLVALUE AS BUSINESS_UNIT, RECNAME, SETID "
+                "FROM PS_SET_CNTRL_REC"),
+            [{"schema": "", "object": "PS_SET_CNTRL_REC",
+              "column": "SETCNTRLVALUE", "means": "BUSINESS_UNIT"}])
+
+    def test_two_tables_in_scope_keep_a_bare_column_refused(self):
+        """The boundary the previous test rests on. With two sources a
+        bare column genuinely could belong to either, and guessing would
+        attach a person's word to the wrong table."""
+        self.assertEqual(viewharvest.column_vocabulary(
+            "SELECT SETCNTRLVALUE AS BUSINESS_UNIT FROM PS_A A "
+            "JOIN PS_B B ON A.SETID = B.SETID"), [])
+
+    def test_a_set_quantifier_does_not_eat_the_first_column(self):
+        """DISTINCT binds to the SELECT, not to the item after it. Left in
+        place it made `DISTINCT A.C1 AS INVOICE_NUMBER` fail to match, so
+        the FIRST column of every DISTINCT view went unlearned -- a
+        silent, uniform loss that looked exactly like a view with nothing
+        to teach."""
+        for quantifier in ("DISTINCT", "ALL", "UNIQUE", ""):
+            self.assertEqual(
+                [e["means"] for e in viewharvest.column_vocabulary(
+                    f"SELECT {quantifier} A.C1 AS INVOICE_NUMBER, "
+                    "A.C2 AS VENDOR_NAME FROM T A")],
+                ["INVOICE_NUMBER", "VENDOR_NAME"], quantifier)
+
+    def test_a_keyword_is_never_read_as_a_bare_column(self):
+        """With one source in scope the bare-column rule is permissive, so
+        the quantifier must be stripped rather than consumed: otherwise
+        `DISTINCT SETID` reads as column DISTINCT meaning SETID."""
+        self.assertEqual(viewharvest.column_vocabulary(
+            "SELECT DISTINCT SETID FROM PS_A"), [])
+        self.assertEqual(viewharvest.column_vocabulary(
+            "SELECT ALL FROM PS_A"), [])
+
+    def test_a_lone_source_does_not_relax_the_expression_rule(self):
+        """Permissiveness about WHICH table must not become permissiveness
+        about what a name describes. Two guards hold this jointly -- the
+        item must match end to end, AND its first token must be capable
+        of being a column -- so the sabotage reverts both."""
+        for item in ("SUM(AMOUNT) AS TOTAL_DUE",
+                     "COALESCE(A, B) AS RANGE_TO",
+                     "POSTED_TOTAL_AMT AS POSTED_TOTAL_AMT",
+                     "AMOUNT AS VALUE"):
+            self.assertEqual(
+                viewharvest.column_vocabulary(
+                    f"SELECT {item} FROM PS_A"), [], item)
+
+    def test_a_constant_is_not_a_column_of_the_lone_table(self):
+        """`NULL AS DISCOUNT_AMT` pads a UNION arm in a great deal of real
+        view SQL. Read as a bare column it asserts that this table has a
+        column called NULL that means a discount amount -- a false fact
+        about the schema, produced from perfectly ordinary SQL."""
+        for item in ("NULL AS DISCOUNT_AMT", "SYSDATE AS RUN_DATE",
+                     "USER AS RUN_BY", "ROWNUM AS LINE_NUMBER",
+                     "LEVEL AS TREE_DEPTH"):
+            self.assertEqual(
+                viewharvest.column_vocabulary(
+                    f"SELECT {item} FROM PS_A"), [], item)
+
     def test_readable_words(self):
         self.assertEqual(viewharvest.readable_words("INVOICE_NUMBER"),
                          "invoice number")
@@ -249,6 +319,10 @@ class HarvestEndToEndTests(unittest.TestCase):
                WHERE A.C9 = 'OPEN';
             CREATE VIEW INVOICE_STATES AS
               SELECT A.C9 AS PAYMENT_STATUS FROM TU_X7 A;
+            -- the shape real view SQL actually takes: one table, no
+            -- alias prefix, columns renamed to what they mean
+            CREATE VIEW VENDOR_NAMES AS
+              SELECT C7 AS SUPPLIER_NAME FROM TU_Q2;
             CREATE TABLE TU_SHARED_A (
                 SETID TEXT, BUSINESS_UNIT TEXT, AMOUNT NUMERIC);
             CREATE TABLE TU_SHARED_B (
@@ -330,6 +404,8 @@ class HarvestEndToEndTests(unittest.TestCase):
         self.assertIn(("TU_X7", "C1", "INVOICE_NUMBER"), terms)
         self.assertIn(("TU_X7", "C1", "invoice number"), terms)
         self.assertIn(("TU_Q2", "C7", "VENDOR_NAME"), terms)
+        # ... and from the unqualified, single-source view
+        self.assertIn(("TU_Q2", "C7", "SUPPLIER_NAME"), terms)
         # The aggregate names a computation, not C4.
         self.assertEqual([t for t in terms if t[2] == "TOTAL_DUE"], [])
 

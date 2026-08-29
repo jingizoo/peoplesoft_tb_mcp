@@ -387,7 +387,11 @@ Tier 1 comes from view definitions, which are read and discarded. A view is
 often the only place a cryptically named schema writes down its own meaning,
 so two things are extracted and nothing else: join predicates between two
 qualified columns, and column aliases (`C1 AS INVOICE_NUMBER` becomes a
-searchable term on that column). Expressions never name a column, because
+searchable term on that column). A column needs no table prefix when
+exactly one object is in scope — a view over a single table, renaming its
+columns, is the commonest shape there is and the one most worth reading —
+but with two or more sources a bare column is genuinely ambiguous and is
+refused. Expressions never name a column, because
 `SUM(C4) AS TOTAL_DUE` describes a computation and calling it a name for
 `C4` would be false. Both column names in a harvested join must exist on the
 objects named — on Oracle a long definition arrives through a `VARCHAR2`
