@@ -7,21 +7,37 @@ analyzed, how wide the copies problem actually is. The bundled sample has
 63 objects and no backup tables, so tuning against it would be tuning
 against a fiction.
 
-So this asks, and reports. It is READ ONLY and it is cheap:
+So this asks, and reports. It is READ ONLY:
 
 * every query reads the Oracle data dictionary, never a business table;
-* nothing is counted with COUNT(*) -- NUM_ROWS is already in the
-  dictionary, and a count sweep across a mismanaged schema is the kind of
-  thing a reporting account loses its grant for;
+* no business table is ever counted or scanned -- row counts come from
+  NUM_ROWS, which is already in the dictionary, because a count sweep
+  across a mismanaged schema is the kind of thing a reporting account
+  loses its grant for;
 * nothing is written anywhere, including the catalog.
+
+Most sections are cheap dictionary lookups. TWO ARE NOT, and they are
+marked EXPENSIVE where they appear: the PL/SQL sections aggregate over
+ALL_SOURCE, which holds one row per line of stored code, and the last one
+pattern-matches every one of those lines. They are placed last so that
+everything above them has already printed if they are slow.
+
+A query that TIMES OUT reports through the same `UNREADABLE:` slot as one
+the account may not read. If a line here says UNREADABLE, check the text:
+a privilege error names the object, a timeout does not. They are not the
+same finding and the remedies are opposites.
 
 Run it on the work box and send back the output:
 
     python scripts/probe_profiling.py                 # the primary
     python scripts/probe_profiling.py --source p2go
+    python scripts/probe_profiling.py --skip-expensive
 
-Two of the reported figures decide whether phase two is worth building at
-all -- see COVERAGE and GRANTS at the end of the output.
+Nothing printed is a value from a business table, and no line of stored
+source is printed anywhere -- only counts, ratios, and object names.
+
+Three of the reported figures decide what gets built next -- see COVERAGE,
+the PLSQL ratio, and GRANTS.
 """
 from __future__ import annotations
 
@@ -63,6 +79,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=None)
     ap.add_argument("--source", default="", help="registry source (default: primary)")
+    ap.add_argument("--skip-expensive", action="store_true",
+                    help="omit the ALL_SOURCE aggregates and the shape scan")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config) if args.config else load_config()
@@ -193,12 +211,155 @@ def main(argv=None) -> int:
         ("V$SQL", "SELECT COUNT(*) FROM V$SQL"),
         ("DBA_HIST_SQLSTAT", "SELECT COUNT(*) FROM DBA_HIST_SQLSTAT"),
         ("ALL_DEPENDENCIES", f"SELECT COUNT(*) FROM ALL_DEPENDENCIES {where}"),
+        # Stored-source reach. ALL_SOURCE unscoped answers a different
+        # question from ALL_SOURCE scoped: whether this account can see
+        # ANY owner's code, which separates "no grant" from "no code
+        # here". DBA_SOURCE is the remedy to ask for when it cannot.
+        ("DBA_SOURCE", "SELECT COUNT(*) FROM DBA_SOURCE WHERE ROWNUM <= 1"),
+        ("ALL_SOURCE owners",
+         "SELECT COUNT(DISTINCT OWNER) FROM ALL_SOURCE"),
+        ("ALL_IDENTIFIERS",
+         "SELECT COUNT(*) FROM ALL_IDENTIFIERS WHERE ROWNUM <= 1"),
+        ("ALL_STATEMENTS",
+         "SELECT COUNT(*) FROM ALL_STATEMENTS WHERE ROWNUM <= 1"),
     ):
         value, err = _one(db, sql, params if "ALL_DEPENDENCIES" in sql else {})
         print(f"  {label:<24} {'readable, ' + str(value) if not err else 'no: ' + err}")
 
+    # ---------------------------------------------------------- PLSQL
+    # The go/no-go for harvesting stored code. A custom schema writes its
+    # real joins and its load lineage into packages, but only if this
+    # account can SEE them: ALL_OBJECTS and ALL_SOURCE are both privilege
+    # filtered, and a reporting account with no EXECUTE typically sees a
+    # package's existence and not its body. So the ratio of the first two
+    # numbers is the whole question, and a low one is a PRIVILEGE GAP,
+    # not evidence that this schema has no PL/SQL.
+    unit_types = ("PACKAGE BODY", "PROCEDURE", "FUNCTION", "TRIGGER",
+                  "TYPE BODY")
+    type_list = ", ".join(f"'{t}'" for t in unit_types)
+    and_where = f"{where} AND " if where else "WHERE "
+
+    _section("PLSQL  (is there stored source, and may this account read it)")
+    visible, err_v = _one(
+        db,
+        f"SELECT COUNT(*) FROM ALL_OBJECTS {and_where}"
+        f"OBJECT_TYPE IN ({type_list})", params)
+    print(f"  units visible in ALL_OBJECTS    "
+          f"{visible if not err_v else 'UNREADABLE: ' + err_v}")
+    readable, err_r = _one(
+        db,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT OWNER,NAME,TYPE "
+        f"FROM ALL_SOURCE {and_where}TYPE IN ({type_list}))", params)
+    print(f"  units with readable source      "
+          f"{readable if not err_r else 'UNREADABLE: ' + err_r}")
+    if not err_v and not err_r and visible:
+        share = 100.0 * (int(readable or 0) / int(visible))
+        print(f"  ^ {share:.1f}% readable -- THE GO/NO-GO NUMBER. Near zero "
+              "means this")
+        print("    account sees the objects and not their text, which is a "
+              "grant to")
+        print("    ask for (SELECT on DBA_SOURCE), not an absence of code.")
+
+    if args.skip_expensive:
+        print("  (--skip-expensive: the ALL_SOURCE aggregates were not run)")
+    else:
+        _section("PLSQL VOLUME  (EXPENSIVE -- aggregates over one row per line)")
+        rows, err = _rows(
+            db,
+            "SELECT TYPE, COUNT(*) AS LINES, COUNT(DISTINCT NAME) AS OBJECTS "
+            f"FROM ALL_SOURCE {where} GROUP BY TYPE ORDER BY 2 DESC",
+            params, cap=30)
+        if err:
+            print(f"  by type: UNREADABLE: {err}")
+        else:
+            for row in rows:
+                print(f"  {str(row.get('type') or ''):<16} "
+                      f"{row.get('lines'):>9} lines  "
+                      f"{row.get('objects'):>6} objects")
+            print("  ^ says from the instance whether TRIGGER bodies live "
+                  "here at all")
+
+        rows, err = _rows(
+            db,
+            "SELECT OWNER, NAME, TYPE, COUNT(*) AS LINES FROM ALL_SOURCE "
+            f"{where} GROUP BY OWNER, NAME, TYPE ORDER BY 4 DESC "
+            "FETCH FIRST 10 ROWS ONLY", params, cap=10)
+        print("  largest programs:")
+        if err:
+            print(f"    UNREADABLE: {err}")
+        for row in rows:
+            print(f"    {row.get('lines'):>7} lines  "
+                  f"{row.get('owner')}.{row.get('name')} "
+                  f"({row.get('type')})")
+
+        value, err = _one(
+            db, f"SELECT MAX(LENGTH(TEXT)) FROM ALL_SOURCE {where}", params)
+        # A blank source line is stored as NULL ('' IS NULL in Oracle), so
+        # this maximum skips them -- it sizes the fetch buffer, and blank
+        # lines cost nothing to fetch.
+        print(f"  widest line (chars)             "
+              f"{value if not err else 'UNREADABLE: ' + err}")
+
+        value, err = _one(
+            db,
+            "SELECT COUNT(DISTINCT OWNER||'.'||NAME) FROM ALL_SOURCE "
+            f"{and_where}LINE <= 5 AND LOWER(TEXT) LIKE '%wrapped%'", params)
+        print(f"  programs that look wrapped      "
+              f"{value if not err else 'UNREADABLE: ' + err}")
+        print("  ^ wrapped bodies are ciphertext: visible, readable, and "
+              "useless")
+
+        value, err = _one(
+            db,
+            "SELECT COUNT(*) FROM (SELECT OWNER, NAME, TYPE FROM "
+            f"ALL_DEPENDENCIES {and_where}TYPE IN ({type_list}) "
+            "AND REFERENCED_TYPE IN "
+            "('TABLE','VIEW','MATERIALIZED VIEW','SYNONYM') "
+            "GROUP BY OWNER, NAME, TYPE "
+            "HAVING COUNT(DISTINCT REFERENCED_OWNER||'.'||"
+            "REFERENCED_NAME) >= 2)", params)
+        print(f"  programs touching 2+ objects    "
+              f"{value if not err else 'UNREADABLE: ' + err}")
+        print("  ^ what a ranked harvest would actually queue")
+
+        # ------------------------------------------------- PLSQL OWNERS
+        # Deliberately UNSCOPED. The package that loads a custom schema is
+        # very often owned by a neighbouring account, and a scoped probe
+        # would report zero while the code sits one owner away.
+        _section("PLSQL OWNERS  (EXPENSIVE, and UNSCOPED on purpose)")
+        rows, err = _rows(
+            db,
+            "SELECT OWNER, COUNT(*) AS LINES, COUNT(DISTINCT NAME) AS OBJECTS "
+            "FROM ALL_SOURCE GROUP BY OWNER ORDER BY 2 DESC "
+            "FETCH FIRST 20 ROWS ONLY", {}, cap=20)
+        if err:
+            print(f"  UNREADABLE: {err}")
+        for row in rows:
+            print(f"  {row.get('lines'):>9} lines  "
+                  f"{row.get('objects'):>6} objects  "
+                  f"{str(row.get('owner') or '')[:60]}")
+        print("  ^ if the volume is next door, `schemas` is pointed at the "
+              "wrong owner")
+
+        # -------------------------------------------------- PLSQL SHAPE
+        _section("PLSQL SHAPE  (MOST EXPENSIVE -- pattern-matches every line)")
+        value, err = _one(
+            db,
+            "SELECT COUNT(DISTINCT OWNER||'.'||NAME) FROM ALL_SOURCE "
+            f"{and_where}REGEXP_LIKE(TEXT, "
+            "'(^|[^A-Za-z_])JOIN[^A-Za-z_]', 'i')", params)
+        print(f"  programs containing a JOIN      "
+              f"{value if not err else 'UNREADABLE: ' + err}")
+        print("  ^ a harvest can only accept an explicit JOIN ... ON. Legacy")
+        print("    PL/SQL joins in the WHERE clause with (+), which is NOT")
+        print("    extractable safely. If this number is near zero, the "
+              "feature")
+        print("    would read a great deal and find nothing -- do not build "
+              "it.")
+
     print()
-    print("Nothing was written and no business table was read.")
+    print("Nothing was written, no business table was read, and no line of")
+    print("stored source was printed -- only counts, ratios and names.")
     return 0
 
 
