@@ -3202,6 +3202,19 @@ class TBEngine:
                 "Remote database links and external rowset functions are "
                 "not allowed; query only the selected database source."
             )
+        # A backtick is not an identifier quote this system understands, and
+        # that is the whole problem: _SQL_IDENTIFIER covers unquoted, "..."
+        # and [...], so `FROM \`X\`` yields NO table reference at all. Every
+        # control keyed on those references -- the schema allowlist, the
+        # existence check, and the operator's record veto -- is then skipped
+        # rather than failed, while SQLite executes the statement happily.
+        # Nothing in this codebase emits a backtick, so refusing them
+        # outright costs nothing and closes the class rather than one case.
+        if "`" in scrubbed:
+            raise EngineError(
+                "Backtick-quoted identifiers are not accepted; quote an "
+                "identifier with double quotes, or use its bare name."
+            )
         # Oracle's remote boundary is @DBLINK, checked above. Three-token
         # SCHEMA.PACKAGE.FUNCTION calls are legitimate within one Oracle
         # database, so the SQL Server multipart-name rules below must not

@@ -99,6 +99,47 @@ class RemedyTests(unittest.TestCase):
                 self.engine.run_sql(sql)
             self.assertIn("selected database source", str(caught.exception))
 
+    def test_a_backticked_reference_cannot_slip_past_every_guard(self) -> None:
+        """A backtick is not an identifier quote this system understands,
+        and that is exactly the danger. `_SQL_IDENTIFIER` covers unquoted,
+        "..." and [...] only, so a backticked name yields NO table
+        reference -- and every control keyed on those references is then
+        SKIPPED rather than failed: the schema allowlist, the existence
+        check, and the operator's record veto. SQLite executes backticks
+        happily, so this is a live read of an unlisted table, not a
+        syntax error that fails safe."""
+        for sql in (
+            "SELECT * FROM `PS_LEDGER`",
+            "SELECT * FROM `my-proj-1.dataset.table`",
+            "SELECT * FROM PS_LEDGER L JOIN `SECRET` S ON S.ID = L.ACCOUNT",
+            "SELECT * FROM `SYSADM`.`PS_LEDGER`",
+        ):
+            with self.subTest(sql=sql):
+                # The assertion lives INSIDE the subTest so each case
+                # proves THIS guard refused it. Left outside, a case
+                # caught by the three-part-name rule would satisfy the
+                # loop while the backtick rule did nothing.
+                with self.assertRaises(EngineError) as caught:
+                    self.engine.run_sql(sql)
+                self.assertIn("Backtick", str(caught.exception))
+
+    def test_the_bypass_this_closes_is_real(self) -> None:
+        """Proof the refusal is the right fix rather than a belt: the
+        extractor genuinely sees NOTHING in a backticked statement, so
+        nothing downstream can be trusted to catch it."""
+        scrubbed = self.engine._scrub_sql("SELECT * FROM `PS_LEDGER`")
+        self.assertEqual(self.engine._table_refs(scrubbed), set())
+        plain = self.engine._scrub_sql("SELECT * FROM PS_LEDGER")
+        self.assertEqual(self.engine._table_refs(plain), {"PS_LEDGER"})
+
+    def test_a_backtick_inside_a_value_is_not_a_refusal(self) -> None:
+        """The refusal reads SCRUBBED sql, so a backtick in a literal is
+        already blanked. A guard that fired on a correct question would
+        be worse than the hole it closes."""
+        out = self.engine.run_sql(
+            "SELECT COUNT(*) AS n FROM PS_BI_HDR WHERE BILL_STATUS = 'a`b'")
+        self.assertEqual(len(out["rows"]), 1)
+
     def test_remote_database_links_are_refused_before_explain(self) -> None:
         for sql in (
             "SELECT * FROM P2GO_ORDER@FINANCE_LINK",
