@@ -1204,6 +1204,57 @@ then a live tool must enforce caller scope and the required date/status basis.
 The full contract, confidence tiers, source examples and first-slice
 limitations are in [METADATA_CATALOG.md](METADATA_CATALOG.md).
 
+## 7b2. Continuous exception ticker (optional, off by default)
+
+Every check the product knows how to run normally waits to be asked. The
+ticker inverts that for the core tie-out: a background loop re-runs the
+integrity check on a cadence, remembers the last outcome per check, and the
+Diagnostics page shows only what CHANGED — a new exception, a delta that
+moved, an exception that cleared. Nobody asks; the surface is green until it
+is not.
+
+```yaml
+ticker:
+  enabled: true            # literal boolean; a quoted "true" is refused
+  cadence_minutes: 30      # bounded 5..1440
+  business_units: [US001]  # empty list = the configured default unit
+  # ledger: ACTUALS
+  # max_queries_per_tick: 40
+  # max_seconds_per_tick: 600
+```
+
+Rules the ticker holds itself to, so it can be left on against a production
+reporting account:
+
+* **Budgets are spent by reservation.** Each tick reserves the next check's
+  worst-case query cost before starting it; a check the budget cannot afford
+  appears in the feed as budget-cut rather than silently missing. Every
+  budget field has a floor and a ceiling — a config typo cannot buy an
+  unbounded loop.
+* **Nothing row-shaped persists.** The diff store and the `/api/exceptions`
+  feed hold check identities, statuses, integer counts, deltas and
+  timestamps. Never a journal id, an amount, or raw error text (errors are
+  stored as closed categories). Drill into a flagged check through chat,
+  which sees your access and the operator's current record exclusions.
+* **The operator veto binds background work.** An excluded record is refused
+  by the ticker exactly as it is refused in a question, re-checked on every
+  tick.
+* **Staleness is louder than absence.** The feed computes the age of the
+  last tick against the cadence and fails closed to stale; a dead runner
+  reads as UNKNOWN, never as "no exceptions". A check that stops being
+  scheduled is an event.
+* **Failure trips a breaker.** Repeated failed ticks — and any refused
+  logon, immediately — stop the loop until the process is restarted, so a
+  broken configuration cannot retry its way into a locked service account.
+* The per-check baselines are bound to the database endpoint's fingerprint;
+  repointing the connection archives them and starts fresh (disclosed in
+  the feed as a baseline reset) rather than diffing against another
+  database's history.
+
+The feed requires a signed-in session; rows carrying a business unit are
+narrowed to the caller's grants. The store lives in `ticker/` beside the
+other sidecars and holds no secrets.
+
 ## 7c. When a query hangs
 
 If the UI or chat sits on a tool call and never returns, time each database

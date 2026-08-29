@@ -4951,6 +4951,64 @@ function renderCoverageGaps(d,holder){
     '<span class="sub">'+esc((d&&d.note)||'')+'</span>'));
   holder.append(card);
 }
+async function loadExceptions(holder,source){
+  const existing=holder.querySelector('[data-exceptions]');
+  const box=el('div'); box.setAttribute('data-exceptions','1');
+  if(existing) existing.replaceWith(box); else holder.append(box);
+  const c=el('div','card');
+  c.append(el('h2',null,'Continuous checks <span class="sub">what changed since the last tick</span>'));
+  try{
+    const d=await api('/api/exceptions?source='+
+      encodeURIComponent(source||'default'));
+    if(!d.enabled){
+      c.append(el('div','pad','<span class="badge">off</span> '+esc(d.note||'Continuous checks are not enabled.')));
+      box.append(c); return;
+    }
+    if(!d.readable){
+      c.append(el('div','pad','<span class="badge warn">unreadable</span> '+esc(d.note||'The check state could not be read; nothing is shown rather than partial state.')));
+      box.append(c); return;
+    }
+    const state=(d.runner&&d.runner.state)||'unknown';
+    if(d.stale||state==='tripped'||state==='not_running'){
+      c.append(el('div','pad','<span class="badge warn">stale</span> '+
+        'The last completed tick is '+(d.age_seconds==null?'unknown':Math.round(d.age_seconds/60)+' min old')+
+        ' and the runner state is '+esc(state)+'. Treat this as UNKNOWN, not as "no exceptions".'));
+    }
+    const open=(d.rows||[]).filter(r=>!r.retired);
+    if(!open.length){
+      c.append(el('div','pad',d.stale?'' :'<span class="badge ok">clear</span> No standing exceptions in the scheduled checks.'));
+    }else{
+      const t=document.createElement('table');
+      t.innerHTML='<tr><th>check</th><th>unit</th><th>status</th><th>signals</th><th>last change</th></tr>';
+      for(const r of open){
+        const sig=Object.entries(r.counts||{}).filter(([k,v])=>v>0&&k!=='checks_narrowed')
+          .map(([k,v])=>esc(k.replace(/_/g,' '))+': '+v).join(', ')||'—';
+        const badge=r.status==='passed'?'<span class="badge ok">passed</span>'
+          :r.status==='exceptions_found'?'<span class="badge warn">exceptions</span>'
+          :'<span class="badge warn">'+esc(r.status.replace(/_/g,' '))+'</span>';
+        const tr=document.createElement('tr');
+        tr.innerHTML='<td>'+esc(r.check_id)+(r.narrowed?' <span class="sub">(narrowed scope)</span>':'')+'</td>'+
+          '<td>'+esc(r.business_unit||'—')+'</td><td>'+badge+'</td>'+
+          '<td>'+sig+'</td><td>'+esc((r.last_changed||'').slice(0,16))+'</td>';
+        t.append(tr);
+      }
+      const wrap2=el('div','pad'); wrap2.append(t); c.append(wrap2);
+      if(d.counts_note) c.append(el('div','pad sub',esc(d.counts_note)));
+    }
+    const ev=(d.events||[]).slice(0,8);
+    if(ev.length){
+      c.append(el('div','pad sub','Recent: '+ev.map(e0=>
+        esc(e0.kind.replace(/_/g,' '))+' — '+esc(e0.check_id)+
+        (e0.metric?' ('+esc(e0.metric.replace(/_/g,' '))+
+          (e0.before_n!=null?' '+e0.before_n+'→'+e0.after_n:'')+')':'')
+      ).join(' · ')));
+    }
+  }catch(e){
+    c.append(el('div','pad','<span class="badge warn">unavailable</span> '+esc(errText(e))));
+  }
+  box.append(c);
+}
+
 async function loadCoverageGaps(holder,source){
   const existing=holder.querySelector('[data-coverage]');
   const box=el('div'); box.setAttribute('data-coverage','1');
@@ -5134,6 +5192,7 @@ async function viewDiag(){
       const d=await api('/api/diagnostics?include_timings='+(withTimings?1:0));
       renderDiag(d,holder);
       await loadApprovals(holder,ACTIVE_CHAT_SOURCE);
+      await loadExceptions(holder,ACTIVE_CHAT_SOURCE);
       await loadCoverageGaps(holder,ACTIVE_CHAT_SOURCE);
       try{
         holder.append(renderQlogReport(await api('/api/question-report')));
