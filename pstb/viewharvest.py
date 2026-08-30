@@ -291,7 +291,19 @@ def column_vocabulary(sql: str, aliases: Mapping | None = None) -> list:
             target = lone_source
         else:
             continue                      # an expression, or ambiguous
-        means = _unquote(match.group("alias"))
+        raw_alias = match.group("alias")
+        if raw_alias.strip().startswith('"'):
+            # A bare identifier can never contain a space, an apostrophe
+            # or mixed case -- only a QUOTED one can, which is exactly
+            # the shape a party name takes: `AS "Acme Manufacturing
+            # rebate"`. _unquote uppercases everything, which would
+            # destroy that signal before it could be checked, so this
+            # refuses on the raw text rather than sanitizing what
+            # survives. A column named with a quoted phrase is rare
+            # enough in real view SQL that refusing it costs little;
+            # keeping it costs a customer name in a search index.
+            continue
+        means = _unquote(raw_alias)
         if target is None or not means or means == column:
             continue
         if means in _NOT_AN_ALIAS or means in _EMPTY_ALIASES:

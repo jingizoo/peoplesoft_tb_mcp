@@ -2172,6 +2172,62 @@ def coverage_gaps_endpoint(request: Request = None, source: str = "default"):
     return demand.coverage_gaps(turns, search, usefulness, source=canonical)
 
 
+def _canonical_or_404(source: str) -> str:
+    canonical = (engine.registry.resolve_name(source)
+                if engine.registry is not None else "default")
+    known = (list(engine.registry.names())
+            if engine.registry is not None else ["default"])
+    if canonical not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown source {source!r}; choose one of "
+                   f"{', '.join(known)}")
+    return canonical
+
+
+@app.get("/api/source/{command}/meaning-worklist")
+def meaning_worklist_endpoint(request: Request, command: str):
+    """Every object in one source, bucketed by whether a person could
+    write down what it means -- never a drafted meaning, never a write.
+
+    Same gate as coverage-gaps and for the same reason: a refusal bucket
+    is not sensitive, but this can be ordered by demand (failed question
+    phrases), and a shared-VPN reader has no business seeing those.
+    """
+    _require_question_log_operator(request)
+    from .. import meaning_worklist
+    canonical = _canonical_or_404(command)
+    try:
+        catalog = _coverage_catalog(canonical)
+        store = _source_knowledge_store(canonical)
+        if not catalog.available():
+            return {"source": canonical, "total": 0, "counts": {},
+                    "rows": [], "notes": {},
+                    "note": f"no readable metadata catalog for "
+                            f"{canonical!r}; build it first"}
+        return meaning_worklist.build_worklist(catalog, store, canonical)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/source/{command}/meaning-evidence")
+def meaning_evidence_endpoint(request: Request, command: str,
+                              identifier: str = ""):
+    """The same allow-listed packet a person would need to author a
+    meaning -- re-read live from the catalog, never stored. Fresher than
+    a snapshot and needs no schema to hold it."""
+    _require_question_log_operator(request)
+    canonical = _canonical_or_404(command)
+    if not str(identifier or "").strip():
+        raise HTTPException(status_code=400, detail="identifier required")
+    catalog = _coverage_catalog(canonical)
+    if not catalog.available():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no readable metadata catalog for {canonical!r}")
+    return catalog.object_evidence(identifier, source=canonical)
+
+
 # ---- continuous exception ticker ----------------------------------------
 # The runner lives in this process because this is the only process with a
 # managed lifecycle (the lifespan), a singleton guarantee where it matters

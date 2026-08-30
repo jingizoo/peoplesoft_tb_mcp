@@ -217,6 +217,51 @@ optimizer planning, guarded SQL, and streamed exports. Existing approved
 wording that explicitly says “do not use” is read as an exclusion; “staging”
 alone remains descriptive rather than prohibitive.
 
+### The evidence surface: who needs a written meaning, and what they'd see
+
+Writing a meaning by hand does not scale past a handful of objects, and a
+model that drafts one without evidence cannot be told apart from a model
+that is confidently wrong. `MetadataCatalog.object_evidence(identifier,
+source)` and the `pstb.meaning_worklist` module exist to close that gap
+without drafting anything: they read the catalog's own evidence about one
+object and sort every object into a bucket — worth a person's attention now,
+or refused with the reason named. Nothing here writes a proposal.
+
+`object_evidence` requires an explicit `source`; there is no cross-source
+resolution to bypass by accident. It returns the object's identity, its full
+column signature, its liveness with a **caveat branch name** rather than the
+rendered sentence (which interpolates a row-modification count — a digit a
+drafted meaning could never legally contain), declared foreign keys, joins a
+view author declared (with completeness and whether other views join the
+same pair differently), mined value-overlap joins (confidence per column
+pair, never the sampled percentage), and column vocabulary a view harvested
+— itself screened at extraction: a quoted alias like `AS "Acme Manufacturing
+rebate"` is refused outright rather than sanitized, because a bare identifier
+can never carry a space or mixed case and a quoted one that does is exactly
+the shape a party name takes. Row estimates, activity counts and every other
+volumetric never leave the catalog.
+
+The worklist buckets every table and view in one source: `eligible` (a
+person could write a meaning from what exists), `no_human_wording` (nothing
+founds one — see below), `empty`, `profiler_silent`, or `already_spoken_for`
+(a proposal exists for this object in *any* status; there is no bulk-decide
+in the review drawer, and re-listing a decided object trains an operator to
+stop reading it). A relationship — declared or mined — only **corroborates**;
+it never **founds**. Only three things do: a record label that says
+something the physical name did not already say, three or more distinct
+words a view author wrote down for a column, or a directly joined neighbour
+that already has an approved meaning. An object with rich view vocabulary
+is, not coincidentally, one a person could already decode by reading the
+view — the worklist's value is pointing at the objects that cannot be
+decoded that way.
+
+Both are reachable only as an operator surface — `python -m
+pstb.meaning_worklist --source <name>` on the host, or
+`GET /api/source/{command}/meaning-worklist` and
+`GET /api/source/{command}/meaning-evidence?identifier=...` behind the same
+machine-local gate as the failed-question worklist. Neither is an MCP tool;
+no chat turn can reach them.
+
 ### Minimum read-only access
 
 The build uses only catalog reads and `SELECT`/PRAGMA operations. Ask the DBA
