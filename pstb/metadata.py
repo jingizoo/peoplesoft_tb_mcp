@@ -2681,12 +2681,6 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
             state.alias(source, entry["means"], owner, "view vocabulary")
             terms += 1
 
-    if joins or terms:
-        state.note(
-            source, "view_vocabulary",
-            f"{joins} join(s) a view author declared and {terms} column "
-            f"name(s) they wrote down, harvested from {evidence}; the "
-            "definitions themselves are not stored", ok=True)
     # One edge per pair of objects, carrying one view's WHOLE condition.
     # Two views can join the same objects differently; the edge key is
     # (src,dst,kind), so only one survives. The first in deterministic
@@ -2722,6 +2716,19 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
                 "alternate_conditions": alternates,
             })
         joins += 1
+
+    if joins or terms:
+        # AFTER the emission loop, deliberately: #179 deferred edge
+        # emission but left this note above it, so `joins` was always 0
+        # here and the note reported "0 join(s)" on every build -- and a
+        # schema whose views declare joins but teach no vocabulary got no
+        # note at all. An operator judging whether the harvest works
+        # reads this line; it has to count what was actually written.
+        state.note(
+            source, "view_vocabulary",
+            f"{joins} join(s) a view author declared and {terms} column "
+            f"name(s) they wrote down, harvested from {evidence}; the "
+            "definitions themselves are not stored", ok=True)
 
     if len(rows) >= cap:
         # Reading exactly the cap means there were probably more. A
@@ -3959,6 +3966,26 @@ class MetadataCatalog:
             basis = edge["evidence"]
             label = record["label"] or label
             evidence.append(self._evidence(edge))
+        label_source = None
+        if label is None and mappings:
+            # The one human-written description a PS_ table has is its
+            # record's RECDESCR, and until now only a SEARCH that matched
+            # through the record could surface it -- context(), the tool a
+            # person actually uses to study one object, always showed
+            # label: null. The mapping's own confidence rides along and
+            # the match confidence is left alone: this labels the object,
+            # it does not upgrade the evidence for choosing it.
+            labelled = [(edge, record) for edge, record in mappings
+                        if record["label"]]
+            distinct = {record["label"] for _edge, record in labelled}
+            if len(distinct) == 1:
+                map_edge, map_record = labelled[0]
+                label = map_record["label"]
+                label_source = {
+                    "logical_record": map_record["name"],
+                    "confidence": map_edge["confidence"],
+                    "basis": map_edge["evidence"],
+                }
         for item in extra_evidence or []:
             ev = self._evidence(item)
             if ev not in evidence:
@@ -3978,6 +4005,7 @@ class MetadataCatalog:
             } for edge, record in mappings[:20]],
             "physical_object": row["name"],
             "label": label,
+            **({"label_source": label_source} if label_source else {}),
             "object_confidence": {
                 "tier": row["confidence"], "basis": row["evidence"]},
             "confidence": {"tier": confidence, "basis": basis},

@@ -1409,7 +1409,7 @@ def propose_metadata_meaning(
     meaning: str,
     aliases: str = "",
     source: str = "",
-    selection: str = "prefer",
+    selection: str = "",
 ) -> dict:
     """PROPOSE a durable selection rule for one exact table/view.
 
@@ -1417,7 +1417,10 @@ def propose_metadata_meaning(
     First call get_metadata_context, then pass its exact schema.object as
     identifier. aliases is optional comma-separated business wording.
     selection=prefer makes the approved meaning a discovery pointer;
-    selection=exclude makes approval a hard "do not use for answers" veto.
+    selection=exclude makes approval a hard "do not use for answers" veto;
+    omitted, the wording decides -- a lesson phrased "do not use X" becomes
+    a veto as written. Explicit prefer contradicted by veto-style wording
+    is refused rather than silently inverted.
     Use exclude for junk, obsolete, duplicate, or non-reporting staging
     objects, but not merely because a valid interface table is called staging.
     This

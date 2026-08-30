@@ -2658,8 +2658,27 @@ def list_approvals(request: Request, response: Response,
         wanted = "pending"
         listing = {"facts": [], "counts": {}}
     else:
-        listing = _site_memory().list_facts(
-            "" if wanted == "all" else wanted)
+        requested_source = str(source or "").strip()
+        if requested_source:
+            # Honored, at last: a drawer titled "Metadata meanings - P2Go"
+            # used to list Finance proposals, site-memory facts and every
+            # source's decision history, because this parameter was read
+            # only on the unauthenticated-remote branch.
+            if engine.registry is None:
+                raise HTTPException(status_code=404,
+                                    detail="no sources configured")
+            canonical = engine.registry.resolve_name(requested_source)
+            known = list(engine.registry.names())
+            if canonical not in known:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"unknown source {requested_source!r}; choose "
+                           f"one of {', '.join(known)}")
+            source_names = [canonical]
+        listing = ({"facts": [], "counts": {}}
+                   if requested_source and requested_source != "default"
+                   else _site_memory().list_facts(
+                       "" if wanted == "all" else wanted))
     items = [{
         "queue": "memory",
         "id": fact.get("id"),
