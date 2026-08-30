@@ -4398,6 +4398,14 @@ class MetadataCatalog:
                     "confidence": row["edge_confidence"],
                     "evidence": row["edge_evidence"],
                     "declared_in_view": attrs.get("declared_in_view"),
+                    # Raw facts, not just the rendered sentence below: a
+                    # caller building its OWN safe description (never a
+                    # literal count -- see _caveat_branch's reasoning)
+                    # needs pairs_complete and alternate_conditions as
+                    # data, not parsed back out of prose.
+                    "pairs_complete": bool(attrs.get("pairs_complete")),
+                    "alternate_conditions": int(
+                        attrs.get("alternate_conditions") or 0),
                     "caveat": (
                         "DECLARED BY A VIEW AUTHOR, not enforced by the "
                         "database: a person asserted this join in "
@@ -4548,6 +4556,210 @@ class MetadataCatalog:
             return {"available": True, "found": False,
                     "source_database": source or None,
                     "detail": str(exc), "relationships": []}
+        finally:
+            con.close()
+
+    def object_evidence(self, identifier: str, source: str = "") -> dict:
+        """The allow-listed packet a person needs to author a meaning.
+
+        Everything context() and relationships_of() already know about
+        one object, projected through an EXPLICIT allow-list -- the
+        rerank.metadata_document discipline applied here: a caller
+        accidentally attaching a row sample or a volumetric to either of
+        those results cannot make it into what this returns. No row
+        value, no amount, no count that could stand in for one, and no
+        rendered sentence that embeds a digit (_caveat_branch exists
+        precisely so the WHY survives without the count).
+
+        source is REQUIRED, not merely accepted: this method exists to
+        hand evidence to something less trusted than a person browsing
+        the GUI with a session already scoped to one source, and a
+        cross-source resolution here would be the packet silently
+        crossing a silo boundary that every other tool refuses to cross.
+        """
+        canonical = _s(source)
+        if not canonical:
+            raise MetadataError(
+                "object_evidence requires source= -- resolving across "
+                "every configured source is exactly the cross-silo "
+                "leak this method exists to prevent")
+        try:
+            return self._object_evidence(identifier, canonical)
+        except MetadataError as exc:
+            # context() raises rather than returning found=False for an
+            # unrecognised source (unlike relationships_of(), which
+            # already catches this) -- a worklist iterating many objects
+            # must survive one bad name rather than dying on it.
+            return {"available": True, "found": False,
+                    "bucket": "source_error", "detail": str(exc)}
+
+    def _object_evidence(self, identifier: str, canonical: str) -> dict:
+        ctx = self.context(identifier, source=canonical, limit=200)
+        if not ctx.get("available"):
+            return ctx
+        if ctx.get("ambiguous"):
+            return {"available": True, "found": False,
+                    "bucket": "ambiguous", "detail": ctx.get("detail")}
+        if not ctx.get("found"):
+            return {"available": True, "found": False,
+                    "bucket": "not_found", "detail": ctx.get("detail")}
+        subject = ctx.get("subject") or {}
+        if (str(ctx.get("source_database") or "") != canonical
+                or str(subject.get("source") or "") != canonical):
+            # Defence in depth: context() already scopes by source, but
+            # this is the one method a refusal here must never bypass.
+            return {"available": True, "found": False,
+                    "bucket": "wrong_source",
+                    "detail": "the resolved object did not come from "
+                              "the requested source"}
+        if str(subject.get("kind") or "").lower() not in ("table", "view"):
+            return {"available": True, "found": False,
+                    "bucket": "not_an_object",
+                    "detail": "object_evidence covers tables and views; "
+                              "this identifier resolved to a "
+                              "PeopleTools record with no physical "
+                              "object behind it"}
+        node_id = str(subject.get("object_id") or "")
+
+        con = self._open()
+        try:
+            profile = con.execute(
+                "SELECT signature, column_count FROM object_profiles "
+                "WHERE node_id=?", (node_id,)).fetchone()
+        except sqlite3.OperationalError:
+            profile = None
+        finally:
+            con.close()
+
+        signature = str(profile["signature"]) if profile else ""
+        signature_blank = not signature
+        columns = ([] if signature_blank else signature.split("|"))
+
+        usefulness = ctx.get("usefulness") or {}
+        liveness = usefulness.get("liveness")
+        prefer = usefulness.get("prefer_instead")
+
+        rel = self.relationships_of(identifier, source=canonical)
+        hops = rel.get("relationships") or [] if rel.get("found") else []
+
+        def trim_pairs(pairs):
+            return [{"column": p.get("left_column"),
+                     "references_column": p.get("right_column")}
+                    for p in (pairs or [])]
+
+        foreign_keys, view_joins, mined_joins = [], [], []
+        for hop in hops:
+            kind = hop.get("relationship")
+            next_obj = hop.get("next") or {}
+            with_name = ".".join(filter(None, [
+                str(next_obj.get("schema") or ""),
+                str(next_obj.get("object") or "")]))
+            if kind == "foreign_key":
+                foreign_keys.append({
+                    "direction": hop.get("direction"),
+                    "with": with_name,
+                    "with_object_id": next_obj.get("id"),
+                    "column_pairs": trim_pairs(hop.get("column_pairs")),
+                    "complete": bool(hop.get("column_pairs_complete")),
+                })
+            elif kind == "view_declared_join":
+                view_joins.append({
+                    "direction": hop.get("direction"),
+                    "with": with_name,
+                    "with_object_id": next_obj.get("id"),
+                    "declared_in_view": hop.get("declared_in_view"),
+                    "column_pairs": trim_pairs(hop.get("column_pairs")),
+                    "complete": bool(hop.get("column_pairs_complete")),
+                    "has_alternate_conditions": bool(
+                        hop.get("alternate_conditions")),
+                })
+            elif kind == "value_overlap":
+                # Per-pair CONFIDENCE only -- the plan's own reasoning:
+                # "a possible pair must stay visibly possible on a
+                # likely edge". overlap_pct/sampled are volumetrics and
+                # never leave the catalog.
+                mined_joins.append({
+                    "direction": hop.get("direction"),
+                    "with": with_name,
+                    "measurements": [{
+                        "column": m.get("column"),
+                        "references_column": m.get("referenced_column"),
+                        "confidence": m.get("confidence"),
+                        "mutual": bool(m.get("mutual")),
+                    } for m in (hop.get("measurements") or [])],
+                })
+
+        notes = self._evidence_notes(canonical)
+        vocabulary = self._view_vocabulary_for(node_id)
+
+        profiler_status = ("silent" if not usefulness else "measured")
+        empty_verified = (liveness == "empty" and usefulness.get(
+            "caveat_branch") == "verified_empty_current")
+
+        return {
+            "available": True, "found": True,
+            "source_database": canonical,
+            "schema": subject.get("schema"),
+            "object": subject.get("physical_object") or subject.get("name"),
+            "kind": subject.get("kind"),
+            "label": subject.get("label"),
+            "label_source": subject.get("label_source"),
+            "columns": columns,
+            "signature_blank": signature_blank,
+            "liveness": liveness,
+            "population_basis": usefulness.get("basis"),
+            "caveat_branch": usefulness.get("caveat_branch"),
+            "empty_verified": empty_verified,
+            "referenced_by": bool(usefulness.get("referenced_by")),
+            "prefer_instead": ({"object": prefer.get("object"),
+                                "relation": prefer.get("relation")}
+                               if isinstance(prefer, dict) else None),
+            "declared_foreign_keys": foreign_keys,
+            "view_declared_joins": view_joins,
+            "mined_joins": mined_joins,
+            "view_vocabulary": vocabulary,
+            "notes": notes,
+            "profiler_status": profiler_status,
+            "coverage_note": (
+                "Structure and evidence only: no row was read from any "
+                "business table to build this packet, and nothing here "
+                "is financial evidence."),
+        }
+
+    def _evidence_notes(self, source: str) -> dict:
+        """view_vocabulary/value_joins notes, verbatim -- so 'nothing
+        declared' and 'the harvest was capped' are never confused."""
+        con = self._open()
+        try:
+            rows = con.execute(
+                "SELECT layer, note FROM notes WHERE source=? "
+                "AND layer IN ('view_vocabulary','value_joins') "
+                "ORDER BY layer", (source,)).fetchall()
+            return {row["layer"]: row["note"] for row in rows}
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            con.close()
+
+    def _view_vocabulary_for(self, node_id: str) -> list:
+        """Column names a view author wrote down for THIS object's
+        columns -- the one field allowed to carry prose, because it is
+        already screened at harvest time (viewharvest refuses any
+        quoted, party-name-shaped alias before it ever reaches a
+        search_terms row)."""
+        con = self._open()
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT N.name AS column, T.text AS means "
+                "FROM search_terms T JOIN nodes N ON N.id = T.node_id "
+                "JOIN edges E ON E.dst = N.id "
+                "AND E.kind='object_has_column' AND E.src=? "
+                "WHERE T.facet LIKE 'view %' "
+                "ORDER BY N.name, T.text", (node_id,)).fetchall()
+            return [{"column": row["column"], "means": row["means"]}
+                    for row in rows]
+        except sqlite3.OperationalError:
+            return []
         finally:
             con.close()
 
@@ -4889,6 +5101,28 @@ class MetadataCatalog:
         finally:
             con.close()
 
+    @staticmethod
+    def _caveat_branch(liveness: str, mods, row_estimate) -> str:
+        """Which of _usefulness's five caveat sentences fired, as a name.
+
+        The rendered sentences interpolate {int(mods)} -- exactly the
+        digit an evidence packet must never carry (a meaning built on it
+        can never contain a bare number either). A caller that needs to
+        know WHY without the count reads this branch name instead of
+        parsing the count back out of prose it was never meant to carry.
+        """
+        if liveness == "unknown" and (mods or 0) > 0 and row_estimate is not None:
+            return "empty_contradicted_by_dml"
+        if liveness == "unknown" and (mods or 0) > 0:
+            return "unmeasured_but_active"
+        if liveness == "unknown":
+            return "unmeasured"
+        if liveness == "empty" and mods is not None and int(mods) == 0:
+            return "verified_empty_current"
+        if liveness == "empty":
+            return "empty_unconfirmed"
+        return "none"
+
     def _usefulness(self, con, node_id: str) -> dict:
         """What the profiler concluded about one object, or {} if it did not.
 
@@ -4928,6 +5162,8 @@ class MetadataCatalog:
             out["measured_at"] = row["analyzed_at"]
         if mods is not None:
             out["modified_since_stats"] = int(mods)
+        out["caveat_branch"] = self._caveat_branch(
+            row["liveness"], mods, row["row_estimate"])
         when = f" (gathered {row['analyzed_at']})" if row["analyzed_at"] else ""
         if row["liveness"] == "unknown" and (mods or 0) > 0                 and row["row_estimate"] is not None:
             # The contradiction case: statistics said empty, the
