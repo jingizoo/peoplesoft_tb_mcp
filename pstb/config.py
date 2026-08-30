@@ -343,6 +343,23 @@ class PsApiCfg:
 
 
 @dataclass
+class TickerCfg:
+    """The continuous exception ticker. OFF by default, like everything
+    here that costs the database or exposes state: a standing loop
+    against a read-only reporting account is enabled by a person who has
+    read what it runs, never by a default."""
+    enabled: bool = False
+    cadence_minutes: int = 30
+    ledger: str = ""
+    business_units: list = field(default_factory=list)
+    max_queries_per_tick: int = 40
+    max_seconds_per_tick: int = 600
+    history_per_check: int = 200
+    events_kept: int = 500
+    failure_trip: int = 3
+
+
+@dataclass
 class SecurityCfg:
     """Business-unit row security, read from PeopleSoft's own configuration.
 
@@ -404,6 +421,7 @@ class Config:
     anomalies: AnomalyCfg = field(default_factory=AnomalyCfg)
     coupa: CoupaCfg = field(default_factory=CoupaCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
+    ticker: TickerCfg = field(default_factory=TickerCfg)
 
     @classmethod
     def sample(cls, root: Path | str) -> "Config":
@@ -422,6 +440,25 @@ def _apply_section(obj: Any, data: Optional[dict]) -> None:
     for k, v in data.items():
         if k in names and v is not None:
             setattr(obj, k, v)
+
+
+def _validate_ticker(cfg: TickerCfg) -> None:
+    """The off-switch must be a literal boolean, never a truthy value.
+
+    The ticker is a standing loop against a production database; the
+    quoted string "false" being truthy in Python must not be what turns
+    it on. Numeric budgets are validated with floors AND ceilings where
+    they are spent (ticker.TickerLimits) so a config typo cannot buy an
+    unbounded loop either.
+    """
+    enabled = getattr(cfg, "enabled", False)
+    if type(enabled) is not bool:  # bool only; integers are not accepted
+        raise RuntimeError(
+            "ticker.enabled must be the YAML boolean true or false "
+            "(without quotes)")
+    units = getattr(cfg, "business_units", [])
+    if not isinstance(units, (list, tuple)):
+        raise RuntimeError("ticker.business_units must be a list")
 
 
 def _validate_security(cfg: SecurityCfg) -> None:
@@ -824,6 +861,8 @@ def load_config(path: Optional[str] = None) -> Config:
         _validate_coupa(cfg.coupa)
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))
+        _apply_section(cfg.ticker, data.get("ticker"))
+        _validate_ticker(cfg.ticker)
         _validate_security(cfg.security)
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]

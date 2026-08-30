@@ -325,9 +325,11 @@ async def _lifespan(_app):
     # first paint depends on it, so start it at boot rather than on the first
     # visitor's request. Serves from the persisted catalog meanwhile.
     _prime_scope_catalog()
+    _start_ticker()
     try:
         yield
     finally:
+        _stop_ticker()
         stop.set()
         # A live subprocess is worth a graceful close. One that never
         # finished starting has nothing to close gracefully, and waiting on
@@ -446,7 +448,7 @@ _OPEN_PATHS = frozenset({
 _UNIT_FREE_PREFIXES = ("/api/wiki", "/api/activity", "/api/feedback",
                        "/api/chat/reset", "/api/question-report",
                        "/api/question-review", "/api/approvals",
-                       "/api/coverage-gaps",
+                       "/api/coverage-gaps", "/api/exceptions",
                        "/api/batch-exports")
 
 
@@ -2168,6 +2170,152 @@ def coverage_gaps_endpoint(request: Request = None, source: str = "default"):
         return (result or {}).get("usefulness") or {}
 
     return demand.coverage_gaps(turns, search, usefulness, source=canonical)
+
+
+# ---- continuous exception ticker ----------------------------------------
+# The runner lives in this process because this is the only process with a
+# managed lifecycle (the lifespan), a singleton guarantee where it matters
+# (Cloud Run pins min=max=1 with CPU always allocated), and the operator's
+# record-exclusion index already attached to its engine. It is OFF by
+# default and never starts in tests unless a test says so.
+_TICKER = None
+_TICKER_CONFIG_ERROR = ""
+
+
+def _ticker_context():
+    """Resolved on EVERY tick: the console reload swaps these globals at
+    runtime, and a runner that captured them once would keep checking the
+    previous database."""
+    from types import SimpleNamespace
+    return SimpleNamespace(engine=engine, cfg=cfg, source="default")
+
+
+def _start_ticker() -> None:
+    global _TICKER, _TICKER_CONFIG_ERROR
+    if getattr(getattr(cfg, "ticker", None), "enabled", False) is not True:
+        return
+    from ..ticker import TickerError, TickerLimits, TickerRunner
+    try:
+        TickerLimits.from_config(cfg.ticker)
+    except TickerError as exc:
+        # A misconfigured budget must not become an unbounded loop; the
+        # feed discloses why the ticker is not running.
+        _TICKER_CONFIG_ERROR = str(exc)
+        return
+    _TICKER = TickerRunner(_ticker_context)
+    _TICKER.start()
+
+
+def _stop_ticker() -> None:
+    global _TICKER
+    runner, _TICKER = _TICKER, None
+    if runner is not None:
+        runner.stop()
+
+
+@app.get("/api/exceptions")
+def exceptions_feed(request: Request, response: Response,
+                    source: str = "default"):
+    """What changed since the last tick, with staleness stated up front.
+
+    Signed-in-session gated (unit-free), because a row here is counts,
+    deltas and check identities -- never a journal id, an amount from a
+    row, or question text. Business-unit-labeled rows are still narrowed
+    to the caller's grants on the way out.
+    """
+    response.headers["Cache-Control"] = "no-store, private"
+    canonical = (engine.registry.resolve_name(source)
+                 if engine.registry is not None else "default")
+    known = (list(engine.registry.names())
+             if engine.registry is not None else ["default"])
+    if canonical not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown source {source!r}; choose one of "
+                   f"{', '.join(known)}")
+    from ..metadata import source_fingerprint
+    from ..ticker import TickerError, TickerLimits, TickerStore, store_path
+    ticker_cfg = getattr(cfg, "ticker", None)
+    enabled = getattr(ticker_cfg, "enabled", False) is True
+    envelope = {
+        "source": canonical,
+        "enabled": enabled,
+        "runner": (_TICKER.status() if _TICKER is not None else
+                   {"state": "not_running"}),
+        "rows": [], "events": [], "stale": True, "age_seconds": None,
+        "readable": True, "truncated": False, "note": "",
+    }
+    if _TICKER_CONFIG_ERROR:
+        envelope["note"] = (f"the ticker is not running: "
+                            f"{_TICKER_CONFIG_ERROR}")
+        return envelope
+    if not enabled:
+        envelope["note"] = ("the ticker is off; set ticker.enabled: true "
+                            "in config.yaml and restart to turn the "
+                            "continuous checks on")
+        return envelope
+    try:
+        limits = TickerLimits.from_config(ticker_cfg)
+        store = TickerStore(
+            store_path(Path(getattr(cfg, "root", ".")), canonical),
+            source=canonical,
+            fingerprint=source_fingerprint(cfg, canonical),
+            limits=limits)
+        feed = store.read_feed()
+    except TickerError as exc:
+        envelope.update({"readable": False,
+                         "note": f"the ticker store is not readable "
+                                 f"({type(exc).__name__})"})
+        return envelope
+    envelope["cadence_minutes"] = limits.cadence_minutes
+    rows = feed["rows"]
+    # access_for_request, NOT current_access(): the unit-free middleware
+    # branch checks the sign-in and returns WITHOUT binding access_scope,
+    # so current_access() is None on this route and narrowing keyed on it
+    # is dead code that only a test that patches it can see pass.
+    access = access_for_request(request)
+    events = feed["events"]
+    if access is not None and not getattr(access, "all_units", True):
+        # Narrowed on the way OUT: the store is shared, the reach is not.
+        # Events are the second channel -- a check id embeds its unit,
+        # and a worsened-delta about a unit the caller was never granted
+        # is that unit's data whichever array carries it.
+        rows = [r for r in rows
+                if not r["business_unit"]
+                or access.allows(r["business_unit"])]
+        allowed = {r["check_id"] for r in rows} | {"ticker"}
+        events = [e for e in events if e["check_id"] in allowed]
+    envelope["truncated"] = len(rows) > 200
+    envelope.update({
+        "rows": rows[:200], "events": events,
+        "last_tick": feed["last_tick"], "stale": feed["stale"],
+        "age_seconds": feed.get("age_seconds"),
+        "readable": feed["readable"], "note": feed.get("note", ""),
+        "counts_note": ("counts are bounded by each check's own row "
+                        "caps; a saturated count means AT LEAST that "
+                        "many"),
+    })
+    return envelope
+
+
+@app.get("/api/exceptions/count")
+def exceptions_count(request: Request, response: Response):
+    """A NUMBER for the badge, never the content. Degrades to zero:
+    an affordance that errors is worse than one that hides."""
+    response.headers["Cache-Control"] = "no-store, private"
+    try:
+        body = exceptions_feed(request, response)
+        if not body.get("readable") or body.get("stale"):
+            return {"pending": 0, "readable": False}
+        # not_run counts too: a check the budget starved did NOT verify
+        # anything, and a starved check must never make the dot greener.
+        pending = sum(1 for row in body.get("rows", [])
+                      if not row.get("retired") and row.get("status") in
+                      ("exceptions_found", "checks_incomplete",
+                       "refused", "error", "not_run"))
+        return {"pending": pending, "readable": True}
+    except Exception:                             # noqa: BLE001
+        return {"pending": 0, "readable": False}
 
 
 @app.get("/api/question-report")
