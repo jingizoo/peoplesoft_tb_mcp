@@ -986,7 +986,10 @@ class SourceKnowledge:
                         ORDER BY D.event_id DESC LIMIT 1),'pending') AS status,
               (SELECT D.decided_at FROM decisions D
                WHERE D.proposal_id=P.id
-               ORDER BY D.event_id DESC LIMIT 1) AS decided_at
+               ORDER BY D.event_id DESC LIMIT 1) AS decided_at,
+              (SELECT D.decided_by FROM decisions D
+               WHERE D.proposal_id=P.id
+               ORDER BY D.event_id DESC LIMIT 1) AS decided_by
             FROM proposals P
         """
 
@@ -1087,6 +1090,25 @@ class SourceKnowledge:
             "excluded" if status == "approved" and effect == "exclude"
             else status
         )
+        def cosmetic(name: str, limit: int) -> str:
+            """Lenient, never-raising read for display-only labels.
+
+            _public runs on EVERY row at connection open, and one raise
+            disables the whole overlay -- after which the record veto
+            resolver fails closed and refuses every query on the source.
+            propose() stores origin as str(...)[:40] with no validation,
+            so a strict round-trip check here could take a source OFFLINE
+            over a label nobody queries by. Sanitize and degrade instead.
+            """
+            try:
+                raw = row[name]
+            except (IndexError, KeyError):
+                return ""
+            text = " ".join(str(raw or "").split())[:limit]
+            return text if text.isprintable() else ""
+
+        origin_label = cosmetic("origin", 40)
+        decided_by = cosmetic("decided_by", 80)
         return {
             "id": proposal_id,
             "source_database": source,
@@ -1100,6 +1122,8 @@ class SourceKnowledge:
             "selection_effect": effect,
             "proposed_at": proposed_at,
             **({"decided_at": approved_at} if approved_at else {}),
+            **({"origin": origin_label} if origin_label else {}),
+            **({"decided_by": decided_by} if decided_by else {}),
         }
 
     def _rows(self) -> list[sqlite3.Row]:
@@ -1145,7 +1169,7 @@ class SourceKnowledge:
 
     def propose(self, *, object_id: str, schema: str, object_name: str,
                 object_kind: str, meaning: str, aliases: object = (),
-                origin: str = "conversation", selection: str = "prefer") -> dict:
+                origin: str = "conversation", selection: str = "") -> dict:
         oid = str(object_id or "").strip()
         owner = str(schema or "").strip()
         name = str(object_name or "").strip()
@@ -1153,10 +1177,16 @@ class SourceKnowledge:
         if not oid or not owner or not name or kind not in {"table", "view"}:
             raise SourceKnowledgeError(
                 "a proposal needs one exact catalog table/view identity")
-        requested = str(selection or "prefer").strip().casefold()
-        if requested not in {"prefer", "exclude"}:
+        # Three states, not two. Omitted means "derive the effect from
+        # the wording" -- the conversation-lesson path, where an approved
+        # "do not use X" becomes a veto exactly as written. An EXPLICIT
+        # prefer is an assertion, and an assertion contradicted by its
+        # own wording is refused below rather than silently inverted.
+        requested = str(selection or "").strip().casefold()
+        if requested not in {"", "prefer", "exclude"}:
             raise SourceKnowledgeError(
-                "selection must be prefer or exclude")
+                "selection must be prefer, exclude, or omitted "
+                "(omitted derives the effect from the wording)")
         body = _one_line(
             meaning, label="meaning", limit=MAX_MEANING_CHARS)
         # Persist an explicit, human-readable veto without changing the v1
@@ -1167,6 +1197,21 @@ class SourceKnowledge:
             body = _one_line(
                 f"Do not use this record for answers — {body}",
                 label="meaning", limit=MAX_MEANING_CHARS)
+        # The mirror-image trap: readers derive the effect from WORDING on
+        # every read, so a meaning explicitly submitted as PREFER that
+        # happens to say "do not use ... for reporting totals" or
+        # "deprecated record" would become a durable veto, enforced
+        # pre-database at every query site, that the operator never chose.
+        # Refused at write time -- but only for the EXPLICIT choice: an
+        # omitted selection means the wording is the choice, which is how
+        # a conversation-taught "do not use X" lesson works on purpose.
+        if requested == "prefer" and selection_effect(body) == "exclude":
+            raise SourceKnowledgeError(
+                "this wording reads as a veto — phrases like 'do not use', "
+                "'obsolete record' or 'deprecated table' make an approved "
+                "meaning EXCLUDE the record from answers. Either choose "
+                "selection=exclude deliberately, or reword the meaning so "
+                "it does not read as a prohibition")
         alias_list = normalize_aliases(aliases)
         canonical = json.dumps({
             "source": self.source,
