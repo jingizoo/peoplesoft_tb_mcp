@@ -135,14 +135,41 @@ class ProvenanceProjectionTests(unittest.TestCase):
 
 
 class ContextLabelTests(unittest.TestCase):
+    """Built from the BUNDLED sample, never from a checkout's untracked
+    metadata_catalog.db -- the first version read the repo-root artifact,
+    which exists on a developer machine and not in CI, and the KeyError
+    it died with there was this lesson arriving late."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pstb.config import Config
+        from pstb.db import Database
+        from pstb.metadata import MetadataCatalog, build_catalog
+        cls.temp = tempfile.TemporaryDirectory(prefix="pstb-ctxlabel-")
+        root = Path(cls.temp.name)
+        cfg = Config.sample(root)
+        cfg.db.sqlite_path = str(
+            Path(__file__).resolve().parent.parent /
+            "sample_data" / "ps_sample.db")
+        cfg.sources = {}
+        db = Database(cfg)
+        try:
+            build_catalog(root / "c.db", [("default", db)],
+                          peopletools_source="default")
+        finally:
+            db.close()
+        cls.catalog = MetadataCatalog(root / "c.db")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
     def test_context_shows_the_records_label_with_its_provenance(self):
         """21 of 63 sample objects have a human-written description that
         only a lucky SEARCH phrase could surface; context() -- the tool a
         person uses to study one object -- always said label: null."""
-        from pstb.metadata import MetadataCatalog
-        catalog = MetadataCatalog(
-            Path(__file__).resolve().parent.parent / "metadata_catalog.db")
-        subject = catalog.context("PS_JRNL_LN", source="default")["subject"]
+        subject = self.catalog.context(
+            "PS_JRNL_LN", source="default")["subject"]
         self.assertEqual(subject["label"], "Journal Line")
         provenance = subject["label_source"]
         self.assertEqual(provenance["logical_record"], "JRNL_LN")
@@ -154,10 +181,8 @@ class ContextLabelTests(unittest.TestCase):
     def test_the_label_does_not_upgrade_match_confidence(self):
         """Labeling the object must not strengthen the evidence for
         having CHOSEN it -- the old comment's warning stands."""
-        from pstb.metadata import MetadataCatalog
-        catalog = MetadataCatalog(
-            Path(__file__).resolve().parent.parent / "metadata_catalog.db")
-        subject = catalog.context("PS_JRNL_LN", source="default")["subject"]
+        subject = self.catalog.context(
+            "PS_JRNL_LN", source="default")["subject"]
         self.assertNotEqual(subject["confidence"]["basis"],
                             subject["label_source"]["basis"])
 
