@@ -213,6 +213,13 @@ class MetadataCatalogCfg:
     mine_max_pairs: int = 120
     mine_sample_rows: int = 100
     mine_max_probes: int = 240
+    # Failed-question demand steering of the miner working set; 0 = off.
+    mine_demand_terms: int = 12
+    # View-definition harvesting (#178). These were documented as config
+    # keys from the start but existed only as CLI flags -- a config.yaml
+    # entry was silently ignored, which the docs flatly contradicted.
+    harvest_view_vocabulary: bool = True
+    max_view_definitions: int = 5_000
 
 
 @dataclass

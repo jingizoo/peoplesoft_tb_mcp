@@ -248,6 +248,19 @@ metadata_catalog:
   max_peopletools_rows: 500000
   query_page_size: 5000
   stale_after_hours: 168
+  # Structure harvested from view definitions (never the SQL text itself).
+  harvest_view_vocabulary: true
+  max_view_definitions: 5000
+  # Value-overlap join mining: bounded sampled probes for undeclared joins.
+  mine_value_joins: true
+  mine_max_tables: 40
+  mine_max_pairs: 120
+  mine_sample_rows: 100
+  mine_max_probes: 240
+  # Failed-question demand steering of the miner's working set: terms from
+  # logged FAILED questions nudge which tables earn measurement (a bounded
+  # hint; only hit COUNTS enter the artifact, never question text). 0 = off.
+  mine_demand_terms: 12
 
 # Optional hybrid retrieval. The catalog first chooses a bounded, explainable
 # candidate set; Vertex embeddings may only reorder those candidates. Enabling

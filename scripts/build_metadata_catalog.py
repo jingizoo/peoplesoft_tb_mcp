@@ -96,6 +96,10 @@ def main(argv=None) -> int:
         "--no-view-vocabulary", action="store_true",
         help="skip reading view definitions for declared joins and column "
              "vocabulary")
+    parser.add_argument(
+        "--no-demand", action="store_true",
+        help="ignore the question log; the miner ranks by measurement "
+             "alone")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -160,6 +164,13 @@ def main(argv=None) -> int:
             overrides[limit_name] = value
     if args.no_view_vocabulary:
         overrides["harvest_view_vocabulary"] = 0
+    if args.no_demand:
+        # ONE off mechanism, not two: the knob is the switch, so the
+        # collector -- not this script -- decides and discloses. The
+        # first wiring blanked the path instead, which made the
+        # "disabled" note unreachable from production and left an
+        # unconfigured build indistinguishable from a switched-off one.
+        overrides["mine_demand_terms"] = 0
     try:
         limits = MetadataBuildLimits.from_config(
             cfg.metadata_catalog, **overrides)
@@ -167,6 +178,21 @@ def main(argv=None) -> int:
         print(f"Invalid metadata catalog limits: {exc}")
         primary.close()
         return 2
+
+    # The question log steers the miner's working set when configured.
+    # Resolution mirrors QuestionLog's own: absolute stays, relative
+    # roots under cfg.root. Resolved UNCONDITIONALLY -- the collector,
+    # not this script, decides and discloses, so every build carries
+    # exactly one demand note whatever the state. The build only ever
+    # READS the log, through the report loader that tolerates a
+    # concurrent writer.
+    question_log = ""
+    configured = str(getattr(cfg.tools, "question_log", "") or "")
+    if configured:
+        candidate = Path(configured)
+        if not candidate.is_absolute():
+            candidate = Path(cfg.root) / candidate
+        question_log = str(candidate)
 
     _say("sources: " + ", ".join(requested), args.quiet)
     _say(
@@ -179,6 +205,12 @@ def main(argv=None) -> int:
         f"{limits.max_peopletools_rows:,} rows/PeopleTools layer; "
         + (f"{limits.max_view_definitions:,} view definitions/source; "
            if limits.harvest_view_vocabulary else "view vocabulary off; ")
+        + (f"demand steering from up to {limits.mine_demand_terms} "
+           "failed terms; "
+           if question_log and limits.mine_demand_terms > 0 else
+           "demand steering off (no question log configured); "
+           if limits.mine_demand_terms > 0 else
+           "demand steering off; ")
         + f"{limits.query_page_size:,}/page", args.quiet)
 
     failures = []
@@ -226,7 +258,8 @@ def main(argv=None) -> int:
                 info = build_catalog(
                     out, [(name, database)], limits=limits,
                     peopletools_source=(
-                        name if args.peopletools_source == name else "none"))
+                        name if args.peopletools_source == name else "none"),
+                    question_log=question_log)
                 elapsed = time.perf_counter() - started
             except Exception as exc:  # atomic builder preserves this source
                 _record_build_status(out, {

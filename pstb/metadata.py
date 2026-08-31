@@ -541,6 +541,12 @@ class MetadataBuildLimits:
     mine_max_pairs: int = 120
     mine_sample_rows: int = 100
     mine_max_probes: int = 240
+    # Demand steering: how many failed-question terms may nudge the
+    # miner's working set. 0 disables the signal entirely. The BOOST is
+    # fixed (0.05 per matched term, capped at 0.15) so demand stays a
+    # hint that reorders the margin, never a hijack that outruns
+    # measurement -- the cap is below a single organic score component.
+    mine_demand_terms: int = 12
     # View vocabulary harvesting. Definitions are READ and dropped, but
     # they are read into memory first: an Oracle VARCHAR2 projection is
     # up to 4,000 characters, so this cap is a memory budget as much as
@@ -583,6 +589,21 @@ class MetadataBuildLimits:
                 raise MetadataError(
                     f"metadata_catalog.{name} must be between 1 and "
                     f"{ceiling:,}; received {value:,}")
+        # The mine_* budgets were the recorded hole in this validator: a
+        # config typo of 240,000 probes would have passed, and a standing
+        # review wrote that lesson down twice before it was closed here.
+        # Floors of 0 are deliberate where 0 means "off".
+        for name, value, floor, ceiling in (
+            ("mine_max_tables", self.mine_max_tables, 1, 500),
+            ("mine_max_pairs", self.mine_max_pairs, 1, 2_000),
+            ("mine_sample_rows", self.mine_sample_rows, 1, 1_000),
+            ("mine_max_probes", self.mine_max_probes, 1, 5_000),
+            ("mine_demand_terms", self.mine_demand_terms, 0, 50),
+        ):
+            if value < floor or value > ceiling:
+                raise MetadataError(
+                    f"metadata_catalog.{name} must be between {floor} "
+                    f"and {ceiling:,}; received {value:,}")
         if self.stale_after_hours < 1:
             raise MetadataError(
                 "metadata_catalog.stale_after_hours must be at least 1")
@@ -685,6 +706,12 @@ class _Writer:
         self.limits = limits
         self.collected_at = _stamp()
         self.partial = False
+        # Demand hits flow to the miner THROUGH MEMORY, all-or-nothing:
+        # journal_mode=OFF has no rollback, so a persist loop that dies
+        # midway would leave half the rows boosted while the guard note
+        # swears nothing was applied. The components write is the durable
+        # RECORD of what happened, never the input to behavior.
+        self.demand_hits: dict = {}
         self.degraded: set[str] = set()
         self.limit_hits: list[dict] = []
         # Objects whose column list was cut off by the field cap. Their
@@ -2748,6 +2775,219 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
     return "complete" if (joins or terms) else "nothing_declared"
 
 
+def _shadow_ids(con: sqlite3.Connection) -> set:
+    """Every object a shadow_of edge redirects. One helper, two callers
+    (the demand matcher and the miner's selection), so the exclusions
+    cannot drift apart."""
+    return {row[0] for row in con.execute(
+        "SELECT src FROM edges WHERE kind='shadow_of'")}
+
+
+_RECORDISH_TOKEN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+
+
+def _collect_demand_signal(state: _Writer, source: str,
+                           question_log) -> str:
+    """Count which ELIGIBLE tables failed questions point at.
+
+    The failure flywheel mines redacted failed questions into demand
+    TERMS; this step matches them against the artifact being built and
+    records a per-object HIT COUNT. Only the count crosses into the
+    artifact -- a demand term is a chunk of user prose and can carry a
+    party name, and the artifact travels where questions must not.
+
+    Matching is PRECISION-FIRST and eligible-only, in Python over maps
+    loaded up front -- no term ever reaches the SQL layer, not even as
+    a bind. The first version matched substrings against every object
+    and column term with an id-ordered cap, and on a schema full of
+    *_DATE columns it credited seven arbitrary noise tables the same as
+    the demanded one. A boost misallocated is worse than a boost
+    missed, so: exact record-ish names, exact governed aliases (which
+    include view-taught vocabulary -- this runs AFTER that collector),
+    whole name segments (every word), whole label words (every word) --
+    and a term matching more than 8 tables is too generic to mean
+    anything and contributes NOTHING rather than an arbitrary eight.
+
+    Every branch leaves exactly one note. Exception TYPE NAMES only,
+    basenames only: an OSError string embeds filesystem paths, and the
+    artifact travels.
+    """
+    state.demand_hits = {}
+    limits = state.limits
+    max_terms = int(getattr(limits, "mine_demand_terms", 12))
+    if max_terms < 1:
+        state.note(source, "demand_signal",
+                   "demand steering is switched off "
+                   "(metadata_catalog.mine_demand_terms: 0); the miner "
+                   "ranks by measurement alone", ok=True)
+        return "disabled"
+    if not question_log:
+        state.note(source, "demand_signal",
+                   "demand steering is off (no question log is "
+                   "configured); the miner ranks by measurement alone",
+                   ok=True)
+        return "not_configured"
+    try:
+        os.stat(question_log)
+    except FileNotFoundError:
+        state.note(source, "demand_signal",
+                   f"no question log exists at "
+                   f"{Path(str(question_log)).name}; the miner ranks by "
+                   "measurement alone", ok=False, status="unavailable")
+        return "missing"
+    except OSError as exc:
+        state.note(source, "demand_signal",
+                   f"the question log was not readable "
+                   f"({type(exc).__name__}); the miner ranks by "
+                   "measurement alone", ok=False, status="unavailable")
+        return "unreadable"
+    from . import demand as demand_module
+    from . import qlog_report
+    try:
+        turns, _ = qlog_report.load(question_log)
+    except Exception as exc:                      # noqa: BLE001
+        state.note(source, "demand_signal",
+                   f"the question log was not readable "
+                   f"({type(exc).__name__}); the miner ranks by "
+                   "measurement alone", ok=False, status="unavailable")
+        return "unreadable"
+    total_turns = len(turns)
+    failed_turns = sum(
+        1 for turn in turns
+        if isinstance(turn, dict) and turn.get("failed")
+        and str(turn.get("source_database") or "default") == source
+        and str(turn.get("question") or "").strip())
+    if not failed_turns:
+        state.note(source, "demand_signal",
+                   f"read {total_turns} turn(s) from the question log; "
+                   "none are failed turns for this source; the miner "
+                   "ranks by measurement alone", ok=True)
+        return "no_demand"
+    terms = demand_module.failed_question_terms(
+        turns, source=source, max_terms=max_terms)
+    if not terms:
+        state.note(source, "demand_signal",
+                   f"{failed_turns} failed turn(s) mined no usable "
+                   "terms; the miner ranks by measurement alone",
+                   ok=True)
+        return "no_terms"
+
+    con = state.con
+    shadows = _shadow_ids(con)
+    universe = []           # (node_id, name_upper, segments, label_words)
+    for row in con.execute(
+            "SELECT P.node_id AS node_id, P.name AS name, "
+            "N.label AS label FROM object_profiles P "
+            "JOIN nodes N ON N.id = P.node_id "
+            "WHERE P.source=? AND P.kind='table' "
+            "AND P.liveness='populated' "
+            "ORDER BY P.name, P.node_id", (source,)):
+        if row["node_id"] in shadows:
+            continue
+        name_upper = _u(row["name"])
+        segments = [seg for seg in name_upper.split("_") if seg]
+        if segments and segments[0] == "PS":
+            segments = segments[1:]
+        label_words = {word for word in re.findall(
+            r"[A-Za-z]{4,}", str(row["label"] or "").upper())}
+        universe.append((row["node_id"], name_upper,
+                         frozenset(segments), label_words))
+    aliases: dict = {}
+    eligible_ids = {entry[0] for entry in universe}
+    for row in con.execute(
+            "SELECT alias_upper, node_id FROM aliases WHERE source=? "
+            "ORDER BY alias_upper, node_id", (source,)):
+        if row["node_id"] in eligible_ids:
+            # Underscores become spaces on BOTH sides of the alias
+            # lookup: a view teaches SUPPLIER_NAME, a person asks about
+            # the "supplier name", and an exact-equality route that let
+            # one character of punctuation defeat the strongest link in
+            # the chain would be precision theatre.
+            key = " ".join(
+                str(row["alias_upper"] or "").replace("_", " ").split())
+            aliases.setdefault(key, set()).add(row["node_id"])
+
+    hits: dict = {}
+    matched_terms = 0
+    for entry in terms:
+        token = " ".join(_u(entry.get("term")).split())
+        if not token:
+            continue
+        words = [w for w in token.split() if len(w) >= 4 and w.isalpha()]
+        matched: set = set()
+        if _RECORDISH_TOKEN.fullmatch(token):
+            for node_id, name_upper, _segs, _label in universe:
+                if (name_upper in (token, f"PS_{token}")
+                        or token == f"PS_{name_upper}"):
+                    matched.add(node_id)
+        matched.update(aliases.get(token.replace("_", " "), ()))
+        if words:
+            for node_id, _name, segments, label_words in universe:
+                if all(word in segments for word in words):
+                    matched.add(node_id)
+                elif all(word in label_words for word in words):
+                    matched.add(node_id)
+        if not matched or len(matched) > 8:
+            # Over-wide means no signal: crediting an arbitrary eight of
+            # them was the id-lottery this rewrite exists to kill.
+            continue
+        matched_terms += 1
+        for node_id in matched:
+            hits[node_id] = hits.get(node_id, 0) + 1
+
+    if not hits:
+        state.note(source, "demand_signal",
+                   f"{failed_turns} failed turn(s) mined "
+                   f"{len(terms)} term(s); none matched an eligible "
+                   "table; the miner ranks by measurement alone",
+                   ok=True)
+        return "no_matches"
+
+    try:
+        for node_id in sorted(hits):
+            row = con.execute(
+                "SELECT components FROM object_profiles WHERE node_id=?",
+                (node_id,)).fetchone()
+            if row is None:
+                continue
+            components = _json(row["components"])
+            components["demand_hits"] = int(hits[node_id])
+            con.execute(
+                "UPDATE object_profiles SET components=? WHERE node_id=?",
+                (json.dumps(components, sort_keys=True), node_id))
+    except Exception as exc:                      # noqa: BLE001
+        state.demand_hits = {}
+        state.note(source, "demand_signal",
+                   f"demand hits could not be recorded "
+                   f"({type(exc).__name__}); the demand boost was not "
+                   "applied and the miner ranks by measurement alone",
+                   ok=False, status="unavailable")
+        return "unrecorded"
+    state.note(
+        source, "demand_signal",
+        f"read {total_turns} turn(s) ({failed_turns} failed for this "
+        f"source); {matched_terms} of {len(terms)} mined term(s) "
+        f"matched {len(hits)} eligible table(s). Counts only are "
+        "stored -- the terms themselves never enter this artifact",
+        ok=True)
+    # Assignment LAST: if the note write itself failed, the outer guard
+    # fires with an empty dict and the disclosure can never contradict
+    # the behavior.
+    state.demand_hits = dict(hits)
+    return "applied"
+
+
+# The selection-time arithmetic, in INTEGER BASIS POINTS on the score's
+# own 1e-4 grid: one matched term is worth 500bp (0.05) and demand can
+# add at most 1500bp (0.15) -- below the smallest organic component
+# weight (0.25), so a measured gap wider than the cap is unbridgeable.
+# Integer arithmetic makes engineered ties EXACT, so the name tiebreak
+# genuinely runs; the float constants this replaces made 0.40 + 2*0.05
+# land on 0.5000000000000001 and the tie was unreachable.
+DEMAND_BOOST_PER_HIT_BP = 500
+DEMAND_BOOST_CAP_BP = 1500
+
+
 def _collect_value_joins(state: _Writer, source: str, db) -> str:
     """Mine undeclared joins by measuring value containment (relmine).
 
@@ -2760,19 +3000,54 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
     """
     limits = state.limits
     if not getattr(limits, "mine_value_joins", True):
+        state.note(source, "value_joins",
+                   "join mining is switched off "
+                   "(metadata_catalog.mine_value_joins: 0); no "
+                   "value-overlap edges were mined", ok=True)
         return "disabled"
     con = state.con
 
-    shadows = {row[0] for row in con.execute(
-        "SELECT src FROM edges WHERE kind='shadow_of'")}
-    tables = []
+    shadows = _shadow_ids(con)
+    # Ranked in Python, for three reasons the old ORDER BY ... LIMIT
+    # could not give: shadows are filtered BEFORE the cut (a shadow in
+    # the top-N used to consume a working-set slot and shrink the set),
+    # ties break on name instead of rowid luck (two builds of one
+    # database now pick one set), and the demand boost is added here,
+    # bounded, where the arithmetic is visible -- value_score itself is
+    # never rewritten.
+    # Behavior comes from MEMORY, all-or-nothing: reading persisted
+    # components back would let a half-failed persist half-steer while
+    # the guard note swore nothing was applied.
+    hits_map = dict(getattr(state, "demand_hits", {}) or {})
+    candidates = []
     for row in con.execute(
-            "SELECT node_id, schema_name, name, value_score "
+            "SELECT node_id, schema_name, name, value_score, components "
             "FROM object_profiles WHERE source=? AND kind='table' "
-            "AND liveness='populated' ORDER BY value_score DESC LIMIT ?",
-            (source, int(getattr(limits, "mine_max_tables", 40)))):
+            "AND liveness='populated'", (source,)):
         if row["node_id"] in shadows:
             continue
+        score_bp = int(round(float(row["value_score"] or 0.0) * 10_000))
+        boost_bp = min(hits_map.get(row["node_id"], 0)
+                       * DEMAND_BOOST_PER_HIT_BP, DEMAND_BOOST_CAP_BP)
+        candidates.append((
+            -(score_bp + boost_bp),
+            str(row["schema_name"] or ""), str(row["name"] or ""), row))
+    candidates.sort(key=lambda item: item[:3])
+    cut = int(getattr(limits, "mine_max_tables", 40))
+    tables = []
+    if hits_map:
+        boosted_in_set = sum(
+            1 for _r, _s, _n, row in candidates[:cut]
+            if hits_map.get(row["node_id"], 0) > 0)
+        # Written even when zero landed: silence about a no-op is still
+        # silence. This layer's notes reach per-object evidence packets.
+        state.note(
+            source, "value_joins",
+            f"demand steering: {boosted_in_set} of "
+            f"{min(cut, len(candidates))} working-set table(s) carry a "
+            "failed-question boost (at most 0.15 on a 0-1 score); pair "
+            "probing still ranks by measured value alone", ok=True)
+    for _rank, _schema, _name, row in candidates[:cut]:
         columns = [
             {"name": c["name"], "data_type": _json(c["attrs"]).get("data_type")}
             for c in con.execute(
@@ -3330,7 +3605,8 @@ def _try_fts(con: sqlite3.Connection) -> bool:
 
 def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                   limits: MetadataBuildLimits | None = None,
-                  peopletools_source: str = "default") -> dict:
+                  peopletools_source: str = "default",
+                  question_log: object = "") -> dict:
     """Build a metadata artifact beside the target, then atomically publish it."""
     limits = limits or MetadataBuildLimits()
     limits.validate()
@@ -3403,6 +3679,22 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                                f"view vocabulary was not harvested ({exc}); "
                                "the catalog itself is unaffected",
                                ok=False, partial=True)
+                # Demand steering AFTER the view harvest, deliberately:
+                # the matcher's alias route must see view-taught
+                # vocabulary, which only exists once that collector has
+                # run. Still before the miner, whose working-set cut is
+                # what the hits steer. TypeName only in the guard note --
+                # an exception string can embed filesystem paths, and
+                # the artifact travels.
+                try:
+                    _collect_demand_signal(state, source, question_log)
+                except Exception as exc:      # noqa: BLE001
+                    state.demand_hits = {}
+                    state.note(source, "demand_signal",
+                               f"the demand signal was not applied "
+                               f"({type(exc).__name__}); the miner ranks "
+                               "by measurement alone", ok=False,
+                               status="unavailable")
                 try:
                     _collect_value_joins(state, source, db)
                 except Exception as exc:      # noqa: BLE001
