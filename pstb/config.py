@@ -351,6 +351,8 @@ class TickerCfg:
     enabled: bool = False
     cadence_minutes: int = 30
     ledger: str = ""
+    # Adds the AP invoice-pipeline check (stuck vouchers) to each tick.
+    watch_invoicing: bool = False
     business_units: list = field(default_factory=list)
     max_queries_per_tick: int = 40
     max_seconds_per_tick: int = 600
@@ -451,11 +453,12 @@ def _validate_ticker(cfg: TickerCfg) -> None:
     they are spent (ticker.TickerLimits) so a config typo cannot buy an
     unbounded loop either.
     """
-    enabled = getattr(cfg, "enabled", False)
-    if type(enabled) is not bool:  # bool only; integers are not accepted
-        raise RuntimeError(
-            "ticker.enabled must be the YAML boolean true or false "
-            "(without quotes)")
+    for name in ("enabled", "watch_invoicing"):
+        value = getattr(cfg, name, False)
+        if type(value) is not bool:  # bool only; integers are not accepted
+            raise RuntimeError(
+                f"ticker.{name} must be the YAML boolean true or false "
+                "(without quotes)")
     units = getattr(cfg, "business_units", [])
     if not isinstance(units, (list, tuple)):
         raise RuntimeError("ticker.business_units must be a list")

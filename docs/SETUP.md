@@ -1218,10 +1218,24 @@ ticker:
   enabled: true            # literal boolean; a quoted "true" is refused
   cadence_minutes: 30      # bounded 5..1440
   business_units: [US001]  # empty list = the configured default unit
+  # watch_invoicing: true  # adds the AP invoice-pipeline check (below)
   # ledger: ACTUALS
   # max_queries_per_tick: 40
   # max_seconds_per_tick: 600
 ```
+
+`watch_invoicing` adds a second check per unit: vouchers stuck in recycle
+or unposted status — money that is owed but invisible to a payment run
+until someone fixes the entry. One bounded query against the local
+database; the feed carries only counts (stuck, in recycle, unposted, and
+whether the 10,000-row cap was reached), never a voucher id, vendor or
+amount. The open-voucher total is deliberately not a tracked metric — it
+rises with ordinary volume, and a "worsened" event on every entered
+voucher is churn that trains an operator to stop reading the feed. The
+playbook that also covers this ground (`ap_completeness`) is not what
+runs here: it is structurally always-incomplete and calls the external
+procurement API on every run, which is exactly what a standing loop must
+never schedule.
 
 Rules the ticker holds itself to, so it can be left on against a production
 reporting account:

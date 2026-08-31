@@ -71,6 +71,16 @@ TB_INTEGRITY_READS = (
     "PS_JRNL_HEADER", "PS_JRNL_LN", "PS_LEDGER", "PS_SET_CNTRL_REC",
 )
 
+# The AP invoice pipeline check (modules.open_payables), measured the
+# same way: 3 queries on the sample plus catalog describes on a first
+# Oracle tick, reserved as 4. The read list is the SUPERSET the check may
+# touch -- PS_PYMNT_VCHR_XREF is only read on installations whose voucher
+# table has no CLOSE_STATUS, but a veto gate that names what a check
+# MIGHT read is the only one an operator can rely on. A test asserts the
+# measured set stays within this list.
+AP_PIPELINE_QUERY_COST = 4
+AP_PIPELINE_READS = ("PS_PYMNT_VCHR_XREF", "PS_VENDOR", "PS_VOUCHER")
+
 STATUSES = frozenset({
     "passed", "exceptions_found", "checks_incomplete", "not_run",
     "refused", "error",
@@ -206,6 +216,36 @@ def reduce_tb_integrity(result: Mapping) -> tuple:
     except (TypeError, ValueError):
         fy, per = 0, 0
     return status, counts, fy, per, counts["checks_narrowed"] > 0
+
+
+def reduce_open_payables(result: Mapping) -> tuple:
+    """(status, counts, narrowed) from a full open_payables answer.
+
+    The full payload carries voucher ids, vendor ids and amounts. What a
+    standing feed needs from it is one fact -- how many vouchers are
+    stuck where a payment run cannot see them -- so only exception-shaped
+    counts survive. The open-voucher total is deliberately NOT a metric:
+    it rises with ordinary volume, and a "worsened" event every time a
+    voucher is entered is churn that trains an operator to stop reading.
+    """
+    exceptions = [e for e in (result.get("pipeline_exceptions") or ())
+                  if isinstance(e, Mapping)]
+    recycle = sum(1 for e in exceptions
+                  if e.get("why") == "recycle status")
+    counts = {
+        "stuck_vouchers": len(exceptions),
+        "in_recycle": recycle,
+        "unposted": len(exceptions) - recycle,
+        "result_capped": int(int(result.get("voucher_count") or 0)
+                             >= 10_000),
+    }
+    status = "exceptions_found" if exceptions else "passed"
+    # point_in_time_complete is False for every reason the answer is an
+    # approximation (no CLOSE_STATUS, no date column, capped rows). The
+    # differ treats a narrowed-flag CHANGE as scope_changed, so numbers
+    # measured under different completeness are never compared.
+    narrowed = not bool(result.get("point_in_time_complete"))
+    return status, counts, narrowed
 
 
 def _validate_outcome(outcome: CheckOutcome) -> CheckOutcome:
@@ -789,30 +829,45 @@ class TickerRunner:
             units = [default_bu] if default_bu else []
         ledger = str(getattr(ticker_cfg, "ledger", "") or "")
 
+        # The plan, built before any query: which checks run this tick,
+        # each with the worst-case cost the budget reserves BEFORE it
+        # starts. A check that leaves the plan (the operator flips its
+        # flag off) leaves `scheduled`, and the differ turns that into a
+        # no_longer_scheduled event rather than a silence.
+        plan = [("tb_integrity", TB_INTEGRITY_QUERY_COST,
+                 lambda u, cid: self._run_tb_integrity(
+                     engine, source, u, ledger, cid))]
+        if getattr(ticker_cfg, "watch_invoicing", False) is True:
+            plan.append(("ap_pipeline", AP_PIPELINE_QUERY_COST,
+                         lambda u, cid: self._run_ap_pipeline(
+                             context, engine, source, u, cid)))
+
         outcomes: list[CheckOutcome] = []
         scheduled: list[str] = []
         queries_used = 0
         partial = False
-        for unit in units:
-            check_id = f"tb_integrity:{source}:{unit}"
-            scheduled.append(check_id)
-            elapsed = time.monotonic() - started
-            if queries_used + TB_INTEGRITY_QUERY_COST > \
-                    limits.max_queries_per_tick:
-                partial = True
-                outcomes.append(CheckOutcome(
-                    check_id=check_id, source=source, business_unit=unit,
-                    status="not_run", error_category="budget"))
-                continue
-            if elapsed > limits.max_seconds_per_tick:
-                partial = True
-                outcomes.append(CheckOutcome(
-                    check_id=check_id, source=source, business_unit=unit,
-                    status="not_run", error_category="wall_clock"))
-                continue
-            outcomes.append(self._run_tb_integrity(
-                engine, source, unit, ledger, check_id))
-            queries_used += TB_INTEGRITY_QUERY_COST
+        for check_name, check_cost, run_check in plan:
+            for unit in units:
+                check_id = f"{check_name}:{source}:{unit}"
+                scheduled.append(check_id)
+                elapsed = time.monotonic() - started
+                if queries_used + check_cost > \
+                        limits.max_queries_per_tick:
+                    partial = True
+                    outcomes.append(CheckOutcome(
+                        check_id=check_id, source=source,
+                        business_unit=unit,
+                        status="not_run", error_category="budget"))
+                    continue
+                if elapsed > limits.max_seconds_per_tick:
+                    partial = True
+                    outcomes.append(CheckOutcome(
+                        check_id=check_id, source=source,
+                        business_unit=unit,
+                        status="not_run", error_category="wall_clock"))
+                    continue
+                outcomes.append(run_check(unit, check_id))
+                queries_used += check_cost
 
         try:
             store = self._store(context, limits)
@@ -851,46 +906,85 @@ class TickerRunner:
                 "queries_used": queries_used, "partial": partial,
                 "events": len(events)}
 
-    def _run_tb_integrity(self, engine, source, unit, ledger,
-                          check_id) -> CheckOutcome:
-        base = CheckOutcome(check_id=check_id, source=source,
-                            business_unit=unit, status="error")
+    def _veto_refusal(self, engine, base: CheckOutcome,
+                      reads: tuple) -> CheckOutcome | None:
+        """The operator's veto binds background work exactly as it binds
+        a question, re-read every tick so a veto approved mid-flight
+        takes effect on the next one. None means the check may proceed."""
         try:
-            # The operator's veto binds background work exactly as it
-            # binds a question, and it is re-read every tick so a veto
-            # approved mid-flight takes effect on the next one.
             engine._require_records_allowed(
-                TB_INTEGRITY_READS,
-                action="Continuous tie-out monitoring")
+                reads, action="Continuous tie-out monitoring")
         except Exception as exc:                  # noqa: BLE001
             base.status = "refused"
             base.error_category = "operator_exclusion" if \
                 "excluded" in str(exc).lower() else \
                 refusal_category(str(exc))
             return base
+        return None
+
+    def _failure(self, engine, base: CheckOutcome,
+                 exc: Exception) -> CheckOutcome:
+        """Classify one check's failure, tripping terminally on refused
+        credentials: every further attempt would bury the remedy under
+        repetition, and rebuilding connections against refused
+        credentials is how a service account gets locked."""
+        text = str(exc)
+        category = ("credentials" if _is_credential_failure(text)
+                    else refusal_category(text))
+        base.error_category = category
+        if category == "credentials" or getattr(
+                getattr(engine, "db", None), "_credentials_refused", ""):
+            self._terminal = True
+            self.state = "tripped"
+            self.last_error_category = category
+        return base
+
+    def _run_tb_integrity(self, engine, source, unit, ledger,
+                          check_id) -> CheckOutcome:
+        base = CheckOutcome(check_id=check_id, source=source,
+                            business_unit=unit, status="error")
+        refused = self._veto_refusal(engine, base, TB_INTEGRITY_READS)
+        if refused is not None:
+            return refused
         try:
             result = engine.tb_integrity_check(
                 business_unit=unit, ledger=ledger)
         except Exception as exc:                  # noqa: BLE001
-            text = str(exc)
-            category = ("credentials" if _is_credential_failure(text)
-                        else refusal_category(text))
-            base.error_category = category
-            if category == "credentials" or getattr(
-                    getattr(engine, "db", None),
-                    "_credentials_refused", ""):
-                # Every further attempt would bury the remedy under
-                # repetition, and rebuilding connections against refused
-                # credentials is how a service account gets locked.
-                self._terminal = True
-                self.state = "tripped"
-                self.last_error_category = category
-            return base
+            return self._failure(engine, base, exc)
         status, counts, fy, per, narrowed = reduce_tb_integrity(result)
         return CheckOutcome(
             check_id=check_id, source=source, business_unit=unit,
             status=status, counts=counts, fiscal_year=fy, period=per,
             narrowed=narrowed)
+
+    def _run_ap_pipeline(self, context, engine, source, unit,
+                         check_id) -> CheckOutcome:
+        """Vouchers stuck in recycle or unposted status: money that is
+        owed but invisible to a payment run until someone fixes the
+        entry. One bounded query, no external system -- the playbook
+        that also covers this ground (ap_completeness) is structurally
+        always-incomplete and calls the Coupa API on every run, which is
+        exactly what a standing loop must never schedule."""
+        base = CheckOutcome(check_id=check_id, source=source,
+                            business_unit=unit, status="error")
+        refused = self._veto_refusal(engine, base, AP_PIPELINE_READS)
+        if refused is not None:
+            return refused
+        modules = getattr(context, "modules", None)
+        if modules is None:
+            # A context without the module pack (an embedding without the
+            # GUI's object graph) is a wiring gap, not a database fact;
+            # the row says so instead of the loop dying on it.
+            base.error_category = "tool_error"
+            return base
+        try:
+            result = modules.open_payables(business_unit=unit)
+        except Exception as exc:                  # noqa: BLE001
+            return self._failure(engine, base, exc)
+        status, counts, narrowed = reduce_open_payables(result)
+        return CheckOutcome(
+            check_id=check_id, source=source, business_unit=unit,
+            status=status, counts=counts, narrowed=narrowed)
 
     def _store(self, context, limits: TickerLimits) -> TickerStore:
         if self._store_factory is not None:

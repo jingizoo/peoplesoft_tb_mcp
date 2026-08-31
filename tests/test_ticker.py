@@ -346,20 +346,39 @@ class _StubEngine:
         return self.result
 
 
-def _runner(engine, root, *, units=("US001",), **limit_overrides):
+def _runner(engine, root, *, units=("US001",), watch_invoicing=False,
+            modules=None, **limit_overrides):
     ticker_cfg = SimpleNamespace(
         enabled=True, business_units=list(units), ledger="",
+        watch_invoicing=watch_invoicing,
         **{name: limit_overrides.get(name, getattr(TickerLimits, name))
            for name in TickerLimits._BOUNDS})
     cfg = SimpleNamespace(ticker=ticker_cfg,
                           defaults=SimpleNamespace(business_unit="US001"),
                           root=root)
-    context = SimpleNamespace(engine=engine, cfg=cfg, source="default")
+    context = SimpleNamespace(engine=engine, cfg=cfg, source="default",
+                              modules=modules)
     return TickerRunner(
         lambda: context,
         store_factory=lambda ctx, limits: TickerStore(
             Path(root) / "t.db", source="default",
             fingerprint=FINGERPRINT, limits=limits))
+
+
+def _payables(exceptions=(), voucher_count=11, complete=True):
+    calls = []
+
+    def open_payables(business_unit="", as_of_date=""):
+        calls.append(business_unit)
+        return {"pipeline_exceptions": list(exceptions),
+                "voucher_count": voucher_count,
+                "point_in_time_complete": complete,
+                "open_total": float(AMOUNT_SENTINEL),
+                "by_vendor": [{"vendor_id": "V1", "vendor": ROW_SENTINEL}]}
+
+    stub = SimpleNamespace(open_payables=open_payables)
+    stub.calls = calls
+    return stub
 
 
 class RunnerTests(unittest.TestCase):
@@ -751,6 +770,221 @@ class SynthesisFixTests(unittest.TestCase):
         finally:
             first.stop()
             second.stop()
+
+
+class InvoicePipelineTests(unittest.TestCase):
+    """The second check: stuck vendor invoices, counts only, off unless
+    the operator turns it on. The AP surface it deliberately does NOT
+    schedule -- the ap_completeness playbook -- is structurally always
+    incomplete and calls an external API per run; this one is one
+    bounded query against the local database."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-tickap-")
+        self.root = Path(self.temp.name)
+        self.stuck = [
+            {"voucher_id": "VCHR-SENTINEL-1", "vendor_id": "V-SENT",
+             "amount": float(AMOUNT_SENTINEL),
+             "why": "recycle status"},
+            {"voucher_id": "VCHR-SENTINEL-2", "vendor_id": "V-SENT",
+             "amount": 12.5, "why": "not posted"},
+        ]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_the_reducer_keeps_counts_and_nothing_row_shaped(self):
+        from pstb.ticker import reduce_open_payables
+        status, counts, narrowed = reduce_open_payables({
+            "pipeline_exceptions": self.stuck, "voucher_count": 11,
+            "point_in_time_complete": True})
+        self.assertEqual(status, "exceptions_found")
+        self.assertEqual(counts, {"stuck_vouchers": 2, "in_recycle": 1,
+                                  "unposted": 1, "result_capped": 0})
+        self.assertFalse(narrowed)
+        for value in counts.values():
+            self.assertIsInstance(value, int)
+
+    def test_open_volume_is_deliberately_not_a_metric(self):
+        """The open-voucher total rises with ordinary volume; a
+        'worsened' event on every entered voucher is churn that trains
+        an operator to stop reading the feed."""
+        from pstb.ticker import reduce_open_payables
+        _, counts, _ = reduce_open_payables({
+            "pipeline_exceptions": [], "voucher_count": 9_999,
+            "point_in_time_complete": True})
+        self.assertNotIn("open_vouchers", counts)
+        self.assertNotIn("voucher_count", counts)
+
+    def test_an_incomplete_answer_is_narrowed_and_a_capped_one_counted(self):
+        from pstb.ticker import reduce_open_payables
+        _, counts, narrowed = reduce_open_payables({
+            "pipeline_exceptions": [], "voucher_count": 10_000,
+            "point_in_time_complete": False})
+        self.assertTrue(narrowed)
+        self.assertEqual(counts["result_capped"], 1)
+
+    def test_off_by_default_the_check_is_not_even_scheduled(self):
+        """Two defaults, both off: an explicit False, and -- the case
+        the first sabotage run proved this test was blind to -- a config
+        that predates the field entirely. getattr's fallback IS the
+        default for every deployment that never edited its config, so
+        the absent-attribute case is the one that guards real installs."""
+        engine = _StubEngine()
+        runner = _runner(engine, self.root, modules=_payables())
+        runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        rows = _store(self.root).read_feed()["rows"]
+        self.assertEqual([r["check_id"] for r in rows],
+                         ["tb_integrity:default:US001"])
+        delattr(runner._resolve().cfg.ticker, "watch_invoicing")
+        runner.run_tick_once(now="2026-08-30T10:30:00+00:00")
+        rows = _store(self.root).read_feed()["rows"]
+        self.assertEqual([r["check_id"] for r in rows],
+                         ["tb_integrity:default:US001"])
+
+    def test_no_row_value_survives_the_tick(self):
+        """Sentinels planted in every field the payload could leak from
+        -- voucher id, vendor name, the open total -- and the raw store
+        bytes must be free of all of them after a full tick."""
+        engine = _StubEngine()
+        modules = _payables(exceptions=self.stuck)
+        runner = _runner(engine, self.root, watch_invoicing=True,
+                         modules=modules)
+        runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        self.assertEqual(modules.calls, ["US001"])
+        raw = (self.root / "t.db").read_bytes()
+        self.assertNotIn(b"VCHR-SENTINEL", raw)
+        self.assertNotIn(ROW_SENTINEL.encode(), raw)
+        self.assertNotIn(AMOUNT_SENTINEL.encode(), raw)
+        row = next(r for r in _store(self.root).read_feed()["rows"]
+                   if r["check_id"].startswith("ap_pipeline"))
+        self.assertEqual(row["counts"]["stuck_vouchers"], 2)
+
+    def test_the_budget_reserves_the_second_checks_cost_too(self):
+        """tb costs 8 and fits an 8-query budget exactly; the AP check's
+        4 must then be refused BEFORE it runs, and the row says budget."""
+        engine = _StubEngine()
+        modules = _payables()
+        runner = _runner(engine, self.root, watch_invoicing=True,
+                         modules=modules, max_queries_per_tick=8)
+        summary = runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        self.assertTrue(summary["partial"])
+        self.assertEqual(modules.calls, [])
+        row = next(r for r in _store(self.root).read_feed()["rows"]
+                   if r["check_id"].startswith("ap_pipeline"))
+        self.assertEqual(row["status"], "not_run")
+        self.assertEqual(row["error_category"], "budget")
+
+    def test_the_operator_veto_stops_it_before_the_database(self):
+        engine = _StubEngine(
+            veto=EngineError("PS_VOUCHER is excluded by operator decision"))
+        modules = _payables()
+        runner = _runner(engine, self.root, watch_invoicing=True,
+                         modules=modules)
+        runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        self.assertEqual(modules.calls, [])
+        row = next(r for r in _store(self.root).read_feed()["rows"]
+                   if r["check_id"].startswith("ap_pipeline"))
+        self.assertEqual(row["status"], "refused")
+        self.assertEqual(row["error_category"], "operator_exclusion")
+
+    def test_a_context_without_the_module_pack_is_an_error_row_not_a_crash(self):
+        """The attribute is deleted outright, not set to None: a bare
+        attribute access on that context RAISES, and only the getattr
+        guard turns it into an error row. modules=None reaches the same
+        row through the generic failure classifier, which is why the
+        first sabotage run found this test toothless against removing
+        the guard."""
+        engine = _StubEngine()
+        runner = _runner(engine, self.root, watch_invoicing=True,
+                         modules=None)
+        delattr(runner._resolve(), "modules")
+        summary = runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        self.assertTrue(summary["ran"])
+        row = next(r for r in _store(self.root).read_feed()["rows"]
+                   if r["check_id"].startswith("ap_pipeline"))
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["error_category"], "tool_error")
+
+    def test_flipping_the_flag_off_is_an_event_not_a_silence(self):
+        engine = _StubEngine()
+        runner = _runner(engine, self.root, watch_invoicing=True,
+                         modules=_payables())
+        runner.run_tick_once(now="2026-08-30T10:00:00+00:00")
+        runner._resolve().cfg.ticker.watch_invoicing = False
+        runner.run_tick_once(now="2026-08-30T10:30:00+00:00")
+        feed = _store(self.root).read_feed()
+        ap_row = next(r for r in feed["rows"]
+                      if r["check_id"].startswith("ap_pipeline"))
+        self.assertTrue(ap_row["retired"])
+        kinds = {(e["kind"], e["check_id"]) for e in feed["events"]}
+        self.assertIn(("no_longer_scheduled",
+                       "ap_pipeline:default:US001"), kinds)
+
+    def test_the_veto_gate_names_every_table_the_check_may_read(self):
+        """Measured, not recalled -- the tb gate's lesson. The declared
+        list is a SUPERSET: PS_PYMNT_VCHR_XREF is read only when the
+        voucher table has no CLOSE_STATUS, and a gate that names what a
+        check MIGHT read is the only one an operator can rely on."""
+        import re as _re
+        from pstb.config import Config
+        from pstb.db import Database
+        from pstb.engine import TBEngine
+        from pstb.modules import ModulePacks
+        from pstb.ticker import AP_PIPELINE_READS
+        seen = set()
+
+        class Audited(Database):
+            def query(self, sql, params=None, max_rows=None):
+                seen.update(
+                    m.upper() for m in _re.findall(
+                        r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w]*)", sql, _re.I))
+                return super().query(sql, params, max_rows)
+
+        cfg = Config.sample(self.root)
+        cfg.db.sqlite_path = str(
+            Path(__file__).resolve().parent.parent /
+            "sample_data" / "ps_sample.db")
+        db = Audited(cfg)
+        try:
+            ModulePacks(TBEngine(db, cfg)).open_payables(
+                business_unit="US001")
+        finally:
+            db.close()
+        measured = {t for t in seen if t.startswith(("PS_", "XX_"))}
+        self.assertTrue(measured)
+        self.assertLessEqual(measured, set(AP_PIPELINE_READS))
+
+    def test_the_check_never_touches_an_external_system(self):
+        """ap_completeness calls the Coupa API on every run, which is
+        why it must never be scheduled. Asserted on the module's ACTUAL
+        imports and calls, not a raw grep -- the first version failed on
+        its own explanatory comment, the exact toothless-by-overreach
+        shape a guard must not have."""
+        import ast as _ast
+        import pstb.ticker as ticker_module
+        source = Path(ticker_module.__file__).read_text()
+        tree = _ast.parse(source)
+        imported = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, _ast.ImportFrom):
+                imported.add(node.module or "")
+                imported.update(alias.name for alias in node.names)
+        for module in imported:
+            for banned in ("coupa", "requests", "httpx", "urllib"):
+                self.assertNotIn(banned, str(module).lower(), module)
+        self.assertNotIn(".coupa", source.lower())
+
+    def test_the_invoicing_flag_must_be_a_literal_boolean(self):
+        from pstb.config import TickerCfg, _validate_ticker
+        cfg = TickerCfg()
+        cfg.watch_invoicing = "true"
+        with self.assertRaises(RuntimeError):
+            _validate_ticker(cfg)
+        cfg.watch_invoicing = True
+        _validate_ticker(cfg)
 
 
 if __name__ == "__main__":
