@@ -52,6 +52,15 @@ class FakeDatabase:
     def query(self, sql, params=None, max_rows=None):
         self.seen.append(sql)
         for needle in self.unreadable:
+            # a plain string raises the grant-style error; a
+            # (needle, message) pair raises that exact message, so a
+            # test can present a timeout vs an overflow and watch the
+            # probe respond differently.
+            if isinstance(needle, tuple):
+                needle, message = needle
+                if needle in sql:
+                    raise DbError(message)
+                continue
             if needle in sql:
                 raise DbError(f"ORA-00942: table or view does not exist "
                               f"[{needle}]")
@@ -145,10 +154,11 @@ class ProbePromiseTests(unittest.TestCase):
         RATIO is the finding: 4,000 units and 12 readable is a privilege
         gap, and the operator must not file it as 'we have no PL/SQL'."""
         db = FakeDatabase(rows_for={
-            # Insertion order matters: both queries contain
-            # "FROM ALL_OBJECTS" now, and the readable one is told apart
-            # by its per-unit EXISTS probe.
-            "AND EXISTS": [{"n": 8}],
+            # Insertion order matters: both unit queries contain
+            # "FROM ALL_OBJECTS", and COPIES now contains an EXISTS of
+            # its own -- the LINE = 1 probe is the one distinctive
+            # marker of the readable-units query.
+            "S.LINE = 1": [{"n": 8}],
             "FROM ALL_OBJECTS": [{"n": 400}],
         })
         _, printed = _run(self.module, db)
@@ -192,6 +202,62 @@ class ProbePromiseTests(unittest.TestCase):
             self.assertTrue(
                 "ROWNUM" in sql.upper() or "S.LINE = 1" in sql,
                 f"scans source lines outside the expensive gate: {sql}")
+
+    def test_status_all_lists_everything_instead_of_crashing(self):
+        """The runbook said `--status all`; the store said only the five
+        decided states were words. The operator's traceback is why the
+        store now speaks the operator's word for the empty filter."""
+        import tempfile
+        from pathlib import Path as _P
+        from pstb.source_knowledge import SourceKnowledge
+        with tempfile.TemporaryDirectory() as tmp:
+            sk = SourceKnowledge(_P(tmp) / "sk.db", source="default",
+                                 source_fingerprint="sha256:" + "0" * 64)
+            sk.propose(object_id="tbl:MAIN.TU_X7", schema="MAIN",
+                       object_name="TU_X7", object_kind="table",
+                       meaning="Vendor invoice staging rows")
+            self.assertEqual(sk.list_proposals("all"),
+                             sk.list_proposals(""))
+
+    def test_copies_scans_only_live_tables(self):
+        """Measured on the real instance: 76,044 of 84,532 tables are
+        empty, and the unfiltered aggregate read ten times the columns
+        to rank copies of tables the profiler refuses anyway. It timed
+        out at 180s; the live filter is what makes it finish."""
+        db = FakeDatabase()
+        _run(self.module, db)
+        copies = [sql for sql in db.seen if "ORA_HASH" in sql]
+        self.assertTrue(copies)
+        for sql in copies:
+            self.assertIn("NUM_ROWS > 0", sql)
+
+    def test_a_copies_timeout_is_not_retried_but_an_overflow_is(self):
+        """The fallback exists for one error -- LISTAGG overflowing 4000
+        chars -- and retrying on ANY error made a timeout cost two full
+        timeouts back to back."""
+        timeout = FakeDatabase(unreadable=[
+            ("ORA_HASH", "Query exceeded the 180s timeout. Narrow the "
+                         "scope or raise db.query_timeout_seconds.")])
+        _run(self.module, timeout)
+        self.assertEqual(
+            sum(1 for sql in timeout.seen if "ORA_HASH" in sql), 1)
+        overflow = FakeDatabase(unreadable=[
+            ("LISTAGG", "ORA-01489: result of string concatenation is "
+                        "too long")])
+        _run(self.module, overflow)
+        self.assertEqual(
+            sum(1 for sql in overflow.seen if "ORA_HASH" in sql), 2)
+
+    def test_the_awr_grant_row_reads_one_row_not_millions(self):
+        """DBA_HIST_SQLSTAT held 4.7M rows when first measured; counting
+        them on every probe is a timeout waiting to happen, and it
+        happened. The grants question is reach, nothing else."""
+        db = FakeDatabase()
+        _run(self.module, db)
+        awr = [sql for sql in db.seen if "DBA_HIST_SQLSTAT" in sql]
+        self.assertTrue(awr)
+        for sql in awr:
+            self.assertIn("ROWNUM", sql.upper())
 
     def test_the_owners_sweep_is_deliberately_unscoped(self):
         """The package that loads a custom schema is often owned next
