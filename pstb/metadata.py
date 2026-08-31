@@ -541,6 +541,12 @@ class MetadataBuildLimits:
     mine_max_pairs: int = 120
     mine_sample_rows: int = 100
     mine_max_probes: int = 240
+    # Demand steering: how many failed-question terms may nudge the
+    # miner's working set. 0 disables the signal entirely. The BOOST is
+    # fixed (0.05 per matched term, capped at 0.15) so demand stays a
+    # hint that reorders the margin, never a hijack that outruns
+    # measurement -- the cap is below a single organic score component.
+    mine_demand_terms: int = 12
     # View vocabulary harvesting. Definitions are READ and dropped, but
     # they are read into memory first: an Oracle VARCHAR2 projection is
     # up to 4,000 characters, so this cap is a memory budget as much as
@@ -583,6 +589,21 @@ class MetadataBuildLimits:
                 raise MetadataError(
                     f"metadata_catalog.{name} must be between 1 and "
                     f"{ceiling:,}; received {value:,}")
+        # The mine_* budgets were the recorded hole in this validator: a
+        # config typo of 240,000 probes would have passed, and a standing
+        # review wrote that lesson down twice before it was closed here.
+        # Floors of 0 are deliberate where 0 means "off".
+        for name, value, floor, ceiling in (
+            ("mine_max_tables", self.mine_max_tables, 1, 500),
+            ("mine_max_pairs", self.mine_max_pairs, 1, 2_000),
+            ("mine_sample_rows", self.mine_sample_rows, 1, 1_000),
+            ("mine_max_probes", self.mine_max_probes, 1, 5_000),
+            ("mine_demand_terms", self.mine_demand_terms, 0, 50),
+        ):
+            if value < floor or value > ceiling:
+                raise MetadataError(
+                    f"metadata_catalog.{name} must be between {floor} "
+                    f"and {ceiling:,}; received {value:,}")
         if self.stale_after_hours < 1:
             raise MetadataError(
                 "metadata_catalog.stale_after_hours must be at least 1")
@@ -2748,6 +2769,132 @@ def _collect_view_vocabulary(state: _Writer, source: str, db) -> str:
     return "complete" if (joins or terms) else "nothing_declared"
 
 
+def _collect_demand_signal(state: _Writer, source: str,
+                           question_log) -> str:
+    """Count which catalog objects failed questions point at.
+
+    The failure flywheel mines redacted failed questions into demand
+    TERMS; this step matches those terms against the artifact being
+    built and records a per-object HIT COUNT in the profile's
+    components. Only the count crosses into the artifact: a demand term
+    is a chunk of user prose and can carry a party name, and the
+    artifact travels where questions must not.
+
+    The read is the report's own path-mode loader -- per-line tolerant
+    of a torn tail, rotation-aware, O_NOFOLLOW -- because the GUI may be
+    appending while this build runs in another process. Demand is a
+    HINT, so an approximate read is honest: a missed final line costs
+    one turn's worth of counting, disclosed staleness costs nothing.
+    """
+    limits = state.limits
+    max_terms = int(getattr(limits, "mine_demand_terms", 12))
+    if not question_log:
+        return "not_configured"
+    if max_terms < 1:
+        state.note(source, "demand_signal",
+                   "demand steering is disabled "
+                   "(metadata_catalog.mine_demand_terms: 0); the miner "
+                   "ranks by measurement alone", ok=True)
+        return "disabled"
+    from . import demand as demand_module
+    from . import qlog_report
+    try:
+        turns, _ = qlog_report.load(question_log)
+    except Exception as exc:                      # noqa: BLE001
+        # status="unavailable", NOT partial=True: partial marks the WHOLE
+        # snapshot degraded and stamps every answer in the product with a
+        # partial warning -- the wrong verdict for an optional hint whose
+        # input happens to be absent or unreadable. The PSQRYRECORD
+        # precedent: honestly unavailable, degrading nothing else.
+        state.note(source, "demand_signal",
+                   f"the question log was not readable "
+                   f"({type(exc).__name__}); the miner ranks by "
+                   "measurement alone", ok=False, status="unavailable")
+        return "unreadable"
+    terms = demand_module.failed_question_terms(
+        turns, source=source, max_terms=max_terms)
+    if not terms:
+        state.note(source, "demand_signal",
+                   "no failed questions are logged for this source; the "
+                   "miner ranks by measurement alone", ok=True)
+        return "no_demand"
+
+    con = state.con
+    hits: dict = {}
+    for entry in terms:
+        token = _u(entry.get("term"))
+        if not token:
+            continue
+        matched: set = set()
+        # Exact governed alias first -- the strongest link a term can
+        # have to an object -- then per WORD: demand's own subsumption
+        # rule keeps bigrams ("rebate accrual") over their unigram
+        # halves, and it is the half ("REBATE") that appears in a
+        # physical name like TU_REBATE_HDR. The FTS index the coverage
+        # worklist matches through does this tokenisation for free, but
+        # it is built AFTER the collectors, so this step splits by hand.
+        # Every route is bounded and name-ordered; per term at most 8
+        # objects count, the same cap the worklist shows a person.
+        for row in con.execute(
+                "SELECT A.node_id FROM aliases A JOIN nodes N "
+                "ON N.id = A.node_id WHERE A.source=? AND A.alias_upper=? "
+                "AND N.kind IN ('table','view') LIMIT 8",
+                (source, token)):
+            matched.add(row[0])
+        for word in token.split():
+            if len(word) < 3:
+                continue                  # too short to mean anything
+            like = f"%{word}%"
+            for row in con.execute(
+                    "SELECT id FROM nodes WHERE source=? AND "
+                    "kind IN ('table','view') AND UPPER(name) LIKE ? "
+                    "ORDER BY name LIMIT 8", (source, like)):
+                matched.add(row[0])
+            for row in con.execute(
+                    "SELECT E.src FROM search_terms T "
+                    "JOIN nodes C ON C.id = T.node_id AND C.source=? "
+                    "JOIN edges E ON E.dst = C.id "
+                    "AND E.kind='object_has_column' "
+                    "WHERE UPPER(T.text) LIKE ? "
+                    "ORDER BY E.src LIMIT 8", (source, like)):
+                matched.add(row[0])
+        for node_id in sorted(matched)[:8]:
+            hits[node_id] = hits.get(node_id, 0) + 1
+
+    boosted = 0
+    for node_id, count in sorted(hits.items()):
+        row = con.execute(
+            "SELECT components FROM object_profiles WHERE node_id=?",
+            (node_id,)).fetchone()
+        if row is None:
+            continue
+        components = _json(row["components"])
+        # The COUNT persists, never the terms, and value_score is left
+        # untouched: demand lives beside the measurement, it does not
+        # rewrite it. The miner adds its bounded boost at selection
+        # time, where the arithmetic is visible in one place.
+        components["demand_hits"] = int(count)
+        con.execute(
+            "UPDATE object_profiles SET components=? WHERE node_id=?",
+            (json.dumps(components), node_id))
+        boosted += 1
+    state.note(
+        source, "demand_signal",
+        f"{len(terms)} failed-question term(s) matched {boosted} "
+        "profiled object(s); their miner ranking carries a bounded "
+        "demand boost. Counts only are stored -- the terms themselves "
+        "never enter this artifact", ok=True)
+    return "applied" if boosted else "no_matches"
+
+
+# The selection-time arithmetic, in one visible place: a matched term is
+# worth 0.05, and however demanded an object is, demand can add at most
+# 0.15 -- below one organic score component, so measurement still rules
+# and demand only reorders the margin.
+DEMAND_BOOST_PER_HIT = 0.05
+DEMAND_BOOST_CAP = 0.15
+
+
 def _collect_value_joins(state: _Writer, source: str, db) -> str:
     """Mine undeclared joins by measuring value containment (relmine).
 
@@ -2765,14 +2912,29 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
 
     shadows = {row[0] for row in con.execute(
         "SELECT src FROM edges WHERE kind='shadow_of'")}
-    tables = []
+    # Ranked in Python, for three reasons the old ORDER BY ... LIMIT
+    # could not give: shadows are filtered BEFORE the cut (a shadow in
+    # the top-N used to consume a working-set slot and shrink the set),
+    # ties break on name instead of rowid luck (two builds of one
+    # database now pick one set), and the demand boost is added here,
+    # bounded, where the arithmetic is visible -- value_score itself is
+    # never rewritten.
+    candidates = []
     for row in con.execute(
-            "SELECT node_id, schema_name, name, value_score "
+            "SELECT node_id, schema_name, name, value_score, components "
             "FROM object_profiles WHERE source=? AND kind='table' "
-            "AND liveness='populated' ORDER BY value_score DESC LIMIT ?",
-            (source, int(getattr(limits, "mine_max_tables", 40)))):
+            "AND liveness='populated'", (source,)):
         if row["node_id"] in shadows:
             continue
+        hits = int(_json(row["components"]).get("demand_hits") or 0)
+        boost = min(hits * DEMAND_BOOST_PER_HIT, DEMAND_BOOST_CAP)
+        candidates.append((
+            -(float(row["value_score"] or 0.0) + boost),
+            str(row["schema_name"] or ""), str(row["name"] or ""), row))
+    candidates.sort(key=lambda item: item[:3])
+    tables = []
+    for _rank, _schema, _name, row in candidates[
+            :int(getattr(limits, "mine_max_tables", 40))]:
         columns = [
             {"name": c["name"], "data_type": _json(c["attrs"]).get("data_type")}
             for c in con.execute(
@@ -3330,7 +3492,8 @@ def _try_fts(con: sqlite3.Connection) -> bool:
 
 def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                   limits: MetadataBuildLimits | None = None,
-                  peopletools_source: str = "default") -> dict:
+                  peopletools_source: str = "default",
+                  question_log: object = "") -> dict:
     """Build a metadata artifact beside the target, then atomically publish it."""
     limits = limits or MetadataBuildLimits()
     limits.validate()
@@ -3396,6 +3559,18 @@ def build_catalog(path, sources: Iterable[tuple[str, object]], *,
                 # the previous step wrote.
                 # Before the miner: a join a person declared makes
                 # measuring that same pair redundant.
+                # Demand steering before the miner: which objects failed
+                # questions point at, counted into the profiles so the
+                # working-set cut below spends probes where users
+                # actually asked. A hint; measurement still rules.
+                try:
+                    _collect_demand_signal(state, source, question_log)
+                except Exception as exc:      # noqa: BLE001
+                    state.note(source, "demand_signal",
+                               f"the demand signal was not applied "
+                               f"({exc}); the miner ranks by "
+                               "measurement alone", ok=False,
+                               status="unavailable")
                 try:
                     _collect_view_vocabulary(state, source, db)
                 except Exception as exc:      # noqa: BLE001

@@ -93,6 +93,10 @@ def main(argv=None) -> int:
     # magnitude between instances. An operator who finds it expensive
     # needs to switch it off for a build without editing configuration.
     parser.add_argument(
+        "--no-demand", action="store_true",
+        help="ignore the question log; the miner ranks by measurement "
+             "alone")
+    parser.add_argument(
         "--no-view-vocabulary", action="store_true",
         help="skip reading view definitions for declared joins and column "
              "vocabulary")
@@ -168,6 +172,20 @@ def main(argv=None) -> int:
         primary.close()
         return 2
 
+    # The question log steers the miner's working set when configured.
+    # Resolution mirrors QuestionLog's own: absolute stays, relative
+    # roots under cfg.root. The build only ever READS it, through the
+    # report loader that tolerates a concurrent writer.
+    question_log = ""
+    if not args.no_demand and int(getattr(
+            limits, "mine_demand_terms", 0)) > 0:
+        configured = str(getattr(cfg.tools, "question_log", "") or "")
+        if configured:
+            candidate = Path(configured)
+            if not candidate.is_absolute():
+                candidate = Path(cfg.root) / candidate
+            question_log = str(candidate)
+
     _say("sources: " + ", ".join(requested), args.quiet)
     _say(
         f"limits: {limits.max_objects:,} objects/source; "
@@ -179,6 +197,8 @@ def main(argv=None) -> int:
         f"{limits.max_peopletools_rows:,} rows/PeopleTools layer; "
         + (f"{limits.max_view_definitions:,} view definitions/source; "
            if limits.harvest_view_vocabulary else "view vocabulary off; ")
+        + (f"demand steering from {limits.mine_demand_terms} failed "
+           "terms; " if question_log else "demand steering off; ")
         + f"{limits.query_page_size:,}/page", args.quiet)
 
     failures = []
@@ -226,7 +246,8 @@ def main(argv=None) -> int:
                 info = build_catalog(
                     out, [(name, database)], limits=limits,
                     peopletools_source=(
-                        name if args.peopletools_source == name else "none"))
+                        name if args.peopletools_source == name else "none"),
+                    question_log=question_log)
                 elapsed = time.perf_counter() - started
             except Exception as exc:  # atomic builder preserves this source
                 _record_build_status(out, {
