@@ -2243,7 +2243,8 @@ def _ticker_context():
     runtime, and a runner that captured them once would keep checking the
     previous database."""
     from types import SimpleNamespace
-    return SimpleNamespace(engine=engine, cfg=cfg, source="default")
+    return SimpleNamespace(engine=engine, cfg=cfg, source="default",
+                           modules=modules)
 
 
 def _start_ticker() -> None:
