@@ -216,8 +216,14 @@ def main(argv=None) -> int:
         # ANY owner's code, which separates "no grant" from "no code
         # here". DBA_SOURCE is the remedy to ask for when it cannot.
         ("DBA_SOURCE", "SELECT COUNT(*) FROM DBA_SOURCE WHERE ROWNUM <= 1"),
-        ("ALL_SOURCE owners",
-         "SELECT COUNT(DISTINCT OWNER) FROM ALL_SOURCE"),
+        # Reach, not breadth: COUNT(DISTINCT OWNER) here was a full
+        # unscoped scan of every line of stored code on the instance --
+        # sitting in GRANTS, which --skip-expensive does not gate. The
+        # grants question is only "can this account see ANY other
+        # owner's source"; the per-owner breadth stays in PLSQL OWNERS,
+        # which is marked expensive and skippable.
+        ("ALL_SOURCE (any owner)",
+         "SELECT COUNT(*) FROM ALL_SOURCE WHERE ROWNUM <= 1"),
         ("ALL_IDENTIFIERS",
          "SELECT COUNT(*) FROM ALL_IDENTIFIERS WHERE ROWNUM <= 1"),
         ("ALL_STATEMENTS",
@@ -246,10 +252,19 @@ def main(argv=None) -> int:
         f"OBJECT_TYPE IN ({type_list})", params)
     print(f"  units visible in ALL_OBJECTS    "
           f"{visible if not err_v else 'UNREADABLE: ' + err_v}")
+    # One indexed probe per unit, never a scan of every line: ALL_SOURCE
+    # is one row per LINE of stored code, so COUNT over its DISTINCT
+    # units reads the whole schema's source to answer a question about
+    # unit COUNTS -- on a large instance that cannot finish inside any
+    # sane per-query timeout (measured: it did not, at 180s). EXISTS on
+    # LINE = 1 touches one indexed row per visible unit instead.
     readable, err_r = _one(
         db,
-        "SELECT COUNT(*) FROM (SELECT DISTINCT OWNER,NAME,TYPE "
-        f"FROM ALL_SOURCE {and_where}TYPE IN ({type_list}))", params)
+        f"SELECT COUNT(*) FROM ALL_OBJECTS O {and_where}"
+        f"O.OBJECT_TYPE IN ({type_list}) "
+        "AND EXISTS (SELECT 1 FROM ALL_SOURCE S "
+        "WHERE S.OWNER = O.OWNER AND S.NAME = O.OBJECT_NAME "
+        "AND S.TYPE = O.OBJECT_TYPE AND S.LINE = 1)", params)
     print(f"  units with readable source      "
           f"{readable if not err_r else 'UNREADABLE: ' + err_r}")
     if not err_v and not err_r and visible:

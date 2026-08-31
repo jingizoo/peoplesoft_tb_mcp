@@ -145,8 +145,11 @@ class ProbePromiseTests(unittest.TestCase):
         RATIO is the finding: 4,000 units and 12 readable is a privilege
         gap, and the operator must not file it as 'we have no PL/SQL'."""
         db = FakeDatabase(rows_for={
+            # Insertion order matters: both queries contain
+            # "FROM ALL_OBJECTS" now, and the readable one is told apart
+            # by its per-unit EXISTS probe.
+            "AND EXISTS": [{"n": 8}],
             "FROM ALL_OBJECTS": [{"n": 400}],
-            "SELECT DISTINCT OWNER,NAME,TYPE": [{"n": 8}],
         })
         _, printed = _run(self.module, db)
         self.assertIn("2.0% readable", printed)
@@ -170,6 +173,25 @@ class ProbePromiseTests(unittest.TestCase):
         self.assertNotIn("PLSQL SHAPE", skipped)
         self.assertIn("COVERAGE", skipped)
         self.assertIn("GRANTS", skipped)
+
+    def test_no_skippable_run_ever_scans_source_lines(self):
+        """ALL_SOURCE is one row per LINE of stored code. The go/no-go
+        ratio and a GRANTS row both scanned it while wearing cheap
+        clothes -- the ratio's COUNT(DISTINCT ...) read every line of
+        the schema's source, and the owners count read every line of the
+        INSTANCE's, in a section --skip-expensive does not gate. Both
+        timed out on the real box at 180s. The invariant: outside the
+        sections marked EXPENSIVE, every query that touches ALL_SOURCE
+        is either first-row bounded or a per-unit LINE=1 probe."""
+        db = FakeDatabase()
+        code, _ = _run(self.module, db, ["--skip-expensive"])
+        self.assertEqual(code, 0)
+        touching = [sql for sql in db.seen if "ALL_SOURCE" in sql.upper()]
+        self.assertTrue(touching)
+        for sql in touching:
+            self.assertTrue(
+                "ROWNUM" in sql.upper() or "S.LINE = 1" in sql,
+                f"scans source lines outside the expensive gate: {sql}")
 
     def test_the_owners_sweep_is_deliberately_unscoped(self):
         """The package that loads a custom schema is often owned next
