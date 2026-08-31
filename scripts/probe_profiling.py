@@ -159,32 +159,47 @@ def main(argv=None) -> int:
     # second. Reported as candidates only -- this prints names so the
     # markers actually in use here can be read off, since the built-in
     # list was written from experience elsewhere.
-    _section("COPIES  (identically shaped tables, worst offenders first)")
+    _section("COPIES  (identically shaped LIVE tables, worst offenders first)")
+    print("  (among tables whose own statistics report rows; a copy of a")
+    print("   dead table is not the shadow problem, and the ~90%-empty")
+    print("   dictionary is what made the unfiltered aggregate time out)")
     # ORA-01489 on the first attempt: LISTAGG of every column name
     # overflows 4000 characters on a schema with 3.19M columns. Hashing
     # instead cannot overflow. SUM is commutative, so the signature is
     # order-independent for free -- and collisions only ever produce a
     # CANDIDATE here, which is then read by eye.
+    #
+    # The inner scan is restricted to tables with a NONZERO row estimate:
+    # measured on the real instance, 76,044 of 84,532 tables are empty,
+    # so the unfiltered aggregate reads ten times the columns to rank
+    # copies of tables the profiler will refuse anyway. Unanalyzed
+    # tables (no estimate at all) are excluded too and said so above --
+    # unknown is not empty, but an unbounded scan to include them is
+    # exactly what did not finish.
+    live = ("SELECT OWNER, TABLE_NAME, COUNT(*) AS NCOLS, "
+            "        SUM(ORA_HASH(COLUMN_NAME || ':' || DATA_TYPE)) AS SIG "
+            f"      FROM ALL_TAB_COLUMNS C {where}"
+            f"{' AND ' if where else ' WHERE '}EXISTS "
+            "(SELECT 1 FROM ALL_TABLES T WHERE T.OWNER = C.OWNER "
+            "AND T.TABLE_NAME = C.TABLE_NAME AND T.NUM_ROWS > 0) "
+            "GROUP BY OWNER, TABLE_NAME")
     rows, err = _rows(
         db,
         "SELECT NCOLS, SIG, COUNT(*) AS N, "
         "  SUBSTR(LISTAGG(TABLE_NAME, ', ') WITHIN GROUP "
         "         (ORDER BY TABLE_NAME), 1, 300) AS NAMES "
-        "FROM (SELECT OWNER, TABLE_NAME, COUNT(*) AS NCOLS, "
-        "        SUM(ORA_HASH(COLUMN_NAME || ':' || DATA_TYPE)) AS SIG "
-        f"      FROM ALL_TAB_COLUMNS {where} GROUP BY OWNER, TABLE_NAME) "
+        f"FROM ({live}) "
         "GROUP BY NCOLS, SIG HAVING COUNT(*) > 1 "
         "ORDER BY COUNT(*) DESC FETCH FIRST 20 ROWS ONLY", params, cap=20)
-    if err:
-        # The inner LISTAGG is now over table names within one signature
-        # group, not every column in the schema, so it is far shorter --
-        # but a group with hundreds of members can still overflow.
+    if err and "01489" in err:
+        # Retry ONLY for the LISTAGG overflow the fallback exists for.
+        # The first version retried on ANY error, so a timeout here cost
+        # two full timeouts back to back -- six minutes of a stuck probe
+        # to learn the same fact twice.
         rows, err = _rows(
             db,
             "SELECT NCOLS, SIG, COUNT(*) AS N, MIN(TABLE_NAME) AS NAMES "
-            "FROM (SELECT OWNER, TABLE_NAME, COUNT(*) AS NCOLS, "
-            "        SUM(ORA_HASH(COLUMN_NAME || ':' || DATA_TYPE)) AS SIG "
-            f"      FROM ALL_TAB_COLUMNS {where} GROUP BY OWNER, TABLE_NAME) "
+            f"FROM ({live}) "
             "GROUP BY NCOLS, SIG HAVING COUNT(*) > 1 "
             "ORDER BY COUNT(*) DESC FETCH FIRST 20 ROWS ONLY", params, cap=20)
     if err:
@@ -209,15 +224,26 @@ def main(argv=None) -> int:
         ("ALL_TAB_MODIFICATIONS", "SELECT COUNT(*) FROM ALL_TAB_MODIFICATIONS"),
         ("DBA_TAB_MODIFICATIONS", "SELECT COUNT(*) FROM DBA_TAB_MODIFICATIONS"),
         ("V$SQL", "SELECT COUNT(*) FROM V$SQL"),
-        ("DBA_HIST_SQLSTAT", "SELECT COUNT(*) FROM DBA_HIST_SQLSTAT"),
+        # Reach, not size: this view held 4.7M AWR rows when first
+        # measured, and counting them all on every probe run is a
+        # timeout waiting to happen (it happened). The grants question
+        # is only whether the account can read it at all.
+        ("DBA_HIST_SQLSTAT",
+         "SELECT COUNT(*) FROM DBA_HIST_SQLSTAT WHERE ROWNUM <= 1"),
         ("ALL_DEPENDENCIES", f"SELECT COUNT(*) FROM ALL_DEPENDENCIES {where}"),
         # Stored-source reach. ALL_SOURCE unscoped answers a different
         # question from ALL_SOURCE scoped: whether this account can see
         # ANY owner's code, which separates "no grant" from "no code
         # here". DBA_SOURCE is the remedy to ask for when it cannot.
         ("DBA_SOURCE", "SELECT COUNT(*) FROM DBA_SOURCE WHERE ROWNUM <= 1"),
-        ("ALL_SOURCE owners",
-         "SELECT COUNT(DISTINCT OWNER) FROM ALL_SOURCE"),
+        # Reach, not breadth: COUNT(DISTINCT OWNER) here was a full
+        # unscoped scan of every line of stored code on the instance --
+        # sitting in GRANTS, which --skip-expensive does not gate. The
+        # grants question is only "can this account see ANY other
+        # owner's source"; the per-owner breadth stays in PLSQL OWNERS,
+        # which is marked expensive and skippable.
+        ("ALL_SOURCE (any owner)",
+         "SELECT COUNT(*) FROM ALL_SOURCE WHERE ROWNUM <= 1"),
         ("ALL_IDENTIFIERS",
          "SELECT COUNT(*) FROM ALL_IDENTIFIERS WHERE ROWNUM <= 1"),
         ("ALL_STATEMENTS",
@@ -246,10 +272,19 @@ def main(argv=None) -> int:
         f"OBJECT_TYPE IN ({type_list})", params)
     print(f"  units visible in ALL_OBJECTS    "
           f"{visible if not err_v else 'UNREADABLE: ' + err_v}")
+    # One indexed probe per unit, never a scan of every line: ALL_SOURCE
+    # is one row per LINE of stored code, so COUNT over its DISTINCT
+    # units reads the whole schema's source to answer a question about
+    # unit COUNTS -- on a large instance that cannot finish inside any
+    # sane per-query timeout (measured: it did not, at 180s). EXISTS on
+    # LINE = 1 touches one indexed row per visible unit instead.
     readable, err_r = _one(
         db,
-        "SELECT COUNT(*) FROM (SELECT DISTINCT OWNER,NAME,TYPE "
-        f"FROM ALL_SOURCE {and_where}TYPE IN ({type_list}))", params)
+        f"SELECT COUNT(*) FROM ALL_OBJECTS O {and_where}"
+        f"O.OBJECT_TYPE IN ({type_list}) "
+        "AND EXISTS (SELECT 1 FROM ALL_SOURCE S "
+        "WHERE S.OWNER = O.OWNER AND S.NAME = O.OBJECT_NAME "
+        "AND S.TYPE = O.OBJECT_TYPE AND S.LINE = 1)", params)
     print(f"  units with readable source      "
           f"{readable if not err_r else 'UNREADABLE: ' + err_r}")
     if not err_v and not err_r and visible:

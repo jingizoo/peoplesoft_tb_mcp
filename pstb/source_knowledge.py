@@ -1431,10 +1431,17 @@ class SourceKnowledge:
 
     def list_proposals(self, status: str = "") -> list[dict]:
         wanted = str(status or "").strip().lower()
+        if wanted == "all":
+            # The GUI's listing accepted "all" and mapped it to the
+            # empty filter before calling here; the CLI passed it
+            # through verbatim and crashed. The operator-facing word is
+            # "all", so the store speaks it too.
+            wanted = ""
         allowed = {"", "pending", "approved", "excluded", "rejected", "revoked"}
         if wanted not in allowed:
             raise SourceKnowledgeError(
-                "status must be pending, approved, excluded, rejected or revoked")
+                "status must be pending, approved, excluded, rejected, "
+                "revoked, or all")
         return [public for row in self._rows()
                 for public in (self._public(row),)
                 if not wanted or public["status"] == wanted]
