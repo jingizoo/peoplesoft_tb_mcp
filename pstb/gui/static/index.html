@@ -4748,7 +4748,10 @@ function renderApprovals(d,holder,refresh){
     const badge=item.status==='pending'?'':
       '<span class="badge '+(item.status==='approved'?'ok':item.status==='excluded'?'bad':'dim')+'">'+
       esc(item.status)+(item.decided_by?' by '+esc(item.decided_by):'')+'</span> ';
-    row.innerHTML=badge+'<b>'+esc(item.subject||item.kind||'')+'</b> '+
+    const draftedRow=String(item.origin||'').indexOf('drafted')===0;
+    row.innerHTML=badge+(draftedRow
+      ?'<span class="badge dim">drafted from catalog evidence</span> ':'')+
+      '<b>'+esc(item.subject||item.kind||'')+'</b> '+
       '<span style="color:var(--muted)">'+esc(item.queue==='memory'
         ? 'site fact' : (item.selection_effect==='exclude'?'record exclusion':'meaning')+
           ' \u00b7 '+(item.source||''))+'</span>'+
@@ -4759,6 +4762,36 @@ function renderApprovals(d,holder,refresh){
       '<div style="color:var(--muted);font-size:12px">'+
       esc(item.origin||'')+(item.proposed?' \u00b7 '+esc(String(item.proposed).slice(0,19)):'')+
       '</div>';
+    if(draftedRow&&item.status==='pending'&&item.queue!=='memory'){
+      // The information the approver needs, in front of their eyes:
+      // the same live evidence packet the drafter saw, plus whether it
+      // has changed since drafting.
+      const ev=el('div','pad sub'); ev.innerHTML='<span class="spin"></span>';
+      row.append(ev);
+      (async()=>{try{
+        const src=encodeURIComponent(item.source||'default');
+        const packet=await api('/api/source/'+src+'/meaning-evidence?identifier='+
+          encodeURIComponent(item.subject||''));
+        const bits=[];
+        if(packet.label) bits.push('label: '+esc(packet.label));
+        const vocab=(packet.view_vocabulary||[]).map(v=>esc(v.means));
+        if(vocab.length) bits.push('view vocabulary: '+vocab.slice(0,8).join(', ')+
+          (vocab.length>8?' \u2026':''));
+        const fks=(packet.declared_foreign_keys||[]).map(h=>esc(h.with));
+        if(fks.length) bits.push('declared keys with: '+fks.slice(0,6).join(', '));
+        const vjs=(packet.view_declared_joins||[]).map(h=>esc(h.with));
+        if(vjs.length) bits.push('view joins with: '+vjs.slice(0,6).join(', '));
+        let changed='';
+        try{
+          const audit=await api('/api/source/'+src+'/draft-audit?proposal_id='+
+            encodeURIComponent(item.id||''));
+          if(audit&&audit.found&&audit.evidence_changed===true){
+            changed=' <span class="badge warn">evidence changed since drafting</span>';
+          }
+        }catch(e2){}
+        ev.innerHTML=(bits.length?bits.join(' \u00b7 '):'no packet evidence readable')+changed;
+      }catch(e1){ ev.innerHTML='evidence unavailable: '+esc(errText(e1)); }})();
+    }
     if(item.status==='pending'){
       const bar=el('div'); bar.style.marginTop='6px';
       const yes=el('button','btn',item.selection_effect==='exclude'
@@ -5028,6 +5061,138 @@ async function loadCoverageGaps(holder,source){
   }
 }
 
+function draftPanel(d,source,identifier,refresh){
+  const box=el('div'); box.style.margin='8px 0 0 0';
+  if(d.abstained){
+    box.append(el('div','pad sub','The model abstained rather than guess: '+
+      esc(d.reason||'no reason given')+'. The object stays on this list.'));
+    return box;
+  }
+  const head=el('div','pad sub','founded by '+esc((d.founding_signals||[]).join(', '))+
+    ' \u00b7 queue: pending free '+esc(String((d.headroom||{}).pending_free))+
+    ', lifetime free '+esc(String((d.headroom||{}).lifetime_free)));
+  box.append(head);
+  const ta=document.createElement('textarea');
+  ta.value=d.meaning||''; ta.rows=3; ta.style.width='100%';
+  ta.style.boxSizing='border-box'; ta.style.font='inherit';
+  box.append(ta);
+  const aliasesIn=document.createElement('input');
+  aliasesIn.value=(d.aliases||[]).join(', ');
+  aliasesIn.placeholder='aliases (comma separated; only vocabulary the catalog can prove survives)';
+  aliasesIn.style.width='100%'; aliasesIn.style.boxSizing='border-box';
+  aliasesIn.style.font='inherit'; aliasesIn.style.marginTop='4px';
+  box.append(aliasesIn);
+  if((d.grounding||[]).length){
+    box.append(el('div','pad sub','grounded: '+d.grounding.map(g=>
+      esc(g.phrase)+' \u2190 '+esc(g.evidence_ref)+
+      (g.neighbour_only?' (borrowed from a neighbour\u2019s meaning)':'')).join(' \u00b7 ')));
+  }
+  const w=d.warnings||{};
+  if((w.dropped_aliases||[]).length){
+    box.append(el('div','pad sub','dropped aliases (not provable from the packet): '+
+      esc(w.dropped_aliases.join(', '))));
+  }
+  if((w.neighbour_only_terms||[]).length){
+    box.append(el('div','pad sub','wording borrowed from approved neighbours: '+
+      esc(w.neighbour_only_terms.join(', '))));
+  }
+  const lock=el('div','pad sub','selection is locked to <b>prefer</b> \u2014 a draft can '+
+    'never exclude a record; exclusions are a deliberate manual decision.');
+  box.append(lock);
+  const prov=el('div','pad sub'); box.append(prov);
+  function provenance(){
+    const edited=(ta.value.trim().toLowerCase()!==String(d.meaning||'').trim().toLowerCase())
+      ||(aliasesIn.value.split(',').map(a=>a.trim()).filter(Boolean).some(
+          a=>!(d.aliases||[]).map(x=>x.toLowerCase()).includes(a.toLowerCase())));
+    prov.innerHTML='will be recorded as: <b>'+(edited?'drafted, edited':'drafted')+'</b>';
+  }
+  provenance(); ta.oninput=provenance; aliasesIn.oninput=provenance;
+  const bar=el('div'); bar.style.marginTop='6px';
+  const go=el('button','btn','Submit for approval');
+  const say=el('span'); say.style.marginLeft='10px';
+  go.onclick=async()=>{
+    go.disabled=true; say.innerHTML='<span class="spin"></span>';
+    try{
+      const r=await api('/api/source/'+encodeURIComponent(source)+'/meaning-draft-submit',
+        {method:'POST',headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({draft_token:d.draft_token,meaning:ta.value,
+           aliases:aliasesIn.value.split(',').map(a=>a.trim()).filter(Boolean)})});
+      say.innerHTML='<span class="badge ok">pending proposal recorded ('+
+        esc(r.origin||'drafted')+')</span>';
+      if(refresh) setTimeout(refresh,700);
+    }catch(e){
+      say.innerHTML='<span class="badge bad">'+esc(errText(e))+'</span> '+
+        '<span class="sub">a refused submit consumes the draft; use Draft again</span>';
+      go.disabled=false;
+    }
+  };
+  bar.append(go,say); box.append(bar);
+  return box;
+}
+
+function renderMeaningWorklist(d,holder,refresh,source){
+  const card=el('div','card');
+  const rows=d.rows||[]; const counts=d.counts||{};
+  const eligible=rows.filter(r=>r.bucket==='eligible');
+  card.append(el('h2',null,'Objects awaiting a meaning '+
+    (eligible.length
+      ?'<span class="badge warn">'+eligible.length+' eligible</span>'
+      :'<span class="badge ok">none eligible</span>')+
+    '<span class="sub">a draft is a suggestion \u2014 nothing reaches an answer until a person approves it</span>'));
+  if(d.note){ card.append(el('div','pad',esc(d.note))); holder.append(card); return; }
+  const countsLine=Object.keys(counts).sort().map(k=>
+    esc(k.replace(/_/g,' '))+': '+counts[k]).join(' \u00b7 ');
+  if(countsLine) card.append(el('div','pad sub',countsLine));
+  eligible.slice(0,30).forEach(r=>{
+    const row=el('div','pad'); row.style.borderTop='1px solid var(--line)';
+    const ident=(r.schema?r.schema+'.':'')+r.object;
+    const line=el('div');
+    line.innerHTML='<b>'+esc(ident)+'</b> <span style="color:var(--muted)">'+
+      esc(r.kind||'table')+' \u00b7 founded by '+
+      esc((r.founding_signals||[]).map(x=>x.replace(/_/g,' ')).join(', ')||'?')+'</span>';
+    const btn=el('button','btn ghost','Draft a meaning');
+    btn.style.marginLeft='10px';
+    const slot=el('div');
+    btn.onclick=async()=>{
+      btn.disabled=true; slot.innerHTML='<div class="pad"><span class="spin"></span> asking the configured model\u2026</div>';
+      try{
+        const draft=await api('/api/source/'+encodeURIComponent(source)+'/meaning-draft',
+          {method:'POST',headers:{'Content-Type':'application/json'},
+           body:JSON.stringify({identifier:ident})});
+        slot.innerHTML=''; slot.append(draftPanel(draft,source,ident,refresh));
+      }catch(e){
+        slot.innerHTML='<div class="pad"><span class="badge warn">not drafted</span> '+esc(errText(e))+'</div>';
+      }
+      btn.disabled=false;
+    };
+    line.append(btn); row.append(line,slot); card.append(row);
+  });
+  if(eligible.length>30){
+    card.append(el('div','pad sub','\u2026 and '+(eligible.length-30)+
+      ' more eligible objects; the worklist CLI lists them all'));
+  }
+  holder.append(card);
+}
+
+async function loadMeaningWorklist(holder,source){
+  const existing=holder.querySelector('[data-worklist]');
+  const box=el('div'); box.setAttribute('data-worklist','1');
+  if(existing) existing.replaceWith(box); else holder.append(box);
+  const canonical=source||'default';
+  try{
+    const d=await api('/api/source/'+encodeURIComponent(canonical)+'/meaning-worklist');
+    renderMeaningWorklist(d,box,()=>loadMeaningWorklist(holder,canonical),canonical);
+  }catch(e){
+    const c=el('div','card');
+    c.append(el('h2',null,'Objects awaiting a meaning'));
+    c.append(el('div','pad',e.status===403
+      ? '<span class="badge warn">operator access required</span> '+esc(errText(e))
+      : '<span class="badge warn">unavailable</span> '+esc(errText(e))));
+    if(e.status===403) c.append(operatorUnlock(()=>loadMeaningWorklist(holder,source)));
+    box.append(c);
+  }
+}
+
 /* One unlock control for every operator card: enter the key, retry the
    panel. Entering a wrong key just yields the same 403 card back. */
 function operatorUnlock(retry){
@@ -5194,6 +5359,7 @@ async function viewDiag(){
       await loadApprovals(holder,ACTIVE_CHAT_SOURCE);
       await loadExceptions(holder,ACTIVE_CHAT_SOURCE);
       await loadCoverageGaps(holder,ACTIVE_CHAT_SOURCE);
+      await loadMeaningWorklist(holder,ACTIVE_CHAT_SOURCE);
       try{
         holder.append(renderQlogReport(await api('/api/question-report')));
       }catch(e2){

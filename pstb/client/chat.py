@@ -101,6 +101,54 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def build_bare_provider(name: str, cfg: Config,
+                        system_prompt_text: str) -> LLMProvider:
+    """A provider with NO tools, NO site memory, and a caller-supplied
+    system prompt. The meaning drafter uses this: its prompt is an
+    allow-listed evidence packet, and the chat system prompt (workspace
+    instructions, taught site facts) must never ride along -- taught
+    text is exactly the kind of unreviewed wording the drafter's
+    validators exist to keep out of the approval store.
+
+    Deliberately NOT a build_provider(tools=[]) call: that constructor
+    hardwires the chat prompt and SiteMemory, and a future edit there
+    should never silently start leaking either into drafts.
+    """
+    provider_name = (name or getattr(cfg.llm, "provider", "")
+                     or "").strip().lower()
+    if provider_name == "gemini":
+        from .llm_gemini import GeminiVertexProvider
+        return GeminiVertexProvider(cfg, system_prompt_text, [])
+    if provider_name == "claude":
+        from .llm_claude import ClaudeProvider
+        return ClaudeProvider(cfg, system_prompt_text, [])
+    if provider_name == "ollama":
+        from .llm_ollama import OllamaProvider
+        return OllamaProvider(cfg, system_prompt_text, [])
+    raise ValueError(
+        f"unknown provider {provider_name!r} -- use 'ollama', 'gemini' "
+        "or 'claude'")
+
+
+def one_shot_completion(cfg: Config, provider_name: str, system_text: str,
+                        user_text: str) -> tuple[str, str, str]:
+    """One prompt in, one text out, nothing retained: build a bare
+    provider, send a single user message, reset, and return
+    (text, provider, model). No timeout here -- callers that need one
+    run this in a worker they control."""
+    provider = build_bare_provider(provider_name, cfg, system_text)
+    try:
+        response = provider.send_user(user_text)
+        return (str(getattr(response, "text", "") or ""),
+                str(getattr(provider, "name", "") or ""),
+                str(getattr(provider, "model", "") or ""))
+    finally:
+        try:
+            provider.reset()
+        except Exception:                       # noqa: BLE001
+            pass
+
+
 def build_provider(name: str, cfg: Config, tools: list[ToolSpec]) -> LLMProvider:
     from ..memory import SiteMemory
     prompt = system_prompt(cfg, memory=SiteMemory(cfg.resolve_path(

@@ -144,6 +144,28 @@ def classify_object(evidence: dict, *, already_proposed: bool,
                           evidence=evidence)
 
 
+def proposal_ledger(store) -> tuple[set, set]:
+    """(burying_ids, approved_ids) from the approval store, applying the
+    drafted exception: a machine draft a human REJECTED or REVOKED does
+    not bury the object -- rejecting a bad draft returns it to the
+    worklist for a human sentence. Human-origin decisions keep the 7.1
+    semantics: a person already looked and declined."""
+    burying, approved = set(), set()
+    for row in (store.list_proposals("") or ()):
+        object_id = str(row.get("object_id") or "")
+        if not object_id:
+            continue
+        status = str(row.get("status") or "pending")
+        origin = str(row.get("origin") or "")
+        if status == "approved":
+            approved.add(object_id)
+        if (origin.startswith("drafted")
+                and status in {"rejected", "revoked"}):
+            continue
+        burying.add(object_id)
+    return burying, approved
+
+
 def iter_catalog_objects(con, source: str):
     """(node_id, schema, name, kind) for every table/view in one source,
     in a stable order -- the worklist must be reproducible run to run."""
@@ -181,14 +203,7 @@ def build_worklist(catalog, store, source: str) -> dict:
             "otherwise be reported profiler_silent, which would look "
             "like a real finding instead of a broken artifact")
 
-    proposed_ids: set = set()
-    approved_ids: set = set()
-    for row in (store.list_proposals("") or ()):
-        object_id = str(row.get("object_id") or "")
-        if object_id:
-            proposed_ids.add(object_id)
-            if row.get("status") == "approved":
-                approved_ids.add(object_id)
+    proposed_ids, approved_ids = proposal_ledger(store)
 
     rows = []
     counts: dict = {}
