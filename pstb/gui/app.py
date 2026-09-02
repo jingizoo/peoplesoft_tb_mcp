@@ -359,11 +359,14 @@ _PROTECTED_WRITE_PATHS = frozenset({
 _PROTECTED_WRITE_MAX_BYTES = 8 * 1024
 _METADATA_PROPOSAL_PATH = re.compile(
     r"^/api/source/[^/]+/metadata-proposals$")
+_MEANING_DRAFT_PATH = re.compile(
+    r"^/api/source/[^/]+/meaning-draft(?:-submit)?$")
 
 
 def _is_bounded_write_path(path: str) -> bool:
     return (path in _PROTECTED_WRITE_PATHS
-            or _METADATA_PROPOSAL_PATH.fullmatch(path) is not None)
+            or _METADATA_PROPOSAL_PATH.fullmatch(path) is not None
+            or _MEANING_DRAFT_PATH.fullmatch(path) is not None)
 
 
 @app.middleware("http")
@@ -2226,6 +2229,147 @@ def meaning_evidence_endpoint(request: Request, command: str,
             status_code=404,
             detail=f"no readable metadata catalog for {canonical!r}")
     return catalog.object_evidence(identifier, source=canonical)
+
+
+def _draft_error(exc):
+    from ..meaning_draft import DraftRefusal, DraftUnavailable
+    if isinstance(exc, DraftRefusal):
+        return HTTPException(status_code=exc.http_status,
+                             detail=f"{exc.stage}: {exc.detail}"
+                             if exc.detail else exc.stage)
+    if isinstance(exc, DraftUnavailable):
+        return HTTPException(status_code=exc.http_status, detail=str(exc))
+    return HTTPException(status_code=500, detail="drafting failed")
+
+
+@app.post("/api/source/{command}/meaning-draft")
+def meaning_draft_endpoint(command: str, payload: dict,
+                           request: Request = None):
+    """One grounded draft for one ELIGIBLE worklist object -- ephemeral,
+    held server-side under a single-use token. Nothing is written until
+    the operator submits, and a refused or abstained draft writes
+    nothing anywhere but a stage counter.
+
+    Operator-gated like the worklist itself, and in the bounded-write
+    family: this endpoint spends model budget and mints server state, so
+    a foreign page must not be able to POST at it."""
+    _require_question_log_operator(request)
+    from .. import meaning_draft
+    canonical = _canonical_or_404(command)
+    identifier = (payload or {}).get("identifier")
+    provider = (payload or {}).get("provider") or ""
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise HTTPException(status_code=400, detail="identifier required")
+    if not isinstance(provider, str):
+        raise HTTPException(status_code=400, detail="provider must be text")
+    catalog = _coverage_catalog(canonical)
+    if not catalog.available():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no readable metadata catalog for {canonical!r}")
+    store = _source_knowledge_store(canonical)
+    try:
+        return meaning_draft.draft_meaning(
+            cfg, catalog, store, canonical, identifier.strip(),
+            provider=provider.strip())
+    except (meaning_draft.DraftRefusal,
+            meaning_draft.DraftUnavailable) as exc:
+        raise _draft_error(exc) from exc
+
+
+@app.post("/api/source/{command}/meaning-draft-submit")
+def meaning_draft_submit_endpoint(command: str, payload: dict,
+                                  request: Request = None):
+    """The write leg: consumes the draft token, re-proves eligibility
+    and evidence live, and writes ONE pending proposal through the
+    unmodified store -- the server's own validated text on the verbatim
+    path, revalidated text on the edited path, selection always
+    an explicit prefer."""
+    _require_question_log_operator(request)
+    from .. import meaning_draft
+    canonical = _canonical_or_404(command)
+    body = payload or {}
+    token = body.get("draft_token")
+    meaning = body.get("meaning")
+    aliases = body.get("aliases") or []
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(status_code=400, detail="draft_token required")
+    if not isinstance(meaning, str) or not meaning.strip():
+        raise HTTPException(status_code=400, detail="meaning required")
+    if not isinstance(aliases, list) or any(
+            not isinstance(a, str) for a in aliases):
+        raise HTTPException(status_code=400,
+                            detail="aliases must be a list of text")
+    catalog = _coverage_catalog(canonical)
+    if not catalog.available():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no readable metadata catalog for {canonical!r}")
+    store = _source_knowledge_store(canonical)
+    try:
+        return meaning_draft.submit_draft(
+            cfg, catalog, store, canonical, token.strip(), meaning,
+            aliases)
+    except (meaning_draft.DraftRefusal,
+            meaning_draft.DraftUnavailable) as exc:
+        raise _draft_error(exc) from exc
+
+
+@app.get("/api/source/{command}/draft-audit")
+def draft_audit_endpoint(request: Request, command: str,
+                         proposal_id: str = ""):
+    """Provenance for one drafted proposal, recomputed live: whether it
+    was edited before submission, and whether the evidence that grounded
+    it has changed since (digest over the rendered prompt subset).
+    Model identity deliberately stays OUT of this response -- it lives
+    in the CLI --audit output only, never in page-reachable JSON."""
+    _require_question_log_operator(request)
+    import sqlite3 as _sqlite3
+
+    from ..meaning_draft import (_neighbour_meanings, draft_audit_path,
+                                 render_prompt)
+    from ..meaning_worklist import proposal_ledger
+    canonical = _canonical_or_404(command)
+    candidate = str(proposal_id or "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="proposal_id required")
+    path = draft_audit_path(cfg, canonical)
+    if not path.exists():
+        return {"found": False}
+    try:
+        con = _sqlite3.connect(path, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT evidence_digest, edited, drafted_at "
+                "FROM draft_audit WHERE proposal_id=?",
+                (candidate,)).fetchone()
+        finally:
+            con.close()
+    except _sqlite3.Error:
+        return {"found": False}
+    if row is None:
+        return {"found": False}
+    evidence_changed = None
+    try:
+        store = _source_knowledge_store(canonical)
+        proposal = store.get(candidate)
+        catalog = _coverage_catalog(canonical)
+        if catalog.available():
+            identifier = ".".join(filter(None, [
+                str(proposal.get("schema") or ""),
+                str(proposal.get("object") or "")]))
+            evidence = catalog.object_evidence(identifier, source=canonical)
+            if evidence.get("found"):
+                _, approved = proposal_ledger(store)
+                live = render_prompt(
+                    evidence,
+                    _neighbour_meanings(store, evidence, approved))
+                evidence_changed = live.digest != str(row[0] or "")
+    except Exception:                             # noqa: BLE001
+        evidence_changed = None
+    return {"found": True, "edited": bool(row[1]),
+            "drafted_at": str(row[2] or ""),
+            "evidence_changed": evidence_changed}
 
 
 # ---- continuous exception ticker ----------------------------------------
