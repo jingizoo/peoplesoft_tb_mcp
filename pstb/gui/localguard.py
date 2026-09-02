@@ -59,6 +59,7 @@ ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 # a single pasted URL works on the first click; the middleware turns it into
 # a cookie so the page's own fetches do not have to repeat it.
 TOKEN_COOKIE = "pstb_token"
+SIGNIN_PATH = "/api/token-signin"
 TOKEN_HEADER = "x-pstb-token"
 TOKEN_QUERY = "token"
 
@@ -353,6 +354,78 @@ def tunnel_command(port: int = DEFAULT_PORT) -> str:
     return f"ssh -L {port}:localhost:{port} <this-host>"
 
 
+def _is_signin_door(scope, policy: Optional[Policy] = None) -> bool:
+    """Exactly one request may arrive tokenless: the POST that presents
+    the token, and only behind a trusted proxy -- everywhere else the
+    printed ?token= URL flow already works and this door stays shut."""
+    policy = policy or POLICY
+    return bool(
+        policy.trusted_proxy and policy.token
+        and str(scope.get("method") or "").upper() == "POST"
+        and str(scope.get("path") or "") == SIGNIN_PATH)
+
+
+def wants_signin_page(scope, policy: Optional[Policy] = None) -> bool:
+    """A browser NAVIGATING to the app without a token should see the
+    sign-in form, not raw JSON. Page requests only: an API fetch keeps
+    its machine-readable refusal."""
+    policy = policy or POLICY
+    if not (policy.trusted_proxy and policy.token):
+        return False
+    if str(scope.get("method") or "GET").upper() != "GET":
+        return False
+    if str(scope.get("path") or "") != "/":
+        return False
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+               for k, v in scope.get("headers") or []}
+    return "text/html" in headers.get("accept", "")
+
+
+def signin_page(reason: str) -> str:
+    """Self-contained, vendor-neutral, and deliberately tiny: nothing of
+    the application -- no page chrome, no script surface, no endpoint
+    names beyond the door itself -- is served to an unauthenticated
+    caller."""
+    import html as _html
+    message = _html.escape(" ".join(str(reason or "").split()))
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title><style>
+body{{margin:0;display:flex;align-items:center;justify-content:center;
+min-height:100vh;background:#111418;color:#e8eaed;
+font:15px/1.5 system-ui,sans-serif}}
+main{{max-width:420px;padding:32px}}
+h1{{font-size:19px;margin:0 0 6px}}
+p{{color:#9aa0a6;font-size:13px;margin:0 0 18px}}
+input{{width:100%;box-sizing:border-box;padding:10px 12px;
+border-radius:8px;border:1px solid #3c4043;background:#1b1f24;
+color:inherit;font-size:15px}}
+button{{margin-top:10px;padding:10px 18px;border-radius:8px;border:0;
+background:#8ab4f8;color:#111418;font-size:14px;font-weight:600;
+cursor:pointer}}
+#err{{color:#f28b82;font-size:13px;margin-top:10px;min-height:1.2em}}
+</style></head><body><main>
+<h1>Access token required</h1>
+<p>{message}</p>
+<form id="f"><input id="t" type="password" autocomplete="off"
+placeholder="access token" autofocus>
+<button>Sign in</button><div id="err"></div></form>
+<script>
+document.getElementById('f').onsubmit=async function(e){{
+  e.preventDefault();
+  var err=document.getElementById('err');err.replaceChildren();
+  try{{
+    var r=await fetch('{SIGNIN_PATH}',{{method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{token:document.getElementById('t').value}})}});
+    if(r.ok){{location.replace('/');return;}}
+    err.textContent=r.status===403?'That token was not accepted.'
+      :'Sign-in failed ('+r.status+').';
+  }}catch(x){{err.textContent='Sign-in failed.';}}
+}};
+</script></main></body></html>"""
+
+
 def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     """(status, reason) when this request must not be served, else (0, "").
 
@@ -370,8 +443,10 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
         return 401, (
             "This deployment does not accept the token in the URL: the "
             "load balancer logs request URLs, and the token is the access "
-            "control. Send it as an Authorization: Bearer header once and "
-            "the cookie takes over.")
+            "control. Open the page without the token and enter it on the "
+            "sign-in form -- the form sends it in a request body, which "
+            "the balancer does not log. (An Authorization: Bearer header "
+            "works too, and the cookie takes over either way.)")
     if not policy.shared and not peer_is_loopback(scope.get("client")):
         return 403, ("This server answers only on the loopback interface. "
                      "Reach it through an SSH tunnel: "
@@ -405,6 +480,20 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     # rather than being sent to look for a token they would then also need.
     if policy.token and not any(token_ok(t, policy)
                                 for t in presented_tokens(scope)):
+        if _is_signin_door(scope, policy):
+            # The one request allowed through WITHOUT a token: the POST
+            # that presents it. Every earlier rule above already ran --
+            # this narrows only the token check, and only in proxy mode,
+            # where no printed-URL flow exists.
+            return 0, ""
+        if policy.trusted_proxy:
+            # The startup banner deliberately does not print the token on
+            # this deployment (stdout persists in the platform's logs).
+            return 401, (
+                "This deployment requires its access token. Open the app "
+                "in a browser and enter the token on the sign-in form, or "
+                "send it as an Authorization: Bearer header; the cookie "
+                "takes over either way.")
         return 401, (
             "This server is bound to a routable address, so it requires the "
             "access token printed when it started. Open the URL that "
