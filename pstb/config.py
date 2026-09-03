@@ -477,6 +477,47 @@ def _validate_ticker(cfg: TickerCfg) -> None:
     units = getattr(cfg, "business_units", [])
     if not isinstance(units, (list, tuple)):
         raise RuntimeError("ticker.business_units must be a list")
+    tables = getattr(cfg, "watch_tables", [])
+    if isinstance(tables, str):
+        raise RuntimeError(
+            "ticker.watch_tables must be a YAML list -- a bare string "
+            "iterates one character at a time")
+    if not isinstance(tables, (list, tuple)):
+        raise RuntimeError("ticker.watch_tables must be a list")
+    # $/# are legal Oracle identifier characters, but the ticker's
+    # check-id grammar refuses them -- refused HERE with the reason,
+    # not mid-tick where the failure would become three _fail calls
+    # and a tripped breaker.
+    ident = re.compile(
+        r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+    seen_fold: dict = {}
+    for entry in tables:
+        if type(entry) is not str or not entry.strip():
+            raise RuntimeError(
+                "ticker.watch_tables entries must be non-empty table "
+                "names")
+        name = entry.strip()
+        if len(name) > 60 or not ident.fullmatch(name):
+            raise RuntimeError(
+                f"ticker.watch_tables entry {entry!r} is not a plain "
+                "TABLE or SCHEMA.TABLE identifier of letters, digits "
+                "and underscores (up to 60 characters); $ and # are "
+                "refused because the ticker's check-id grammar cannot "
+                "carry them")
+        fold = name.casefold()
+        if fold in seen_fold:
+            raise RuntimeError(
+                f"ticker.watch_tables lists {seen_fold[fold]!r} and "
+                f"{entry!r}, which differ only by case: two spellings "
+                "of one table would double-spend the query budget and "
+                "split its history across two baselines")
+        seen_fold[fold] = entry
+    if len(tables) > 20:
+        raise RuntimeError(
+            "ticker.watch_tables is capped at 20 tables: 20 reserve 40 "
+            "queries -- the entire default max_queries_per_tick -- and "
+            "tb_integrity is charged first, so trailing tables would "
+            "never run; raise the budget or shorten the list")
 
 
 def _validate_security(cfg: SecurityCfg) -> None:
