@@ -20,9 +20,11 @@ from fastapi.testclient import TestClient
 
 from pstb.db import DbError
 from pstb.engine import EngineError
-from pstb.ticker import (CheckOutcome, EVENT_KINDS, TickerError,
+from pstb.ticker import (CheckOutcome, EVENT_KINDS,
+                         TABLE_HEALTH_QUERY_COST, TickerError,
                          TickerLimits, TickerRunner, TickerStore,
-                         reduce_tb_integrity, store_path)
+                         reduce_table_health, reduce_tb_integrity,
+                         store_path)
 
 FINGERPRINT = "sha256:" + "0" * 64
 ROW_SENTINEL = "SENTINEL JANE DOE"
@@ -347,17 +349,20 @@ class _StubEngine:
 
 
 def _runner(engine, root, *, units=("US001",), watch_invoicing=False,
-            modules=None, **limit_overrides):
+            modules=None, watch_tables=(), catalog_for=None,
+            exclusions=None, **limit_overrides):
     ticker_cfg = SimpleNamespace(
         enabled=True, business_units=list(units), ledger="",
         watch_invoicing=watch_invoicing,
+        watch_tables=list(watch_tables),
         **{name: limit_overrides.get(name, getattr(TickerLimits, name))
            for name in TickerLimits._BOUNDS})
     cfg = SimpleNamespace(ticker=ticker_cfg,
                           defaults=SimpleNamespace(business_unit="US001"),
                           root=root)
     context = SimpleNamespace(engine=engine, cfg=cfg, source="default",
-                              modules=modules)
+                              modules=modules, catalog_for=catalog_for,
+                              exclusions=exclusions)
     return TickerRunner(
         lambda: context,
         store_factory=lambda ctx, limits: TickerStore(
@@ -989,3 +994,264 @@ class InvoicePipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _NoExclusions:
+    def for_source(self, source):
+        return []
+
+
+def _health_fixture(root, *, dup_rows=0):
+    """A real sqlite table with a DECLARED unique key, its catalog, and
+    a Database -- the unchurnable core is tested against the genuine
+    engine, not a scripted result."""
+    import sqlite3 as _sqlite3
+
+    from pstb.config import Config
+    from pstb.db import Database
+    from pstb.metadata import MetadataCatalog, build_catalog
+    db_path = Path(root) / "p.db"
+    con = _sqlite3.connect(db_path)
+    con.executescript(
+        "CREATE TABLE PS_WATCHED (UNIT TEXT, DOC_ID TEXT, AMT NUMERIC);"
+        "CREATE UNIQUE INDEX PS_WATCHED_K ON PS_WATCHED (UNIT, DOC_ID);")
+    for n in range(30):
+        con.execute("INSERT INTO PS_WATCHED VALUES (?,?,?)",
+                    ("US001", f"D{n}", n))
+    con.commit()
+    con.close()
+    cfg = Config.sample(Path(root))
+    cfg.db.sqlite_path = str(db_path)
+    cfg.sources = {}
+    db = Database(cfg)
+    build_catalog(Path(root) / "c.db", [("default", db)],
+                  peopletools_source="default")
+    catalog = MetadataCatalog(Path(root) / "c.db")
+    return db, catalog
+
+
+class _HealthEngine(_StubEngine):
+    """The stub engine, extended with what _run_table_health touches."""
+
+    def __init__(self, db, **kwargs):
+        super().__init__(**kwargs)
+        self.db = db
+        self.registry = SimpleNamespace(resolve_name=lambda s: "default")
+
+    def for_source(self, source):
+        return SimpleNamespace(db=self.db)
+
+
+class TableHealthCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-tickth-")
+        self.root = Path(self.temp.name)
+        self.db, self.catalog = _health_fixture(self.root)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def _health_runner(self, engine=None, **kwargs):
+        engine = engine or _HealthEngine(self.db)
+        return _runner(engine, self.root, watch_tables=("PS_WATCHED",),
+                       catalog_for=lambda name: self.catalog,
+                       exclusions=_NoExclusions(), **kwargs), engine
+
+    def test_reduce_saturates_and_maps_incompleteness_to_narrowed(self):
+        status, counts, narrowed = reduce_table_health(
+            {"duplicate_keys": {"checked": True,
+                                "duplicate_groups": "50+"}})
+        self.assertEqual((status, counts, narrowed),
+                         ("exceptions_found", {"duplicate_groups": 51},
+                          False))
+        status, counts, narrowed = reduce_table_health(
+            {"duplicate_keys": {"checked": False,
+                                "skipped": "no declared key"}})
+        self.assertEqual((status, counts, narrowed),
+                         ("checks_incomplete", {}, True))
+
+    def test_two_ticks_of_unchanged_data_emit_zero_events(self):
+        """THE unchurnable core: the metric ships only because this
+        holds against the real engine, not a scripted result."""
+        runner, _ = self._health_runner()
+        first = runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        second = runner.run_tick_once(now="2026-08-01T10:30:00+00:00")
+        self.assertTrue(first["events"] >= 1)     # baseline
+        self.assertEqual(second["events"], 0)
+
+    def test_a_real_new_duplicate_is_one_worsened_event(self):
+        runner, _ = self._health_runner()
+        runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        import sqlite3 as _sqlite3
+        # sqlite ENFORCES the unique index, so a real duplicate needs
+        # the constraint relaxed first -- which is exactly the incident
+        # shape on the target box: a key dropped in a migration and
+        # duplicates arriving afterwards. The catalog still carries the
+        # declared key from the build.
+        con = _sqlite3.connect(self.root / "p.db")
+        con.execute("DROP INDEX PS_WATCHED_K")
+        con.execute("INSERT INTO PS_WATCHED VALUES ('US001','D5',99)")
+        con.commit()
+        con.close()
+        self.db.clear_catalog()
+        runner.run_tick_once(now="2026-08-01T11:00:00+00:00")
+        # a SECOND new duplicate group: exceptions_found -> higher count
+        con = _sqlite3.connect(self.root / "p.db")
+        con.execute("INSERT INTO PS_WATCHED VALUES ('US001','D7',77)")
+        con.commit()
+        con.close()
+        runner.run_tick_once(now="2026-08-01T12:00:00+00:00")
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        events = [e for e in store.read_feed()["events"]
+                  if e["check_id"].startswith("table_health:")]
+        kinds = [e["kind"] for e in events]
+        # the staircase: clean baseline -> the first group is
+        # new_exceptions (a status change) -> the second is worsened
+        # (a count change within the same status)
+        self.assertIn("new_exceptions", kinds)
+        self.assertIn("worsened", kinds)
+        worsened = next(e for e in events if e["kind"] == "worsened")
+        self.assertEqual(worsened["metric"], "duplicate_groups")
+
+    def test_the_operator_veto_refuses_before_any_query(self):
+        engine = _HealthEngine(self.db, veto=EngineError(
+            "PS_WATCHED is excluded from this source"))
+        queries = []
+        real_query = self.db.query
+        self.db.query = lambda *a, **k: queries.append(a) or real_query(
+            *a, **k)
+        runner, _ = self._health_runner(engine=engine)
+        runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        row = next(r for r in store.read_feed()["rows"]
+                   if r["check_id"].startswith("table_health:"))
+        self.assertEqual(row["status"], "refused")
+        self.assertEqual(row["error_category"], "operator_exclusion")
+        self.assertEqual(queries, [])
+
+    def test_a_tight_budget_starves_tables_never_the_tie_out(self):
+        runner, engine = self._health_runner(max_queries_per_tick=8)
+        runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        rows = {r["check_id"]: r for r in store.read_feed()["rows"]}
+        tb = rows["tb_integrity:default:US001"]
+        th = rows["table_health:default:PS_WATCHED"]
+        self.assertNotEqual(tb["status"], "not_run")
+        self.assertEqual(th["status"], "not_run")
+        self.assertEqual(th["error_category"], "budget")
+
+    def test_unwatching_a_table_retires_it_in_the_feed(self):
+        runner, _ = self._health_runner()
+        runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        engine = _HealthEngine(self.db)
+        bare = _runner(engine, self.root)
+        bare.run_tick_once(now="2026-08-01T11:00:00+00:00")
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        kinds = [e["kind"] for e in store.read_feed()["events"]
+                 if e["check_id"].startswith("table_health:")]
+        self.assertIn("no_longer_scheduled", kinds)
+
+    def test_a_revoked_grant_is_an_error_and_ora_01017_trips(self):
+        """The engine swallows a DbError from the GROUP BY into the
+        duplicates dict; reading that as checks_incomplete would file a
+        revoked grant as quiet amber and bypass the credential-terminal
+        path."""
+        real_query = self.db.query
+
+        def deny(sql, params=None, max_rows=None):
+            if "GROUP BY" in sql:
+                raise DbError("ORA-00942: table or view does not exist")
+            return real_query(sql, params, max_rows)
+
+        self.db.query = deny
+        try:
+            runner, _ = self._health_runner()
+            runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        finally:
+            self.db.query = real_query
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        row = next(r for r in store.read_feed()["rows"]
+                   if r["check_id"].startswith("table_health:"))
+        self.assertEqual(row["status"], "error")
+        self.assertNotEqual(row["status"], "checks_incomplete")
+
+        def refuse(sql, params=None, max_rows=None):
+            if "GROUP BY" in sql:
+                raise DbError("ORA-01017: invalid username/password")
+            return real_query(sql, params, max_rows)
+
+        self.db.query = refuse
+        try:
+            runner2, _ = self._health_runner()
+            runner2.run_tick_once(now="2026-08-01T12:00:00+00:00")
+            self.assertEqual(runner2.state, "tripped")
+        finally:
+            self.db.query = real_query
+
+    def test_the_measured_cost_never_exceeds_the_reservation(self):
+        queries = []
+        real_query = self.db.query
+        self.db.query = lambda *a, **k: queries.append(a[0]) or real_query(
+            *a, **k)
+        try:
+            runner, _ = self._health_runner(units=())
+            runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        finally:
+            self.db.query = real_query
+        health_queries = [q for q in queries if "PS_WATCHED" in q]
+        self.assertTrue(health_queries)
+        self.assertLessEqual(len(health_queries), TABLE_HEALTH_QUERY_COST)
+
+    def test_an_empty_business_unit_passes_the_persistence_boundary(self):
+        from pstb.ticker import _validate_outcome
+        outcome = CheckOutcome(
+            check_id="table_health:default:PS_WATCHED", source="default",
+            business_unit="", status="passed",
+            counts={"duplicate_groups": 0})
+        self.assertIs(_validate_outcome(outcome), outcome)
+
+    def test_a_wiring_gap_is_a_tool_error_row_not_a_crash(self):
+        engine = _HealthEngine(self.db)
+        runner = _runner(engine, self.root, watch_tables=("PS_WATCHED",),
+                         catalog_for=None, exclusions=None)
+        summary = runner.run_tick_once(now="2026-08-01T10:00:00+00:00")
+        self.assertTrue(summary["ran"])
+        store = TickerStore(self.root / "t.db", source="default",
+                            fingerprint=FINGERPRINT, limits=_limits())
+        row = next(r for r in store.read_feed()["rows"]
+                   if r["check_id"].startswith("table_health:"))
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["error_category"], "tool_error")
+
+
+class WatchTablesConfigTests(unittest.TestCase):
+    def _validate(self, tables):
+        from pstb.config import TickerCfg, _validate_ticker
+        cfg = TickerCfg()
+        cfg.watch_tables = tables
+        _validate_ticker(cfg)
+
+    def test_refusals_each_carry_their_named_reason(self):
+        cases = [
+            ("PS_X", "YAML list"),
+            (["PS_X$Y"], "check-id grammar"),
+            (["PS_A", "ps_a"], "differ only by case"),
+            ([f"T{i}" for i in range(21)], "capped at 20"),
+            ([42], "non-empty table names"),
+            (["A" * 61], "60 characters"),
+        ]
+        for tables, needle in cases:
+            with self.subTest(tables=str(tables)[:30]):
+                with self.assertRaises(RuntimeError) as caught:
+                    self._validate(tables)
+                self.assertIn(needle, str(caught.exception))
+
+    def test_legal_lists_pass(self):
+        self._validate([])
+        self._validate(["PS_JRNL_LN", "SYSADM.PS_VOUCHER"])

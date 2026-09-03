@@ -2428,7 +2428,9 @@ def _ticker_context():
     previous database."""
     from types import SimpleNamespace
     return SimpleNamespace(engine=engine, cfg=cfg, source="default",
-                           modules=modules)
+                           modules=modules,
+                           catalog_for=_coverage_catalog,
+                           exclusions=record_exclusions)
 
 
 def _start_ticker() -> None:

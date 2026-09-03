@@ -79,6 +79,12 @@ TB_INTEGRITY_READS = (
 # MIGHT read is the only one an operator can rely on. A test asserts the
 # measured set stays within this list.
 AP_PIPELINE_QUERY_COST = 4
+
+# table_health, duplicates-only: one wrapped GROUP BY against the
+# watched table (catalog context and the exclusion sidecar are offline
+# artifact reads), plus one of headroom for first-tick session overhead
+# -- the same rounding convention as the checks above.
+TABLE_HEALTH_QUERY_COST = 2
 AP_PIPELINE_READS = ("PS_PYMNT_VCHR_XREF", "PS_VENDOR", "PS_VOUCHER")
 
 STATUSES = frozenset({
@@ -216,6 +222,33 @@ def reduce_tb_integrity(result: Mapping) -> tuple:
     except (TypeError, ValueError):
         fy, per = 0, 0
     return status, counts, fy, per, counts["checks_narrowed"] > 0
+
+
+def reduce_table_health(result: Mapping) -> tuple:
+    """(status, counts, narrowed) from a full table_health answer.
+
+    ONE metric -- duplicate_groups on a DECLARED unique key -- because
+    it is the only figure in the payload two ticks against unchanged
+    data are guaranteed to reproduce byte-identically. Sampled null
+    rates and sampled orphan probes vary with row order and never run
+    for the ticker (see _run_table_health). "50+" saturates to 51: one
+    worsened event at the crossing, then silence -- 51 already says
+    "at least 50", and a second capped metric whose delta ties this
+    one's would leave the differ's max() to dict insertion order.
+
+    checks_incomplete (no declared key, wide key, expression columns,
+    size gate) maps to narrowed=True: stable catalog facts, one
+    baseline event, then silence -- and a catalog rebuild that moves
+    the row estimate across the 2M gate flips narrowed, which the
+    differ turns into the single scope_changed that flip deserves.
+    """
+    dup = result.get("duplicate_keys") or {}
+    if not dup.get("checked"):
+        return "checks_incomplete", {}, True
+    raw = dup.get("duplicate_groups")
+    groups = 51 if raw == "50+" else int(raw or 0)
+    return (("exceptions_found" if groups else "passed"),
+            {"duplicate_groups": groups}, False)
 
 
 def reduce_open_payables(result: Mapping) -> tuple:
@@ -829,45 +862,74 @@ class TickerRunner:
             units = [default_bu] if default_bu else []
         ledger = str(getattr(ticker_cfg, "ledger", "") or "")
 
-        # The plan, built before any query: which checks run this tick,
-        # each with the worst-case cost the budget reserves BEFORE it
-        # starts. A check that leaves the plan (the operator flips its
-        # flag off) leaves `scheduled`, and the differ turns that into a
+        # The plan, built before any query and FLATTENED: every entry
+        # carries its own identity (check_id, business_unit, cost, run)
+        # because the checks no longer share one iteration domain --
+        # tb/ap run per business unit, table_health per watched table
+        # with an empty unit. tb entries come first, so a long watch
+        # list can starve only itself, never the tie-out. A check that
+        # leaves the plan (the operator flips its flag off, unwatches a
+        # table) leaves `scheduled`, and the differ turns that into a
         # no_longer_scheduled event rather than a silence.
-        plan = [("tb_integrity", TB_INTEGRITY_QUERY_COST,
-                 lambda u, cid: self._run_tb_integrity(
-                     engine, source, u, ledger, cid))]
+        #
+        # DELIBERATELY NOT SCHEDULED, recorded here like ap_completeness:
+        # cash_outlook -- no churn-safe metric serves its purpose.
+        # Amounts move with every posting run; overdue/bucket counts sit
+        # under the CALENDAR (as-of defaults to today), so items cross
+        # week boundaries by clock alone and the differ would emit
+        # worsened/improved events no person caused, evicting real
+        # events from the bounded store. A continuously varying level
+        # belongs on the live tool (which now carries its own
+        # truncation disclosure); a diff store is a derivative detector.
+        plan: list[tuple] = []
+        for unit in units:
+            plan.append((f"tb_integrity:{source}:{unit}", unit,
+                         TB_INTEGRITY_QUERY_COST,
+                         lambda u=unit, cid=f"tb_integrity:{source}:{unit}":
+                         self._run_tb_integrity(
+                             engine, source, u, ledger, cid)))
         if getattr(ticker_cfg, "watch_invoicing", False) is True:
-            plan.append(("ap_pipeline", AP_PIPELINE_QUERY_COST,
-                         lambda u, cid: self._run_ap_pipeline(
-                             context, engine, source, u, cid)))
+            for unit in units:
+                plan.append((f"ap_pipeline:{source}:{unit}", unit,
+                             AP_PIPELINE_QUERY_COST,
+                             lambda u=unit,
+                             cid=f"ap_pipeline:{source}:{unit}":
+                             self._run_ap_pipeline(
+                                 context, engine, source, u, cid)))
+        for table in [str(t) for t in
+                      (getattr(ticker_cfg, "watch_tables", None) or [])
+                      if str(t).strip()]:
+            plan.append((f"table_health:{source}:{table}", "",
+                         TABLE_HEALTH_QUERY_COST,
+                         lambda t=table,
+                         cid=f"table_health:{source}:{table}":
+                         self._run_table_health(
+                             context, engine, source, t, cid)))
 
         outcomes: list[CheckOutcome] = []
         scheduled: list[str] = []
         queries_used = 0
         partial = False
-        for check_name, check_cost, run_check in plan:
-            for unit in units:
-                check_id = f"{check_name}:{source}:{unit}"
-                scheduled.append(check_id)
-                elapsed = time.monotonic() - started
-                if queries_used + check_cost > \
-                        limits.max_queries_per_tick:
-                    partial = True
-                    outcomes.append(CheckOutcome(
-                        check_id=check_id, source=source,
-                        business_unit=unit,
-                        status="not_run", error_category="budget"))
-                    continue
-                if elapsed > limits.max_seconds_per_tick:
-                    partial = True
-                    outcomes.append(CheckOutcome(
-                        check_id=check_id, source=source,
-                        business_unit=unit,
-                        status="not_run", error_category="wall_clock"))
-                    continue
-                outcomes.append(run_check(unit, check_id))
-                queries_used += check_cost
+        for check_id, unit, check_cost, run_check in plan:
+            scheduled.append(check_id)
+            elapsed = time.monotonic() - started
+            if queries_used + check_cost > \
+                    limits.max_queries_per_tick:
+                partial = True
+                outcomes.append(CheckOutcome(
+                    check_id=check_id, source=source,
+                    business_unit=unit,
+                    status="not_run", error_category="budget"))
+                continue
+            if elapsed > limits.max_seconds_per_tick:
+                partial = True
+                outcomes.append(CheckOutcome(
+                    check_id=check_id, source=source,
+                    business_unit=unit,
+                    status="not_run", error_category="wall_clock"))
+                continue
+            outcomes.append(run_check())
+            queries_used += check_cost
 
         try:
             store = self._store(context, limits)
@@ -985,6 +1047,64 @@ class TickerRunner:
         return CheckOutcome(
             check_id=check_id, source=source, business_unit=unit,
             status=status, counts=counts, narrowed=narrowed)
+
+    def _run_table_health(self, context, engine, source, table,
+                          check_id) -> CheckOutcome:
+        """Duplicates on a DECLARED key, plus the canary the metric
+        rides in on: a watched table that stops resolving, stops being
+        readable (a revoked grant), or becomes operator-excluded
+        surfaces as a deterministic event from a background loop --
+        which is the ticker's whole job, and what the chat tool cannot
+        do unasked. Sampled sections never run: not run-and-discarded,
+        NOT RUN -- the read-only account's grant survival is the cost
+        doctrine, and a sampled metric in a diff store is churn."""
+        base = CheckOutcome(check_id=check_id, source=source,
+                            business_unit="", status="error")
+        refused = self._veto_refusal(engine, base, (table,))
+        if refused is not None:
+            return refused
+        catalog_for = getattr(context, "catalog_for", None)
+        exclusions = getattr(context, "exclusions", None)
+        if catalog_for is None or exclusions is None:
+            # A context without the catalog/exclusion handles (an
+            # embedding without the GUI's object graph) is a wiring
+            # gap, not a database fact; the row says so.
+            base.error_category = "tool_error"
+            return base
+        try:
+            registry = getattr(engine, "registry", None)
+            canonical = (registry.resolve_name(source)
+                         if registry is not None else "default")
+            from .health import table_health
+            result = table_health(
+                table, source_name=canonical,
+                catalog=catalog_for(canonical),
+                get_db=lambda: engine.for_source(source).db,
+                exclusions=exclusions,
+                sections=frozenset({"duplicates"}),
+                declared_keys_only=True)
+        except Exception as exc:                  # noqa: BLE001
+            return self._failure(engine, base, exc)
+        err = str(result.get("error") or "")
+        if err:
+            if "excluded" in err.lower():
+                base.status = "refused"
+                base.error_category = "operator_exclusion"
+                return base
+            return self._failure(engine, base, RuntimeError(err))
+        dup = result.get("duplicate_keys") or {}
+        if dup.get("error"):
+            # The engine swallows a DbError from the GROUP BY into the
+            # duplicates dict with checked=False. Reading that as
+            # checks_incomplete would file a revoked grant as quiet
+            # amber and bypass the credential-terminal path -- route it
+            # through the classifier like any other failure.
+            return self._failure(engine, base,
+                                 RuntimeError(str(dup["error"])))
+        status, counts, narrowed = reduce_table_health(result)
+        return CheckOutcome(check_id=check_id, source=source,
+                            business_unit="", status=status,
+                            counts=counts, narrowed=narrowed)
 
     def _store(self, context, limits: TickerLimits) -> TickerStore:
         if self._store_factory is not None:

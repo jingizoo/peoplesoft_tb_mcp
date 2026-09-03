@@ -1487,7 +1487,7 @@ class ARBilling:
         asof = _iso(self._asof(as_of_date))
         weeks = max(1, min(int(weeks or 8), 13))
         p = self.db.prefix
-        items, _ = self.db.query(
+        items, items_truncated = self.db.query(
             f"SELECT DUE_DT AS due, BAL_AMT AS amt, BAL_CURRENCY AS cur "
             f"FROM {p}PS_ITEM WHERE BUSINESS_UNIT = :bu "
             f"AND ITEM_STATUS = 'O'", {"bu": bu}, max_rows=DETAIL_ROW_CAP)
@@ -1503,11 +1503,33 @@ class ARBilling:
             notes.append("PS_VOUCHER here has no CLOSE_STATUS; 'open' "
                          "means no payment cross-reference exists, which "
                          "misses partial payments.")
-        vchr, _ = self.db.query(
+        vchr, vchr_truncated = self.db.query(
             f"SELECT V.DUE_DT AS due, V.GROSS_AMT AS amt, "
             f"V.CURRENCY_CD AS cur FROM {p}PS_VOUCHER V "
             f"WHERE V.BUSINESS_UNIT = :bu AND {open_pred}",
             {"bu": bu}, max_rows=DETAIL_ROW_CAP)
+        # A truncated read here is not a smaller answer -- it is a WRONG
+        # answer sold as a total. Neither read has an ORDER BY and both
+        # amounts can be negative (credit memos, on-account cash), so a
+        # truncated sum is not even a reliable floor.
+        if items_truncated:
+            notes.append(
+                f"Open AR items for this business unit exceed the "
+                f"{DETAIL_ROW_CAP:,}-row detail cap; inflow amounts were "
+                "computed from the first rows the database happened to "
+                "return, with no ordering imposed. Every inflow bucket, "
+                "total and net is INCOMPLETE -- and because credit items "
+                "may be among the unread rows, not even a reliable "
+                "floor. Do not state these figures as totals.")
+        if vchr_truncated:
+            notes.append(
+                f"Open vouchers for this business unit exceed the "
+                f"{DETAIL_ROW_CAP:,}-row detail cap; outflow amounts were "
+                "computed from the first rows the database happened to "
+                "return, with no ordering imposed. Every outflow bucket, "
+                "total and net is INCOMPLETE -- and because credit "
+                "vouchers may be among the unread rows, not even a "
+                "reliable floor. Do not state these figures as totals.")
         starts = [asof + dt.timedelta(days=7 * i) for i in range(weeks)]
 
         def bucket(due):
@@ -1559,17 +1581,27 @@ class ARBilling:
                 t["expected_in"] = r2(t["expected_in"] + r["expected_in"])
                 t["expected_out"] = r2(t["expected_out"] + r["expected_out"])
                 t["net"] = r2(t["net"] + r["net"])
+        truncated_any = items_truncated or vchr_truncated
         return {
             "business_unit": bu, "as_of": asof.isoformat(),
             "weeks": weeks, "rows": rows_out,
             "totals_by_currency": totals,
+            **({"items_truncated": True} if items_truncated else {}),
+            **({"vouchers_truncated": True} if vchr_truncated else {}),
             **({"record_notes": notes} if notes else {}),
+            # The instruction surface the model actually reads must not
+            # contradict record_notes: an untruncated payload keeps
+            # today's wording byte for byte, a truncated one carries the
+            # contradiction-killer inline.
             "note": ("Due-date arithmetic over open AR items and open "
                      "vouchers — the starting point a treasurer refines, "
                      "NOT a payment-behavior forecast. Overdue is its own "
                      "bucket (and its own totals); amounts stay per "
                      "currency. State totals from totals_by_currency — "
-                     "never add buckets yourself."),
+                     "never add buckets yourself."
+                     + (" CAP EXCEEDED: these figures are incomplete — "
+                        "see record_notes; do not state them as totals."
+                        if truncated_any else "")),
         }
 
     def customer_intelligence(self, business_unit: str = "", n: int = 20,
