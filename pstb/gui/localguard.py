@@ -47,6 +47,10 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import json
+import threading
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 from urllib.parse import parse_qs
@@ -139,6 +143,20 @@ class Policy:
     # balancer": forwarded headers pass, and the peer address is never
     # treated as an identity again (no loopback privileges exist).
     trusted_proxy: bool = False
+    # The balancer's identity-aware front end signs EVERY request it
+    # forwards (x-goog-iap-jwt-assertion). trusted_iap says "verify that
+    # signature and accept it as the access control": a colleague who
+    # passed corporate sign-in needs no token at all. The token stays a
+    # valid alternative -- machine callers, and any request that reached
+    # this service WITHOUT crossing the front end (a VPC-internal hit on
+    # the service URL carries no assertion, which is exactly why the app
+    # verifies instead of trusting the network path).
+    trusted_iap: bool = False
+    # The expected JWT audience, explicit and exact
+    # (/projects/NUMBER/regions/REGION/backendServices/ID for a regional
+    # backend service). Never derived: a guessed audience that happens to
+    # verify somewhere else is an impersonation hole, not a convenience.
+    iap_audience: str = ""
 
     def __post_init__(self) -> None:
         if self.shared and not self.token and not self.unauthenticated:
@@ -149,6 +167,18 @@ class Policy:
                 "routable bind, and the balancer forwards ANYONE -- the "
                 "token is the only control left. Set PSTB_AUTH_TOKEN and "
                 "bind 0.0.0.0, or drop PSTB_TRUSTED_PROXY.")
+        if self.trusted_iap and not self.trusted_proxy:
+            raise ValueError(
+                "trusted_iap verifies the assertion a managed balancer's "
+                "identity-aware front end injects; without trusted_proxy "
+                "there is no such balancer. Set PSTB_TRUSTED_PROXY=1 as "
+                "well, or drop PSTB_TRUSTED_IAP.")
+        if self.trusted_iap and not str(self.iap_audience or "").strip():
+            raise ValueError(
+                "trusted_iap needs the exact JWT audience of the backend "
+                "service (PSTB_IAP_AUDIENCE=/projects/<number>/regions/"
+                "<region>/backendServices/<id>). It is never derived: a "
+                "guessed audience is an impersonation hole.")
         if self.hosts is None and not self.shared:
             # hosts=None means "accept any Host name", which is only safe
             # when a token is the control in its place. Outside shared
@@ -167,7 +197,9 @@ POLICY = Policy()
 def configure(host: str, token: str = "",
               allowed_hosts: Iterable[str] = (),
               unauthenticated: bool = False,
-              trusted_proxy: bool = False) -> Policy:
+              trusted_proxy: bool = False,
+              trusted_iap: bool = False,
+              iap_audience: str = "") -> Policy:
     """Install the policy for this process and return it.
 
     A routable bind needs either a token or an explicit
@@ -187,7 +219,9 @@ def configure(host: str, token: str = "",
         hosts = None      # any name — we do not know what colleagues type
     POLICY = Policy(hosts=hosts, token=token, shared=shared,
                     unauthenticated=bool(shared and not token),
-                    trusted_proxy=bool(trusted_proxy))
+                    trusted_proxy=bool(trusted_proxy),
+                    trusted_iap=bool(trusted_iap),
+                    iap_audience=str(iap_audience or "").strip())
     return POLICY
 
 
@@ -354,6 +388,115 @@ def tunnel_command(port: int = DEFAULT_PORT) -> str:
     return f"ssh -L {port}:localhost:{port} <this-host>"
 
 
+IAP_HEADER = "x-goog-iap-jwt-assertion"
+IAP_ISSUER = "https://cloud.google.com/iap"
+# kid -> PEM public keys, published by the front end's operator. Rotated
+# rarely; cached here so verification costs no network round trip.
+IAP_CERTS_URL = "https://www.gstatic.com/iap/verify/public_key"
+_IAP_CERTS_TTL = 6 * 3600
+_IAP_CERTS_STALE_MAX = 24 * 3600     # beyond this, fail closed
+_IAP_MAX_ASSERTION_BYTES = 8192
+
+_iap_cache = {"certs": None, "fetched_at": 0.0}
+_iap_cache_lock = threading.Lock()
+
+
+class IAPRejected(Exception):
+    """The assertion did not verify. The reason never includes the
+    assertion itself."""
+
+
+def _iap_certs(force: bool = False) -> dict:
+    """The verification keys, cached; stale keys serve for a bounded
+    window when the fetch fails (a transient outage must not lock the
+    whole team out), and beyond that window verification fails CLOSED --
+    admitting an unverified assertion because a fetch failed would turn
+    a network error into an authentication bypass."""
+    now = time.monotonic()
+    with _iap_cache_lock:
+        certs = _iap_cache["certs"]
+        age = now - _iap_cache["fetched_at"]
+        if certs is not None and age < _IAP_CERTS_TTL and not force:
+            return certs
+    try:
+        with urllib.request.urlopen(IAP_CERTS_URL, timeout=5) as reply:
+            fetched = json.loads(reply.read(65536).decode("utf-8"))
+        if not isinstance(fetched, dict) or not fetched:
+            raise ValueError("key document is not a non-empty object")
+    except Exception as exc:                      # noqa: BLE001
+        with _iap_cache_lock:
+            certs = _iap_cache["certs"]
+            age = now - _iap_cache["fetched_at"]
+            if certs is not None and age < _IAP_CERTS_STALE_MAX:
+                return certs
+        raise IAPRejected(
+            f"identity verification keys unavailable "
+            f"({type(exc).__name__})") from exc
+    with _iap_cache_lock:
+        _iap_cache["certs"] = fetched
+        _iap_cache["fetched_at"] = now
+    return fetched
+
+
+def verify_iap_assertion(assertion: str,
+                         policy: Optional[Policy] = None) -> str:
+    """Signature, audience, expiry, issuer -- or IAPRejected. Returns
+    the verified identity (email when present, else subject).
+
+    The signature check is the whole point: this runs INSIDE the app so
+    a request that reached the service without crossing the identity-
+    aware front end -- a VPC-internal call on the service URL -- has no
+    signed assertion and is refused, whatever network path admitted it.
+    """
+    policy = policy or POLICY
+    token = str(assertion or "").strip()
+    if not token:
+        raise IAPRejected("no assertion presented")
+    if len(token.encode("latin-1", "replace")) > _IAP_MAX_ASSERTION_BYTES:
+        raise IAPRejected("assertion is too large")
+    try:
+        from google.auth import jwt as _gjwt
+    except ImportError as exc:                    # pragma: no cover
+        raise IAPRejected("identity verification is not installed "
+                          "(google-auth is missing)") from exc
+    try:
+        claims = _gjwt.decode(token, certs=_iap_certs(),
+                              audience=policy.iap_audience)
+    except IAPRejected:
+        raise
+    except Exception:                             # noqa: BLE001
+        # One forced key refresh covers rotation (an unknown kid), then
+        # the failure is the failure. Reasons stay generic on purpose:
+        # a precise oracle helps only an attacker refining a forgery.
+        try:
+            claims = _gjwt.decode(token, certs=_iap_certs(force=True),
+                                  audience=policy.iap_audience)
+        except IAPRejected:
+            raise
+        except Exception as exc:                  # noqa: BLE001
+            raise IAPRejected("the assertion did not verify") from exc
+    if str(claims.get("iss") or "") != IAP_ISSUER:
+        raise IAPRejected("wrong issuer")
+    identity = str(claims.get("email") or claims.get("sub") or "")
+    if not identity:
+        raise IAPRejected("no identity in the assertion")
+    return identity
+
+
+def iap_admits(scope, policy: Optional[Policy] = None) -> bool:
+    """True when this request carries a VERIFIED front-end assertion."""
+    policy = policy or POLICY
+    if not policy.trusted_iap:
+        return False
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+               for k, v in scope.get("headers") or []}
+    try:
+        verify_iap_assertion(headers.get(IAP_HEADER, ""), policy)
+        return True
+    except IAPRejected:
+        return False
+
+
 def _is_signin_door(scope, policy: Optional[Policy] = None) -> bool:
     """Exactly one request may arrive tokenless: the POST that presents
     the token, and only behind a trusted proxy -- everywhere else the
@@ -480,6 +623,11 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
     # rather than being sent to look for a token they would then also need.
     if policy.token and not any(token_ok(t, policy)
                                 for t in presented_tokens(scope)):
+        if policy.trusted_iap and iap_admits(scope, policy):
+            # Corporate sign-in already happened at the front end and
+            # the signature proves it. Same rung of the ladder as the
+            # token on purpose: every earlier rule has already run.
+            return 0, ""
         if _is_signin_door(scope, policy):
             # The one request allowed through WITHOUT a token: the POST
             # that presents it. Every earlier rule above already ran --
@@ -489,6 +637,13 @@ def rejection(scope, policy: Optional[Policy] = None) -> tuple:
         if policy.trusted_proxy:
             # The startup banner deliberately does not print the token on
             # this deployment (stdout persists in the platform's logs).
+            if policy.trusted_iap:
+                return 401, (
+                    "This request carried no verifiable identity from "
+                    "the sign-in front end and no access token. Reach "
+                    "the app through its public URL so corporate "
+                    "sign-in runs, or present the token as an "
+                    "Authorization: Bearer header.")
             return 401, (
                 "This deployment requires its access token. Open the app "
                 "in a browser and enter the token on the sign-in form, or "

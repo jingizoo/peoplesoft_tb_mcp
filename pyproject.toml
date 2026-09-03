@@ -35,6 +35,11 @@ gui = [
     "uvicorn>=0.27,<1.0",
 ]
 oracle = ["oracledb>=2.4,<4.0"]
+# Verifying the identity-aware front end's signed assertions
+# (PSTB_TRUSTED_IAP). [crypto] carries the ES256 backend; the llm extra
+# happens to pull google-auth transitively, but a security feature does
+# not lean on a coincidence of someone else's dependency tree.
+iap = ["google-auth[crypto]>=2.35,<3.0"]
 sqlserver = ["pyodbc>=5.1,<6.0"]
 
 [project.scripts]

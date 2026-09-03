@@ -4455,9 +4455,27 @@ def main() -> None:
                 "print(secrets.token_urlsafe(24))\"\n")
     trusted_proxy = (os.environ.get("PSTB_TRUSTED_PROXY") or "").strip() \
         in ("1", "true", "yes")
+    trusted_iap = (os.environ.get("PSTB_TRUSTED_IAP") or "").strip() \
+        in ("1", "true", "yes")
+    iap_audience = (os.environ.get("PSTB_IAP_AUDIENCE") or "").strip()
+    if trusted_iap:
+        # Fail at STARTUP, with the remedy, not at the first sign-in:
+        # the verifier needs google-auth, and a deployment that only
+        # discovers the missing wheel when a colleague hits the page has
+        # already failed them once.
+        try:
+            from google.auth import jwt as _probe          # noqa: F401
+        except ImportError:
+            raise SystemExit(
+                "\n  PSTB_TRUSTED_IAP=1 needs the google-auth package to "
+                "verify the front end's signed assertions. Install the "
+                "iap extra (pip install -e '.[iap]') or add "
+                "google-auth[crypto] to the image.\n")
     localguard.configure(args.host, token, args.allow_host,
                          unauthenticated=not loopback and not token,
-                         trusted_proxy=trusted_proxy)
+                         trusted_proxy=trusted_proxy,
+                         trusted_iap=trusted_iap,
+                         iap_audience=iap_audience)
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  PeopleSoft Trial Balance — {url}")
