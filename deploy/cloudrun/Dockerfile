@@ -15,7 +15,7 @@ COPY config.example.yaml ./
 # gui is NOT transitive: fastapi lives in that extra, and the image died
 # at boot without it (review blocker). The sqlite sample is gitignored,
 # so it is seeded at build rather than copied.
-RUN pip install --no-cache-dir ".[oracle,llm,gui]" \
+RUN pip install --no-cache-dir ".[oracle,llm,gui,iap]" \
  && python scripts/seed_sample_data.py
 
 # State lives OUTSIDE the image. Mount a volume at /data and point

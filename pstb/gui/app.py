@@ -4469,8 +4469,8 @@ def main() -> None:
             raise SystemExit(
                 "\n  PSTB_TRUSTED_IAP=1 needs the google-auth package to "
                 "verify the front end's signed assertions. Install the "
-                "llm extra (pip install -e '.[llm]') or add google-auth "
-                "to the image.\n")
+                "iap extra (pip install -e '.[iap]') or add "
+                "google-auth[crypto] to the image.\n")
     localguard.configure(args.host, token, args.allow_host,
                          unauthenticated=not loopback and not token,
                          trusted_proxy=trusted_proxy,

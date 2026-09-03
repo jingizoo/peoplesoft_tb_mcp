@@ -19,10 +19,22 @@ import time
 import unittest
 from unittest.mock import patch
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from google.auth import jwt as gjwt
-from google.auth.crypt import es256
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from google.auth import jwt as gjwt
+    from google.auth.crypt import es256
+    HAVE_IAP_DEPS = True
+except ImportError:                              # pragma: no cover
+    HAVE_IAP_DEPS = False
+
+if not HAVE_IAP_DEPS:                            # pragma: no cover
+    # A bare [gui] install has no ES256 stack; the FEATURE refuses at
+    # startup with the remedy, and these tests skip with the same one.
+    # CI installs the iap extra, so the skips never hide the suite
+    # where it matters.
+    raise unittest.SkipTest(
+        "iap extra not installed (pip install -e '.[iap]')")
 
 from pstb.gui import localguard
 from pstb.gui.localguard import (IAP_HEADER, IAPRejected, Policy,

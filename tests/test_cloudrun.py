@@ -366,7 +366,7 @@ class SecurityReviewFixTests(unittest.TestCase):
     def test_the_image_installs_the_gui_extra(self):
         docker = __import__("pathlib").Path(
             "deploy/cloudrun/Dockerfile").read_text()
-        self.assertIn('".[oracle,llm,gui]"', docker)
+        self.assertIn('".[oracle,llm,gui,iap]"', docker)
         self.assertIn("seed_sample_data.py", docker)
         self.assertNotIn("PSTB_TRUSTED_PROXY=1", docker,
                          "the proxy switch belongs to the service, not "
