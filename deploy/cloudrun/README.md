@@ -50,6 +50,31 @@ like any private traffic; firewall the DB VM to the service's subnet.
 * `PSTB_MCP_TOKEN` — the MCP service refuses to start without it.
   Ingress rules are a network posture, not authentication.
 
+## Identity-aware front end (recommended once DNS + certs exist)
+
+With IAP enabled on the backend service, colleagues get corporate
+sign-in instead of a token paste. Two extra env vars turn on the app's
+own verification of the front end's signed assertion:
+
+* `PSTB_TRUSTED_IAP=1` — verify `x-goog-iap-jwt-assertion` on every
+  request and accept it as the access control. The token remains a
+  valid alternative (machine callers, break-glass) and the sign-in form
+  stays as the fallback door.
+* `PSTB_IAP_AUDIENCE` — the exact JWT audience, never derived:
+  `/projects/<PROJECT_NUMBER>/regions/<REGION>/backendServices/<ID>`,
+  where the ID comes from
+  `gcloud compute backend-services describe <name> --region <region>
+  --format='value(id)'`.
+
+Why in-app verification and not just the network: `--ingress
+internal-and-cloud-load-balancing` admits VPC-internal traffic that
+never crossed the front end. Such a request carries no signed
+assertion, so it falls back to the token requirement — the signature is
+the proof, not the route. Verification keys are fetched from a public
+Google URL and cached for hours; with `--vpc-egress private-ranges-only`
+(the default here) that fetch goes out directly, while `all-traffic`
+egress needs a NAT path to the internet.
+
 ## State — the part that bites
 
 Everything governed lives in files: approval queues
