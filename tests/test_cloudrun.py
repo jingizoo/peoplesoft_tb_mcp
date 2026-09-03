@@ -311,14 +311,15 @@ class SecurityReviewFixTests(unittest.TestCase):
                  "headers": [(b"host", b"pstb.example.com")]}
         status, reason = rejection(scope, proxied)
         self.assertEqual(status, 401)
-        self.assertIn("Bearer", reason)
+        self.assertIn("sign-in form", reason)
 
     # ── transport hardening behind the TLS-terminating balancer ──
     def test_cookies_are_secure_and_hsts_is_sent_in_proxy_mode(self):
         source = __import__("pathlib").Path(gui.__file__).read_text()
         self.assertEqual(
-            source.count("secure=localguard.POLICY.trusted_proxy"), 2,
-            "both the token cookie and the user cookie")
+            source.count("secure=localguard.POLICY.trusted_proxy"), 3,
+            "the token cookie (URL mint), the sign-in mint, and the "
+            "user cookie")
         proxied = Policy(hosts=None, token=TOKEN, shared=True,
                          trusted_proxy=True)
         headers = {}

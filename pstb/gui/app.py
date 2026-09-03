@@ -43,7 +43,8 @@ from . import console, localguard, progress
 
 try:
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, JSONResponse, Response
+    from fastapi.responses import (FileResponse, HTMLResponse,
+                                   JSONResponse, Response)
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
         "The web UI needs FastAPI. Install it with:\n"
@@ -355,6 +356,7 @@ app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
 
 _PROTECTED_WRITE_PATHS = frozenset({
     "/api/feedback", "/api/question-review", "/api/approvals/decide",
+    localguard.SIGNIN_PATH,
 })
 _PROTECTED_WRITE_MAX_BYTES = 8 * 1024
 _METADATA_PROPOSAL_PATH = re.compile(
@@ -412,7 +414,12 @@ async def _access_guard(request, call_next):
                 localguard.apply_security_headers(response.headers)
                 return response
     status, reason = localguard.rejection(request.scope)
-    if status:
+    if status == 401 and localguard.wants_signin_page(request.scope):
+        # A browser navigating to the app gets the form; an API fetch
+        # keeps its machine-readable refusal.
+        response = HTMLResponse(localguard.signin_page(reason),
+                                status_code=status)
+    elif status:
         response = JSONResponse(status_code=status,
                                 content={"error": reason})
     else:
@@ -1790,6 +1797,39 @@ def whoami(request: Request = None):
             "privileged": access.privileged, "source": access.source,
             "detail": access.detail, "summary": access.describe(),
             "is_authentication": False}
+
+
+@app.post("/api/token-signin")
+def token_signin(payload: dict, request: Request = None):
+    """Present the page token in a request BODY and receive the cookie.
+
+    The door the guard's exemption opens: behind a load balancer the
+    ?token= URL flow is refused (URLs are logged) and a plain browser
+    cannot send an Authorization header on a page load. Bodies are not
+    logged by the balancer. Wrong tokens get a constant-time comparison,
+    a flat delay, and a hintless refusal; the cookie is minted from the
+    POLICY's own token, never from the caller's echo."""
+    if not (localguard.POLICY.trusted_proxy and localguard.POLICY.token):
+        raise HTTPException(
+            status_code=404,
+            detail="Token sign-in exists only on load-balancer "
+                   "deployments; this server uses the printed URL flow.")
+    presented = (payload or {}).get("token")
+    if not isinstance(presented, str) or not presented.strip():
+        raise HTTPException(status_code=400, detail="token required")
+    if len(presented) > 512:
+        raise HTTPException(status_code=400, detail="token is too long")
+    if not localguard.token_ok(presented.strip()):
+        time.sleep(0.3)      # flatten guessing, cheap for a person
+        raise HTTPException(status_code=403,
+                            detail="That token was not accepted.")
+    response = JSONResponse(content={"ok": True})
+    response.set_cookie(
+        localguard.TOKEN_COOKIE, localguard.POLICY.token,
+        httponly=True,
+        secure=localguard.POLICY.trusted_proxy, samesite="strict",
+        path="/")
+    return response
 
 
 @app.post("/api/signin")
