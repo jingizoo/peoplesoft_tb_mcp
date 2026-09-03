@@ -45,6 +45,20 @@ db:
 # Keep its Oracle credentials in .env as
 # PSTB_SRC_P2GO_DSN, PSTB_SRC_P2GO_USER and PSTB_SRC_P2GO_PASSWORD.
 # sources:
+#   warehouse:                       # a BigQuery dataset as its own silo
+#     backend: bigquery
+#     bigquery_project: my-project   # REQUIRED; jobs run and BILL here
+#     schema: sales_mart             # the dataset; exactly one; case-sensitive
+#     bigquery_location: US          # optional; pins the job location
+#     # Per-QUERY server-side byte cap -- NOT a daily budget. There is no
+#     # daily ceiling in this release; for an account-level backstop set a
+#     # GCP custom quota (BigQuery API -> Query usage per day) on the
+#     # service account. Credentials are Application Default Credentials:
+#     # locally `gcloud auth application-default login`; on Cloud Run the
+#     # attached service account (roles/bigquery.jobUser on the project,
+#     # roles/bigquery.dataViewer on the dataset).
+#     bigquery_max_bytes_billed: 1073741824   # 1 GiB ~= $0.006/query
+#     bigquery_warn_bytes: 268435456          # disclose estimates above this
 #   p2go:
 #     backend: oracle
 #     schema: P2GO              # default for unqualified table names

@@ -56,6 +56,14 @@ class DbCfg:
     oracle_wallet_dir: str = ""
     oracle_wallet_password: str = ""
     mssql_conn_str: str = ""
+    # BigQuery silo (sources: only). The project is where jobs run and
+    # BILL; the dataset rides ``schema`` so every schema-boundary guard
+    # stays armed. The byte cap is per QUERY, enforced server-side on
+    # the client's default job config -- it is not a daily budget.
+    bigquery_project: str = ""
+    bigquery_location: str = ""
+    bigquery_max_bytes_billed: int = 1_073_741_824   # 1 GiB ~= $0.006
+    bigquery_warn_bytes: int = 268_435_456           # dry-run disclosure
     query_timeout_seconds: int = 120
     # Concurrent chat channels each need their own session; this caps them.
     pool_max: int = 8
@@ -549,12 +557,22 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
             raise RuntimeError(f"{section}.schemas must be a list of schema names")
         raw_values = ([raw_default] if raw_default.strip() else []) + list(raw_allowed)
 
+    # BigQuery datasets are case-sensitive: validation elsewhere folds
+    # to uppercase (comparisons stay internally consistent), but the
+    # stored value must remain verbatim or executed SQL would name a
+    # dataset that does not exist. Idempotent across the loader's
+    # repeated normalization passes.
+    keep_case = str(getattr(cfg, "backend", "")).lower() == "bigquery"
+
+    def _fold(value: str) -> str:
+        return value.strip() if keep_case else value.strip().upper()
+
     normalized: list[str] = []
     seen: set[str] = set()
     for raw in raw_values:
         if not isinstance(raw, str):
             raise RuntimeError(f"{section}.schemas must contain only schema names")
-        value = raw.strip().upper()
+        value = _fold(raw)
         if not value:
             raise RuntimeError(f"{section}.schemas cannot contain blank schema names")
         if not _SCHEMA_IDENT.fullmatch(value):
@@ -565,7 +583,7 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
             normalized.append(value)
             seen.add(value)
 
-    default = str(raw_default).strip().upper()
+    default = _fold(str(raw_default))
     if default:
         if not _SCHEMA_IDENT.fullmatch(default):
             raise RuntimeError(
@@ -580,6 +598,56 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
     cfg.schema = default
     cfg.schemas = normalized
     return list(normalized)
+
+
+def _validate_bigquery_source(block: Any, *, section: str) -> None:
+    """Refuse a BigQuery block this release cannot honour.
+
+    Silo-only: the curated PeopleSoft toolchain, the ticker and the
+    profiles were never designed for this backend, so the PRIMARY db
+    refuses it outright. The budgets get validate()-style floors and
+    ceilings -- the 10MB floor is BigQuery's own billing minimum, below
+    which a cap can never be satisfied.
+    """
+    if not isinstance(block, dict):
+        return
+    if str(block.get("backend") or "").strip().lower() != "bigquery":
+        return
+    if section == "db":
+        raise RuntimeError(
+            "BigQuery is supported as a sources: silo only in this "
+            "release; the primary db must stay sqlite/oracle/sqlserver")
+    if not str(block.get("bigquery_project") or "").strip():
+        raise RuntimeError(
+            f"{section}: a BigQuery source needs bigquery_project "
+            "(where jobs run and bill)")
+    raw_schema = block.get("schema", "")
+    if isinstance(raw_schema, (list, tuple)) and len(raw_schema) != 1:
+        raise RuntimeError(
+            f"{section}: a BigQuery source is exactly one dataset")
+    if not str(raw_schema[0] if isinstance(raw_schema, (list, tuple))
+               else raw_schema or "").strip():
+        raise RuntimeError(
+            f"{section}: a BigQuery source needs schema: <dataset>")
+    for name, floor, ceiling in (
+        ("bigquery_max_bytes_billed", 10 * 1024 * 1024, 2**40),
+        ("bigquery_warn_bytes", 10 * 1024 * 1024, 2**40),
+    ):
+        if name not in block:
+            continue
+        value = block[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(f"{section}.{name} must be an integer")
+        if not floor <= value <= ceiling:
+            raise RuntimeError(
+                f"{section}.{name} must be between {floor} and {ceiling}")
+    warn = block.get("bigquery_warn_bytes")
+    cap = block.get("bigquery_max_bytes_billed", 1_073_741_824)
+    if (isinstance(warn, int) and isinstance(cap, int)
+            and not isinstance(warn, bool) and warn > cap):
+        raise RuntimeError(
+            f"{section}.bigquery_warn_bytes cannot exceed "
+            "bigquery_max_bytes_billed")
 
 
 def _validate_multi_schema_backend(block: Any, *, section: str) -> None:
@@ -858,6 +926,7 @@ def load_config(path: Optional[str] = None) -> Config:
                 elif isinstance(block, dict):
                     data[section] = block
         _validate_multi_schema_backend(data.get("db"), section="db")
+        _validate_bigquery_source(data.get("db"), section="db")
         _apply_section(cfg.defaults, data.get("defaults"))
         _apply_section(cfg.db, data.get("db"))
         _apply_section(cfg.llm, data.get("llm"))
@@ -879,6 +948,8 @@ def load_config(path: Optional[str] = None) -> Config:
         for name, block in (data.get("sources") or {}).items():
             _validate_multi_schema_backend(
                 block, section=f"sources.{name}")
+            _validate_bigquery_source(
+                block, section=f"sources.{name}")
             src = DbCfg()
             _apply_section(src, block)
             # Per-source credentials come from env vars named after the
@@ -889,6 +960,8 @@ def load_config(path: Optional[str] = None) -> Config:
             src.oracle_user = _env(f"PSTB_SRC_{key}_USER", src.oracle_user)
             src.oracle_password = _env(f"PSTB_SRC_{key}_PASSWORD",
                                        src.oracle_password)
+            src.bigquery_project = _env(f"PSTB_SRC_{key}_BQ_PROJECT",
+                                        src.bigquery_project)
             cfg.sources[str(name)] = src
 
     # Do this after both YAML layers have been applied.  It turns the accepted

@@ -36,6 +36,33 @@ from __future__ import annotations
 import re
 from typing import Iterable, Mapping
 
+
+def normalize_bigquery_view_sql(text: str, project: str, dataset: str) -> str:
+    """Make real BigQuery view text readable by this module's regexes.
+
+    Real view definitions arrive backticked and project-qualified
+    (`proj.ds.t`); the harvest's identifier grammar refuses backticks by
+    doctrine and its alias map accepts at most schema.object. Two
+    contained rewrites, nothing else:
+
+    * strip backticks around identifier paths -- `proj.ds.t` becomes
+      proj.ds.t, `ident` becomes ident;
+    * collapse the CONFIGURED project's prefix so its references take
+      the dataset.table shape the regexes parse.
+
+    References to OTHER projects keep their three-part form, fail node
+    resolution downstream, and drop -- silence over wrong edges, this
+    module's own doctrine.
+    """
+    cleaned = re.sub(
+        r"`([A-Za-z0-9_$#.\-]+)`", lambda m: m.group(1), str(text or ""))
+    prefix = str(project or "").strip()
+    if prefix:
+        cleaned = re.sub(
+            re.escape(prefix) + r"\.(?=[A-Za-z0-9_])", "", cleaned)
+    _ = dataset  # reserved for a future dataset-collapse decision
+    return cleaned
+
 # Identifiers Oracle and friends actually allow, unquoted or quoted.
 _IDENT = r'(?:"[^"]{1,128}"|[A-Za-z][A-Za-z0-9_$#]{0,127})'
 _QUALIFIED = rf"(?P<a>{_IDENT})\s*\.\s*(?P<b>{_IDENT})"

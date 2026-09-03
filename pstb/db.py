@@ -101,9 +101,95 @@ def _bound_params(sql: str, params: dict) -> dict:
     return {k: v for k, v in params.items() if k.lower() in used}
 
 
+def _bind_spans(sql: str) -> list:
+    """(start, end, name) for every REAL bind, located on the blanked
+    copy so :name inside a string literal stays text. _blank_literals is
+    length-preserving, so the spans map straight onto the original."""
+    return [(m.start(), m.end(), m.group(1))
+            for m in _BIND_RE.finditer(_blank_literals(sql))]
+
+
+def _to_pyformat(sql: str, params: dict) -> tuple[str, dict]:
+    """:name -> %(name)s for the BigQuery DB-API shim (pyformat).
+
+    The shim renders the operation with Python %-formatting, so every
+    literal % in non-bind text must become %%. Span-based on purpose:
+    _to_qmark's regex substitutes inside string literals, which is a
+    known weakness this translator must not inherit."""
+    spans = _bind_spans(sql)
+    out = []
+    cursor = 0
+    used: dict = {}
+    lowered = {k.lower(): k for k in (params or {})}
+    for start, end, name in spans:
+        out.append(sql[cursor:start].replace("%", "%%"))
+        out.append(f"%({name})s")
+        original = lowered.get(name.lower())
+        if original is not None:
+            used[name] = params[original]
+        cursor = end
+    out.append(sql[cursor:].replace("%", "%%"))
+    return "".join(out), used
+
+
+def _to_bq_named(sql: str, params: dict) -> tuple[str, dict]:
+    """:name -> @name, for the dry-run path that calls the client
+    directly (pyformat is a shim-layer convention the raw client does
+    not speak)."""
+    spans = _bind_spans(sql)
+    out = []
+    cursor = 0
+    used: dict = {}
+    lowered = {k.lower(): k for k in (params or {})}
+    for start, end, name in spans:
+        out.append(sql[cursor:start])
+        out.append(f"@{name}")
+        original = lowered.get(name.lower())
+        if original is not None:
+            used[name] = params[original]
+        cursor = end
+    out.append(sql[cursor:])
+    return "".join(out), used
+
+
+def _bq_query_parameters(params: dict) -> list:
+    """Typed ScalarQueryParameters for the dry-run path. bool before
+    int on purpose: bool is an int subclass and would silently become
+    INT64."""
+    import datetime as _dt
+    import decimal as _decimal
+
+    from google.cloud import bigquery
+    typed = []
+    for name, value in (params or {}).items():
+        if isinstance(value, bool):
+            kind = "BOOL"
+        elif isinstance(value, int):
+            kind = "INT64"
+        elif isinstance(value, float):
+            kind = "FLOAT64"
+        elif isinstance(value, _decimal.Decimal):
+            kind = "NUMERIC"
+        elif isinstance(value, _dt.datetime):
+            kind = "TIMESTAMP"
+        elif isinstance(value, _dt.date):
+            kind = "DATE"
+        else:
+            kind = "STRING"
+            value = None if value is None else str(value)
+        typed.append(bigquery.ScalarQueryParameter(name, kind, value))
+    return typed
+
+
 def _jsonable(v: Any) -> Any:
     if hasattr(v, "isoformat"):  # datetime.date / datetime.datetime
         return v.isoformat()[:10] if getattr(v, "hour", None) in (None, 0) else v.isoformat()
+    import decimal
+    if isinstance(v, decimal.Decimal):
+        # BigQuery NUMERIC arrives as Decimal; pivot arithmetic needs a
+        # number. Finance amounts sit far below 2**53, so float is exact
+        # for every value this app should ever see.
+        return float(v)
     return v
 
 
@@ -185,12 +271,15 @@ class Database:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.dialect = cfg.db.backend.lower()
-        if self.dialect not in ("sqlite", "oracle", "sqlserver"):
+        if self.dialect not in ("sqlite", "oracle", "sqlserver",
+                                "bigquery"):
             raise DbError(f"Unsupported db backend: {self.dialect}")
         self._lock = threading.Lock()          # guards pool/connection setup
         self._conn = None                      # sqlserver + legacy single conn
         self._pool = None                      # oracle session pool
         self._local = threading.local()        # per-thread sqlite connections
+        self._bq_client = None                 # shared thread-safe client
+        self._bq_stats = threading.local()     # last bytes-billed, per channel
         self._catalog: dict = {}               # table -> real column names
         self._catalog_lock = threading.Lock()
         # Set once the database has REJECTED these credentials. Every later
@@ -253,8 +342,27 @@ class Database:
 
     @property
     def prefix(self) -> str:
+        if self.dialect == "bigquery":
+            # The uppercased validation-space default must never be
+            # spliced into executed SQL: BigQuery names are case
+            # sensitive, and unqualified names resolve server-side via
+            # default_dataset on the job config.
+            return ""
         s = self.default_schema
         return f"{s}." if s else ""
+
+    @property
+    def bigquery_dataset(self) -> str:
+        """The TRUE-CASE configured dataset, for internal SQL only.
+
+        Validation compares uppercase (default_schema); execution and
+        interpolation use this verbatim value. Operator-configured and
+        identifier-validated at load -- the same trust level as prefix,
+        never model-influenced."""
+        raw = getattr(self.cfg.db, "schema", "")
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else ""
+        return str(raw or "").strip().rstrip(".")
 
     # ---- schema catalog --------------------------------------------------
     def columns(self, table: str) -> set:
@@ -408,16 +516,18 @@ class Database:
             "sqlite": "DATE('now')",
             "oracle": "TRUNC(SYSDATE)",
             "sqlserver": "CAST(GETDATE() AS DATE)",
+            "bigquery": "CURRENT_DATE()",
         }[self.dialect]
 
     def exists_sql(self, sql: str) -> str:
         """Wrap a SELECT so it stops at the first matching row."""
         if self.dialect == "oracle":
             return f"SELECT * FROM ({sql}) WHERE ROWNUM = 1"
-        if self.dialect == "sqserver":  # pragma: no cover
-            return sql
         if self.dialect == "sqlserver":
             return sql.replace("SELECT 1", "SELECT TOP 1 1", 1)
+        # sqlite and bigquery both speak LIMIT. On BigQuery LIMIT bounds
+        # ROWS, not bytes billed -- the client's byte cap is the cost
+        # guard, this is only an early stop.
         return f"{sql} LIMIT 1"
 
     def days_past_expr(self, date_col: str, asof_bind: str) -> str:
@@ -426,12 +536,18 @@ class Database:
             return f"TRUNC(TO_DATE(:{asof_bind}, 'YYYY-MM-DD') - {date_col})"
         if self.dialect == "sqlserver":
             return f"DATEDIFF(day, {date_col}, :{asof_bind})"
+        if self.dialect == "bigquery":
+            # CAST is legal on both DATE and TIMESTAMP columns.
+            return (f"DATE_DIFF(CAST(:{asof_bind} AS DATE), "
+                    f"CAST({date_col} AS DATE), DAY)")
         return f"CAST(julianday(:{asof_bind}) - julianday({date_col}) AS INTEGER)"
 
     def date_bind(self, name: str) -> str:
         """Expression that binds an ISO yyyy-mm-dd string as a date."""
         if self.dialect == "oracle":
             return f"TO_DATE(:{name}, 'YYYY-MM-DD')"
+        if self.dialect == "bigquery":
+            return f"CAST(:{name} AS DATE)"
         return f":{name}"
 
     # ---- connection ------------------------------------------------------
@@ -578,8 +694,71 @@ class Database:
                     pass
         elif self.dialect == "sqlite":
             yield self._sqlite_conn(), False
+        elif self.dialect == "bigquery":
+            try:
+                from google.cloud.bigquery import dbapi
+            except ImportError as e:
+                raise DbError(
+                    "google-cloud-bigquery is not installed -- "
+                    "pip install -e '.[bigquery]'") from e
+            # One shared thread-safe Client; a fresh, free dbapi
+            # Connection per session (no logon happens at connect).
+            # needs_lock=False: HTTP jobs are independent, so chat
+            # channels get Oracle-pool concurrency with zero pool code.
+            conn = dbapi.connect(self._bigquery_client())
+            try:
+                yield conn, False
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         else:
             yield self._sqlserver_conn(), True
+
+    def _bigquery_client(self):
+        """The shared client, built once under the lock.
+
+        The default job config is THE cost guard: maximum_bytes_billed
+        rides on every query because no call-site ever passes its own
+        job config -- there is no path that can forget the cap.
+
+        NO credential latch for this dialect, deliberately: the Oracle
+        latch exists because retrying harms (FAILED_LOGIN_ATTEMPTS
+        lockout). ADC has no lockout counter, and a transient
+        metadata-server blip at Cloud Run cold start looks exactly like
+        a credential refusal -- latching it would brick a healthy
+        revision until restart. Every credential-shaped failure is
+        translated with the full remedy, every time.
+        """
+        with self._lock:
+            if self._bq_client is not None:
+                return self._bq_client
+            try:
+                from google.cloud import bigquery
+            except ImportError as e:
+                raise DbError(
+                    "google-cloud-bigquery is not installed -- "
+                    "pip install -e '.[bigquery]'") from e
+            c = self.cfg.db
+            job_cfg = bigquery.QueryJobConfig(
+                maximum_bytes_billed=int(
+                    getattr(c, "bigquery_max_bytes_billed", 0)
+                    or 1_073_741_824),
+                use_query_cache=True,
+                default_dataset=(
+                    f"{c.bigquery_project}.{self.bigquery_dataset}"),
+                labels={"app": "pstb"})
+            if self._timeout_ms > 0:
+                job_cfg.job_timeout_ms = self._timeout_ms
+            try:
+                self._bq_client = bigquery.Client(
+                    project=c.bigquery_project,
+                    location=getattr(c, "bigquery_location", "") or None,
+                    default_query_job_config=job_cfg)
+            except Exception as e:
+                raise self._translate(e) from e
+            return self._bq_client
 
     def _discard_session(self) -> None:
         """Drop cached state after a dead-connection error so the retry (and
@@ -599,6 +778,14 @@ class Database:
                     pool.close(force=True)
                 except Exception:
                     pass
+        elif self.dialect == "bigquery":
+            with self._lock:
+                client, self._bq_client = self._bq_client, None
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         else:
             conn, self._conn = self._conn, None
             if conn is not None:
@@ -612,6 +799,48 @@ class Database:
         with self._session() as (conn, _):
             return conn
 
+
+    def _capture_bq_stats(self, cur) -> None:
+        """Actual spend, per channel (threading.local -- chat channels
+        run concurrently and must not read each other's bill)."""
+        job = getattr(cur, "query_job", None)
+        if job is None:
+            return
+        try:
+            self._bq_stats.last = {
+                "bytes_billed": int(
+                    getattr(job, "total_bytes_billed", 0) or 0),
+                "cache_hit": bool(getattr(job, "cache_hit", False)),
+            }
+        except Exception:
+            pass
+
+    def last_query_stats(self) -> dict:
+        """The most recent bigquery job's billing facts for THIS thread;
+        empty for every other dialect."""
+        return dict(getattr(self._bq_stats, "last", {}) or {})
+
+    def table_names(self) -> frozenset:
+        """Uppercase table/view names of the configured dataset, cached
+        for the process lifetime (same staleness the columns cache
+        already accepts). One 10MB-minimum job per process instead of
+        one per referenced table per question."""
+        if self.dialect != "bigquery":
+            raise DbError("table_names() is a bigquery-only accessor")
+        key = ("BQ_TABLES",)
+        with self._catalog_lock:
+            cached = self._catalog.get(key)
+        if cached is not None:
+            return cached
+        ds = self.bigquery_dataset
+        rows, _ = self.query(
+            f"SELECT table_name FROM {ds}.INFORMATION_SCHEMA.TABLES",
+            {}, max_rows=100_000)
+        names = frozenset(str(r.get("table_name") or "").upper()
+                          for r in rows)
+        with self._catalog_lock:
+            self._catalog[key] = names
+        return names
 
     def explain_plan(self, sql: str, params: Optional[dict] = None) -> dict:
         """Optimizer plan for a SELECT, WITHOUT executing it.
@@ -678,6 +907,34 @@ class Database:
                 })
             return {"available": True, "steps": steps}
 
+        if self.dialect == "bigquery":
+            try:
+                from google.cloud import bigquery
+                named, used = _to_bq_named(sql, params or {})
+                job_cfg = bigquery.QueryJobConfig(
+                    dry_run=True, use_query_cache=False,
+                    default_dataset=(
+                        f"{self.cfg.db.bigquery_project}."
+                        f"{self.bigquery_dataset}"),
+                    query_parameters=_bq_query_parameters(used))
+                job = self._bigquery_client().query(named, job_config=job_cfg)
+                estimated = int(getattr(job, "total_bytes_processed", 0) or 0)
+            except Exception as e:
+                return {"available": False, "reason": str(e)[:200]}
+            cap = int(getattr(self.cfg.db, "bigquery_max_bytes_billed", 0)
+                      or 1_073_741_824)
+            return {
+                "available": True,
+                "steps": [{"operation": "ESTIMATE", "options": "DRY_RUN",
+                           "object_owner": "", "object": "",
+                           "rows": None, "cost": estimated}],
+                "estimated_bytes": estimated,
+                # on-demand list price; an estimate for a person, not a bill
+                "estimated_cost_usd": round(estimated / 2**40 * 6.25, 4),
+                "cap_bytes": cap,
+                "within_cap": estimated <= cap,
+            }
+
         return {"available": False, "reason": f"no plan support for {self.dialect}"}
 
     # ---- querying --------------------------------------------------------
@@ -692,7 +949,10 @@ class Database:
         except DbError:
             raise
         except Exception as ex:
-            if not _is_dead_connection(str(ex)):
+            # No dead-session retry on BigQuery: HTTP is stateless,
+            # google-api-core already retries transient transport faults,
+            # and re-running a query here RE-BILLS it.
+            if self.dialect == "bigquery" or not _is_dead_connection(str(ex)):
                 raise self._translate(ex) from ex
             # The session died (idle reaped, DBA kill, network drop). Drop it
             # and try once on a fresh one — otherwise every later question in
@@ -725,7 +985,8 @@ class Database:
             except DbError:
                 raise
             except Exception as ex:
-                if attempt == 0 and _is_dead_connection(str(ex)):
+                if (attempt == 0 and self.dialect != "bigquery"
+                        and _is_dead_connection(str(ex))):
                     self._discard_session()
                     continue
                 raise self._translate(ex) from ex
@@ -749,6 +1010,10 @@ class Database:
                     if self.dialect == "sqlserver":
                         qsql, seq = _to_qmark(sql, params)
                         cur.execute(qsql, seq)
+                    elif self.dialect == "bigquery":
+                        qsql, used = _to_pyformat(sql, params)
+                        cur.execute(qsql, used)
+                        self._capture_bq_stats(cur)
                     else:
                         cur.execute(sql, _bound_params(sql, params))
                     cols = [d[0].lower() for d in cur.description]
@@ -795,6 +1060,10 @@ class Database:
                     if self.dialect == "sqlserver":
                         qsql, seq = _to_qmark(sql, params)
                         cur.execute(qsql, seq)
+                    elif self.dialect == "bigquery":
+                        qsql, used = _to_pyformat(sql, params)
+                        cur.execute(qsql, used)
+                        self._capture_bq_stats(cur)
                     else:
                         cur.execute(sql, _bound_params(sql, params))
                     cols = [d[0].lower() for d in cur.description]
@@ -810,12 +1079,71 @@ class Database:
                         pass
         return rows, truncated
 
+    def _translate_bigquery(self, msg: str, low: str) -> DbError:
+        """BigQuery errors -> remedies in this deployment's own terms.
+
+        Credential-shaped failures are translated with the full remedy
+        EVERY time and never latched (see _bigquery_client)."""
+        c = self.cfg.db
+        cap = int(getattr(c, "bigquery_max_bytes_billed", 0)
+                  or 1_073_741_824)
+        if "bytes billed" in low or "exceeded limit" in low:
+            usd = round(cap / 2**40 * 6.25, 4)
+            return DbError(
+                "This query would scan more than the per-query byte cap "
+                f"({cap:,} bytes ~= ${usd} at on-demand pricing; "
+                "sources.<name>.bigquery_max_bytes_billed, operator-"
+                "owned). Add a partition or date filter, or select fewer "
+                "columns -- LIMIT does not reduce bytes billed on this "
+                "backend.")
+        if "not found: table" in low or "not found: dataset" in low:
+            return DbError(
+                f"Not found -- {msg.strip()[:300]}. Names are case-"
+                "sensitive on this backend: copy them exactly as "
+                "list_tables returns them.")
+        if "unrecognized name" in low:
+            return DbError(
+                f"Column not found -- {msg.strip()[:300]}. Use "
+                "describe_table to see this table's actual columns.")
+        if ("access denied" in low or "permission denied" in low
+                or "403" in low):
+            return DbError(
+                "The account authenticated but lacks a grant: the "
+                "service account needs roles/bigquery.jobUser on the "
+                f"project ({getattr(c, 'bigquery_project', '')}) and "
+                "roles/bigquery.dataViewer on the dataset "
+                f"({self.bigquery_dataset}).")
+        if ("could not automatically determine credentials" in low
+                or "defaultcredentialserror" in low
+                or "invalid_grant" in low
+                or "reauthentication is needed" in low
+                or "401" in low):
+            return DbError(
+                "No usable Google credentials. Locally: run "
+                "'gcloud auth application-default login' and reload. On "
+                "Cloud Run: attach a service account with "
+                "roles/bigquery.jobUser (project) and "
+                "roles/bigquery.dataViewer (dataset) and redeploy.")
+        if "deadline" in low or "timeout" in low:
+            return DbError(
+                f"Query exceeded the "
+                f"{self.cfg.db.query_timeout_seconds}s timeout "
+                "(db.query_timeout_seconds; enforced server-side as "
+                "job_timeout_ms). Narrow the date range or add a "
+                "partition filter.")
+        return DbError(msg.strip())
+
     def _translate(self, ex: Exception) -> DbError:
         """Driver errors -> actionable remediation."""
         if isinstance(ex, DbError):
             return ex
         msg = str(ex)
         low = msg.lower()
+        if self.dialect == "bigquery":
+            # Dispatched FIRST: the generic head branch below matches any
+            # message containing "timeout" and would dress BigQuery
+            # errors in PS_LEDGER advice.
+            return self._translate_bigquery(msg, low)
         if "DPY-4024" in msg or "call timeout" in low or "timeout" in low:
             return DbError(
                 f"Query exceeded the {self.cfg.db.query_timeout_seconds}s timeout. "

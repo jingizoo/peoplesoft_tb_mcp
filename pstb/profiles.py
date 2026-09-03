@@ -143,6 +143,14 @@ class RecordProfiler:
     # ---- profiling -------------------------------------------------------
     def profile(self, table: str, sample_rows: Optional[int] = None) -> dict:
         """Shape, fill, value distributions and masked sample rows."""
+        if self.db.dialect == "bigquery":
+            # SELECT * bills the FULL table bytes however few rows come
+            # back (LIMIT bounds rows, not bytes), and the uppercased
+            # name would miss anyway on a case-sensitive backend.
+            raise DbError(
+                "profile_record is not available on a BigQuery source: "
+                "a sampled SELECT * bills the whole table's bytes on "
+                "this backend. Use describe_table for the shape.")
         tbl = (table or "").strip().upper()
         if not tbl:
             raise ValueError("profile_record needs a table or record name")

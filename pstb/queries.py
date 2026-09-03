@@ -783,6 +783,16 @@ def ledgers_for_bu(db: Database) -> str:
 
 
 def table_list(db: Database, params: dict) -> str:
+    if db.dialect == "bigquery":
+        # {ds} is the operator-configured, identifier-validated dataset
+        # (db.bigquery_dataset) -- guards-doctrine interpolation, the
+        # same trust level as db.prefix, never model-influenced.
+        ds = db.bigquery_dataset
+        return f"""SELECT table_schema AS schema_name, table_name,
+       CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END
+         AS object_type
+  FROM {ds}.INFORMATION_SCHEMA.TABLES
+ WHERE LOWER(table_name) LIKE LOWER(:pat) ORDER BY table_name"""
     if db.dialect == "sqlite":
         return """SELECT name AS table_name, type AS object_type FROM sqlite_master
  WHERE type IN ('table', 'view') AND name LIKE :pat ORDER BY name"""
@@ -834,6 +844,16 @@ def table_describe(db: Database, table: str, params: dict) -> str:
         owner, name = db.table_scope(table)
     except DbError as exc:
         raise ValueError(str(exc)) from exc
+    if db.dialect == "bigquery":
+        # Case-insensitive VALIDATION against a case-sensitive backend:
+        # UPPER on both sides finds the row whatever case the model
+        # typed; execution paths use the true-case name from list_tables.
+        ds = db.bigquery_dataset
+        params["tname"] = name
+        return f"""SELECT column_name, data_type, NULL AS data_length,
+       CASE is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable
+  FROM {ds}.INFORMATION_SCHEMA.COLUMNS
+ WHERE UPPER(table_name) = :tname ORDER BY ordinal_position"""
     if db.dialect == "sqlite":
         # PRAGMA cannot take binds; the identifier is regex-validated above.
         return f"PRAGMA table_info({name})"

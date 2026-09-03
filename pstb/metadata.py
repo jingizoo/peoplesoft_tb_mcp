@@ -90,7 +90,12 @@ def _configured_schemas(db) -> tuple[str, ...]:
             "for Oracle in this release; configure other databases as "
             "separate sources instead"
         )
-    return schemas
+    # VALIDATION space is uppercase everywhere in this module (nodes are
+    # stored through _u). A no-op for oracle/sqlserver, whose normalizer
+    # already uppercased; load-bearing for bigquery, whose config keeps
+    # the dataset's true case for EXECUTION -- collectors there build
+    # SQL from db.bigquery_dataset, never from this tuple.
+    return tuple(str(schema).upper() for schema in schemas)
 
 
 def _owner_scope(column: str, owners: tuple[str, ...], params: dict) -> str:
@@ -834,10 +839,38 @@ class _Writer:
             "LIMIT 3", (source, _u(logical))).fetchall()
 
 
+def _bq_dataset_objects(db) -> list:
+    """The whole object list in ONE billed job, memoized on the Database
+    for the build's lifetime. Keyset pagination re-bills a 10MB-minimum
+    job per page on this backend -- hostile arithmetic the other
+    dialects never had to think about."""
+    cached = getattr(db, "_bq_object_rows", None)
+    if cached is not None:
+        return cached
+    ds = db.bigquery_dataset
+    rows, _ = db.query(
+        "SELECT table_schema AS schema_name, table_name AS object_name, "
+        "CASE table_type WHEN 'VIEW' THEN 'VIEW' "
+        "WHEN 'MATERIALIZED VIEW' THEN 'VIEW' ELSE 'TABLE' END "
+        f"AS object_type FROM {ds}.INFORMATION_SCHEMA.TABLES "
+        "ORDER BY table_schema, table_name",
+        {}, max_rows=200_000)
+    db._bq_object_rows = list(rows)
+    return db._bq_object_rows
+
+
 def _object_page(db, after: tuple | None, cap: int) -> tuple[list[dict], bool]:
     dialect = db.dialect
     owners = _configured_schemas(db)
     configured = owners[0] if owners else ""
+    if dialect == "bigquery":
+        rows = _bq_dataset_objects(db)
+        if after is not None:
+            threshold = (str(after[0]).upper(), str(after[1]).upper())
+            rows = [r for r in rows
+                    if (str(r.get("schema_name") or "").upper(),
+                        str(r.get("object_name") or "").upper()) > threshold]
+        return rows[:cap], len(rows) > cap
     if dialect == "sqlite":
         name = after[1] if after else ""
         return db.query(
@@ -892,6 +925,22 @@ def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     dialect = db.dialect
     owners = _configured_schemas(db)
     configured = owners[0] if owners else ""
+    if dialect == "bigquery":
+        # One billed job for the whole surface; pages are served from a
+        # local buffer (see _bq_dataset_objects for the arithmetic).
+        ds = db.bigquery_dataset
+        rows, _ = db.query(
+            "SELECT table_schema AS schema_name, "
+            "table_name AS object_name, column_name, "
+            "data_type, NULL AS data_length, "
+            "CASE is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable "
+            f"FROM {ds}.INFORMATION_SCHEMA.COLUMNS "
+            "ORDER BY table_schema, table_name, ordinal_position",
+            {}, max_rows=1_000_000)
+        buffered = list(rows)
+        for start in range(0, len(buffered), max(int(page_size), 1)):
+            yield buffered[start:start + max(int(page_size), 1)], False
+        return
     after: tuple | None = None
     while True:
         if dialect == "oracle":
@@ -975,7 +1024,9 @@ def _index_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     dialect = db.dialect
     owners = _configured_schemas(db)
     configured = owners[0] if owners else ""
-    if dialect == "sqlite":
+    if dialect in ("sqlite", "bigquery"):
+        # BigQuery has no b-tree indexes; partitioning/clustering are
+        # access-path facts a later slice surfaces deliberately.
         return
     after: tuple | None = None
     while True:
@@ -1084,7 +1135,7 @@ def _constraint_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
     dialect = db.dialect
     owners = _configured_schemas(db)
     configured = owners[0] if owners else ""
-    if dialect == "sqlite":
+    if dialect in ("sqlite", "bigquery"):
         return
     after: tuple | None = None
     while True:
@@ -1411,6 +1462,15 @@ def _collect_constraints(
         state: _Writer, source: str, db, object_keys: dict,
         *, object_overflow: bool) -> int:
     """Collect bounded PK/UQ/FK definitions and their ordered columns."""
+    if db.dialect == "bigquery":
+        state.note(
+            source, "constraints",
+            "BigQuery declares no enforced keys -- tier-0 relationship "
+            "evidence is structurally empty for this source; join paths "
+            "come from view definitions (tier 1) and, when enabled, "
+            "value mining (tier 2).", ok=True, partial=False,
+            status="available")
+        return 0
     limits = state.limits
     count = 0
     overflow = False
@@ -1703,6 +1763,14 @@ def _collect_view_dependencies(
             "Unavailable: SQLite exposes no structured view-dependency "
             "catalog. Full view SQL is deliberately not parsed or stored.",
             ok=False, partial=False, status="unavailable")
+        return 0
+    if db.dialect == "bigquery":
+        state.note(
+            source, "view_dependencies",
+            "Unavailable: BigQuery exposes no structured view-dependency "
+            "catalog; view-to-object edges come from the view-definition "
+            "harvest instead.", ok=False, partial=False,
+            status="unavailable")
         return 0
     if object_overflow:
         state.note(
@@ -2360,6 +2428,46 @@ def _table_statistics(db, owners: tuple[str, ...]) -> tuple[dict, str, bool]:
                 "ALL_TAB_STATISTICS + ALL_TAB_COL_STATISTICS" + mods_evidence,
                 True)
 
+    if dialect == "bigquery":
+        # __TABLES__ carries exact storage-metadata counts, free of any
+        # optimizer-statistics staleness -- but it does NOT see the
+        # streaming buffer, so there IS an interval for DML to hide in.
+        # modified_since_stats stays None ON PURPOSE: the sqlite
+        # branch's justification for 0 (a COUNT taken during THIS
+        # build) does not transfer, and a 0 here would let EMPTY tables
+        # claim verified_empty_current on confidence the buffer never
+        # earned. Consequence: verified-empty is UNREACHABLE for this
+        # dialect and empty tables stay on the worklist as
+        # empty_unconfirmed -- the artifact never over-claims.
+        ds = db.bigquery_dataset
+        try:
+            rows, _ = db.query(
+                "SELECT table_id, row_count, "
+                "TIMESTAMP_MILLIS(last_modified_time) AS modified_at, "
+                f"type FROM {ds}.__TABLES__",
+                {}, max_rows=_PROFILE_MAX_OBJECTS)
+        except DbError:
+            return (stats,
+                    "__TABLES__ was not readable; liveness is unknown "
+                    "for this source", False)
+        owner = _u(owners[0]) if owners else _u(ds)
+        for row in rows:
+            name = _s(row.get("table_id"))
+            if not name:
+                continue
+            # type 1 = table, 2 = view (no rows), others external-ish;
+            # views and external tables carry no trustworthy count.
+            is_table = row.get("type") in (1, "1")
+            estimate = row.get("row_count") if is_table else None
+            stats[(owner, name.upper())] = {
+                "row_estimate": estimate,
+                "analyzed_at": _s(row.get("modified_at"))[:10],
+                "modified_since_stats": None,
+            }
+        return (stats,
+                "__TABLES__ (exact metadata counts; streaming buffer "
+                "not visible)", True)
+
     if dialect == "sqlite":
         # The bundled sample has no optimizer statistics and is small
         # enough to count. This branch is reachable only for sqlite, which
@@ -2574,6 +2682,25 @@ def _view_definitions(db, owners: tuple, cap: int) -> tuple[list, str]:
             return list(rows), "ALL_VIEWS.TEXT_VC"
         except DbError as exc:
             return [], f"ALL_VIEWS.TEXT_VC is not readable ({exc})"
+    if dialect == "bigquery":
+        from .viewharvest import normalize_bigquery_view_sql
+        ds = db.bigquery_dataset
+        project = str(getattr(db.cfg.db, "bigquery_project", "") or "")
+        try:
+            rows, _ = db.query(
+                "SELECT table_schema AS schema_name, "
+                "table_name AS view_name, view_definition AS text "
+                f"FROM {ds}.INFORMATION_SCHEMA.VIEWS "
+                "WHERE view_definition IS NOT NULL",
+                {}, max_rows=cap)
+        except DbError as exc:
+            return [], f"INFORMATION_SCHEMA.VIEWS is not readable ({exc})"
+        # Real BigQuery view text is backticked and project-qualified;
+        # normalized here so the harvest's regexes -- which refuse
+        # backticks by doctrine -- can read what the author declared.
+        normalized = [{**row, "text": normalize_bigquery_view_sql(
+            str(row.get("text") or ""), project, ds)} for row in rows]
+        return normalized, "INFORMATION_SCHEMA.VIEWS.view_definition"
     return [], f"no view-definition source for dialect {dialect!r}"
 
 
@@ -2999,6 +3126,17 @@ def _collect_value_joins(state: _Writer, source: str, db) -> str:
     artifact and the connection, under a hard probe budget.
     """
     limits = state.limits
+    if getattr(db, "dialect", "") == "bigquery":
+        state.note(
+            source, "value_joins",
+            "value-overlap join mining is disabled on BigQuery in this "
+            "release: each probe bills the full column bytes it scans "
+            "and LIMIT does not reduce billed bytes, so the configured "
+            "probe budget bounds query COUNT but not COST on this "
+            "backend. Joins in this artifact come from view definitions "
+            "(tier 1) only; BigQuery has no enforced foreign keys, so "
+            "tier 0 is structurally empty here.", ok=True)
+        return "disabled_dialect"
     if not getattr(limits, "mine_value_joins", True):
         state.note(source, "value_joins",
                    "join mining is switched off "
