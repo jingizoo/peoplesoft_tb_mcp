@@ -3488,6 +3488,13 @@ class TBEngine:
                     "AND OBJECT_TYPE IN ('TABLE','VIEW','SYNONYM',"
                     "'MATERIALIZED VIEW')", {"n": n}, max_rows=1)
             return bool(rows)
+        if self.db.dialect == "bigquery":
+            # One cached 10MB-minimum job per process, not one billed
+            # existence probe per referenced table per question. n is
+            # already uppercase from _table_target and the cache is
+            # uppercase: case-insensitive VALIDATION; execution stays
+            # true-case (the server is the case authority).
+            return n in self.db.table_names()
         where = "UPPER(TABLE_NAME) = :n"
         params = {"n": n}
         if owner:
@@ -3745,6 +3752,13 @@ class TBEngine:
         full scan. When it is not indexed, N slices are N full scans and
         WORSE — explain_query on one slice tells which case this is.
         """
+        if self.db.dialect == "bigquery":
+            raise EngineError(
+                "Partitioned execution is not available on a BigQuery "
+                "source: N slices of an unpartitioned table are N full "
+                "scans at full price — bytes billed multiply, they do "
+                "not divide. Use a partition-column WHERE filter in one "
+                "query instead.")
         from concurrent.futures import ThreadPoolExecutor
 
         from .partition import PartitionError, merge_partials, parse_mergeable
@@ -3796,7 +3810,8 @@ class TBEngine:
         }
         return merged, info
 
-    def _cost_gate(self, sql: str, scrubbed: str = "") -> dict:
+    def _cost_gate(self, sql: str, scrubbed: str = "",
+                   binds: dict | None = None) -> dict:
         """Refuse or flag a plan that scans a large table.
 
         Refusing outright is reserved for the case that actually hurts: a
@@ -3804,7 +3819,42 @@ class TBEngine:
         unreadable plan, a scan of a small setup table — passes with a note,
         because a cost gate that blocks legitimate work would just get turned
         off.
+
+        On BigQuery the question is money, not rows: the dry-run estimate
+        is exact and free, so over the byte cap is refused BEFORE the job
+        exists, above the warn threshold the figure is disclosed, and
+        below it silence — a gate that nags on cheap queries gets turned
+        off. ``binds`` exists for this arm: a dry run of parameterized
+        SQL needs values, and the guards doctrine PREFERS parameterized
+        SQL, so a gate without binds would stand down for exactly the
+        query class it most needs to price.
         """
+        if self.db.dialect == "bigquery":
+            plan = self.db.explain_plan(sql, binds or {})
+            if not plan.get("available"):
+                return {"plan": {"available": False,
+                                 "note": "cost estimate unavailable; query "
+                                         "ran without a byte check",
+                                 "reason": plan.get("reason", "")[:200]}}
+            estimated = int(plan.get("estimated_bytes") or 0)
+            cap = int(plan.get("cap_bytes") or 0)
+            warn = int(getattr(self.db.cfg.db, "bigquery_warn_bytes", 0)
+                       or 268_435_456)
+            if cap and estimated > cap:
+                raise EngineError(
+                    f"This query would scan ~{estimated:,} bytes; the "
+                    f"per-query cap is {cap:,} "
+                    "(sources.<name>.bigquery_max_bytes_billed, operator-"
+                    "owned; ~="
+                    f"${round(cap / 2**40 * 6.25, 4)} at on-demand "
+                    "pricing). Add a partition or date filter, or select "
+                    "fewer columns — LIMIT does not reduce bytes billed.")
+            if estimated > warn:
+                return {"plan": {
+                    "estimated_bytes": estimated,
+                    "estimated_usd": plan.get("estimated_cost_usd"),
+                    "cap_bytes": cap}}
+            return {}
         plan = self.db.explain_plan(sql)
         if not plan.get("available"):
             return {"plan": {"available": False,
@@ -4197,7 +4247,8 @@ class TBEngine:
             # can never lift its own context limit. Cursor batches go straight
             # to the CSV sink; a million-row cap is not a million-row list.
             try:
-                plan_note = self._cost_gate(s, scrubbed)
+                plan_note = self._cost_gate(
+                    s, scrubbed, {**binds, **expanded_lists})
                 streamed_count, truncated, _ = self.db.stream_query(
                     s, {**binds, **expanded_lists}, max_rows=cap,
                     batch_size=getattr(_batch_sink, "fetch_size", 2_000),
@@ -4221,7 +4272,8 @@ class TBEngine:
             # does, so the remedy must wrap BOTH. Non-schema errors (refusals,
             # timeouts) pass through _sql_error_remedy untouched.
             try:
-                plan_note = self._cost_gate(s, scrubbed)
+                plan_note = self._cost_gate(
+                    s, scrubbed, {**binds, **expanded_lists})
                 rows, truncated = self.db.query(s, {**binds, **expanded_lists},
                                                 max_rows=cap)
             except (DbError, EngineError) as e:
@@ -4233,6 +4285,13 @@ class TBEngine:
                "truncated": truncated,
                "sql_executed": s,
                "target_owners": self._target_owners(target_refs)}
+        if self.db.dialect == "bigquery":
+            # Estimates before (the gate), actuals after — both in the
+            # payload, neither skippable by the model.
+            stats = self.db.last_query_stats()
+            if stats:
+                out["bytes_billed"] = stats.get("bytes_billed")
+                out["cache_hit"] = stats.get("cache_hit")
         if streamed_count is not None:
             out["batch_streamed"] = True
         if partition_info:

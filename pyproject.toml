@@ -40,6 +40,11 @@ oracle = ["oracledb>=2.4,<4.0"]
 # happens to pull google-auth transitively, but a security feature does
 # not lean on a coincidence of someone else's dependency tree.
 iap = ["google-auth[crypto]>=2.35,<3.0"]
+# The BigQuery silo backend. google-cloud-bigquery-storage is
+# deliberately NOT included: when importable, the DB-API shim silently
+# switches to a second, differently-billed result-fetch path this
+# release has not tested -- CI asserts its absence.
+bigquery = ["google-cloud-bigquery>=3.25,<4.0"]
 sqlserver = ["pyodbc>=5.1,<6.0"]
 
 [project.scripts]
