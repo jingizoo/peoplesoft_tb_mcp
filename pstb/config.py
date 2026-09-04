@@ -374,6 +374,10 @@ class TickerCfg:
     history_per_check: int = 200
     events_kept: int = 500
     failure_trip: int = 3
+    # How long an operator acknowledgment can quiet an UNCHANGED
+    # exception before it re-demands attention (bounds live with the
+    # other budgets in TickerLimits).
+    ack_ttl_hours: int = 24
 
 
 @dataclass

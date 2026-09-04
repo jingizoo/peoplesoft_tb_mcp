@@ -385,7 +385,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
     <button data-v="reports">Reports</button>
     <button data-v="ar">Receivables</button>
     <button data-v="compare">Variance</button>
-    <button data-v="diag">Diagnostics<span id="approvalbadge" data-approval-badge class="badge warn" hidden></span></button>
+    <button data-v="diag">Diagnostics<span id="approvalbadge" data-approval-badge class="badge warn" hidden></span><span id="excbadge" data-exceptions-badge class="badge warn" hidden></span></button>
     <div class="navfoot" id="navfoot"></div>
   </nav>
 
@@ -4199,8 +4199,9 @@ async function signOutSession(){
     META=await api('/api/meta');      // re-read: the catalog is per-user
   }
   bootSay('Drawing the workspace');
-  // Fire and forget: the badge must never delay the first paint.
+  // Fire and forget: the badges must never delay the first paint.
   refreshApprovalBadge();
+  refreshExceptionsBadge();
   // The token rode in on the URL and is now a cookie; scrub it from the
   // address bar so it does not live on in browser history, bookmarks and
   // screen shares for everyone the link was pasted to.
@@ -4700,6 +4701,37 @@ function paintApprovalBadges(){
     dot.title=n?(n+' waiting for your decision'):'';
   });
 }
+/* The exception badge exists to announce changes the user did not
+   cause, so it polls; the count path reads local check state only —
+   never the ledger database. It paints unacked (attention), while
+   pending stays the truth surface no click can move. */
+async function refreshExceptionsBadge(){
+  const generation=++EXC_REFRESH_GENERATION;
+  let counts=null;
+  try{ counts=await api('/api/exceptions/count'); }catch(e){ counts=null; }
+  if(generation!==EXC_REFRESH_GENERATION)return;
+  EXC_COUNTS=counts;
+  paintExceptionsBadges();  // never turn an affordance into an error
+}
+let EXC_COUNTS=null;
+let EXC_REFRESH_GENERATION=0;
+function paintExceptionsBadges(){
+  document.querySelectorAll('[data-exceptions-badge]').forEach(dot=>{
+    const d=EXC_COUNTS;
+    if(!d||!d.enabled){ dot.hidden=true; dot.textContent=''; dot.title=''; dot.style.opacity=''; return; }
+    if(d.stale||!d.readable){
+      dot.textContent='?'; dot.hidden=false; dot.style.opacity='0.6';
+      dot.title='continuous checks are stale — treat as unknown, not as clear';
+      return;
+    }
+    dot.style.opacity='';
+    const n=Number(d.unacked||0);
+    dot.textContent=String(n);
+    dot.hidden=!n;
+    dot.title=n?(n+' unacknowledged continuous-check exception'+(n>1?'s':'')):'';
+  });
+}
+setInterval(refreshExceptionsBadge,60000);
 
 /* A thrown API error carries .message as a STRING for a plain detail and as
    an OBJECT for a FastAPI validation error, which rendered as
@@ -5009,24 +5041,65 @@ async function loadExceptions(holder,source){
         ' and the runner state is '+esc(state)+'. Treat this as UNKNOWN, not as "no exceptions".'));
     }
     const open=(d.rows||[]).filter(r=>!r.retired);
+    const NONGREEN=['exceptions_found','checks_incomplete','refused','error','not_run'];
+    // Acknowledging is attention state, never a decision: the row stays
+    // visible (dimmed), pending never moves, and the server refuses an
+    // ack for any state this table did not actually render (409).
+    async function ackException(body){
+      try{
+        await api('/api/exceptions/ack',{method:'POST',
+          headers:{'Content-Type':'application/json',
+                   'X-PSTB-Exceptions-Request':'exception-ack'},
+          body:JSON.stringify(Object.assign({source:source||'default'},body))});
+      }catch(e){
+        if(e.status===403){ c.append(operatorUnlock(()=>loadExceptions(holder,source))); return; }
+        c.append(el('div','pad sub',e.status===409
+          ?'This check changed since you looked — showing the new state.'
+          :esc(e.message||'The acknowledgment failed.')));
+      }
+      await loadExceptions(holder,source);
+      refreshExceptionsBadge();
+    }
     if(!open.length){
       c.append(el('div','pad',d.stale?'' :'<span class="badge ok">clear</span> No standing exceptions in the scheduled checks.'));
     }else{
       const t=document.createElement('table');
-      t.innerHTML='<tr><th>check</th><th>unit</th><th>status</th><th>signals</th><th>last change</th></tr>';
+      t.innerHTML='<tr><th>check</th><th>unit</th><th>status</th><th>signals</th><th>last change</th><th></th></tr>';
       for(const r of open){
         const sig=Object.entries(r.counts||{}).filter(([k,v])=>v>0&&k!=='checks_narrowed')
           .map(([k,v])=>esc(k.replace(/_/g,' '))+': '+v).join(', ')||'—';
-        const badge=r.status==='passed'?'<span class="badge ok">passed</span>'
+        const badge=(r.status==='passed'?'<span class="badge ok">passed</span>'
           :r.status==='exceptions_found'?'<span class="badge warn">exceptions</span>'
-          :'<span class="badge warn">'+esc(r.status.replace(/_/g,' '))+'</span>';
+          :'<span class="badge warn">'+esc(r.status.replace(/_/g,' '))+'</span>')
+          +(r.error_category?' <span class="sub">('+esc(r.error_category)+')</span>':'');
         const tr=document.createElement('tr');
         tr.innerHTML='<td>'+esc(r.check_id)+(r.narrowed?' <span class="sub">(narrowed scope)</span>':'')+'</td>'+
           '<td>'+esc(r.business_unit||'—')+'</td><td>'+badge+'</td>'+
           '<td>'+sig+'</td><td>'+esc((r.last_changed||'').slice(0,16))+'</td>';
+        const act=document.createElement('td');
+        if(NONGREEN.includes(r.status)&&!d.stale){
+          if(r.acked){
+            tr.style.opacity='0.55';
+            act.append(el('span','sub','seen · '+esc(r.acked_by||'')+' · '+esc((r.acked_at||'').slice(11,16))+' '));
+            const un=el('a','sub','unack');un.href='#';
+            un.onclick=e=>{e.preventDefault();ackException({check_id:r.check_id,clear:true});};
+            act.append(un);
+          }else{
+            const b=el('button','btn ghost compact','Ack');b.type='button';
+            b.title='Mark this exact state as seen. Any change re-lights the badge; nothing is hidden or resolved.';
+            b.onclick=()=>ackException({check_id:r.check_id,state_fp:r.state_fp});
+            act.append(b);
+          }
+        }
+        tr.append(act);
         t.append(tr);
       }
       const wrap2=el('div','pad'); wrap2.append(t); c.append(wrap2);
+      const ngRows=open.filter(r=>NONGREEN.includes(r.status));
+      if(ngRows.length&&ngRows.every(r=>r.acked)){
+        c.append(el('div','pad sub',ngRows.length+' standing exception'+(ngRows.length>1?'s':'')+
+          ', all acknowledged — acknowledged is seen, not fixed.'));
+      }
       if(d.counts_note) c.append(el('div','pad sub',esc(d.counts_note)));
     }
     const ev=(d.events||[]).slice(0,8);
