@@ -1497,6 +1497,13 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
     check("the acknowledgment posts with its GUI request marker",
           "'X-PSTB-Exceptions-Request':'exception-ack'" in _script,
           "the ack request lost the CSRF marker the endpoint requires")
+    # Multi-source honesty: the per-source strip states each source's
+    # OWN staleness, and a BigQuery watch shows its standing cost note.
+    check("the exceptions card states per-source staleness and cost",
+          "/api/exceptions/summary" in _script
+          and "stale — treat as unknown" in _script
+          and "d.cost_note" in _script,
+          "the per-source summary strip or the cost note render is gone")
     check("the splash screen exists and cannot outlive the page",
           'id="splash"' in _html and "sp.remove()" in _script
           and "prefers-reduced-motion" in _html,

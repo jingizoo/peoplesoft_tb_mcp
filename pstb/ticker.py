@@ -48,6 +48,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping
 
 from .db import _is_credential_failure
@@ -95,6 +96,7 @@ EVENT_KINDS = frozenset({
     "baseline", "new_exceptions", "worsened", "improved", "cleared",
     "became_incomplete", "refused", "error", "recovered", "scope_changed",
     "budget_cut", "no_longer_scheduled", "baseline_reset",
+    "runner_tripped",
 })
 _CHECK_ID = re.compile(r"^[a-z0-9_]{1,40}(?::[A-Za-z0-9_.\-]{1,60}){0,5}$")
 _METRIC = re.compile(r"^[a-z0-9_]{1,64}$")
@@ -693,6 +695,44 @@ class TickerStore:
             "(SELECT event_id FROM events ORDER BY at DESC, event_id "
             "LIMIT ?)", (self.limits.events_kept,))
 
+    def record_runner_event(self, kind: str, *, at: str = "") -> None:
+        """One runner-lifecycle event (check_id "ticker"), disclosed in
+        the store the silence is about. mode=rw and meta-checked like
+        record_ack: a lifecycle note may never create or archive a
+        store."""
+        if kind not in EVENT_KINDS:
+            raise TickerError(f"unknown event kind {kind!r}")
+        if not self.path.exists():
+            return
+        with self._lock:
+            handle = self._flock()
+            try:
+                con = sqlite3.connect(f"file:{self.path}?mode=rw",
+                                      uri=True)
+            except sqlite3.Error:
+                handle.close()
+                return
+            con.row_factory = sqlite3.Row
+            try:
+                meta = {row["key"]: row["value"] for row in
+                        con.execute("SELECT key, value FROM meta")}
+                if (meta.get("schema_version") != str(SCHEMA_VERSION)
+                        or meta.get("source") != self.source
+                        or meta.get("source_fingerprint")
+                        != self.fingerprint):
+                    return
+                con.execute(
+                    "INSERT INTO events VALUES (?,?,?,?,?,NULL,NULL)",
+                    (uuid.uuid4().hex, "ticker", at or _utcnow(),
+                     kind, ""))
+                con.commit()
+            except sqlite3.Error:
+                pass
+            finally:
+                con.close()
+                handle.close()
+
+
     # -- acknowledging -----------------------------------------------------
     def record_ack(self, check_id: str, state_fp: str, by: str, *,
                    clear: bool = False, at: str = "") -> dict:
@@ -939,6 +979,17 @@ class TickerRunner:
         self.last_error_category = ""
         self.last_tick_at = ""
         self._terminal = False
+        # Per-source health: one runner thread, one breaker per source.
+        # ORA-01017 on extra A must not stop the default and B from
+        # ticking the same pass and the next -- and vice versa.
+        self._health: dict[str, dict] = {}
+
+    def _health_for(self, source: str) -> dict:
+        return self._health.setdefault(str(source or "default"), {
+            "consecutive_failures": 0, "last_error_category": "",
+            "terminal": False, "tripped": False, "last_tick_at": "",
+            "fingerprint": "",
+        })
 
     # -- public surface ----------------------------------------------------
     def status(self) -> dict:
@@ -946,6 +997,18 @@ class TickerRunner:
                 "consecutive_failures": self.consecutive_failures,
                 "last_error_category": self.last_error_category,
                 "last_tick_at": self.last_tick_at}
+
+    def status_for(self, source: str) -> dict:
+        """One source's breaker state plus the thread lifecycle. The
+        feed reports THIS, so a fresh default cannot mask a tripped
+        extra (or the reverse)."""
+        seg = self._health_for(source)
+        return {"state": ("tripped"
+                          if seg["tripped"] or seg["terminal"]
+                          else self.state),
+                "consecutive_failures": seg["consecutive_failures"],
+                "last_error_category": seg["last_error_category"],
+                "last_tick_at": seg["last_tick_at"]}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1021,17 +1084,15 @@ class TickerRunner:
             return {"ran": False, "reason": "circuit breaker tripped; "
                     "restart the process after fixing the cause"}
         self.state = "running"
-        started = time.monotonic()
         try:
             context = self._resolve()
             cfg = context.cfg
             engine = context.engine
-            source = getattr(context, "source", "default")
             limits = TickerLimits.from_config(getattr(cfg, "ticker", None))
         except Exception as exc:                  # noqa: BLE001
             return self._fail(refusal_category(str(exc)), limits=None)
-        if getattr(getattr(cfg, "ticker", None),
-                   "enabled", False) is not True:
+        ticker_cfg = getattr(cfg, "ticker", None)
+        if getattr(ticker_cfg, "enabled", False) is not True:
             # The console reload can swap the config under a running
             # loop; a loop that keeps querying after the operator turned
             # it off is a loop the operator cannot turn off. One resolve
@@ -1040,7 +1101,150 @@ class TickerRunner:
             self.state = "idle"
             return {"ran": False, "reason": "disabled"}
 
+        # The pass: default first (always due -- the loop's own delay
+        # already paces it at the global heartbeat), then every opted-in
+        # extra whose DURABLE due time has arrived. Due times come from
+        # each source's own store, so a restarted runner does not
+        # re-tick a 720-minute source ticked 40 minutes ago.
+        default_source = getattr(context, "source", "default")
+        segments = [(default_source, None, limits)]
+        for name, entry in (getattr(ticker_cfg, "sources", None)
+                            or {}).items():
+            if not isinstance(entry, dict) \
+                    or entry.get("enabled") is not True:
+                continue
+            try:
+                merged = TickerLimits.from_config(ticker_cfg, **{
+                    key: entry[key] for key in
+                    ("cadence_minutes", "max_queries_per_tick",
+                     "max_seconds_per_tick", "failure_trip")
+                    if key in entry})
+            except TickerError:
+                # Load-time validation already refused this shape; a
+                # runtime-mutated bad entry skips ITSELF, never the pass.
+                continue
+            if self._due(context, cfg, str(name), merged, now):
+                segments.append((str(name), entry, merged))
+
+        results: dict = {}
+        default_result: dict = {}
+        for source, entry, seg_limits in segments:
+            if getattr(ticker_cfg, "enabled", False) is not True:
+                # Flipped off between segments: abort the rest of the
+                # pass rather than finishing work the operator stopped.
+                break
+            result = self._tick_source(context, cfg, engine, source,
+                                       entry, seg_limits, now)
+            results[source] = result
+            if source == default_source:
+                default_result = result
+
+        self._reconcile_state(default_source)
+        self.last_tick_at = now
+        out = dict(default_result
+                   or {"ran": False, "reason": "not run this pass"})
+        out["sources"] = results
+        return out
+
+    def _reconcile_state(self, default_source: str) -> None:
+        """Legacy mirror plus the only whole-runner trip there is.
+
+        The runner-level fields mirror the DEFAULT source (single-source
+        deployments read them unchanged); the runner itself reads
+        "tripped" only when EVERY known source is dead -- one silo's
+        revoked grant must not stop the others from ticking.
+        """
+        seg = self._health_for(default_source)
+        self.consecutive_failures = seg["consecutive_failures"]
+        self.last_error_category = seg["last_error_category"]
+        health = list(self._health.values())
+        dead = [h for h in health if h["tripped"] or h["terminal"]]
+        if health and len(dead) == len(health):
+            self.state = "tripped"
+            self._terminal = any(h["terminal"] for h in health)
+        elif self.state != "passive":
+            self.state = "idle"
+
+    def _segment_context(self, context, cfg, name: str):
+        """A narrowed view for one extra source: same handles, its own
+        ``source``. The default source keeps the caller's context object
+        untouched -- byte-identical single-source behavior."""
+        if name == getattr(context, "source", "default"):
+            return context
+        return SimpleNamespace(
+            cfg=cfg, engine=getattr(context, "engine", None),
+            modules=getattr(context, "modules", None),
+            catalog_for=getattr(context, "catalog_for", None),
+            exclusions=getattr(context, "exclusions", None),
+            source=name)
+
+    def _due(self, context, cfg, name: str, limits: TickerLimits,
+             now: str) -> bool:
+        seg = self._health_for(name)
+        last = seg["last_tick_at"]
+        if not last:
+            try:
+                feed = self._store(
+                    self._segment_context(context, cfg, name),
+                    limits).read_feed(now=now)
+                last = str(((feed.get("last_tick") or {}).get("at"))
+                           or "")
+                seg["last_tick_at"] = last
+            except Exception:                     # noqa: BLE001
+                last = ""
+        then = _parse_ts(last)
+        current = _parse_ts(now)
+        if then is None or current is None:
+            return True                # never ticked, or unreadable: due
+        return ((current - then).total_seconds()
+                >= limits.cadence_minutes * 60)
+
+    def _table_plan(self, seg_context, engine, source: str,
+                    tables) -> list[tuple]:
+        """An extra source's plan is table_health entries BY
+        CONSTRUCTION -- the business-unit checks read PeopleSoft records
+        and must never be planned against another silo, whatever
+        top-level keys are set."""
+        plan: list[tuple] = []
+        for table in [str(t) for t in (tables or []) if str(t).strip()]:
+            plan.append((f"table_health:{source}:{table}", "",
+                         TABLE_HEALTH_QUERY_COST,
+                         lambda t=table,
+                         cid=f"table_health:{source}:{table}":
+                         self._run_table_health(
+                             seg_context, engine, source, t, cid)))
+        return plan
+
+    def _tick_source(self, context, cfg, engine, source: str, entry,
+                     limits: TickerLimits, now: str) -> dict:
+        seg = self._health_for(source)
+        # A changed endpoint fingerprint earns a fresh breaker: the
+        # config-shaped fix (rotated DSN, new dataset) resets health,
+        # BEFORE the tripped check so the reset can actually resume.
+        try:
+            from .metadata import source_fingerprint
+            fp = source_fingerprint(cfg, source)
+        except Exception:                         # noqa: BLE001
+            fp = ""
+        if fp and seg["fingerprint"] and fp != seg["fingerprint"]:
+            seg.update({"consecutive_failures": 0, "tripped": False,
+                        "terminal": False, "last_error_category": ""})
+        if fp:
+            seg["fingerprint"] = fp
+        if seg["tripped"] or seg["terminal"]:
+            # No writes while skipped: the runner_tripped event at the
+            # transition was the disclosure; repeating it is churn.
+            return {"ran": False, "reason": "circuit breaker tripped; "
+                    "restart the process after fixing the cause"}
+        started = time.monotonic()
+        seg_context = self._segment_context(context, cfg, source)
         ticker_cfg = getattr(cfg, "ticker", None)
+        self._active_health = seg
+        if entry is not None:
+            plan = self._table_plan(seg_context, engine, source,
+                                    entry.get("watch_tables"))
+            return self._run_segment(seg_context, engine, source, seg,
+                                     plan, limits, now, started)
         units = [str(u) for u in
                  (getattr(ticker_cfg, "business_units", None) or [])
                  if str(u).strip()]
@@ -1094,67 +1298,97 @@ class TickerRunner:
                          self._run_table_health(
                              context, engine, source, t, cid)))
 
+        return self._run_segment(seg_context, engine, source, seg,
+                                 plan, limits, now, started)
+
+    def _run_segment(self, seg_context, engine, source: str, seg: dict,
+                     plan: list, limits: TickerLimits, now: str,
+                     started: float) -> dict:
         outcomes: list[CheckOutcome] = []
         scheduled: list[str] = []
         queries_used = 0
         partial = False
-        for check_id, unit, check_cost, run_check in plan:
-            scheduled.append(check_id)
-            elapsed = time.monotonic() - started
-            if queries_used + check_cost > \
-                    limits.max_queries_per_tick:
-                partial = True
-                outcomes.append(CheckOutcome(
-                    check_id=check_id, source=source,
-                    business_unit=unit,
-                    status="not_run", error_category="budget"))
-                continue
-            if elapsed > limits.max_seconds_per_tick:
-                partial = True
-                outcomes.append(CheckOutcome(
-                    check_id=check_id, source=source,
-                    business_unit=unit,
-                    status="not_run", error_category="wall_clock"))
-                continue
-            outcomes.append(run_check())
-            queries_used += check_cost
-
         try:
-            store = self._store(context, limits)
+            for check_id, unit, check_cost, run_check in plan:
+                scheduled.append(check_id)
+                elapsed = time.monotonic() - started
+                if queries_used + check_cost > \
+                        limits.max_queries_per_tick:
+                    partial = True
+                    outcomes.append(CheckOutcome(
+                        check_id=check_id, source=source,
+                        business_unit=unit,
+                        status="not_run", error_category="budget"))
+                    continue
+                if elapsed > limits.max_seconds_per_tick:
+                    partial = True
+                    outcomes.append(CheckOutcome(
+                        check_id=check_id, source=source,
+                        business_unit=unit,
+                        status="not_run", error_category="wall_clock"))
+                    continue
+                outcomes.append(run_check())
+                queries_used += check_cost
+        finally:
+            self._active_health = None
+
+        store = None
+        try:
+            store = self._store(seg_context, limits)
             events = store.record_tick(
                 outcomes, scheduled, tick_at=now,
                 queries_used=queries_used,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 partial=partial)
         except Exception as exc:                  # noqa: BLE001
-            return self._fail("store_unwritable" if not isinstance(
-                exc, TickerError) else refusal_category(str(exc)),
-                limits=limits)
+            category = ("store_unwritable" if not isinstance(
+                exc, TickerError) else refusal_category(str(exc)))
+            return self._seg_fail(seg, store, category, limits, now)
         # A terminal condition discovered mid-tick (refused credentials)
         # must survive the epilogue: the tick still records its outcomes,
-        # but the runner stays tripped rather than being reset to idle by
-        # the very success of writing the failure down.
+        # but the source stays tripped rather than being reset by the
+        # very success of writing the failure down.
         all_errored = bool(outcomes) and all(
             o.status == "error" for o in outcomes)
-        if all_errored and not self._terminal:
+        if all_errored and not seg["terminal"]:
             # The store wrote fine, but every check failed. A breaker
             # that only counts plumbing failures lets a dead database be
             # retried forever -- each attempt holding sessions for up to
             # the query timeout -- while the runner reports "idle".
-            self.consecutive_failures += 1
-            self.last_error_category = outcomes[0].error_category or                 "tool_error"
-            if self.consecutive_failures >= limits.failure_trip:
-                self.state = "tripped"
-            else:
-                self.state = "idle"
-        elif not self._terminal:
-            self.state = "idle"
-            self.consecutive_failures = 0
-            self.last_error_category = ""
-        self.last_tick_at = now
+            seg["consecutive_failures"] += 1
+            seg["last_error_category"] = outcomes[0].error_category or                 "tool_error"
+            if seg["consecutive_failures"] >= limits.failure_trip:
+                self._trip(seg, store, now)
+        elif not seg["terminal"]:
+            seg["consecutive_failures"] = 0
+            seg["last_error_category"] = ""
+        elif seg["terminal"] and not seg["tripped"]:
+            self._trip(seg, store, now)
+        seg["last_tick_at"] = now
         return {"ran": True, "checks": len(outcomes),
                 "queries_used": queries_used, "partial": partial,
                 "events": len(events)}
+
+    def _trip(self, seg: dict, store, now: str) -> None:
+        """Exactly one runner_tripped event at the transition, written
+        into the store the coming silence is about."""
+        if seg["tripped"]:
+            return
+        seg["tripped"] = True
+        if store is not None:
+            try:
+                store.record_runner_event("runner_tripped", at=now)
+            except Exception:                     # noqa: BLE001
+                pass
+
+    def _seg_fail(self, seg: dict, store, category: str,
+                  limits: TickerLimits, now: str) -> dict:
+        seg["consecutive_failures"] += 1
+        seg["last_error_category"] = category
+        if seg["consecutive_failures"] >= limits.failure_trip:
+            self._trip(seg, store, now)
+        return {"ran": False, "reason": category,
+                "consecutive_failures": seg["consecutive_failures"]}
 
     def _veto_refusal(self, engine, base: CheckOutcome,
                       reads: tuple) -> CheckOutcome | None:
@@ -1184,9 +1418,15 @@ class TickerRunner:
         base.error_category = category
         if category == "credentials" or getattr(
                 getattr(engine, "db", None), "_credentials_refused", ""):
-            self._terminal = True
-            self.state = "tripped"
-            self.last_error_category = category
+            # Terminal for THIS source's breaker, never the runner: the
+            # engine handed in here is the segment's own (for an extra
+            # source, its for_source child), so one silo's revoked
+            # credentials cannot latch another silo's health.
+            seg = getattr(self, "_active_health", None)
+            if seg is None:
+                seg = self._health_for("default")
+            seg["terminal"] = True
+            seg["last_error_category"] = category
         return base
 
     def _run_tb_integrity(self, engine, source, unit, ledger,
@@ -1251,6 +1491,15 @@ class TickerRunner:
         refused = self._veto_refusal(engine, base, (table,))
         if refused is not None:
             return refused
+        # Failures classify against the SEGMENT's database, not the
+        # primary's: the credential-latch probe must read the db that
+        # actually refused, or an extra silo's ORA-01017 reads the
+        # healthy primary and never goes terminal.
+        probe_engine = engine
+        try:
+            probe_engine = engine.for_source(source)
+        except Exception:                         # noqa: BLE001
+            pass
         catalog_for = getattr(context, "catalog_for", None)
         exclusions = getattr(context, "exclusions", None)
         if catalog_for is None or exclusions is None:
@@ -1272,14 +1521,14 @@ class TickerRunner:
                 sections=frozenset({"duplicates"}),
                 declared_keys_only=True)
         except Exception as exc:                  # noqa: BLE001
-            return self._failure(engine, base, exc)
+            return self._failure(probe_engine, base, exc)
         err = str(result.get("error") or "")
         if err:
             if "excluded" in err.lower():
                 base.status = "refused"
                 base.error_category = "operator_exclusion"
                 return base
-            return self._failure(engine, base, RuntimeError(err))
+            return self._failure(probe_engine, base, RuntimeError(err))
         dup = result.get("duplicate_keys") or {}
         if dup.get("error"):
             # The engine swallows a DbError from the GROUP BY into the
@@ -1287,7 +1536,7 @@ class TickerRunner:
             # checks_incomplete would file a revoked grant as quiet
             # amber and bypass the credential-terminal path -- route it
             # through the classifier like any other failure.
-            return self._failure(engine, base,
+            return self._failure(probe_engine, base,
                                  RuntimeError(str(dup["error"])))
         status, counts, narrowed = reduce_table_health(result)
         return CheckOutcome(check_id=check_id, source=source,
