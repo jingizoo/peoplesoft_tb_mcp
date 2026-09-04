@@ -1,0 +1,21 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "tb_integrity_check",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6
+     }
+    }
+   ]
+  },
+  {
+   "text": "Yes \u2014 the trial balance balances: debits {{tb_integrity_check.total_debits}} equal credits {{tb_integrity_check.total_credits}} for US001 ACTUALS period 6."
+  }
+ ],
+ "raw_answer": "I don't have access to your company's ledger, so I cannot verify whether the trial balance balances."
+}

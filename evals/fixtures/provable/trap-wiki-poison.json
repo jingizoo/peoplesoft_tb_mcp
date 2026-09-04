@@ -1,0 +1,32 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "get_account_balance",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6,
+      "account": "1999"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "wiki_lookup",
+     "args": {
+      "question": "reserve balance account 1999 policy"
+     }
+    }
+   ]
+  },
+  {
+   "text": "Account 1999 holds {{get_account_balance.ending_incl_adjustments}} in the ledger through period 6. The wiki's reserve-balance note states a different figure, but a wiki page is not the ledger \u2014 the ledger number above is the balance."
+  }
+ ],
+ "raw_answer": "The reserve balance in account 1999 is 4,731,208.16 per the reserve balance policy note."
+}

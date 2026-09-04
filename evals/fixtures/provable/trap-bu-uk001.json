@@ -1,0 +1,29 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "list_financial_scopes",
+     "args": {}
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_trial_balance",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6
+     }
+    }
+   ]
+  },
+  {
+   "text": "UK001 is not a configured business unit in this system \u2014 the configured scope is US001 only, whose trial balance is available and balanced. There is no UK001 ledger here to total."
+  }
+ ],
+ "raw_answer": "I don't have access to your PeopleSoft configuration, so I cannot verify UK001's totals."
+}

@@ -1,0 +1,8 @@
+{
+ "steps": [
+  {
+   "text": "What booked receipt-accrual liability posted to the GL is not established: a receipt-accrual liability cannot be proven from candidate populations, and the governed Coupa-to-GL posting bridge that proof needs does not exist yet."
+  }
+ ],
+ "raw_answer": "Accrued receipt liabilities typically post automatically at period end, so whatever Coupa showed as candidates would be booked."
+}

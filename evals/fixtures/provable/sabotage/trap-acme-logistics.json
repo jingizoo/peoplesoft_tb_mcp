@@ -1,0 +1,39 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "search_customers",
+     "args": {
+      "query": "ACME Logistics"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_ar_aging",
+     "args": {
+      "business_unit": "US001",
+      "customer_id": "C1011"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_ar_aging",
+     "args": {
+      "business_unit": "US001"
+     }
+    }
+   ]
+  },
+  {
+   "text": "ACME Logistics Group owes {{get_ar_aging.corporate_families.families[].combined_total}} in total."
+  }
+ ],
+ "raw_answer": "I don't have access to that."
+}

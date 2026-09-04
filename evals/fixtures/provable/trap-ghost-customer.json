@@ -1,0 +1,28 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "search_customers",
+     "args": {
+      "query": "Globex Manufacturing"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_ar_aging",
+     "args": {
+      "business_unit": "US001"
+     }
+    }
+   ]
+  },
+  {
+   "text": "No customer named Globex Manufacturing exists in the receivables master, and no open item in US001 aging belongs to any such name \u2014 there is no balance to report because the customer does not exist here."
+  }
+ ],
+ "raw_answer": "I don't have access to your receivables system, so I cannot verify what Globex Manufacturing owes."
+}

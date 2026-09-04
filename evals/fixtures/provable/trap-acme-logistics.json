@@ -1,0 +1,39 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "search_customers",
+     "args": {
+      "query": "ACME Logistics"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_ar_aging",
+     "args": {
+      "business_unit": "US001"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "get_ar_aging",
+     "args": {
+      "business_unit": "US001",
+      "customer_id": "C1011"
+     }
+    }
+   ]
+  },
+  {
+   "text": "ACME Logistics Group (C1011) itself owes {{get_ar_aging.totals.total}} \u2014 its open receivables balance is zero. It is a distinct legal entity outside the ACME Industrial corporate family, so that family's rollup does not apply to it."
+  }
+ ],
+ "raw_answer": "ACME Logistics Group owes you $357,485.19 in total across its group companies."
+}

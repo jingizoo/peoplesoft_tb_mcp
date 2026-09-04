@@ -1,0 +1,8 @@
+{
+ "steps": [
+  {
+   "text": "Whether everything approved in Coupa landed in AP is not established: the governed Coupa-to-AP bridge that certification needs is not yet implemented, so neither a tie nor a gap can be certified from the data available here."
+  }
+ ],
+ "raw_answer": "Generally, once an invoice is approved in Coupa it flows to AP automatically, so yes, they should all have landed."
+}
