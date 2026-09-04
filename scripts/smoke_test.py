@@ -1470,8 +1470,21 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           "the learning-loop card is gone from Diagnostics")
     check("the page chrome names no company or vendor",
           "PeopleSoft" not in _html and "Oracle" not in _html
-          and "TransUnion" not in _html,
+          and "TransUnion" not in _html and "Google" not in _html
+          and "IAP" not in _html,
           "a company/vendor name crept back into the GUI")
+    # The identity chip is honest or it is gone: the verified branch is
+    # gated on the server's own proof, and the no-identity modes are
+    # STATED, not blank — an absent disclaimer reads as a verified page.
+    check("the identity chip states presence and absence honestly",
+          "corporate sign-in" in _script
+          and "t.mode==='verified'&&t.identity" in _script
+          and "no personal identity" in _script,
+          "the identity chip or its honest-absence branch is gone")
+    check("the identity chip renders text, never markup",
+          "idc.textContent=" in _script
+          and "idc.innerHTML" not in _script,
+          "a network-derived identity is being written as HTML")
     check("the splash screen exists and cannot outlive the page",
           'id="splash"' in _html and "sp.remove()" in _script
           and "prefers-reduced-motion" in _html,

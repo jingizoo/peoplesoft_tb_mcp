@@ -158,6 +158,7 @@ tfoot td{padding:11px 12px;font-weight:700;border-top:2px solid var(--line);back
 .source-command-menu small{display:block;color:var(--muted);margin-top:2px}
 .command-error{margin:0 18px 8px;color:var(--bad);font-size:12px}
 .build-tag{margin-left:auto;color:var(--muted);font-size:11px;font-family:ui-monospace,monospace;cursor:help}
+.id-chip{color:var(--muted);font-size:11px;white-space:nowrap;cursor:help}
 .scope-time{margin-right:6px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .tool-card{margin:6px 0}
 .tool-card>summary{cursor:pointer;list-style:none;display:flex;align-items:center;
@@ -5690,6 +5691,30 @@ function viewChat(){
     const signout=el('button','btn ghost compact','Sign out '+esc(META.security.oprid||''));
     signout.type='button';signout.id='chat-signout';
     signout.onclick=signOutSession;context.append(signout);
+  }
+  // Who reached this page, per the server's own proof — never markup
+  // (the identity is network-derived text), never merged with the
+  // typed user ID beside it, and stated honestly when there is nobody
+  // to name. A laptop session has no sign-in story to disclaim.
+  const t=META.transport||{};
+  if(t.mode&&t.mode!=='local'){
+    const idc=el('span','id-chip');
+    if(t.mode==='verified'&&t.identity){
+      idc.textContent=t.identity+' · corporate sign-in';
+      idc.title='Verified when this page loaded, from the signed assertion '+
+        'the sign-in front end adds to each request. It says who reached '+
+        'the page. It does not choose the finance-system user ID and '+
+        'grants no ledger access.';
+    }else if(t.mode==='token'){
+      idc.textContent='shared token · no personal identity';
+      idc.title='Access came from the shared token, which names nobody. '+
+        'The user ID beside this is typed, not verified.';
+    }else{
+      idc.textContent='open network · no identity';
+      idc.title='Shared without a token on purpose. Anyone who can reach '+
+        'this host is admitted; nobody is named.';
+    }
+    context.append(idc);
   }
   const build=el('span','build-tag');
   build.id='build-tag';

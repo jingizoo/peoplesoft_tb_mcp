@@ -483,18 +483,51 @@ def verify_iap_assertion(assertion: str,
     return identity
 
 
-def iap_admits(scope, policy: Optional[Policy] = None) -> bool:
-    """True when this request carries a VERIFIED front-end assertion."""
+def verified_identity(scope, policy: Optional[Policy] = None) -> str:
+    """The identity the sign-in front end PROVED on this request, or "".
+
+    Recomputed from the request's own header every time -- never stashed,
+    so no copy exists that could outlive revocation or disagree with the
+    admission check. Outside trusted_iap mode the header means nothing
+    and this returns "" without touching the network: the assertion
+    header is not in _FORWARDED, so a real production assertion replayed
+    at a laptop is not even refused -- it is ignored, and must not paint
+    a verified identity for a deployment that has no front door.
+    """
     policy = policy or POLICY
     if not policy.trusted_iap:
-        return False
+        return ""
     headers = {k.decode("latin-1").lower(): v.decode("latin-1")
                for k, v in scope.get("headers") or []}
     try:
-        verify_iap_assertion(headers.get(IAP_HEADER, ""), policy)
-        return True
+        return verify_iap_assertion(headers.get(IAP_HEADER, ""), policy)
     except IAPRejected:
-        return False
+        return ""
+
+
+def iap_admits(scope, policy: Optional[Policy] = None) -> bool:
+    """True when this request carries a VERIFIED front-end assertion.
+
+    Delegates so the identity the page displays and the identity that
+    admits are one code path, not two that could drift apart.
+    (verify_iap_assertion never returns "" -- it raises instead -- so
+    the delegation is exactly the old check.)
+    """
+    return verified_identity(scope, policy) != ""
+
+
+def access_mode(policy: Optional[Policy] = None) -> str:
+    """How requests reach this process: 'local', 'open' or 'token'.
+
+    'verified' is a per-request fact (verified_identity), never a mode:
+    a deployment has no standing state in which every request is proven.
+    """
+    policy = policy or POLICY
+    if not policy.shared:
+        return "local"
+    if not policy.token:
+        return "open"
+    return "token"
 
 
 def _is_signin_door(scope, policy: Optional[Policy] = None) -> bool:
