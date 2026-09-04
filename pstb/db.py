@@ -829,8 +829,10 @@ class Database:
         instance whose dictionary sits behind row-security policies,
         that was the hottest statement the DBA saw. One bounded read
         per process replaces all of them. Staleness is the same the
-        columns cache already accepts; clear_catalog() (the console
-        reload) drops it.
+        columns cache already accepts; the console reload invalidates
+        by REPLACING the Database (a fresh instance has an empty
+        catalog), and clear_catalog() remains the manual/test
+        primitive.
         """
         key = ("ALL_OBJECT_NAMES",)
         with self._catalog_lock:
