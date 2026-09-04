@@ -1953,6 +1953,21 @@ def _collect_native(state: _Writer, source: str, db,
         state.limit(source, "objects", limits.max_objects, len(objects))
 
     object_keys = {(o["schema"], o["name"]): o for o in objects}
+    if db.dialect == "bigquery":
+        digit_led = sum(1 for o in objects
+                        if str(o.get("name") or "")[:1].isdigit())
+        if digit_led:
+            # A zero-count note is forbidden by test: the disclosure
+            # exists for the site that actually has these, never as
+            # ambient noise.
+            state.note(
+                source, "identifier_grammar",
+                f"{digit_led} object(s) in {db.bigquery_dataset} begin "
+                "with a digit and are not addressable through the "
+                "guarded tools: unquoted digit-leading names are invalid "
+                "GoogleSQL and backtick quoting is refused as a guard "
+                "boundary. Rename or view-wrap them to reach them here.",
+                ok=True)
     fields = 0
     field_overflow = False
     last_owner_id = ""

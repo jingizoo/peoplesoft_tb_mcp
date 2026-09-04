@@ -39,6 +39,13 @@ class Defaults:
 class DbCfg:
     backend: str = "sqlite"  # sqlite | oracle | sqlserver
     sqlite_path: str = "sample_data/ps_sample.db"
+    # The configured source name this DbCfg serves, stamped by the
+    # loader (which overwrites any YAML value -- the loader is the
+    # authority) and backfilled by SourceRegistry for hand-assembled
+    # configs. The primary stays "". Observability only: BigQuery job
+    # labels carry it so per-source spend is queryable from the
+    # billing export.
+    source_name: str = ""
     # ``schema`` is the default namespace used for unqualified object names.
     # ``schemas`` is the complete read boundary for a source that deliberately
     # combines more than one namespace in one semantic catalog/graph.  The
@@ -562,6 +569,12 @@ def _validate_security(cfg: SecurityCfg) -> None:
 
 
 _SCHEMA_IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]{0,127}$")
+# BigQuery's own grammar, not Oracle's: leading underscore is legal and
+# common (loader-managed datasets), $ and # are not, and datasets may
+# run to 1024 characters. Digit-leading names stay out on purpose --
+# every internal splice is unquoted, and an unquoted reference to a
+# digit-leading dataset is invalid GoogleSQL.
+_BQ_SCHEMA_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
 
 
 def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
@@ -612,6 +625,19 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
     def _fold(value: str) -> str:
         return value.strip() if keep_case else value.strip().upper()
 
+    # One grammar per dialect, both splice-safe by character class: the
+    # dataset/schema is spliced unquoted into internal SQL, so the class
+    # is the control. BigQuery widens (leading _, 1024 chars) and
+    # tightens ($/# are Oracle-isms GoogleSQL forbids) in one move;
+    # digit-leading names are refused WITH the reason.
+    ident = _BQ_SCHEMA_IDENT if keep_case else _SCHEMA_IDENT
+    remedy = ("use an unquoted GoogleSQL identifier (letters, digits, "
+              "underscore; not starting with a digit -- an unquoted "
+              "reference to a digit-leading dataset is invalid GoogleSQL "
+              "and every internal read here is unquoted)"
+              if keep_case else
+              "use an unquoted database identifier without dots")
+
     normalized: list[str] = []
     seen: set[str] = set()
     for raw in raw_values:
@@ -620,20 +646,20 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
         value = _fold(raw)
         if not value:
             raise RuntimeError(f"{section}.schemas cannot contain blank schema names")
-        if not _SCHEMA_IDENT.fullmatch(value):
+        if not ident.fullmatch(value):
             raise RuntimeError(
                 f"{section}.schemas contains unsafe schema name {raw!r}; "
-                "use an unquoted database identifier without dots")
+                + remedy)
         if value not in seen:
             normalized.append(value)
             seen.add(value)
 
     default = _fold(str(raw_default))
     if default:
-        if not _SCHEMA_IDENT.fullmatch(default):
+        if not ident.fullmatch(default):
             raise RuntimeError(
                 f"{section}.schema contains unsafe schema name {raw_default!r}; "
-                "use an unquoted database identifier without dots")
+                + remedy)
         if default in normalized:
             normalized.remove(default)
         normalized.insert(0, default)
@@ -997,6 +1023,10 @@ def load_config(path: Optional[str] = None) -> Config:
                 block, section=f"sources.{name}")
             src = DbCfg()
             _apply_section(src, block)
+            # After _apply_section on purpose: a YAML source_name is
+            # overwritten -- the loader, not the block, is authoritative
+            # about which source a DbCfg serves.
+            src.source_name = str(name)
             # Per-source credentials come from env vars named after the
             # source (PSTB_SRC_<NAME>_DSN/USER/PASSWORD), so secrets stay in
             # .env with the same handling as the primary connection.

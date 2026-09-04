@@ -1021,3 +1021,222 @@ class PartitionFilterTranslateTests(unittest.TestCase):
         self.assertNotIn("require_partition_filter", capped)
         partition = self._translate(self.MESSAGE)
         self.assertNotIn("operator-owned", partition)
+
+
+class SourceLabelTests(unittest.TestCase):
+    """Per-source job labels: observability that can never fail a job."""
+
+    def test_source_label_rides_default_job_config(self):
+        cfg = _bq_cfg()
+        cfg.db.source_name = "Sales Mart"
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            cfg, rows=[(1, 2)])
+        with ctx:
+            db.query("SELECT a, b FROM t", {})
+        self.assertEqual(
+            constructions[0]["job_config"].kwargs["labels"],
+            {"app": "pstb", "source": "sales-mart"})
+
+    def test_unstamped_config_keeps_slice1_labels_exactly(self):
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            _bq_cfg(), rows=[(1, 2)])
+        with ctx:
+            db.query("SELECT a, b FROM t", {})
+        self.assertEqual(constructions[0]["job_config"].kwargs["labels"],
+                         {"app": "pstb"})
+
+    def test_label_value_always_legal(self):
+        from pstb.db import _bq_label_value
+        for raw in ("", "P2Go", "Ünïcode Mart!!", "___", "!!!",
+                    "x" * 200, "2024 extracts", "sales_mart-2"):
+            with self.subTest(raw=raw[:20]):
+                value = _bq_label_value(raw)
+                if value:
+                    self.assertRegex(value, r"^[a-z0-9_-]{1,63}$")
+        self.assertEqual(_bq_label_value("P2Go"), "p2go")
+        self.assertEqual(_bq_label_value("2024 extracts"),
+                         "2024-extracts")
+        self.assertEqual(len(_bq_label_value("x" * 200)), 63)
+        self.assertEqual(_bq_label_value("!!!"), "")
+
+    def test_the_loader_stamps_and_wins_over_yaml(self):
+        import textwrap
+        from pstb.config import load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text(textwrap.dedent(f"""\
+                db:
+                  backend: sqlite
+                  sqlite_path: {root / 'p.db'}
+                sources:
+                  p2go:
+                    backend: sqlite
+                    sqlite_path: {root / 'x.db'}
+                    schema: MAIN
+                    source_name: spoof
+                """), encoding="utf-8")
+            cfg = load_config(str(root / "config.yaml"))
+        self.assertEqual(cfg.sources["p2go"].source_name, "p2go",
+                         "the loader, not the YAML block, is the "
+                         "authority for source_name")
+        self.assertEqual(cfg.db.source_name, "",
+                         "the primary stays unstamped")
+
+    def test_the_registry_backfills_unstamped_configs(self):
+        from pstb.config import DbCfg
+        from pstb.sources import SourceRegistry
+        cfg = Config.sample(Path(tempfile.mkdtemp()))
+        extra = DbCfg(backend="sqlite",
+                      sqlite_path=cfg.db.sqlite_path, schema="MAIN")
+        cfg.sources = {"extra": extra}
+        registry = SourceRegistry(cfg, Database(cfg))
+        self.assertEqual(extra.source_name, "extra")
+        del registry
+
+
+class IdentifierGrammarTests(unittest.TestCase):
+    """Leading underscore admitted everywhere; digit-leading refused
+    everywhere with the reason; the splice-safe character class never
+    widens."""
+
+    def test_underscore_names_describe_and_scope(self):
+        from pstb.queries import table_describe
+        db = Database(_bq_cfg())
+        params = {}
+        sql = table_describe(db, "_airbyte_raw_orders", params)
+        self.assertEqual(params["tname"], "_AIRBYTE_RAW_ORDERS")
+        self.assertIn(":tname", sql)
+        owner, name = db.table_scope("_airbyte_raw_orders")
+        self.assertEqual(name, "_AIRBYTE_RAW_ORDERS")
+
+    def test_quoted_and_bracketed_underscore_names_match(self):
+        from pstb.queries import IDENT_RE
+        for form in ('_foo', '"_foo"', '[_foo]', 'MAIN._foo'):
+            self.assertIsNotNone(IDENT_RE.match(form), form)
+
+    def test_the_engine_grammar_already_admits_leading_underscore(self):
+        """Pinned so a regex tidy cannot regress what run_sql accepts."""
+        from pstb.engine import TBEngine
+        self.assertIsNotNone(
+            re.fullmatch(TBEngine._UNQUOTED_SQL_IDENTIFIER, "_foo"))
+
+    def test_digit_leading_stays_refused_with_the_reason(self):
+        from pstb.queries import table_describe
+        db = Database(_bq_cfg())
+        with self.assertRaises(ValueError) as caught:
+            table_describe(db, "2024_extract", {})
+        self.assertIn("invalid GoogleSQL", str(caught.exception))
+        self.assertIn("view-wrap", str(caught.exception))
+        oracle_cfg = Config.sample(Path(tempfile.mkdtemp()))
+        with self.assertRaises(ValueError) as plain:
+            table_describe(Database(oracle_cfg), "2024_extract", {})
+        self.assertNotIn("GoogleSQL", str(plain.exception))
+
+    def test_the_dataset_grammar_branches_by_dialect(self):
+        from pstb.config import normalize_db_schemas
+        cfg = _bq_cfg(schema="_staging")
+        self.assertEqual(normalize_db_schemas(cfg.db, section="db"),
+                         ["_staging"])
+        for bad, needle in (("2024_mart", "invalid GoogleSQL"),
+                            ("sales$mart", "invalid GoogleSQL")):
+            with self.subTest(bad=bad):
+                broken = _bq_cfg(schema=bad)
+                with self.assertRaises(RuntimeError) as caught:
+                    normalize_db_schemas(broken.db, section="db")
+                self.assertIn(needle, str(caught.exception))
+        oracle = Config.sample(Path(tempfile.mkdtemp()))
+        oracle.db.backend = "oracle"
+        oracle.db.schema = "_FOO"
+        oracle.db.schemas = ["_FOO"]
+        with self.assertRaises(RuntimeError):
+            normalize_db_schemas(oracle.db, section="db")
+
+    def test_the_splice_class_stays_bounded_after_the_widening(self):
+        from pstb.queries import IDENT_RE
+        for bad in ("_x; DROP TABLE t", "foo bar", "a.b.c",
+                    "_" + "x" * 129, "`orders`", "2024_x"):
+            with self.subTest(bad=bad[:20]):
+                self.assertIsNone(IDENT_RE.match(bad))
+        self.assertIsNotNone(IDENT_RE.match("PS$TABLE"),
+                             "the non-leading class must keep $#")
+
+    def test_digit_leading_objects_get_one_counted_note(self):
+        db = _CollectorDb(tables=[
+            {"schema_name": "sales_mart", "object_name": "2024_x",
+             "object_type": "TABLE"},
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "object_type": "TABLE"},
+        ])
+        from pstb.metadata import build_catalog
+        import sqlite3
+        root = Path(tempfile.mkdtemp())
+        build_catalog(root / "c.db", [("warehouse", db)])
+        con = sqlite3.connect(root / "c.db")
+        con.row_factory = sqlite3.Row
+        notes = [r["note"] for r in con.execute(
+            "SELECT note FROM notes WHERE layer='identifier_grammar'")]
+        con.close()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("1 object(s)", notes[0])
+        self.assertIn("view-wrap", notes[0])
+
+    def test_a_clean_dataset_gets_no_grammar_note(self):
+        from pstb.metadata import build_catalog
+        import sqlite3
+        root = Path(tempfile.mkdtemp())
+        build_catalog(root / "c.db", [("warehouse", _CollectorDb())])
+        con = sqlite3.connect(root / "c.db")
+        rows = con.execute(
+            "SELECT COUNT(*) FROM notes WHERE layer='identifier_grammar'"
+        ).fetchone()
+        con.close()
+        self.assertEqual(rows[0], 0,
+                         "a zero-count note is ambient noise, forbidden")
+
+
+class SpendAccumulatorTests(unittest.TestCase):
+    """Actual bytes billed, per handle, across threads -- and the build
+    banner that prints them in both outcomes."""
+
+    def test_spend_accumulates_across_threads(self):
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            _bq_cfg(), rows=[(1, 2)])
+        with ctx:
+            results = []
+
+            def one():
+                db.query("SELECT a, b FROM t", {})
+                results.append(db.last_query_stats()["bytes_billed"])
+
+            threads = [threading.Thread(target=one) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(results, [12345, 12345],
+                         "last_query_stats must stay per-thread")
+        self.assertEqual(db.bytes_billed_total(), 24690)
+
+    def test_a_capture_without_a_job_adds_nothing(self):
+        db = Database(_bq_cfg())
+        before = db.bytes_billed_total()
+        db._capture_bq_stats(SimpleNamespace())    # no query_job
+        self.assertEqual(db.bytes_billed_total(), before)
+
+    def test_the_spend_line_speaks_only_for_bigquery(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "build_script",
+            Path(__file__).resolve().parents[1]
+            / "scripts" / "build_metadata_catalog.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        line = script._bq_spend_line(
+            SimpleNamespace(dialect="bigquery",
+                            bytes_billed_total=lambda: 500), 100)
+        self.assertIn("400", line)
+        self.assertIn("$", line)
+        # The anti-toothless pair: always-empty fails the assertions
+        # above; always-printing fails this one.
+        self.assertEqual(script._bq_spend_line(
+            SimpleNamespace(dialect="oracle"), 0), "")
