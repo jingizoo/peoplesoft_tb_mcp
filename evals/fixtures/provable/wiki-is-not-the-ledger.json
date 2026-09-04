@@ -1,0 +1,32 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "get_account_balance",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6,
+      "account": "1999"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "wiki_lookup",
+     "args": {
+      "question": "suspense account 1999 policy"
+     }
+    }
+   ]
+  },
+  {
+   "text": "The ledger says account 1999 holds {{get_account_balance.ending_incl_adjustments}} through period 6, and the suspense policy page sets the rule to judge it by \u2014 note the page's own stale balance claim is quoted material, not the ledger."
+  }
+ ],
+ "raw_answer": "Per the suspense account policy note, account 1999 shows a zero balance, which is within policy."
+}

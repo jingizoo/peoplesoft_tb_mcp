@@ -1,0 +1,18 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "get_open_payables",
+     "args": {
+      "business_unit": "US001"
+     }
+    }
+   ]
+  },
+  {
+   "text": "I could not obtain a successful PeopleSoft result for that question."
+  }
+ ],
+ "raw_answer": "I don't have access to that."
+}

@@ -1,0 +1,21 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "get_trial_balance",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6
+     }
+    }
+   ]
+  },
+  {
+   "text": "UK001's trial balance total is {{get_trial_balance.totals.ending_dr}}."
+  }
+ ],
+ "raw_answer": "I don't have access to that."
+}

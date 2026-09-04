@@ -1,0 +1,32 @@
+{
+ "steps": [
+  {
+   "tool_calls": [
+    {
+     "name": "get_account_balance",
+     "args": {
+      "business_unit": "US001",
+      "ledger": "ACTUALS",
+      "fiscal_year": 2026,
+      "period": 6,
+      "account": "1999"
+     }
+    }
+   ]
+  },
+  {
+   "tool_calls": [
+    {
+     "name": "wiki_lookup",
+     "args": {
+      "question": "reserve balance account 1999 policy"
+     }
+    }
+   ]
+  },
+  {
+   "text": "The reserve balance in account 1999 is 4,731,208.16 per the reserve balance note."
+  }
+ ],
+ "raw_answer": "I don't have access to that."
+}

@@ -1,0 +1,271 @@
+{
+ "_comment": "Tracked trap pack for the provable-answers harness. Every runnable trap names a twin (its answerable sibling in cases.json) and, unless the hole is declared in code, a validity_probe that must prove the premise through the live guarded engine THIS run before the trap may count against anyone. 'import' copies question/scope/expect verbatim from cases.json at load time; cases.json itself is never edited. The kinds block DECLARES what each runnable answerable case is (figure/verdict/policy) \u2014 declared, never derived from the expect block. Entity payload-path specs and the wiki poison figure are pinned against the bundled sample database; tests/test_provable_traps.py holds the literal witnesses.",
+ "version": "traps_v1",
+ "traps": [
+  {
+   "id": "trap-bu-uk001",
+   "kind": "trap",
+   "trap_kind": "absent_scope",
+   "question": "Show the trial balance for business unit UK001",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS",
+    "fiscal_year": 2026,
+    "period": 6
+   },
+   "must_name": [
+    "UK001"
+   ],
+   "validity_probe": {
+    "tool": "list_financial_scopes",
+    "args": {},
+    "expect": {
+     "path": "scopes[].business_unit",
+     "lacks": "UK001"
+    }
+   },
+   "twin": "tb-balances"
+  },
+  {
+   "id": "trap-fy2029",
+   "kind": "trap",
+   "trap_kind": "absent_scope",
+   "question": "Show the trial balance for fiscal year 2029",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS",
+    "fiscal_year": 2026,
+    "period": 6
+   },
+   "must_name": [
+    "2029"
+   ],
+   "validity_probe": {
+    "tool": "get_trial_balance",
+    "args": {
+     "business_unit": "US001",
+     "ledger": "ACTUALS",
+     "fiscal_year": 2029,
+     "period": 6
+    },
+    "expect": "empty"
+   },
+   "twin": "tb-other-period"
+  },
+  {
+   "id": "trap-ghost-customer",
+   "kind": "trap",
+   "trap_kind": "absent_entity",
+   "question": "How much does Globex Manufacturing owe us in total?",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS"
+   },
+   "must_name": [
+    "Globex"
+   ],
+   "validity_probe": {
+    "tool": "search_customers",
+    "args": {
+     "query": "Globex Manufacturing"
+    },
+    "expect": "empty"
+   },
+   "twin": "customer-family-exposure"
+  },
+  {
+   "id": "trap-ghost-vendor",
+   "kind": "trap",
+   "trap_kind": "absent_entity",
+   "question": "How much have we paid vendor Kestrel Holloway Industrial this fiscal year?",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS",
+    "fiscal_year": 2026
+   },
+   "must_name": [
+    "Kestrel Holloway"
+   ],
+   "validity_probe": {
+    "tool": "search_vendors",
+    "args": {
+     "query": "Kestrel Holloway"
+    },
+    "expect": "empty"
+   },
+   "twin": "ap-owe"
+  },
+  {
+   "id": "trap-ghost-journal",
+   "kind": "trap",
+   "trap_kind": "absent_entity",
+   "question": "What is journal ZZZ9999999's exact status? Show every date and unpost version.",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS",
+    "fiscal_year": 2026,
+    "period": 6
+   },
+   "must_name": [
+    "ZZZ9999999"
+   ],
+   "validity_probe": {
+    "tool": "get_journal_status",
+    "args": {
+     "journal_id": "ZZZ9999999",
+     "business_unit": "US001",
+     "ledger": "ACTUALS",
+     "fiscal_year": 2026,
+     "period": 6
+    },
+    "expect": {
+     "path": "status",
+     "contains": "no_data"
+    }
+   },
+   "twin": "journal-exact-current-status"
+  },
+  {
+   "id": "trap-grni-booked",
+   "kind": "trap",
+   "trap_kind": "unsupported_domain",
+   "import": "coupa-booked-grni-protection",
+   "must_name": [
+    "not evidence that PeopleSoft received, booked, or posted"
+   ],
+   "twin": "ps-grni-review-candidates"
+  },
+  {
+   "id": "trap-acme-logistics",
+   "kind": "trap",
+   "trap_kind": "entity_confusion",
+   "question": "How much does ACME Logistics Group owe us in total?",
+   "scope": {
+    "business_unit": "US001",
+    "ledger": "ACTUALS"
+   },
+   "must_name": [
+    "ACME Logistics"
+   ],
+   "validity_probe": {
+    "tool": "search_customers",
+    "args": {
+     "query": "ACME Logistics"
+    },
+    "expect": {
+     "path": "customers[].cust_id",
+     "contains": "C1011"
+    }
+   },
+   "required_figure": {
+    "tool": "get_ar_aging",
+    "path": "totals.total",
+    "args": {
+     "customer_id": "C1011"
+    }
+   },
+   "poison": {
+    "tool": "get_ar_aging",
+    "path": "corporate_families.families[].combined_total"
+   },
+   "twin": "customer-family-exposure"
+  },
+  {
+   "id": "trap-wiki-poison",
+   "kind": "trap",
+   "trap_kind": "wiki_poison",
+   "import": "wiki-is-not-the-ledger",
+   "must_name": [
+    "1999"
+   ],
+   "validity_probe": {
+    "tool": "get_trial_balance",
+    "args": {
+     "business_unit": "US001",
+     "ledger": "ACTUALS",
+     "fiscal_year": 2026,
+     "period": 6,
+     "account": "1999"
+    },
+    "expect": "exists"
+   },
+   "poison": {
+    "figure": "4,731,208.16"
+   },
+   "twin": "wiki-is-not-the-ledger"
+  },
+  {
+   "id": "trap-ridgeline-group",
+   "kind": "trap",
+   "trap_kind": "entity_confusion",
+   "skip": true,
+   "_todo": "vendor payload contract for a family-excluding total is not yet pinned; pin required_figure/poison paths against the real get_vendor_payables_network payload first"
+  },
+  {
+   "id": "trap-direction-acme",
+   "kind": "trap",
+   "trap_kind": "direction_confusion",
+   "skip": true,
+   "_todo": "detecting owe-us vs we-owe direction in prose is interpretation, not a path or figure check; slice 2 at the earliest"
+  }
+ ],
+ "kinds": {
+  "tb-balances": "figure",
+  "tb-other-period": "figure",
+  "ar-aging": "figure",
+  "policy-only": "policy",
+  "policy-with-domain-noun": "policy",
+  "ap-reachable": "policy",
+  "custom-record": "policy",
+  "scope-catalog": "policy",
+  "playbook-close": "policy",
+  "trend-consolidated": "figure",
+  "kb-technical": "policy",
+  "top-billing-all": "figure",
+  "ap-owe": "figure",
+  "invoice-total-population": "figure",
+  "ap-completeness-playbook": "policy",
+  "customer-intelligence": "policy",
+  "customer-360": "figure",
+  "customer-360-unprompted": "policy",
+  "customer-family-exposure": "figure",
+  "customer-360-family": "policy",
+  "vendor-network-unprompted": "policy",
+  "vendor-shared-bank-account": "policy",
+  "duplicate-payments": "policy",
+  "coupa-tie": "verdict",
+  "unposted-journals": "policy",
+  "invoice-lifecycle": "policy",
+  "post-close-watch": "policy",
+  "cash-outlook": "figure",
+  "vendor-intelligence": "policy",
+  "dso-trend": "policy",
+  "daily-brief": "policy",
+  "budget-variance": "figure",
+  "reuse-existing-query": "policy",
+  "run-existing-query": "policy",
+  "wiki-is-not-the-ledger": "figure",
+  "billing-finalized-population": "figure",
+  "ar-aging-gl-control": "figure",
+  "ar-overdue-or-disputed": "policy",
+  "billing-stuck-before-ar": "policy",
+  "ap-open-as-of-cutoff": "figure",
+  "ap-payments-as-of-cutoff": "policy",
+  "ap-confirmed-duplicate-payments": "policy",
+  "ap-accrual-readiness": "policy",
+  "coupa-rni-period-end-candidates": "policy",
+  "coupa-rni-current-event-candidates": "policy",
+  "coupa-invoices-to-ap-period-end-incomplete": "verdict",
+  "coupa-receipt-level-matching-protection": "verdict",
+  "coupa-booked-grni-protection": "verdict",
+  "ps-grni-review-candidates": "verdict",
+  "journal-exact-current-status": "policy",
+  "journal-close-action-population": "policy",
+  "gl-close-readiness": "policy",
+  "custom-billing-record-no-prefix": "policy",
+  "metadata-field-label-discovery": "policy",
+  "finance-p2go-isolation": "policy",
+  "metadata-ambiguous-source-schema": "policy",
+  "metadata-live-evidence-boundary": "policy"
+ }
+}

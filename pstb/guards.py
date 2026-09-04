@@ -3172,6 +3172,35 @@ def _is_number(text: str) -> bool:
         return False
 
 
+def substantive_figures(text: str, *, exclude=()) -> list:
+    """Every substantive figure a text states, with no payload judgment.
+
+    The same walk the number guard uses (_FIGURE minus _FIGURE_EXEMPT),
+    exposed so an eval harness counts figures with the runtime's own
+    definition instead of growing a second dialect that drifts. This
+    function never decides whether a figure is GROUNDED -- that stays
+    with ungrounded_figures and the guard; a measurement tool must not
+    quietly become a withholding rule. ``exclude`` drops figures whose
+    canonical form (_numeric_key) matches an entry -- e.g. figures a
+    refusal message itself quoted.
+    """
+    body = str(text or "")
+    exempt_spans = [m.span() for m in _FIGURE_EXEMPT.finditer(body)]
+    excluded = {_numeric_key(str(item)) for item in exclude}
+
+    def inside_exempt(span) -> bool:
+        return any(a <= span[0] and span[1] <= b for a, b in exempt_spans)
+
+    found: list = []
+    for match in _FIGURE.finditer(body):
+        if inside_exempt(match.span()):
+            continue
+        if _numeric_key(match.group(0)) in excluded:
+            continue
+        found.append(match.group(0))
+    return found
+
+
 def _labels_for(text: str, tagged: dict) -> set:
     """Sources that produced this figure, tolerating the same rounded
     restatement the withhold guard tolerates. Empty means the figure is not
