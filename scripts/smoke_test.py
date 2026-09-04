@@ -1485,6 +1485,18 @@ INSERT INTO BILLING_SUMMARY VALUES ('EAST', 1200.5), ('WEST', 900.25);""")
           "idc.textContent=" in _script
           and "idc.innerHTML" not in _script,
           "a network-derived identity is being written as HTML")
+    # The exception badge paints ATTENTION (unacked), never truth
+    # (pending), and a stale board is an honest question mark -- an
+    # absent one would read as "no exceptions".
+    check("the exception badge paints attention and admits staleness",
+          "d.unacked||0" in _script
+          and "data-exceptions-badge" in _html
+          and "treat as unknown" in _script,
+          "the exception badge, its unacked basis, or its honest-stale "
+          "state is gone")
+    check("the acknowledgment posts with its GUI request marker",
+          "'X-PSTB-Exceptions-Request':'exception-ack'" in _script,
+          "the ack request lost the CSRF marker the endpoint requires")
     check("the splash screen exists and cannot outlive the page",
           'id="splash"' in _html and "sp.remove()" in _script
           and "prefers-reduced-motion" in _html,

@@ -555,7 +555,11 @@ class EndpointTests(unittest.TestCase):
     def test_the_count_endpoint_degrades_never_errors(self):
         r = self.client.get("/api/exceptions/count")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json(), {"pending": 0, "readable": False})
+        # enabled: False is load-bearing -- an OFF-by-default install
+        # must get NO badge, not a permanent question mark.
+        self.assertEqual(r.json(),
+                         {"enabled": False, "pending": 0, "unacked": 0,
+                          "readable": False, "stale": True})
 
     def test_rows_are_narrowed_to_the_callers_units_on_the_way_out(self):
         """The store is shared; the reach is not. A restricted caller
@@ -1255,3 +1259,448 @@ class WatchTablesConfigTests(unittest.TestCase):
     def test_legal_lists_pass(self):
         self._validate([])
         self._validate(["PS_JRNL_LN", "SYSADM.PS_VOUCHER"])
+
+
+class AckStoreTests(unittest.TestCase):
+    """Attention state: bound to the exact state seen, dead on ANY
+    change, bounded by a read-time TTL, and structurally unable to
+    touch the truth surface (outcomes, history, events)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-ack-")
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        self.store = _store(self.root)
+        self.check = "tb_integrity:default:US001"
+        self.sched = [self.check]
+
+    def _tick(self, outcome, at):
+        return self.store.record_tick([outcome], self.sched, tick_at=at)
+
+    def _row(self, now="2026-09-04T10:30:00+00:00"):
+        feed = self.store.read_feed(now=now)
+        self.assertTrue(feed["readable"], feed.get("note"))
+        return feed["rows"][0]
+
+    def _ack(self, fp, at="2026-09-04T10:05:00+00:00"):
+        return self.store.record_ack(self.check, fp, "FIN_US001", at=at)
+
+    T0 = "2026-09-04T10:00:00+00:00"
+
+    def test_an_ack_binds_to_the_exact_state_seen(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        row = self._row()
+        from pstb.ticker import AckConflict
+        with self.assertRaises(AckConflict):
+            self._ack("0" * 16)
+        out = self._ack(row["state_fp"])
+        self.assertTrue(out["ok"])
+        after = self._row()
+        self.assertTrue(after["acked"])
+        self.assertEqual(after["acked_by"], "FIN_US001")
+
+    def test_any_change_expires_the_ack(self):
+        base = dict(status="exceptions_found", counts={"issues": 2})
+        variants = {
+            "count up": dict(base, counts={"issues": 3}),
+            "count down": dict(base, counts={"issues": 1}),
+            "status flip": dict(status="error", counts={"issues": 2},
+                                category="budget"),
+            "narrowed flip": dict(base, narrowed=True),
+            "period roll": dict(base, per=7),
+            "category flip": dict(status="error", counts={"issues": 2},
+                                  category="wall_clock"),
+        }
+        for label, kwargs in variants.items():
+            with self.subTest(label=label):
+                store = TickerStore(
+                    Path(self.root) / f"{label.replace(' ', '-')}.db",
+                    source="default", fingerprint=FINGERPRINT,
+                    limits=_limits())
+                first = _outcome(status="error", counts={"issues": 2},
+                                 category="budget") \
+                    if label == "category flip" \
+                    else _outcome(**base)
+                store.record_tick([first], self.sched, tick_at=self.T0)
+                feed = store.read_feed(now="2026-09-04T10:30:00+00:00")
+                fp = feed["rows"][0]["state_fp"]
+                store.record_ack(self.check, fp, "FIN_US001",
+                                 at="2026-09-04T10:05:00+00:00")
+                store.record_tick([_outcome(**kwargs)], self.sched,
+                                  tick_at="2026-09-04T10:10:00+00:00")
+                row = store.read_feed(
+                    now="2026-09-04T10:30:00+00:00")["rows"][0]
+                self.assertFalse(row["acked"], label)
+
+    def test_an_identical_rerun_keeps_the_ack(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        self._ack(self._row()["state_fp"])
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}),
+                   "2026-09-04T10:10:00+00:00")
+        row = self._row()
+        self.assertTrue(row["acked"],
+                        "an unchanged state re-demanded attention")
+
+    def test_an_error_sandwich_does_not_resurrect_the_ack(self):
+        """A -> B -> A: the fingerprint matches again but last_changed
+        moved twice, so the epoch clause kills the ack deterministically
+        -- no dependence on GC timing or ack traffic elsewhere."""
+        a = _outcome(status="exceptions_found", counts={"issues": 51})
+        self._tick(a, self.T0)
+        self._ack(self._row()["state_fp"])
+        self._tick(_outcome(status="error", counts={"issues": 51},
+                            category="budget"),
+                   "2026-09-04T10:10:00+00:00")
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 51}),
+                   "2026-09-04T10:20:00+00:00")
+        row = self._row()
+        self.assertFalse(row["acked"],
+                         "the sandwich resurrected a dead ack")
+
+    def test_the_ttl_is_a_read_time_backstop(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        self._ack(self._row()["state_fp"], at="2026-09-04T10:05:00+00:00")
+        live = self.store.read_feed(
+            now="2026-09-05T09:00:00+00:00")["rows"][0]
+        self.assertTrue(live["acked"], "within the window")
+        expired = self.store.read_feed(
+            now="2026-09-05T11:00:00+00:00")["rows"][0]
+        self.assertFalse(expired["acked"],
+                         "a 25h-old ack outlived the 24h backstop")
+
+    def test_bad_timestamps_fail_toward_attention(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        fp = self._row()["state_fp"]
+        for label, at in (("unparseable", "not-a-time"),
+                          ("future", "2026-09-04T12:00:00+00:00")):
+            with self.subTest(label=label):
+                self.store.record_ack(self.check, fp, "FIN_US001", at=at)
+                row = self.store.read_feed(
+                    now="2026-09-04T10:30:00+00:00")["rows"][0]
+                self.assertFalse(row["acked"], label)
+
+    def test_the_truth_surface_is_byte_identical_across_acks(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        fp = self._row()["state_fp"]
+
+        def truth():
+            con = sqlite3.connect(self.store.path)
+            try:
+                return [con.execute(
+                    f"SELECT * FROM {t} ORDER BY 1, 2").fetchall()
+                    for t in ("outcomes", "history", "events")]
+            finally:
+                con.close()
+
+        before = truth()
+        self._ack(fp)
+        self.assertEqual(truth(), before,
+                         "an acknowledgment wrote into the truth tables")
+
+    def test_events_are_identical_with_and_without_acks(self):
+        """The differ cannot know acks exist: the same change sequence
+        emits the same events either way (the property, not the import
+        graph)."""
+        twin = TickerStore(Path(self.root) / "twin.db", source="default",
+                           fingerprint=FINGERPRINT, limits=_limits())
+        seq = [
+            (dict(status="exceptions_found", counts={"issues": 2}),
+             self.T0),
+            (dict(status="exceptions_found", counts={"issues": 5}),
+             "2026-09-04T10:10:00+00:00"),
+            (dict(status="passed"), "2026-09-04T10:20:00+00:00"),
+        ]
+
+        def keyed(events):
+            return [(e["check_id"], e["kind"], e["metric"],
+                     e["before_n"], e["after_n"]) for e in events]
+
+        acked_stream, plain_stream = [], []
+        for n, (spec, at) in enumerate(seq):
+            acked_stream.extend(keyed(self.store.record_tick(
+                [_outcome(**spec)], self.sched, tick_at=at)))
+            if n == 0:
+                self._ack(self._row()["state_fp"])
+            plain_stream.extend(keyed(twin.record_tick(
+                [_outcome(**spec)], self.sched, tick_at=at)))
+        self.assertEqual(acked_stream, plain_stream)
+
+    def test_a_pre_ack_store_reads_and_first_ack_creates_the_table(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        con = sqlite3.connect(self.store.path)
+        con.execute("DROP TABLE acks")     # a store from before acks
+        con.commit()
+        con.close()
+        row = self._row()
+        self.assertFalse(row["acked"])
+        self.assertIn("state_fp", row)
+        out = self._ack(row["state_fp"])
+        self.assertTrue(out["ok"])
+        self.assertTrue(self._row()["acked"])
+        con = sqlite3.connect(self.store.path)
+        meta = dict(con.execute("SELECT key, value FROM meta"))
+        con.close()
+        self.assertEqual(meta["schema_version"], "1",
+                         "acks must not bump the schema version")
+        self.assertEqual(
+            [p.name for p in self.root.glob("*.superseded-*")], [],
+            "the first ack archived a healthy store")
+
+    def test_a_malformed_ack_row_fails_toward_attention(self):
+        """Contrast the outcomes table, where one malformed row fails
+        the whole read closed: a tampered ACK only loses its silence."""
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        con = sqlite3.connect(self.store.path)
+        con.execute("INSERT INTO acks VALUES (?,?,?,?,?)",
+                    (self.check, "0" * 16, "x",
+                     "JANE'S NOTE about voucher 123",
+                     "2026-09-04T10:05:00+00:00"))
+        con.commit()
+        con.close()
+        feed = self.store.read_feed(now="2026-09-04T10:30:00+00:00")
+        self.assertTrue(feed["readable"])
+        self.assertFalse(feed["rows"][0]["acked"])
+
+    def test_an_endpoint_change_takes_the_acks_with_it(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        self._ack(self._row()["state_fp"])
+        moved = TickerStore(self.store.path, source="default",
+                            fingerprint="sha256:" + "f" * 64,
+                            limits=_limits())
+        moved.record_tick([_outcome(status="exceptions_found",
+                                    counts={"issues": 2})],
+                          self.sched,
+                          tick_at="2026-09-04T10:40:00+00:00")
+        row = moved.read_feed(now="2026-09-04T10:50:00+00:00")["rows"][0]
+        self.assertFalse(row["acked"],
+                         "an ack survived a baseline archive")
+
+    def test_record_ack_refuses_mismatch_and_absence_without_writing(self):
+        foreign = TickerStore(Path(self.root) / "none.db",
+                              source="default", fingerprint=FINGERPRINT,
+                              limits=_limits())
+        with self.assertRaises(TickerError):
+            foreign.record_ack(self.check, "0" * 16, "FIN_US001")
+        self.assertFalse((Path(self.root) / "none.db").exists(),
+                         "an ack against nothing created a husk")
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        wrong = TickerStore(self.store.path, source="default",
+                            fingerprint="sha256:" + "f" * 64,
+                            limits=_limits())
+        with self.assertRaises(TickerError):
+            wrong.record_ack(self.check, self._row()["state_fp"],
+                             "FIN_US001")
+        self.assertEqual(
+            [p.name for p in self.root.glob("*.superseded-*")], [],
+            "record_ack archived; only record_tick may")
+
+    def test_shape_refusals_and_the_retired_row(self):
+        self._tick(_outcome(status="exceptions_found",
+                            counts={"issues": 2}), self.T0)
+        fp = self._row()["state_fp"]
+        for label, args in (
+                ("bad check id", ("NOT A CHECK!", fp, "FIN_US001")),
+                ("bad fingerprint", (self.check, "xyz", "FIN_US001")),
+                ("free-text by", (self.check, fp, "jane doe wrote this")),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(TickerError):
+                    self.store.record_ack(*args)
+        self.store.record_tick([], [],
+                               tick_at="2026-09-04T10:10:00+00:00")
+        with self.assertRaises(TickerError):
+            self.store.record_ack(self.check, fp, "FIN_US001")
+
+
+class AckEndpointTests(unittest.TestCase):
+    """POST /api/exceptions/ack through the app: operator-gated,
+    CSRF-checked, conflict-honest, and structurally unable to hide a
+    row or move `pending`."""
+
+    HEADERS = {"Content-Type": "application/json",
+               "X-PSTB-Exceptions-Request": "exception-ack"}
+
+    def setUp(self):
+        import pstb.gui.app as gui
+        self.gui = gui
+        self.client = TestClient(gui.app, client=("127.0.0.1", 5555),
+                                 base_url="http://localhost")
+
+    def _live_store(self, root):
+        from pstb.metadata import source_fingerprint
+        with patch.object(self.gui.cfg, "root", root):
+            fingerprint = source_fingerprint(self.gui.cfg, "default")
+        return TickerStore(store_path(root, "default"),
+                           source="default", fingerprint=fingerprint,
+                           limits=_limits())
+
+    def _post(self, body, headers=None, client=None):
+        return (client or self.client).post(
+            "/api/exceptions/ack", json=body,
+            headers=dict(self.HEADERS, **(headers or {})))
+
+    def test_the_operator_gate_holds_remotely(self):
+        """A colleague the TOKEN admits still cannot quiet the board:
+        acknowledging is an operator act, and without the operator key
+        there is no remote path to it."""
+        from pstb.gui import localguard
+        from pstb.gui.localguard import Policy
+        remote = TestClient(self.gui.app, client=("10.4.1.9", 5555),
+                            base_url="http://localhost")
+        with patch.object(localguard, "POLICY",
+                          Policy(hosts=None, token="tkn", shared=True)):
+            r = self._post({"check_id": "x", "state_fp": "0" * 16},
+                           headers={"Authorization": "Bearer tkn"},
+                           client=remote)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("machine-local", r.json()["detail"])
+
+    def test_the_gui_marker_is_required(self):
+        r = self.client.post("/api/exceptions/ack",
+                             json={"check_id": "x"},
+                             headers={"Content-Type": "application/json"})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("marker", r.json()["detail"])
+
+    def test_a_foreign_origin_is_refused_and_an_absent_one_is_not(self):
+        r = self._post({"check_id": "x", "state_fp": "0" * 16},
+                       headers={"Origin": "http://evil.example"})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("origin", r.json()["detail"].lower())
+        # Absent Origin passes CSRF and reaches the ticker-off refusal:
+        # curl and same-origin GETs carry none, and the marker header
+        # already forces a preflighted request.
+        r = self._post({"check_id": "x", "state_fp": "0" * 16})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("ticker is off", r.json()["detail"])
+
+    def test_non_json_content_is_415(self):
+        r = self.client.post("/api/exceptions/ack", content="check_id=x",
+                             headers={"Content-Type": "text/plain",
+                                      "X-PSTB-Exceptions-Request":
+                                          "exception-ack"})
+        self.assertEqual(r.status_code, 415)
+        self.assertIn("exception acknowledgments", r.json()["error"])
+
+    def test_an_oversize_body_is_413(self):
+        r = self.client.post(
+            "/api/exceptions/ack", content=b"{" + b" " * 9000 + b"}",
+            headers={"Content-Type": "application/json",
+                     "X-PSTB-Exceptions-Request": "exception-ack"})
+        self.assertEqual(r.status_code, 413)
+
+    def test_an_unknown_source_is_404(self):
+        registry = SimpleNamespace(
+            names=lambda: ["default", "p2go"],
+            resolve_name=lambda s="": (s or "default"))
+        with patch.object(self.gui.engine, "registry", registry):
+            r = self._post({"source": "nosuch", "check_id": "x",
+                            "state_fp": "0" * 16})
+        self.assertEqual(r.status_code, 404)
+
+    def test_a_stale_feed_refuses_the_ack_but_not_the_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._live_store(root)
+            store.record_tick(
+                [_outcome(status="exceptions_found",
+                          counts={"issues": 1})],
+                ["tb_integrity:default:US001"],
+                tick_at="2026-08-01T10:00:00+00:00")   # long past
+            with patch.object(self.gui.cfg.ticker, "enabled", True), \
+                    patch.object(self.gui.cfg, "root", root):
+                fp = self.client.get(
+                    "/api/exceptions").json()["rows"][0]["state_fp"]
+                r = self._post(
+                    {"check_id": "tb_integrity:default:US001",
+                     "state_fp": fp})
+                self.assertEqual(r.status_code, 409)
+                self.assertIn("fresh", r.json()["detail"])
+                cleared = self._post(
+                    {"check_id": "tb_integrity:default:US001",
+                     "clear": True})
+                self.assertEqual(cleared.status_code, 200,
+                                 "removing attention must work from a "
+                                 "stale board")
+
+    def test_the_full_round_trip_over_http(self):
+        """The toothless-no-op probe, end to end with exactly the
+        headers the GUI sends: count lights, ack drops unacked (never
+        pending), rows are decorated but never filtered, a changed
+        state re-lights, and unack restores attention."""
+        from pstb.ticker import _utcnow
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._live_store(root)
+            check = "tb_integrity:default:US001"
+            store.record_tick(
+                [_outcome(status="exceptions_found",
+                          counts={"issues": 2})],
+                [check], tick_at=_utcnow())
+            with patch.object(self.gui.cfg.ticker, "enabled", True), \
+                    patch.object(self.gui.cfg, "root", root):
+                count = self.client.get("/api/exceptions/count").json()
+                self.assertEqual(count, {
+                    "enabled": True, "pending": 1, "unacked": 1,
+                    "readable": True, "stale": False})
+                feed = self.client.get("/api/exceptions").json()
+                row = feed["rows"][0]
+                self.assertFalse(row["acked"])
+                self.assertRegex(row["state_fp"], r"^[0-9a-f]{16}$")
+
+                wrong = self._post({"check_id": check,
+                                    "state_fp": "0" * 16})
+                self.assertEqual(wrong.status_code, 409)
+
+                acked = self._post({"check_id": check,
+                                    "state_fp": row["state_fp"]})
+                self.assertEqual(acked.status_code, 200, acked.text)
+                # No OPRID cookie on this box: provenance falls back to
+                # a closed-shape literal, never a blank.
+                self.assertEqual(acked.json()["acked_by"], "operator")
+
+                count = self.client.get("/api/exceptions/count").json()
+                self.assertEqual((count["pending"], count["unacked"]),
+                                 (1, 0),
+                                 "the ack moved pending or missed "
+                                 "unacked")
+                after = self.client.get("/api/exceptions").json()
+                self.assertEqual(
+                    [r_["check_id"] for r_ in after["rows"]],
+                    [r_["check_id"] for r_ in feed["rows"]],
+                    "an acknowledged row was filtered from the feed")
+                self.assertTrue(after["rows"][0]["acked"])
+
+                store.record_tick(
+                    [_outcome(status="exceptions_found",
+                              counts={"issues": 7})],
+                    [check], tick_at=_utcnow())
+                count = self.client.get("/api/exceptions/count").json()
+                self.assertEqual(count["unacked"], 1,
+                                 "a worsened check stayed quiet")
+
+                fresh_fp = self.client.get(
+                    "/api/exceptions").json()["rows"][0]["state_fp"]
+                self._post({"check_id": check, "state_fp": fresh_fp})
+                self.assertEqual(self.client.get(
+                    "/api/exceptions/count").json()["unacked"], 0)
+                unacked = self._post({"check_id": check, "clear": True})
+                self.assertEqual(unacked.status_code, 200)
+                self.assertEqual(self.client.get(
+                    "/api/exceptions/count").json()["unacked"], 1,
+                    "unack failed to restore attention")
+
+    def test_disabled_is_409_with_the_remedy(self):
+        r = self._post({"check_id": "x", "state_fp": "0" * 16})
+        self.assertEqual(r.status_code, 409)

@@ -100,10 +100,38 @@ _CHECK_ID = re.compile(r"^[a-z0-9_]{1,40}(?::[A-Za-z0-9_.\-]{1,60}){0,5}$")
 _METRIC = re.compile(r"^[a-z0-9_]{1,64}$")
 _BU = re.compile(r"^[A-Za-z0-9_\-]{0,30}$")
 _MAX_COUNT = 10 ** 12
+_STATE_FP = re.compile(r"^[0-9a-f]{16}$")
+_ACKED_BY = re.compile(r"^[A-Za-z0-9_\-.@]{1,64}$")
+# The ack basis mirrors the differ's change predicate (status, counts,
+# narrowed) PLUS its two re-baseline triggers (fiscal_year/period roll,
+# scope flip) PLUS error_category -- deliberately stricter than the
+# differ: an ack given to error(tool_error) must not silence
+# error(credentials), the product's named terminal condition.
+_STATE_FP_FIELDS = ("status", "counts", "narrowed", "fiscal_year",
+                    "period", "error_category")
+
+
+def state_fingerprint(row) -> str:
+    """A short stable hash of exactly the state an operator saw.
+
+    Any change an operator should re-see -- worsen, improve, status
+    flip, scope flip, period roll, category flip -- moves this value,
+    so a stored ack bound to it can never survive the change. Counts
+    must already be a dict (the read_feed row shape)."""
+    basis = {k: row[k] for k in _STATE_FP_FIELDS}
+    basis["narrowed"] = bool(basis["narrowed"])
+    return hashlib.sha256(
+        json.dumps(basis, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
 class TickerError(RuntimeError):
     """A ticker rule was violated; the message names the remedy."""
+
+
+class AckConflict(TickerError):
+    """The check changed between rendering and acknowledging. The
+    endpoint maps this to 409: an ack may only apply to a state the
+    operator's browser actually showed them."""
 
 
 def _utcnow() -> str:
@@ -132,6 +160,10 @@ class TickerLimits:
     history_per_check: int = 200
     events_kept: int = 500
     failure_trip: int = 3
+    # The read-time backstop on acknowledgments: the one change a state
+    # hash cannot see is one the reducers cannot represent (a saturated
+    # count worsening past its cap), so no ack outlives this window.
+    ack_ttl_hours: int = 24
 
     _BOUNDS = {
         "cadence_minutes": (5, 24 * 60),
@@ -140,6 +172,7 @@ class TickerLimits:
         "history_per_check": (10, 2000),
         "events_kept": (50, 5000),
         "failure_trip": (1, 10),
+        "ack_ttl_hours": (1, 168),
     }
 
     @classmethod
@@ -335,7 +368,23 @@ def store_path(root: Path, source: str) -> Path:
     return Path(root) / "ticker" / f"{slug or 'default'}-{digest}.db"
 
 
-_DDL = """
+# Attention state, not a ledger: one row per check, replaced on re-ack,
+# archived with the baselines (same file on purpose -- a surviving
+# sidecar would resurrect suppression across a schema or endpoint
+# reset). IF NOT EXISTS because an old store meets this table for the
+# first time on its first ack write, without any version bump: acks
+# never feed the differ, so they cannot corrupt a baseline comparison.
+_ACKS_DDL = """
+CREATE TABLE IF NOT EXISTS acks (
+  check_id    TEXT PRIMARY KEY,
+  state_fp    TEXT NOT NULL,
+  state_epoch TEXT NOT NULL,
+  acked_by    TEXT NOT NULL,
+  acked_at    TEXT NOT NULL
+);
+"""
+
+_DDL = _ACKS_DDL + """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE outcomes (
   check_id TEXT PRIMARY KEY,
@@ -644,6 +693,110 @@ class TickerStore:
             "(SELECT event_id FROM events ORDER BY at DESC, event_id "
             "LIMIT ?)", (self.limits.events_kept,))
 
+    # -- acknowledging -----------------------------------------------------
+    def record_ack(self, check_id: str, state_fp: str, by: str, *,
+                   clear: bool = False, at: str = "") -> dict:
+        """One attention bit per check, bound to the exact state seen.
+
+        The write path is deliberately weaker than record_tick's: it
+        opens mode=rw (cannot create a file -- an ack against a
+        never-ticked store must not leave a metaless husk), and on a
+        meta mismatch it REFUSES rather than archives (only record_tick
+        may archive; the reader doctrine, extended to this writer).
+        A clear needs no fingerprint: removing attention always fails
+        toward attention.
+        """
+        if not _CHECK_ID.fullmatch(str(check_id or "")):
+            raise TickerError(f"invalid check id {check_id!r}")
+        if not _ACKED_BY.fullmatch(str(by or "")):
+            raise TickerError(
+                "acked_by must be 1-64 characters of letters, digits, "
+                "_-.@ -- provenance is a closed shape, never free text")
+        if not clear and not _STATE_FP.fullmatch(str(state_fp or "")):
+            raise TickerError("state_fp must be 16 lowercase hex digits "
+                              "from the feed row being acknowledged")
+        with self._lock:
+            handle = self._flock()
+            try:
+                return self._record_ack_locked(str(check_id),
+                                               str(state_fp), str(by),
+                                               clear=clear, at=at)
+            finally:
+                handle.close()
+
+    def _record_ack_locked(self, check_id, state_fp, by, *, clear, at):
+        if not self.path.exists():
+            raise TickerError(
+                "no ticks have been recorded yet; nothing to acknowledge")
+        try:
+            con = sqlite3.connect(f"file:{self.path}?mode=rw", uri=True)
+        except sqlite3.Error as exc:
+            raise TickerError(
+                f"the ticker store could not be opened for an "
+                f"acknowledgment ({exc})") from exc
+        con.row_factory = sqlite3.Row
+        try:
+            meta = {row["key"]: row["value"]
+                    for row in con.execute("SELECT key, value FROM meta")}
+            if (meta.get("schema_version") != str(SCHEMA_VERSION)
+                    or meta.get("source") != self.source
+                    or meta.get("source_fingerprint") != self.fingerprint):
+                raise TickerError(
+                    "these baselines belong to a different endpoint or "
+                    "schema version; the next tick will archive and "
+                    "reset them -- nothing was acknowledged")
+            con.executescript(_ACKS_DDL)
+            if clear:
+                con.execute("DELETE FROM acks WHERE check_id=?",
+                            (check_id,))
+                con.commit()
+                return {"ok": True, "check_id": check_id,
+                        "cleared": True}
+            row = con.execute(
+                "SELECT * FROM outcomes WHERE check_id=?",
+                (check_id,)).fetchone()
+            if row is None or row["retired"]:
+                raise TickerError(
+                    f"{check_id} is not a standing check; only current "
+                    "outcomes can be acknowledged")
+            try:
+                counts = json.loads(row["counts"])
+            except ValueError as exc:
+                raise TickerError(
+                    "the outcome row failed validation; nothing was "
+                    "acknowledged") from exc
+            current_fp = state_fingerprint({
+                "status": row["status"],
+                "counts": counts,
+                "narrowed": row["narrowed"],
+                "fiscal_year": row["fiscal_year"],
+                "period": row["period"],
+                "error_category": row["error_category"],
+            })
+            if current_fp != state_fp:
+                raise AckConflict(
+                    f"{check_id} changed since that state was rendered; "
+                    "re-read the feed and acknowledge what it shows now")
+            acked_at = str(at) or _utcnow()
+            con.execute(
+                "INSERT INTO acks VALUES (?,?,?,?,?) "
+                "ON CONFLICT(check_id) DO UPDATE SET "
+                "state_fp=excluded.state_fp, "
+                "state_epoch=excluded.state_epoch, "
+                "acked_by=excluded.acked_by, acked_at=excluded.acked_at",
+                (check_id, current_fp, row["last_changed"], by, acked_at))
+            # Housekeeping: an ack whose check left the outcomes table
+            # entirely is noise with nothing to silence.
+            con.execute("DELETE FROM acks WHERE check_id NOT IN "
+                        "(SELECT check_id FROM outcomes)")
+            con.commit()
+            return {"ok": True, "check_id": check_id,
+                    "state_fp": current_fp, "acked_by": by,
+                    "acked_at": acked_at,
+                    "expires_by": self.limits.ack_ttl_hours}
+        finally:
+            con.close()
+
     # -- reading -----------------------------------------------------------
     def read_feed(self, *, now: str = "") -> dict:
         """Everything the /api/exceptions envelope needs, revalidated.
@@ -701,6 +854,17 @@ class TickerStore:
             raw = con.execute(
                 "SELECT value FROM meta WHERE key='last_tick'").fetchone()
             last_tick = json.loads(raw["value"]) if raw else None
+            # Attention state fails toward attention, never toward
+            # unreadable: a store from before acks existed has no table
+            # (OperationalError -> nothing is acked), and a malformed
+            # ack row simply is not live. Contrast the outcomes rows
+            # above, where one malformed row fails the whole read.
+            acks = {}
+            try:
+                acks = {row["check_id"]: dict(row)
+                        for row in con.execute("SELECT * FROM acks")}
+            except sqlite3.OperationalError:
+                acks = {}
         except (TickerError, ValueError, sqlite3.Error) as exc:
             return {"readable": False, "rows": [], "events": [],
                     "last_tick": None, "stale": True, "age_seconds": None,
@@ -709,6 +873,30 @@ class TickerStore:
                             "is being shown rather than partial state"}
         finally:
             con.close()
+        for row in rows:
+            fp = state_fingerprint(row)
+            row["state_fp"] = fp
+            ack = acks.get(row["check_id"])
+            live = False
+            if ack and not row["retired"]:
+                acked_at = _parse_ts(ack.get("acked_at"))
+                # Unparseable or FUTURE acked_at reads as expired (the
+                # clock-skew doctrine below, applied to acks), and the
+                # TTL is read-time arithmetic: nothing stored decays,
+                # nothing scheduled can be down.
+                age = ((current - acked_at).total_seconds()
+                       if acked_at is not None and current is not None
+                       else -1)
+                live = (0 <= age <= self.limits.ack_ttl_hours * 3600
+                        and str(ack.get("state_fp") or "") == fp
+                        and str(ack.get("state_epoch") or "")
+                        == str(row["last_changed"])
+                        and _ACKED_BY.fullmatch(
+                            str(ack.get("acked_by") or "")) is not None)
+            row["acked"] = live
+            if live:
+                row["acked_by"] = ack["acked_by"]
+                row["acked_at"] = ack["acked_at"]
         tick_at = _parse_ts((last_tick or {}).get("at"))
         # Staleness fails CLOSED: no tick, or a timestamp that will not
         # parse, is stale -- an old result presented as current is this

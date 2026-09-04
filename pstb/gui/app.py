@@ -356,6 +356,7 @@ app = FastAPI(title="PeopleSoft Trial Balance", docs_url=None,
 
 _PROTECTED_WRITE_PATHS = frozenset({
     "/api/feedback", "/api/question-review", "/api/approvals/decide",
+    "/api/exceptions/ack",
     localguard.SIGNIN_PATH,
 })
 _PROTECTED_WRITE_MAX_BYTES = 8 * 1024
@@ -401,14 +402,18 @@ async def _access_guard(request, call_next):
             )
             localguard.apply_security_headers(response.headers)
             return response
-        if request.url.path == "/api/approvals/decide":
+        if request.url.path in ("/api/approvals/decide",
+                                "/api/exceptions/ack"):
             content_type = str(
                 request.headers.get("content-type") or "").split(
                     ";", 1)[0].strip().lower()
             if content_type != "application/json":
+                label = ("approval decisions"
+                         if request.url.path == "/api/approvals/decide"
+                         else "exception acknowledgments")
                 response = JSONResponse(
                     status_code=415,
-                    content={"error": "approval decisions require "
+                    content={"error": f"{label} require "
                                       "application/json"},
                 )
                 localguard.apply_security_headers(response.headers)
@@ -2474,6 +2479,33 @@ def _stop_ticker() -> None:
         runner.stop()
 
 
+def _ticker_store_for(canonical: str):
+    """The feed's and the ack's ONE way to open a store: same path,
+    same fingerprint, same limits. Two constructions would eventually
+    disagree about which file an acknowledgment lands in."""
+    from ..metadata import source_fingerprint
+    from ..ticker import TickerLimits, TickerStore, store_path
+    limits = TickerLimits.from_config(getattr(cfg, "ticker", None))
+    return limits, TickerStore(
+        store_path(Path(getattr(cfg, "root", ".")), canonical),
+        source=canonical,
+        fingerprint=source_fingerprint(cfg, canonical),
+        limits=limits)
+
+
+def _resolve_ticker_source(source: str) -> str:
+    canonical = (engine.registry.resolve_name(source)
+                 if engine.registry is not None else "default")
+    known = (list(engine.registry.names())
+             if engine.registry is not None else ["default"])
+    if canonical not in known:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown source {source!r}; choose one of "
+                   f"{', '.join(known)}")
+    return canonical
+
+
 @app.get("/api/exceptions")
 def exceptions_feed(request: Request, response: Response,
                     source: str = "default"):
@@ -2485,17 +2517,8 @@ def exceptions_feed(request: Request, response: Response,
     to the caller's grants on the way out.
     """
     response.headers["Cache-Control"] = "no-store, private"
-    canonical = (engine.registry.resolve_name(source)
-                 if engine.registry is not None else "default")
-    known = (list(engine.registry.names())
-             if engine.registry is not None else ["default"])
-    if canonical not in known:
-        raise HTTPException(
-            status_code=404,
-            detail=f"unknown source {source!r}; choose one of "
-                   f"{', '.join(known)}")
-    from ..metadata import source_fingerprint
-    from ..ticker import TickerError, TickerLimits, TickerStore, store_path
+    canonical = _resolve_ticker_source(source)
+    from ..ticker import TickerError
     ticker_cfg = getattr(cfg, "ticker", None)
     enabled = getattr(ticker_cfg, "enabled", False) is True
     envelope = {
@@ -2516,12 +2539,7 @@ def exceptions_feed(request: Request, response: Response,
                             "continuous checks on")
         return envelope
     try:
-        limits = TickerLimits.from_config(ticker_cfg)
-        store = TickerStore(
-            store_path(Path(getattr(cfg, "root", ".")), canonical),
-            source=canonical,
-            fingerprint=source_fingerprint(cfg, canonical),
-            limits=limits)
+        limits, store = _ticker_store_for(canonical)
         feed = store.read_feed()
     except TickerError as exc:
         envelope.update({"readable": False,
@@ -2561,22 +2579,101 @@ def exceptions_feed(request: Request, response: Response,
 
 @app.get("/api/exceptions/count")
 def exceptions_count(request: Request, response: Response):
-    """A NUMBER for the badge, never the content. Degrades to zero:
-    an affordance that errors is worse than one that hides."""
+    """Numbers for the badge, never the content. Degrades to zero:
+    an affordance that errors is worse than one that hides.
+
+    pending is the truth surface no click can move; unacked is what the
+    badge paints. enabled lets the page distinguish "off by default"
+    (no badge at all) from "on but stale" (an honest question mark).
+    """
     response.headers["Cache-Control"] = "no-store, private"
+    dark = {"enabled": False, "pending": 0, "unacked": 0,
+            "readable": False, "stale": True}
     try:
         body = exceptions_feed(request, response)
+        enabled = bool(body.get("enabled"))
+        if not enabled:
+            return dark
         if not body.get("readable") or body.get("stale"):
-            return {"pending": 0, "readable": False}
+            return {"enabled": True, "pending": 0, "unacked": 0,
+                    "readable": False, "stale": True}
         # not_run counts too: a check the budget starved did NOT verify
         # anything, and a starved check must never make the dot greener.
-        pending = sum(1 for row in body.get("rows", [])
-                      if not row.get("retired") and row.get("status") in
-                      ("exceptions_found", "checks_incomplete",
-                       "refused", "error", "not_run"))
-        return {"pending": pending, "readable": True}
+        nongreen = [row for row in body.get("rows", [])
+                    if not row.get("retired") and row.get("status") in
+                    ("exceptions_found", "checks_incomplete",
+                     "refused", "error", "not_run")]
+        return {"enabled": True, "pending": len(nongreen),
+                "unacked": sum(1 for row in nongreen
+                               if not row.get("acked")),
+                "readable": True, "stale": False}
     except Exception:                             # noqa: BLE001
-        return {"pending": 0, "readable": False}
+        return dark
+
+
+@app.post("/api/exceptions/ack")
+def exceptions_ack(payload: dict, request: Request, response: Response):
+    """Acknowledge one check in exactly the state the feed rendered.
+
+    Attention state, not a decision: the row stays in the feed (dimmed,
+    never hidden), pending never moves, and the ack dies the moment the
+    check changes in any way. The gate is the operator gate (loopback,
+    or the operator key behind a balancer) because quieting a shared
+    surface is an operator act; CSRF checks mirror the approval form's,
+    with the Origin check conditional on the header being present.
+    """
+    response.headers["Cache-Control"] = "no-store, private"
+    _require_question_log_operator(request)
+    if request.headers.get("x-pstb-exceptions-request") != "exception-ack":
+        raise HTTPException(
+            status_code=403,
+            detail="the acknowledgment is missing the GUI request marker")
+    origin = str(request.headers.get("origin") or "").strip()
+    if origin:
+        host = str(request.headers.get("host") or "").strip()
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            parsed = None
+        if (parsed is None or parsed.scheme not in ("http", "https")
+                or not parsed.netloc
+                or parsed.netloc.casefold() != host.casefold()):
+            raise HTTPException(
+                status_code=403,
+                detail="acknowledgments require the same browser origin")
+    from ..ticker import AckConflict, TickerError
+    canonical = _resolve_ticker_source(
+        str(payload.get("source") or "default"))
+    if getattr(getattr(cfg, "ticker", None), "enabled", False) is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="the ticker is off; there is nothing to acknowledge")
+    if _TICKER_CONFIG_ERROR:
+        raise HTTPException(
+            status_code=409,
+            detail=f"the ticker is not running: {_TICKER_CONFIG_ERROR}")
+    clear = payload.get("clear") is True
+    try:
+        _, store = _ticker_store_for(canonical)
+        if not clear:
+            # An ack may only apply to a state a FRESH feed showed.
+            # A clear skips this: removing attention always fails
+            # toward attention, even from a stale board.
+            feed = store.read_feed()
+            if not feed.get("readable") or feed.get("stale"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="the feed is stale or unreadable; "
+                           "acknowledge only what a fresh feed shows")
+        who = resolve_operator(request) or "operator"
+        return store.record_ack(
+            str(payload.get("check_id") or ""),
+            str(payload.get("state_fp") or ""),
+            who, clear=clear)
+    except AckConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TickerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/question-report")
