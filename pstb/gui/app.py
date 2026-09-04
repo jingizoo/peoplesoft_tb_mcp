@@ -1560,6 +1560,13 @@ def meta(request: Request = None):
         (approval_peer_loopback
          and (not row_security.enabled or approval_privileged))
         or approval_unauthenticated_remote_active)
+    # Computed fresh from this request's own signed assertion — the only
+    # code path that yields a non-empty value is verify_iap_assertion,
+    # the same function the access guard trusts. On the rare cold-cert
+    # request this can fetch keys (5s timeout, once per 6h); meta() is
+    # sync def, so that runs in the threadpool, off the event loop.
+    transport_identity = (localguard.verified_identity(request.scope)
+                          if request is not None else "")
     out = {
         "defaults": {
             "business_unit": d.business_unit,
@@ -1620,6 +1627,17 @@ def meta(request: Request = None):
                      "approval_unauthenticated_remote_expires_at": "",
                      "approval_identity_verified": False,
                      "is_authentication": False},
+        # TWO identity axes, two blocks, on purpose. security.oprid is
+        # the SELF-SELECTED finance-system user ID (a scope selector,
+        # not a login). transport says how the request reached this
+        # process and, in trusted_iap mode, WHO the sign-in front end
+        # proved sent it. Neither vouches for the other; do not merge
+        # them, and do not let one "fix" the other's is_authentication.
+        "transport": {
+            "mode": ("verified" if transport_identity
+                     else localguard.access_mode()),
+            "identity": transport_identity,
+        },
         "raw_sql": cfg.tools.allow_raw_sql,
         "batch_exports": {
             "enabled": bool(cfg.batch_exports.enabled),
