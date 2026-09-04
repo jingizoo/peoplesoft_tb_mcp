@@ -732,6 +732,7 @@ class TickerStore:
                 con.close()
                 handle.close()
 
+
     # -- acknowledging -----------------------------------------------------
     def record_ack(self, check_id: str, state_fp: str, by: str, *,
                    clear: bool = False, at: str = "") -> dict:
