@@ -3507,25 +3507,31 @@ class TBEngine:
 
     def _suggest_tables(self, name: str) -> list[str]:
         """Close matches for a nonexistent table name, so 'PS_JRNL_LINE' comes
-        back with 'did you mean PS_JRNL_LN'. Prefix-probes the catalog rather
-        than loading it (a real PS schema has tens of thousands of objects)."""
+        back with 'did you mean PS_JRNL_LN'.
+
+        Served from the per-process object-name cache: the old ladder
+        probed the live dictionary with up to EIGHT LIKE queries per
+        miss, and on a dictionary behind row-security policies those
+        probes were the hottest statement the DBA saw. Same shrinking-
+        prefix semantics, zero dictionary reads per miss after the
+        one-time cache load."""
         import difflib
 
         parsed = self._SCOPED_SQL_IDENTIFIER_RE.fullmatch(name)
         _, target = self._table_target(name)
         base = target.upper()
         qualified_input = bool(parsed and parsed.group(2))
+        try:
+            pairs = self.db.object_names()
+        except Exception:
+            return []
         for cut in (len(base), 12, 10, 8, 7, 6, 5, 4):
             pre = base[:cut].rstrip("_%")
             if len(pre) < 3:
                 break
-            params: dict = {"pat": pre + "%"}
-            try:
-                rows, _ = self.db.query(q.table_list(self.db, params), params,
-                                        max_rows=25)
-            except Exception:
-                return []
-            names = [str(r["table_name"]).upper() for r in rows]
+            hits = [(schema, n) for schema, n in pairs
+                    if n.startswith(pre)][:25]
+            names = list(dict.fromkeys(n for _s, n in hits))
             if names:
                 ranked = difflib.get_close_matches(base, names, n=5, cutoff=0.0) \
                     or names[:5]
@@ -3536,12 +3542,8 @@ class TBEngine:
                 if len(self._configured_schemas()) > 1 or qualified_input:
                     qualified = []
                     for candidate in ranked:
-                        matches = [
-                            str(r.get("schema_name") or "").upper()
-                            for r in rows
-                            if str(r.get("table_name") or "").upper()
-                            == candidate
-                        ]
+                        matches = [schema for schema, n in hits
+                                   if n == candidate]
                         qualified.extend(
                             f"{schema}.{candidate}" if schema else candidate
                             for schema in matches

@@ -820,6 +820,59 @@ class Database:
         empty for every other dialect."""
         return dict(getattr(self._bq_stats, "last", {}) or {})
 
+    def object_names(self) -> tuple:
+        """(SCHEMA_UPPER, NAME_UPPER) for every table/view this
+        connection may see, cached for the process lifetime.
+
+        The suggestion ladder used to probe the live dictionary with up
+        to eight LIKE queries per unresolved name -- on a PeopleSoft
+        instance whose dictionary sits behind row-security policies,
+        that was the hottest statement the DBA saw. One bounded read
+        per process replaces all of them. Staleness is the same the
+        columns cache already accepts; clear_catalog() (the console
+        reload) drops it.
+        """
+        key = ("ALL_OBJECT_NAMES",)
+        with self._catalog_lock:
+            cached = self._catalog.get(key)
+        if cached is not None:
+            return cached
+        if self.dialect == "sqlite":
+            rows, _ = self.query(
+                "SELECT 'MAIN' AS s, name AS n FROM sqlite_master "
+                "WHERE type IN ('table','view') "
+                "AND name NOT LIKE 'sqlite_%'", {}, max_rows=250_000)
+        elif self.dialect == "oracle":
+            owners = self.allowed_schemas
+            if owners:
+                marks = ", ".join(f":o{i}" for i in range(len(owners)))
+                params = {f"o{i}": o for i, o in enumerate(owners)}
+                rows, _ = self.query(
+                    "SELECT OWNER AS s, OBJECT_NAME AS n FROM "
+                    f"ALL_OBJECTS WHERE OWNER IN ({marks}) "
+                    "AND OBJECT_TYPE IN ('TABLE','VIEW')",
+                    params, max_rows=250_000)
+            else:
+                rows, _ = self.query(
+                    "SELECT USER AS s, OBJECT_NAME AS n FROM "
+                    "USER_OBJECTS WHERE OBJECT_TYPE IN ('TABLE','VIEW')",
+                    {}, max_rows=250_000)
+        elif self.dialect == "sqlserver":
+            rows, _ = self.query(
+                "SELECT S.name AS s, O.name AS n FROM sys.objects O "
+                "JOIN sys.schemas S ON S.schema_id = O.schema_id "
+                "WHERE O.type IN ('U','V')", {}, max_rows=250_000)
+        else:
+            rows = [(self.bigquery_dataset.upper(), n)
+                    for n in sorted(self.table_names())]
+            rows = [{"s": s, "n": n} for s, n in rows]
+        pairs = tuple(sorted(
+            (str(r.get("s") or "").upper(), str(r.get("n") or "").upper())
+            for r in rows if str(r.get("n") or "")))
+        with self._catalog_lock:
+            self._catalog[key] = pairs
+        return pairs
+
     def table_names(self) -> frozenset:
         """Uppercase table/view names of the configured dataset, cached
         for the process lifetime (same staleness the columns cache
