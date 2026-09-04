@@ -385,6 +385,18 @@ class TickerCfg:
     # exception before it re-demands attention (bounds live with the
     # other budgets in TickerLimits).
     ack_ttl_hours: int = 24
+    # Duplicate checks on DECLARED keys for these tables of the DEFAULT
+    # source. This field existing is load-bearing: _apply_section drops
+    # keys that are not dataclass fields, so without it a YAML
+    # ticker.watch_tables silently validated an always-empty list and
+    # #193's check could never be scheduled from a real config.
+    watch_tables: list = field(default_factory=list)
+    # Extra configured sources the ticker watches, keyed by the source
+    # name under top-level ``sources:``. Explicit opt-in per entry
+    # (enabled: true, literal) -- presence alone arms nothing, so a
+    # block typed against an older release is refused at load rather
+    # than silently armed by an upgrade.
+    sources: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -470,7 +482,7 @@ def _apply_section(obj: Any, data: Optional[dict]) -> None:
             setattr(obj, k, v)
 
 
-def _validate_ticker(cfg: TickerCfg) -> None:
+def _validate_ticker(cfg: TickerCfg, sources=None) -> None:
     """The off-switch must be a literal boolean, never a truthy value.
 
     The ticker is a standing loop against a production database; the
@@ -488,13 +500,18 @@ def _validate_ticker(cfg: TickerCfg) -> None:
     units = getattr(cfg, "business_units", [])
     if not isinstance(units, (list, tuple)):
         raise RuntimeError("ticker.business_units must be a list")
-    tables = getattr(cfg, "watch_tables", [])
+    _validate_watch_tables(getattr(cfg, "watch_tables", []),
+                           section="ticker")
+    _validate_ticker_sources(cfg, sources)
+
+
+def _validate_watch_tables(tables, *, section: str) -> None:
     if isinstance(tables, str):
         raise RuntimeError(
-            "ticker.watch_tables must be a YAML list -- a bare string "
-            "iterates one character at a time")
+            f"{section}.watch_tables must be a YAML list -- a bare "
+            "string iterates one character at a time")
     if not isinstance(tables, (list, tuple)):
-        raise RuntimeError("ticker.watch_tables must be a list")
+        raise RuntimeError(f"{section}.watch_tables must be a list")
     # $/# are legal Oracle identifier characters, but the ticker's
     # check-id grammar refuses them -- refused HERE with the reason,
     # not mid-tick where the failure would become three _fail calls
@@ -505,12 +522,12 @@ def _validate_ticker(cfg: TickerCfg) -> None:
     for entry in tables:
         if type(entry) is not str or not entry.strip():
             raise RuntimeError(
-                "ticker.watch_tables entries must be non-empty table "
-                "names")
+                f"{section}.watch_tables entries must be non-empty "
+                "table names")
         name = entry.strip()
         if len(name) > 60 or not ident.fullmatch(name):
             raise RuntimeError(
-                f"ticker.watch_tables entry {entry!r} is not a plain "
+                f"{section}.watch_tables entry {entry!r} is not a plain "
                 "TABLE or SCHEMA.TABLE identifier of letters, digits "
                 "and underscores (up to 60 characters); $ and # are "
                 "refused because the ticker's check-id grammar cannot "
@@ -518,17 +535,153 @@ def _validate_ticker(cfg: TickerCfg) -> None:
         fold = name.casefold()
         if fold in seen_fold:
             raise RuntimeError(
-                f"ticker.watch_tables lists {seen_fold[fold]!r} and "
+                f"{section}.watch_tables lists {seen_fold[fold]!r} and "
                 f"{entry!r}, which differ only by case: two spellings "
                 "of one table would double-spend the query budget and "
                 "split its history across two baselines")
         seen_fold[fold] = entry
     if len(tables) > 20:
         raise RuntimeError(
-            "ticker.watch_tables is capped at 20 tables: 20 reserve 40 "
-            "queries -- the entire default max_queries_per_tick -- and "
-            "tb_integrity is charged first, so trailing tables would "
-            "never run; raise the budget or shorten the list")
+            f"{section}.watch_tables is capped at 20 tables: 20 reserve "
+            "40 queries -- the entire default max_queries_per_tick -- "
+            "and tb_integrity is charged first, so trailing tables "
+            "would never run; raise the budget or shorten the list")
+
+
+_TICKER_SOURCE_KEYS = frozenset({
+    "enabled", "watch_tables", "cadence_minutes", "max_queries_per_tick",
+    "max_seconds_per_tick", "failure_trip", "max_ceiling_usd_per_month",
+})
+_TICKER_PS_ONLY_KEYS = frozenset({
+    "business_units", "ledger", "watch_invoicing",
+})
+_BQ_BILLING_FLOOR_BYTES = 10 * 2 ** 20     # BigQuery's 10 MB minimum
+_BQ_USD_PER_TIB = 6.25
+
+
+def bigquery_ticker_costs(tables: int, cadence_minutes: int,
+                          cap_bytes: int) -> tuple[int, float, float]:
+    """(queries/month, ceiling USD, floor USD) for one watched source.
+
+    Static arithmetic, deliberately: nothing here meters actual spend
+    -- the per-query cap bounds each job and the cadence multiplies it.
+    43200 minutes to a month.
+    """
+    per_month = int(tables * (43200 / max(int(cadence_minutes), 1)))
+    ceiling = per_month * (int(cap_bytes) / 2 ** 40) * _BQ_USD_PER_TIB
+    floor = (per_month * (_BQ_BILLING_FLOOR_BYTES / 2 ** 40)
+             * _BQ_USD_PER_TIB)
+    return per_month, ceiling, floor
+
+
+def _validate_ticker_sources(cfg: TickerCfg, sources) -> None:
+    entries = getattr(cfg, "sources", None) or {}
+    if not isinstance(entries, dict):
+        raise RuntimeError(
+            "ticker.sources must be a mapping of configured source "
+            "names to their watch settings")
+    if len(entries) > 8:
+        raise RuntimeError(
+            "ticker.sources is capped at 8 entries; every source is "
+            "another standing loop against another database -- split "
+            "deployments before widening one")
+    configured = dict(sources or {})
+    global_cadence = int(getattr(cfg, "cadence_minutes", 30) or 30)
+    for name, entry in entries.items():
+        section = f"ticker.sources.{name}"
+        if str(name) == "default":
+            raise RuntimeError(
+                "ticker.sources.default: the default source's checks "
+                "are the top-level ticker keys, not a sources entry")
+        if sources is not None and name not in configured:
+            raise RuntimeError(
+                f"{section}: no configured database source named "
+                f"{name!r} exists under top-level sources: (names are "
+                "case-exact)")
+        if not isinstance(entry, dict) or not entry:
+            raise RuntimeError(
+                f"{section} must be a non-empty mapping -- an empty or "
+                "null entry arms nothing and means nothing")
+        for key in entry:
+            if key in _TICKER_PS_ONLY_KEYS:
+                raise RuntimeError(
+                    f"{section}.{key}: business-unit checks "
+                    "(tb_integrity, ap_pipeline) read PeopleSoft "
+                    "records and run only on the default source; an "
+                    "extra source can watch tables (watch_tables)")
+            if key not in _TICKER_SOURCE_KEYS:
+                raise RuntimeError(
+                    f"{section}.{key} is not a recognized key; allowed: "
+                    + ", ".join(sorted(_TICKER_SOURCE_KEYS)))
+        enabled = entry.get("enabled")
+        if type(enabled) is not bool:
+            raise RuntimeError(
+                f"{section}.enabled must be the literal YAML boolean "
+                "true or false -- presence alone must never arm a "
+                "standing loop")
+        if not enabled:
+            continue
+        tables = entry.get("watch_tables")
+        if not tables:
+            raise RuntimeError(
+                f"{section}.watch_tables is required and non-empty for "
+                "an enabled source: an enabled source with an empty "
+                "plan would write a fresh green store that verified "
+                "nothing -- absence presented as health")
+        _validate_watch_tables(tables, section=section)
+        overrides = {key: entry[key] for key in
+                     ("cadence_minutes", "max_queries_per_tick",
+                      "max_seconds_per_tick", "failure_trip")
+                     if key in entry}
+        # Both-sided bounds through the same class that spends them.
+        # Local import: ticker.py does not import config, so this stays
+        # acyclic.
+        from .ticker import TickerError, TickerLimits
+        try:
+            merged = TickerLimits.from_config(cfg, **overrides)
+        except TickerError as exc:
+            raise RuntimeError(f"{section}: {exc}") from exc
+        if merged.cadence_minutes < global_cadence:
+            raise RuntimeError(
+                f"{section}.cadence_minutes ({merged.cadence_minutes}) "
+                f"is shorter than the global heartbeat "
+                f"({global_cadence}); a source cannot tick more often "
+                "than the loop that carries it")
+        backend = str(getattr(configured.get(name), "backend", "")
+                      or "").lower()
+        if backend == "bigquery":
+            if "cadence_minutes" not in entry:
+                raise RuntimeError(
+                    f"{section}.cadence_minutes is required for a "
+                    "bigquery source -- billed queries must never "
+                    "inherit a cadence typed for a grant-cost dialect")
+            ceiling_cfg = entry.get("max_ceiling_usd_per_month")
+            if not isinstance(ceiling_cfg, (int, float)) \
+                    or isinstance(ceiling_cfg, bool) or ceiling_cfg <= 0:
+                raise RuntimeError(
+                    f"{section}.max_ceiling_usd_per_month is required "
+                    "for a bigquery source: a typed dollar ceiling is "
+                    "the acknowledgment that this loop bills money")
+            cap_bytes = int(getattr(configured.get(name),
+                                    "bigquery_max_bytes_billed", 0)
+                            or 1_073_741_824)
+            per_month, ceiling, floor = bigquery_ticker_costs(
+                len(tables), merged.cadence_minutes, cap_bytes)
+            if ceiling > float(ceiling_cfg):
+                raise RuntimeError(
+                    f"{section}: {len(tables)} watched table(s) every "
+                    f"{merged.cadence_minutes} minutes is {per_month} "
+                    "billed queries/month. Worst case (each query "
+                    "hitting the {cap:,}-byte per-query cap "
+                    "bigquery_max_bytes_billed): ${ceiling:.2f}/month. "
+                    "Minimum (BigQuery's 10 MB billing floor, even on "
+                    "empty tables): ${floor:.4f}/month. This exceeds "
+                    "max_ceiling_usd_per_month: {typed}. Raise "
+                    "max_ceiling_usd_per_month to accept the worst "
+                    "case, lengthen cadence_minutes, or shorten "
+                    "watch_tables.".format(
+                        cap=cap_bytes, ceiling=ceiling, floor=floor,
+                        typed=ceiling_cfg))
 
 
 def _validate_security(cfg: SecurityCfg) -> None:
@@ -674,11 +827,14 @@ def normalize_db_schemas(cfg: DbCfg, *, section: str = "db") -> list[str]:
 def _validate_bigquery_source(block: Any, *, section: str) -> None:
     """Refuse a BigQuery block this release cannot honour.
 
-    Silo-only: the curated PeopleSoft toolchain, the ticker and the
-    profiles were never designed for this backend, so the PRIMARY db
-    refuses it outright. The budgets get validate()-style floors and
-    ceilings -- the 10MB floor is BigQuery's own billing minimum, below
-    which a cap can never be satisfied.
+    Silo-only: the curated PeopleSoft toolchain and the profiles were
+    never designed for this backend, so the PRIMARY db refuses it
+    outright. The ticker's table_health check IS designed for it --
+    opted in per source under ticker.sources with a typed dollar
+    ceiling (_validate_ticker_sources). The budgets get
+    validate()-style floors and ceilings -- the 10MB floor is
+    BigQuery's own billing minimum, below which a cap can never be
+    satisfied.
     """
     if not isinstance(block, dict):
         return
@@ -1012,7 +1168,6 @@ def load_config(path: Optional[str] = None) -> Config:
         _apply_section(cfg.ps_api, data.get("ps_api"))
         _apply_section(cfg.security, data.get("security"))
         _apply_section(cfg.ticker, data.get("ticker"))
-        _validate_ticker(cfg.ticker)
         _validate_security(cfg.security)
         if isinstance(data.get("semantics"), dict):
             cfg.semantics = data["semantics"]
@@ -1038,6 +1193,11 @@ def load_config(path: Optional[str] = None) -> Config:
             src.bigquery_project = _env(f"PSTB_SRC_{key}_BQ_PROJECT",
                                         src.bigquery_project)
             cfg.sources[str(name)] = src
+
+    # After the sources loop on purpose: ticker.sources entries name
+    # configured sources, so validating them earlier would read an
+    # empty map and refuse every legal block.
+    _validate_ticker(cfg.ticker, cfg.sources)
 
     # Do this after both YAML layers have been applied.  It turns the accepted
     # list shorthand back into the scalar contract every database consumer

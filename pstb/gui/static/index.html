@@ -5040,6 +5040,18 @@ async function loadExceptions(holder,source){
         'The last completed tick is '+(d.age_seconds==null?'unknown':Math.round(d.age_seconds/60)+' min old')+
         ' and the runner state is '+esc(state)+'. Treat this as UNKNOWN, not as "no exceptions".'));
     }
+    if(d.cost_note){ c.append(el('div','pad sub',esc(d.cost_note))); }
+    try{
+      const sm=await api('/api/exceptions/summary');
+      if((sm.sources||[]).length>1){
+        // One line per pass: every source's own staleness stated --
+        // a fresh source must never mask a stale one.
+        c.append(el('div','pad sub',(sm.sources||[]).map(r=>
+          esc(r.source)+': '+(r.enabled
+            ?(r.stale?'stale — treat as unknown':r.pending+' pending')
+            :'not watched')).join(' · ')));
+      }
+    }catch(e){}
     const open=(d.rows||[]).filter(r=>!r.retired);
     const NONGREEN=['exceptions_found','checks_incomplete','refused','error','not_run'];
     // Acknowledging is attention state, never a decision: the row stays

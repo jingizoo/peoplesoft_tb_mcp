@@ -559,7 +559,8 @@ class EndpointTests(unittest.TestCase):
         # must get NO badge, not a permanent question mark.
         self.assertEqual(r.json(),
                          {"enabled": False, "pending": 0, "unacked": 0,
-                          "readable": False, "stale": True})
+                          "readable": False, "stale": True,
+                          "unknown_sources": []})
 
     def test_rows_are_narrowed_to_the_callers_units_on_the_way_out(self):
         """The store is shared; the reach is not. A restricted caller
@@ -1653,7 +1654,8 @@ class AckEndpointTests(unittest.TestCase):
                 count = self.client.get("/api/exceptions/count").json()
                 self.assertEqual(count, {
                     "enabled": True, "pending": 1, "unacked": 1,
-                    "readable": True, "stale": False})
+                    "readable": True, "stale": False,
+                    "unknown_sources": []})
                 feed = self.client.get("/api/exceptions").json()
                 row = feed["rows"][0]
                 self.assertFalse(row["acked"])
@@ -1704,3 +1706,537 @@ class AckEndpointTests(unittest.TestCase):
     def test_disabled_is_409_with_the_remedy(self):
         r = self._post({"check_id": "x", "state_fp": "0" * 16})
         self.assertEqual(r.status_code, 409)
+
+
+def _multi_runner(engine, root, *, sources=None, units=("US001",),
+                  watch_invoicing=False, modules=None, catalog_for=None,
+                  exclusions=None, **limit_overrides):
+    """A runner over default + opted-in extras, one real store each."""
+    ticker_cfg = SimpleNamespace(
+        enabled=True, business_units=list(units), ledger="",
+        watch_invoicing=watch_invoicing, watch_tables=[],
+        sources=dict(sources or {}),
+        **{name: limit_overrides.get(name, getattr(TickerLimits, name))
+           for name in TickerLimits._BOUNDS})
+    cfg = SimpleNamespace(ticker=ticker_cfg,
+                          defaults=SimpleNamespace(business_unit="US001"),
+                          root=root)
+    context = SimpleNamespace(engine=engine, cfg=cfg, source="default",
+                              modules=modules, catalog_for=catalog_for,
+                              exclusions=exclusions)
+    runner = TickerRunner(
+        lambda: context,
+        store_factory=lambda ctx, limits: TickerStore(
+            Path(root) / f"{ctx.source}.db", source=ctx.source,
+            fingerprint=FINGERPRINT, limits=limits))
+    return runner, cfg
+
+
+def _feed_for(root, source):
+    return TickerStore(Path(root) / f"{source}.db", source=source,
+                       fingerprint=FINGERPRINT,
+                       limits=_limits()).read_feed()
+
+
+class PerSourceConfigTests(unittest.TestCase):
+    """ticker.sources: explicit opt-in, closed keys, typed BigQuery
+    cost acknowledgment -- every refusal at load, none mid-tick."""
+
+    def _validate(self, entry, *, configured=None, **ticker_over):
+        from pstb.config import DbCfg, TickerCfg, _validate_ticker
+        cfg = TickerCfg(enabled=True, **ticker_over)
+        cfg.sources = {"p2go": entry}
+        configured = configured if configured is not None else {
+            "p2go": DbCfg(backend="sqlite", sqlite_path="x.db",
+                          schema="MAIN")}
+        _validate_ticker(cfg, configured)
+
+    def test_a_legal_block_passes(self):
+        self._validate({"enabled": True, "watch_tables": ["ORDERS"]})
+
+    def test_refusals_each_carry_their_reason(self):
+        from pstb.config import DbCfg
+        bq = {"bq": DbCfg(backend="bigquery", sqlite_path="",
+                          schema="sales_mart")}
+        cases = [
+            ({"enabled": True, "watch_tables": ["ORDERS"]},
+             {"configured": {}}, "no configured database source"),
+            ({"enabled": True, "watch_tables": ["ORDERS"],
+              "business_units": ["US001"]}, {},
+             "run only on the default source"),
+            ({"enabled": True, "watch_tables": ["ORDERS"],
+              "surprise": 1}, {}, "not a recognized key"),
+            ({"watch_tables": ["ORDERS"]}, {}, "literal YAML boolean"),
+            ({"enabled": True}, {}, "required and non-empty"),
+            ({"enabled": True, "watch_tables": ["ORDERS"],
+              "cadence_minutes": 5}, {"cadence_minutes": 30},
+             "shorter than the global heartbeat"),
+            (None, {}, "non-empty mapping"),
+        ]
+        for entry, extra, needle in cases:
+            with self.subTest(needle=needle):
+                kwargs = dict(extra)
+                configured = kwargs.pop("configured", None)
+                ticker_over = kwargs
+                with self.assertRaises(RuntimeError) as caught:
+                    self._validate(entry, configured=configured,
+                                   **ticker_over)
+                self.assertIn(needle, str(caught.exception))
+        from pstb.config import TickerCfg, _validate_ticker
+        cfg = TickerCfg(enabled=True)
+        cfg.sources = {"default": {"enabled": True,
+                                   "watch_tables": ["ORDERS"]}}
+        with self.assertRaises(RuntimeError) as caught:
+            _validate_ticker(cfg, {})
+        self.assertIn("top-level ticker keys", str(caught.exception))
+        cfg = TickerCfg(enabled=True)
+        cfg.sources = {f"s{i}": {"enabled": False} for i in range(9)}
+        with self.assertRaises(RuntimeError) as caught:
+            _validate_ticker(cfg, {})
+        self.assertIn("capped at 8", str(caught.exception))
+        for missing, needle in ((
+                {"enabled": True, "watch_tables": ["ORDERS"]},
+                "cadence_minutes is required"), (
+                {"enabled": True, "watch_tables": ["ORDERS"],
+                 "cadence_minutes": 720},
+                "max_ceiling_usd_per_month is required")):
+            with self.subTest(needle=needle):
+                from pstb.config import TickerCfg, _validate_ticker
+                cfg = TickerCfg(enabled=True)
+                cfg.sources = {"bq": missing}
+                with self.assertRaises(RuntimeError) as caught:
+                    _validate_ticker(cfg, bq)
+                self.assertIn(needle, str(caught.exception))
+
+    def test_the_ceiling_refusal_shows_both_numbers(self):
+        from pstb.config import DbCfg, TickerCfg, _validate_ticker
+        cfg = TickerCfg(enabled=True)
+        cfg.sources = {"bq": {"enabled": True,
+                              "watch_tables": ["ORDERS"],
+                              "cadence_minutes": 720,
+                              "max_ceiling_usd_per_month": 0.01}}
+        bq = {"bq": DbCfg(backend="bigquery", sqlite_path="",
+                          schema="sales_mart")}
+        with self.assertRaises(RuntimeError) as caught:
+            _validate_ticker(cfg, bq)
+        text = str(caught.exception)
+        self.assertIn("60 billed queries/month", text)
+        self.assertIn("Worst case", text)
+        self.assertIn("10 MB billing floor", text)
+        self.assertIn("lengthen cadence_minutes", text)
+
+    def test_an_accepted_ceiling_passes(self):
+        from pstb.config import DbCfg, TickerCfg, _validate_ticker
+        cfg = TickerCfg(enabled=True)
+        cfg.sources = {"bq": {"enabled": True,
+                              "watch_tables": ["ORDERS"],
+                              "cadence_minutes": 720,
+                              "max_ceiling_usd_per_month": 1}}
+        _validate_ticker(cfg, {"bq": DbCfg(backend="bigquery",
+                                           sqlite_path="",
+                                           schema="sales_mart")})
+
+    def test_watch_tables_round_trips_through_load_config(self):
+        """The commit-0 regression: _apply_section drops non-field
+        keys, so without the TickerCfg fields a YAML watch_tables (and
+        the whole sources block) validated an always-empty default."""
+        import textwrap
+        from pstb.config import load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text(textwrap.dedent(f"""\
+                db:
+                  backend: sqlite
+                  sqlite_path: {root / 'p.db'}
+                ticker:
+                  enabled: true
+                  watch_tables: [PS_JRNL_LN]
+                  sources:
+                    p2go:
+                      enabled: true
+                      watch_tables: [ORDERS]
+                sources:
+                  p2go:
+                    backend: sqlite
+                    sqlite_path: {root / 'x.db'}
+                    schema: MAIN
+                """), encoding="utf-8")
+            cfg = load_config(str(root / "config.yaml"))
+        self.assertEqual(cfg.ticker.watch_tables, ["PS_JRNL_LN"])
+        self.assertEqual(
+            cfg.ticker.sources["p2go"]["watch_tables"], ["ORDERS"])
+
+
+class PerSourceRunnerTests(unittest.TestCase):
+    """One thread, one breaker per source, durable due times."""
+
+    T0 = "2026-09-04T10:00:00+00:00"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pstb-multi-")
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    def test_an_extras_plan_is_table_health_only_by_construction(self):
+        """Top-level business_units and watch_invoicing set, and STILL
+        the extra's schedule holds nothing but its tables -- the
+        PeopleSoft checks can never be planned against another silo."""
+        engine = _StubEngine()
+        runner, _ = _multi_runner(
+            engine, self.root, watch_invoicing=True,
+            modules=_payables(),
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        summary = runner.run_tick_once(now=self.T0)
+        self.assertIn("p2go", summary["sources"])
+        p2go = {r["check_id"]
+                for r in _feed_for(self.root, "p2go")["rows"]}
+        self.assertEqual(p2go, {"table_health:p2go:ORDERS"})
+        default = {r["check_id"]
+                   for r in _feed_for(self.root, "default")["rows"]}
+        self.assertIn("tb_integrity:default:US001", default)
+        self.assertIn("ap_pipeline:default:US001", default)
+        self.assertFalse({c for c in default if ":p2go:" in c})
+
+    def test_one_silos_credentials_stay_its_own(self):
+        """ORA-01017 on the extra: that source goes terminal; the
+        default ticks the same pass AND the next; the runner never
+        reads tripped."""
+        engine = _StubEngine()
+        runner, _ = _multi_runner(
+            engine, self.root,
+            catalog_for=lambda s: object(), exclusions=object(),
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        with patch("pstb.health.table_health",
+                   side_effect=DbError(
+                       "ORA-01017: invalid username/password")):
+            runner.run_tick_once(now=self.T0)
+        seg = runner._health_for("p2go")
+        self.assertTrue(seg["terminal"])
+        self.assertTrue(seg["tripped"])
+        self.assertNotEqual(runner.state, "tripped")
+        self.assertFalse(runner._health_for("default")["terminal"])
+        second = runner.run_tick_once(now="2026-09-04T11:00:00+00:00")
+        self.assertTrue(second["ran"], "the default stopped ticking "
+                                       "over another silo's password")
+        self.assertEqual(len(engine.integrity_calls), 2)
+        self.assertFalse(second["sources"]["p2go"]["ran"])
+
+    def test_the_mirror_default_trips_extras_run(self):
+        engine = _StubEngine(
+            exc=DbError("ORA-01017: invalid username/password"))
+        runner, _ = _multi_runner(
+            engine, self.root,
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        summary = runner.run_tick_once(now=self.T0)
+        self.assertTrue(runner._health_for("default")["terminal"])
+        self.assertTrue(summary["sources"]["p2go"]["ran"],
+                        "the extra died with the default's password")
+        self.assertNotEqual(runner.state, "tripped",
+                            "one dead source tripped the whole runner")
+        second = runner.run_tick_once(now="2026-09-04T22:05:00+00:00")
+        self.assertFalse(second["sources"]["default"]["ran"])
+
+    def test_due_times_survive_a_restart(self):
+        """A new runner over the same stores does NOT re-tick a
+        720-minute source ticked 40 minutes ago -- the store is the
+        schedule's memory, not the process."""
+        engine = _StubEngine()
+        sources = {"p2go": {"enabled": True, "watch_tables": ["ORDERS"],
+                            "cadence_minutes": 720}}
+        runner, _ = _multi_runner(engine, self.root, sources=sources)
+        first = runner.run_tick_once(now=self.T0)
+        self.assertIn("p2go", first["sources"],
+                      "a never-ticked source must be due immediately")
+        fresh, _ = _multi_runner(engine, self.root, sources=sources)
+        second = fresh.run_tick_once(now="2026-09-04T10:40:00+00:00")
+        self.assertNotIn("p2go", second["sources"])
+        third = fresh.run_tick_once(now="2026-09-04T22:05:00+00:00")
+        self.assertIn("p2go", third["sources"])
+
+    def test_disable_flipped_mid_pass_aborts_the_rest(self):
+        engine = _StubEngine()
+        runner, cfg = _multi_runner(
+            engine, self.root,
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        real = engine.tb_integrity_check
+
+        def flip(business_unit="", ledger=""):
+            cfg.ticker.enabled = False
+            return real(business_unit, ledger)
+
+        engine.tb_integrity_check = flip
+        summary = runner.run_tick_once(now=self.T0)
+        self.assertIn("default", summary["sources"])
+        self.assertNotIn("p2go", summary["sources"],
+                         "the pass finished work the operator stopped")
+        self.assertFalse((Path(self.root) / "p2go.db").exists())
+
+    def test_a_trip_writes_exactly_one_runner_tripped_event(self):
+        engine = _StubEngine()
+        runner, _ = _multi_runner(
+            engine, self.root,
+            catalog_for=lambda s: object(), exclusions=object(),
+            sources={"p2go": {"enabled": True, "watch_tables": ["ORDERS"],
+                              "failure_trip": 1}})
+        with patch("pstb.health.table_health",
+                   side_effect=RuntimeError("boom")):
+            runner.run_tick_once(now=self.T0)
+        feed = _feed_for(self.root, "p2go")
+        tripped = [e for e in feed["events"]
+                   if e["kind"] == "runner_tripped"]
+        self.assertEqual(len(tripped), 1)
+        last = feed["last_tick"]
+        runner.run_tick_once(now="2026-09-04T11:00:00+00:00")
+        after = _feed_for(self.root, "p2go")
+        self.assertEqual(after["last_tick"], last,
+                         "a tripped source was written to")
+        self.assertEqual(len([e for e in after["events"]
+                              if e["kind"] == "runner_tripped"]), 1)
+
+    def test_a_changed_fingerprint_resets_the_breaker(self):
+        engine = _StubEngine()
+        runner, _ = _multi_runner(
+            engine, self.root,
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        seg = runner._health_for("p2go")
+        seg.update({"tripped": True, "consecutive_failures": 3,
+                    "fingerprint": "sha256:old"})
+        with patch("pstb.metadata.source_fingerprint",
+                   return_value="sha256:new"):
+            summary = runner.run_tick_once(now=self.T0)
+        self.assertTrue(summary["sources"]["p2go"]["ran"],
+                        "a config-shaped fix earned no fresh start")
+        self.assertFalse(runner._health_for("p2go")["tripped"])
+
+    def test_master_off_means_nothing_ticks_anywhere(self):
+        engine = _StubEngine()
+        runner, cfg = _multi_runner(
+            engine, self.root,
+            sources={"p2go": {"enabled": True,
+                              "watch_tables": ["ORDERS"]}})
+        cfg.ticker.enabled = False
+        summary = runner.run_tick_once(now=self.T0)
+        self.assertEqual(summary["reason"], "disabled")
+        self.assertEqual(engine.integrity_calls, [])
+        self.assertFalse((Path(self.root) / "p2go.db").exists())
+        self.assertFalse((Path(self.root) / "default.db").exists())
+
+    def test_status_for_reports_the_segments_breaker(self):
+        engine = _StubEngine()
+        runner, _ = _multi_runner(
+            engine, self.root,
+            catalog_for=lambda s: object(), exclusions=object(),
+            sources={"p2go": {"enabled": True, "watch_tables": ["ORDERS"],
+                              "failure_trip": 1}})
+        with patch("pstb.health.table_health",
+                   side_effect=RuntimeError("boom")):
+            runner.run_tick_once(now=self.T0)
+        self.assertEqual(runner.status_for("p2go")["state"], "tripped")
+        self.assertNotEqual(runner.status_for("default")["state"],
+                            "tripped")
+        self.assertEqual(runner.status()["state"], "idle",
+                         "the legacy mirror must track the default")
+
+    def test_single_source_results_keep_their_shape(self):
+        """No-regression: without ticker.sources the top-level result
+        keys are exactly yesterday's, plus the additive sources map."""
+        engine = _StubEngine()
+        runner = _runner(engine, self.root)
+        summary = runner.run_tick_once(now=self.T0)
+        for key in ("ran", "checks", "queries_used", "partial",
+                    "events"):
+            self.assertIn(key, summary)
+        self.assertEqual(set(summary["sources"]), {"default"})
+
+
+class PerSourceEndpointTests(unittest.TestCase):
+    """The feed reports the SOURCE's world: its breaker, its cadence,
+    its cost; the count names unknowns instead of zeroing anyone."""
+
+    def setUp(self):
+        import pstb.gui.app as gui
+        self.gui = gui
+        self.client = TestClient(gui.app, client=("127.0.0.1", 5555),
+                                 base_url="http://localhost")
+
+    def _registry(self):
+        return SimpleNamespace(
+            names=lambda: ["default", "p2go"],
+            resolve_name=lambda s="": (s or "default"))
+
+    def _wire(self, root, entry=None, backend="sqlite"):
+        from pstb.config import DbCfg
+        gui = self.gui
+        entries = {"p2go": entry} if entry else {}
+        source_cfg = DbCfg(backend=backend,
+                           sqlite_path=str(root / "x.db"),
+                           schema=("MAIN" if backend == "sqlite"
+                                   else "sales_mart"))
+        if backend == "bigquery":
+            source_cfg.bigquery_project = "acme-fin"
+        return (patch.object(gui.cfg, "root", root),
+                patch.object(gui.cfg.ticker, "enabled", True),
+                patch.object(gui.cfg.ticker, "sources", entries,
+                             create=True),
+                patch.object(gui.cfg, "sources",
+                             {"p2go": source_cfg}),
+                patch.object(gui.engine, "registry", self._registry()))
+
+    def test_an_unopted_source_says_so_calmly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            patches = self._wire(root, entry=None)
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4]:
+                body = self.client.get(
+                    "/api/exceptions?source=p2go").json()
+        self.assertFalse(body["enabled"])
+        self.assertIn("not opted into", body["note"])
+
+    def test_a_720_minute_source_is_fresh_at_five_hours(self):
+        import datetime as dt
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = {"enabled": True, "watch_tables": ["ORDERS"],
+                     "cadence_minutes": 720}
+            patches = self._wire(root, entry=entry)
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4]:
+                from pstb.metadata import source_fingerprint
+                store = TickerStore(
+                    store_path(root, "p2go"), source="p2go",
+                    fingerprint=source_fingerprint(self.gui.cfg,
+                                                   "p2go"),
+                    limits=_limits(cadence_minutes=720))
+                five_hours_ago = (
+                    dt.datetime.now(dt.timezone.utc)
+                    - dt.timedelta(hours=5)).isoformat(
+                        timespec="seconds")
+                store.record_tick(
+                    [CheckOutcome(
+                        check_id="table_health:p2go:ORDERS",
+                        source="p2go", business_unit="",
+                        status="passed")],
+                    ["table_health:p2go:ORDERS"],
+                    tick_at=five_hours_ago)
+                body = self.client.get(
+                    "/api/exceptions?source=p2go").json()
+        self.assertTrue(body["enabled"])
+        self.assertFalse(body["stale"],
+                         "five hours is FRESH at a 720-minute cadence "
+                         "-- the default limits leaked into the read")
+
+    def test_count_names_unknowns_instead_of_zeroing(self):
+        from pstb.metadata import source_fingerprint
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = {"enabled": True, "watch_tables": ["ORDERS"]}
+            patches = self._wire(root, entry=entry)
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4]:
+                store = TickerStore(
+                    store_path(root, "default"), source="default",
+                    fingerprint=source_fingerprint(self.gui.cfg,
+                                                   "default"),
+                    limits=_limits())
+                from pstb.ticker import _utcnow
+                store.record_tick(
+                    [_outcome(status="exceptions_found",
+                              counts={"issues": 2})],
+                    ["tb_integrity:default:US001"], tick_at=_utcnow())
+                count = self.client.get(
+                    "/api/exceptions/count").json()
+                extra = self.client.get(
+                    "/api/exceptions?source=p2go").json()
+        self.assertNotIn("cost_note", extra,
+                         "a dollars note on a sqlite source is noise")
+        self.assertEqual(count["pending"], 1)
+        self.assertEqual(count["unacked"], 1)
+        self.assertTrue(count["readable"])
+        self.assertFalse(count["stale"])
+        self.assertEqual(count["unknown_sources"], ["p2go"],
+                         "a never-ticked extra must be NAMED unknown, "
+                         "not silently zeroed")
+
+    def test_summary_never_collapses_staleness_and_prices_bigquery(self):
+        from pstb.metadata import source_fingerprint
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = {"enabled": True, "watch_tables": ["ORDERS"],
+                     "cadence_minutes": 720,
+                     "max_ceiling_usd_per_month": 1}
+            patches = self._wire(root, entry=entry, backend="bigquery")
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4]:
+                store = TickerStore(
+                    store_path(root, "default"), source="default",
+                    fingerprint=source_fingerprint(self.gui.cfg,
+                                                   "default"),
+                    limits=_limits())
+                from pstb.ticker import _utcnow
+                store.record_tick([_outcome()],
+                                  ["tb_integrity:default:US001"],
+                                  tick_at=_utcnow())
+                body = self.client.get("/api/exceptions/summary").json()
+        rows = {row["source"]: row for row in body["sources"]}
+        self.assertEqual(set(rows), {"default", "p2go"})
+        self.assertFalse(rows["default"]["stale"])
+        self.assertTrue(rows["p2go"]["stale"],
+                        "one fresh source masked a stale one")
+        self.assertEqual(rows["p2go"]["backend"], "bigquery")
+        self.assertIn("Worst case", rows["p2go"]["cost_note"])
+        self.assertIn("10 MB billing minimum",
+                      rows["p2go"]["cost_note"])
+        self.assertNotIn("cost_note", rows["default"],
+                         "a dollars note on a grant-cost dialect is "
+                         "noise")
+
+
+class PerSourceProbeTests(unittest.TestCase):
+    """The two seams a plausible refactor would quietly re-primary."""
+
+    def test_failure_classification_probes_the_segments_database(self):
+        """A latched credential refusal on the EXTRA's db must go
+        terminal even when the exception text is generic -- reading the
+        healthy primary's latch instead is the exact fake-hidden bug
+        this guards."""
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = _StubEngine()
+            engine.for_source = lambda s: SimpleNamespace(
+                db=SimpleNamespace(
+                    _credentials_refused="ORA-01017 latched earlier"))
+            runner, _ = _multi_runner(
+                engine, Path(tmp),
+                catalog_for=lambda s: object(), exclusions=object(),
+                sources={"p2go": {"enabled": True,
+                                  "watch_tables": ["ORDERS"]}})
+            with patch("pstb.health.table_health",
+                       side_effect=RuntimeError("socket reset")):
+                runner.run_tick_once(now="2026-09-04T10:00:00+00:00")
+        self.assertTrue(runner._health_for("p2go")["terminal"],
+                        "the latch was probed on the primary's db")
+        self.assertFalse(runner._health_for("default")["terminal"])
+
+    def test_the_feed_reports_the_sources_own_breaker(self):
+        import pstb.gui.app as gui
+        client = TestClient(gui.app, client=("127.0.0.1", 5555),
+                            base_url="http://localhost")
+        stub = SimpleNamespace(
+            status=lambda: {"state": "idle"},
+            status_for=lambda s: {"state": ("tripped" if s == "p2go"
+                                            else "idle")})
+        registry = SimpleNamespace(
+            names=lambda: ["default", "p2go"],
+            resolve_name=lambda s="": (s or "default"))
+        with patch.object(gui, "_TICKER", stub), \
+                patch.object(gui.engine, "registry", registry):
+            body = client.get("/api/exceptions?source=p2go").json()
+            base = client.get("/api/exceptions").json()
+        self.assertEqual(body["runner"]["state"], "tripped",
+                         "a fresh default masked a tripped extra")
+        self.assertEqual(base["runner"]["state"], "idle")

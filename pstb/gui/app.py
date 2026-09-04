@@ -2479,18 +2479,63 @@ def _stop_ticker() -> None:
         runner.stop()
 
 
+def _ticker_source_entry(canonical: str) -> dict | None:
+    entry = (getattr(getattr(cfg, "ticker", None), "sources", None)
+             or {}).get(canonical)
+    return entry if isinstance(entry, dict) else None
+
+
 def _ticker_store_for(canonical: str):
     """The feed's and the ack's ONE way to open a store: same path,
     same fingerprint, same limits. Two constructions would eventually
-    disagree about which file an acknowledgment lands in."""
+    disagree about which file an acknowledgment lands in -- and a
+    720-minute extra source read with the 30-minute default limits
+    would report stale five hours after a perfectly fresh tick."""
     from ..metadata import source_fingerprint
     from ..ticker import TickerLimits, TickerStore, store_path
-    limits = TickerLimits.from_config(getattr(cfg, "ticker", None))
+    ticker_cfg = getattr(cfg, "ticker", None)
+    overrides = {}
+    entry = _ticker_source_entry(canonical)
+    if entry is not None:
+        overrides = {key: entry[key] for key in
+                     ("cadence_minutes", "max_queries_per_tick",
+                      "max_seconds_per_tick", "failure_trip")
+                     if key in entry}
+    limits = TickerLimits.from_config(ticker_cfg, **overrides)
     return limits, TickerStore(
         store_path(Path(getattr(cfg, "root", ".")), canonical),
         source=canonical,
         fingerprint=source_fingerprint(cfg, canonical),
         limits=limits)
+
+
+def _ticker_cost_note(canonical: str) -> str:
+    """The standing BigQuery disclosure: what this watch costs, worst
+    case and floor, stated where the numbers are read. Empty for every
+    non-bigquery source -- a note about dollars that do not exist is
+    noise."""
+    entry = _ticker_source_entry(canonical)
+    source_cfg = (getattr(cfg, "sources", None) or {}).get(canonical)
+    if (entry is None or source_cfg is None
+            or str(getattr(source_cfg, "backend", "")).lower()
+            != "bigquery"):
+        return ""
+    from ..config import bigquery_ticker_costs
+    tables = [t for t in (entry.get("watch_tables") or []) if t]
+    cadence = int(entry.get("cadence_minutes")
+                  or getattr(getattr(cfg, "ticker", None),
+                             "cadence_minutes", 30))
+    cap = int(getattr(source_cfg, "bigquery_max_bytes_billed", 0)
+              or 1_073_741_824)
+    per_month, ceiling, floor = bigquery_ticker_costs(
+        len(tables), cadence, cap)
+    return (f"Each tick runs {len(tables)} billed quer"
+            f"{'y' if len(tables) == 1 else 'ies'} (one per watched "
+            f"table), every {cadence} minutes. Worst case "
+            f"${ceiling:.2f}/month at the {cap:,}-byte per-query cap; "
+            f"at least ${floor:.4f}/month at BigQuery's 10 MB billing "
+            "minimum. Nothing here meters actual spend -- the cap "
+            "bounds each query, the cadence multiplies it.")
 
 
 def _resolve_ticker_source(source: str) -> str:
@@ -2521,17 +2566,33 @@ def exceptions_feed(request: Request, response: Response,
     from ..ticker import TickerError
     ticker_cfg = getattr(cfg, "ticker", None)
     enabled = getattr(ticker_cfg, "enabled", False) is True
+    opted_out = False
+    if canonical != "default" and enabled:
+        entry = _ticker_source_entry(canonical)
+        if entry is None or entry.get("enabled") is not True:
+            enabled, opted_out = False, True
     envelope = {
         "source": canonical,
         "enabled": enabled,
-        "runner": (_TICKER.status() if _TICKER is not None else
-                   {"state": "not_running"}),
+        # THIS source's breaker, not the runner's: a fresh default must
+        # not mask a tripped extra, and the reverse.
+        "runner": (_TICKER.status_for(canonical)
+                   if _TICKER is not None else {"state": "not_running"}),
         "rows": [], "events": [], "stale": True, "age_seconds": None,
         "readable": True, "truncated": False, "note": "",
     }
+    cost_note = _ticker_cost_note(canonical)
+    if cost_note:
+        envelope["cost_note"] = cost_note
     if _TICKER_CONFIG_ERROR:
         envelope["note"] = (f"the ticker is not running: "
                             f"{_TICKER_CONFIG_ERROR}")
+        return envelope
+    if opted_out:
+        envelope["note"] = (
+            f"this source is not opted into the continuous checks; add "
+            f"ticker.sources.{canonical} with enabled: true and "
+            "watch_tables to watch it")
         return envelope
     if not enabled:
         envelope["note"] = ("the ticker is off; set ticker.enabled: true "
@@ -2588,27 +2649,89 @@ def exceptions_count(request: Request, response: Response):
     """
     response.headers["Cache-Control"] = "no-store, private"
     dark = {"enabled": False, "pending": 0, "unacked": 0,
-            "readable": False, "stale": True}
+            "readable": False, "stale": True, "unknown_sources": []}
     try:
-        body = exceptions_feed(request, response)
-        enabled = bool(body.get("enabled"))
-        if not enabled:
+        if getattr(getattr(cfg, "ticker", None),
+                   "enabled", False) is not True:
             return dark
-        if not body.get("readable") or body.get("stale"):
-            return {"enabled": True, "pending": 0, "unacked": 0,
-                    "readable": False, "stale": True}
-        # not_run counts too: a check the budget starved did NOT verify
-        # anything, and a starved check must never make the dot greener.
-        nongreen = [row for row in body.get("rows", [])
-                    if not row.get("retired") and row.get("status") in
-                    ("exceptions_found", "checks_incomplete",
-                     "refused", "error", "not_run")]
-        return {"enabled": True, "pending": len(nongreen),
-                "unacked": sum(1 for row in nongreen
-                               if not row.get("acked")),
-                "readable": True, "stale": False}
+        names = ["default"] + sorted(
+            name for name, entry in
+            (getattr(getattr(cfg, "ticker", None), "sources", None)
+             or {}).items()
+            if isinstance(entry, dict)
+            and entry.get("enabled") is True)
+        pending = unacked = 0
+        unknown: list = []
+        fresh_any = False
+        for name in names:
+            body = exceptions_feed(request, response, source=name)
+            if not body.get("enabled"):
+                continue
+            # A stale, unreadable, or tripped source is UNKNOWN, named
+            # -- never zeroed into everyone else's green, never allowed
+            # to zero a fresh sibling's real pending count.
+            if (not body.get("readable") or body.get("stale")
+                    or (body.get("runner") or {}).get("state")
+                    == "tripped"):
+                unknown.append(name)
+                continue
+            fresh_any = True
+            # not_run counts too: a check the budget starved did NOT
+            # verify anything, and a starved check must never make the
+            # dot greener.
+            nongreen = [row for row in body.get("rows", [])
+                        if not row.get("retired") and row.get("status")
+                        in ("exceptions_found", "checks_incomplete",
+                            "refused", "error", "not_run")]
+            pending += len(nongreen)
+            unacked += sum(1 for row in nongreen
+                           if not row.get("acked"))
+        return {"enabled": True, "pending": pending, "unacked": unacked,
+                "readable": fresh_any, "stale": not fresh_any,
+                "unknown_sources": unknown}
     except Exception:                             # noqa: BLE001
         return dark
+
+
+@app.get("/api/exceptions/summary")
+def exceptions_summary(request: Request, response: Response):
+    """One row per ticker-configured source. Staleness is NEVER
+    collapsed to one boolean: a fresh source must not mask a stale one,
+    so every row carries its own."""
+    response.headers["Cache-Control"] = "no-store, private"
+    rows = []
+    entries = (getattr(getattr(cfg, "ticker", None), "sources", None)
+               or {})
+    names = ["default"] + sorted(str(n) for n in entries)
+    for name in names:
+        try:
+            body = exceptions_feed(request, response, source=name)
+        except HTTPException:
+            continue
+        if name == "default":
+            backend = str(getattr(cfg.db, "backend", "") or "")
+        else:
+            backend = str(getattr(
+                (getattr(cfg, "sources", None) or {}).get(name),
+                "backend", "") or "")
+        row = {
+            "source": name,
+            "backend": backend,
+            "enabled": bool(body.get("enabled")),
+            "runner_state": (body.get("runner") or {}).get(
+                "state", "unknown"),
+            "stale": bool(body.get("stale")),
+            "age_seconds": body.get("age_seconds"),
+            "pending": sum(
+                1 for r in body.get("rows", [])
+                if not r.get("retired") and r.get("status") in
+                ("exceptions_found", "checks_incomplete", "refused",
+                 "error", "not_run")),
+        }
+        if body.get("cost_note"):
+            row["cost_note"] = body["cost_note"]
+        rows.append(row)
+    return {"sources": rows}
 
 
 @app.post("/api/exceptions/ack")
