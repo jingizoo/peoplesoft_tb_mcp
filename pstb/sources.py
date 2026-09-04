@@ -32,6 +32,10 @@ class SourceRegistry:
         for source_name, source_cfg in (cfg.sources or {}).items():
             normalize_db_schemas(
                 source_cfg, section=f"sources.{source_name}")
+            # Backfill for hand-assembled configs; the loader's stamp
+            # wins when it ran.
+            if not getattr(source_cfg, "source_name", ""):
+                source_cfg.source_name = str(source_name)
         # Every later boundary comparison is case-insensitive.  Accepting
         # both ``P2Go`` and ``p2go`` here would therefore make two credentials
         # collapse to one guard identity even though dict lookup still treated

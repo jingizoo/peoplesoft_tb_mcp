@@ -19,9 +19,18 @@ class DbError(RuntimeError):
 
 _BIND_RE = re.compile(r"(?<![:\w]):(\w+)")
 _CATALOG_IDENTIFIER = (
-    r'(?:[A-Za-z][A-Za-z0-9_$#]*|"[A-Za-z][A-Za-z0-9_$#]*"|'
-    r'\[[A-Za-z][A-Za-z0-9_$#]*\])'
+    r'(?:[A-Za-z_][A-Za-z0-9_$#]*|"[A-Za-z_][A-Za-z0-9_$#]*"|'
+    r'\[[A-Za-z_][A-Za-z0-9_$#]*\])'
 )
+_BQ_LABEL_STRIP = re.compile(r"[^a-z0-9_-]+")
+
+
+def _bq_label_value(name: str) -> str:
+    """Total function: never raises, output always a legal BigQuery
+    label value ([a-z0-9_-]{0,63}). One illegal label fails EVERY job
+    with BadRequest, so legality is enforced here, not hoped for."""
+    return _BQ_LABEL_STRIP.sub(
+        "-", str(name or "").strip().lower())[:63].strip("-")
 _CATALOG_OBJECT_RE = re.compile(
     rf"^\s*({_CATALOG_IDENTIFIER})"
     rf"(?:\s*\.\s*({_CATALOG_IDENTIFIER}))?\s*$"
@@ -280,6 +289,11 @@ class Database:
         self._local = threading.local()        # per-thread sqlite connections
         self._bq_client = None                 # shared thread-safe client
         self._bq_stats = threading.local()     # last bytes-billed, per channel
+        # Cumulative actual spend across every thread. The dedicated
+        # lock is load-bearing: bigquery sessions run needs_lock=False,
+        # so nothing else serializes concurrent captures.
+        self._bq_billing_lock = threading.Lock()
+        self._bq_bytes_billed_total = 0
         self._catalog: dict = {}               # table -> real column names
         self._catalog_lock = threading.Lock()
         # Set once the database has REJECTED these credentials. Every later
@@ -748,7 +762,18 @@ class Database:
                 use_query_cache=True,
                 default_dataset=(
                     f"{c.bigquery_project}.{self.bigquery_dataset}"),
-                labels={"app": "pstb"})
+                # The source label makes per-source spend queryable from
+                # INFORMATION_SCHEMA.JOBS / the billing export. Only
+                # added when non-empty, so unstamped configs keep the
+                # slice-1 labels exactly. Observability, not identity:
+                # collisions after sanitizing are acceptable, unlike the
+                # registry's collision-suffixed command slugs.
+                labels=(
+                    {"app": "pstb",
+                     "source": _bq_label_value(
+                         getattr(c, "source_name", ""))}
+                    if _bq_label_value(getattr(c, "source_name", ""))
+                    else {"app": "pstb"}))
             if self._timeout_ms > 0:
                 job_cfg.job_timeout_ms = self._timeout_ms
             try:
@@ -807,11 +832,13 @@ class Database:
         if job is None:
             return
         try:
+            billed = int(getattr(job, "total_bytes_billed", 0) or 0)
             self._bq_stats.last = {
-                "bytes_billed": int(
-                    getattr(job, "total_bytes_billed", 0) or 0),
+                "bytes_billed": billed,
                 "cache_hit": bool(getattr(job, "cache_hit", False)),
             }
+            with self._bq_billing_lock:
+                self._bq_bytes_billed_total += billed
         except Exception:
             pass
 
@@ -819,6 +846,15 @@ class Database:
         """The most recent bigquery job's billing facts for THIS thread;
         empty for every other dialect."""
         return dict(getattr(self._bq_stats, "last", {}) or {})
+
+    def bytes_billed_total(self) -> int:
+        """Cumulative ACTUAL bytes billed by this handle, all threads.
+
+        Dry runs never pass through _capture_bq_stats (explain_plan
+        calls client.query directly), so estimates cannot double-count
+        as spend; a cache hit adds 0, which is true spend."""
+        with self._bq_billing_lock:
+            return int(self._bq_bytes_billed_total)
 
     def object_names(self) -> tuple:
         """(SCHEMA_UPPER, NAME_UPPER) for every table/view this
@@ -829,8 +865,10 @@ class Database:
         instance whose dictionary sits behind row-security policies,
         that was the hottest statement the DBA saw. One bounded read
         per process replaces all of them. Staleness is the same the
-        columns cache already accepts; clear_catalog() (the console
-        reload) drops it.
+        columns cache already accepts; the console reload invalidates
+        by REPLACING the Database (a fresh instance has an empty
+        catalog), and clear_catalog() remains the manual/test
+        primitive.
         """
         key = ("ALL_OBJECT_NAMES",)
         with self._catalog_lock:
@@ -1149,6 +1187,28 @@ class Database:
                 "owned). Add a partition or date filter, or select fewer "
                 "columns -- LIMIT does not reduce bytes billed on this "
                 "backend.")
+        if ("without a filter over column" in low
+                or "partition elimination" in low):
+            # Self-contained from the server's own message, so it works
+            # with a stale or absent artifact; the artifact-fed
+            # access_path_note is the before-the-fact twin. Order
+            # matters both ways: this message carries neither "bytes
+            # billed" nor "not found: table", and the branches above
+            # and below must not claim it (the dispatch-order tests pin
+            # both directions). Interaction chain: the dry run fails
+            # with this same error, explain_plan reports unavailable,
+            # the gate degrades to its ran-without-a-byte-check note,
+            # execution raises, and this branch names the column.
+            m = re.search(r"column\(s\) '([^']+)'", msg)
+            cols = m.group(1) if m else "its partition column"
+            return DbError(
+                f"This table declares require_partition_filter: BigQuery "
+                f"refuses unfiltered reads server-side. Add a WHERE "
+                f"directly on {cols} (e.g. {cols} >= DATE '2026-01-01', "
+                "or BETWEEN over the dates you need) -- the same filter "
+                "is what cuts bytes billed. Keep the predicate on the "
+                "bare column: wrapping it in a function can defeat "
+                "partition elimination, and LIMIT does not help.")
         if "not found: table" in low or "not found: dataset" in low:
             return DbError(
                 f"Not found -- {msg.strip()[:300]}. Names are case-"

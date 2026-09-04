@@ -155,6 +155,12 @@ engine.attach_memory(memory)
 # A local, mtime-cached index makes an approved "do not use" decision a hard
 # guard on discovery, profiling and SQL without adding a database round trip.
 engine.attach_record_exclusions(record_exclusions)
+# The server owns validated catalog readers (_metadata_for_source fails
+# closed on source/fingerprint mismatch); the engine consumes their facts
+# for row estimates and partition hints. Resolved lazily at call time --
+# _metadata_for_source is defined below.
+engine.attach_metadata_catalogs(
+    lambda name: _metadata_for_source(name or "default")[1])
 
 mcp = FastMCP("peoplesoft-tb")
 

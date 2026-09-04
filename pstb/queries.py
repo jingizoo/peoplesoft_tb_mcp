@@ -29,10 +29,14 @@ GROUPABLE_CHARTFIELDS = {
     "CURRENCY_CD",
 }
 
+# Leading underscore admitted everywhere (a positional widening --
+# splice safety is the CHARACTER CLASS, which does not change);
+# digit-leading stays refused: reaching `2024_x` needs backticks, and
+# backtick refusal is a deliberate closed guard class.
 _IDENT = (
-    r'(?:[A-Za-z][A-Za-z0-9_$#]{0,127}|'
-    r'"[A-Za-z][A-Za-z0-9_$#]{0,127}"|'
-    r'\[[A-Za-z][A-Za-z0-9_$#]{0,127}\])'
+    r'(?:[A-Za-z_][A-Za-z0-9_$#]{0,127}|'
+    r'"[A-Za-z_][A-Za-z0-9_$#]{0,127}"|'
+    r'\[[A-Za-z_][A-Za-z0-9_$#]{0,127}\])'
 )
 IDENT_RE = re.compile(rf"^\s*{_IDENT}(?:\s*\.\s*{_IDENT})?\s*$")
 
@@ -839,6 +843,14 @@ def table_list(db: Database, params: dict) -> str:
 
 def table_describe(db: Database, table: str, params: dict) -> str:
     if not IDENT_RE.match(table):
+        if (db.dialect == "bigquery"
+                and str(table or "").strip()[:1].isdigit()):
+            raise ValueError(
+                f"Invalid table name: {table!r}. Digit-leading names are "
+                "not addressable through the guarded tools: unquoted "
+                "digit-leading identifiers are invalid GoogleSQL and "
+                "backtick quoting is refused as a guard boundary. Rename "
+                "or view-wrap the object to reach it here.")
         raise ValueError(f"Invalid table name: {table!r}")
     try:
         owner, name = db.table_scope(table)

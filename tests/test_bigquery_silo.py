@@ -15,11 +15,14 @@ the miner is off with the artifact saying exactly why.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -449,7 +452,7 @@ class _CollectorDb:
     dialect = "bigquery"
 
     def __init__(self, tables=None, columns=None, storage=None,
-                 views=None):
+                 views=None, options=None):
         self.cfg = _bq_cfg()
         self.executed = []
         self._tables = tables if tables is not None else [
@@ -460,13 +463,24 @@ class _CollectorDb:
             {"schema_name": "sales_mart", "object_name": "Order_Lines_V",
              "object_type": "VIEW"},
         ]
+        self._options = options if options is not None else [
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "option_name": "require_partition_filter",
+             "option_value": "true"},
+        ]
         self._columns = columns if columns is not None else [
             {"schema_name": "sales_mart", "object_name": "Orders_2024",
              "column_name": "ORDER_ID", "data_type": "STRING",
-             "data_length": None, "nullable": "N"},
+             "data_length": None, "nullable": "N",
+             "clustering_ordinal_position": 2},
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "column_name": "Order_Dt", "data_type": "DATE",
+             "data_length": None, "nullable": "Y",
+             "is_partitioning_column": "YES"},
             {"schema_name": "sales_mart", "object_name": "Orders_2024",
              "column_name": "VENDOR_ID", "data_type": "STRING",
-             "data_length": None, "nullable": "Y"},
+             "data_length": None, "nullable": "Y",
+             "clustering_ordinal_position": 1},
             {"schema_name": "sales_mart", "object_name": "Vendors",
              "column_name": "VENDOR_ID", "data_type": "STRING",
              "data_length": None, "nullable": "N"},
@@ -507,6 +521,11 @@ class _CollectorDb:
 
     def query(self, sql, params=None, max_rows=None):
         self.executed.append(sql)
+        # OPTIONS dispatched first on purpose: "INFORMATION_SCHEMA.TABLES"
+        # happens not to be a substring of the OPTIONS marker today, but
+        # the ordering keeps the scaffold robust if either literal moves.
+        if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql:
+            return list(self._options), False
         if "INFORMATION_SCHEMA.TABLES" in sql:
             return list(self._tables), False
         if "INFORMATION_SCHEMA.COLUMNS" in sql:
@@ -729,3 +748,495 @@ class ShimContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccessPathFactsTests(unittest.TestCase):
+    """Partition and clustering facts ride the EXISTING jobs plus one
+    guarded TABLE_OPTIONS read -- and survive the very budget cuts
+    that target the big tables partitioning exists for."""
+
+    def _build(self, db=None, limits=None):
+        from pstb.metadata import build_catalog
+        root = Path(tempfile.mkdtemp())
+        db = db or _CollectorDb()
+        build_catalog(root / "c.db", [("warehouse", db)], limits=limits)
+        import sqlite3
+        con = sqlite3.connect(root / "c.db")
+        con.row_factory = sqlite3.Row
+        return con, db, root
+
+    def _table_attrs(self, con, name):
+        row = con.execute(
+            "SELECT attrs FROM nodes WHERE kind IN ('table','view') "
+            "AND name=?", (name,)).fetchone()
+        return json.loads(row["attrs"]) if row else {}
+
+    def test_partition_facts_ride_existing_jobs_plus_options(self):
+        con, db, _ = self._build()
+        surfaces = {}
+        for sql in db.executed:
+            for marker in ("INFORMATION_SCHEMA.TABLE_OPTIONS",
+                           "INFORMATION_SCHEMA.TABLES",
+                           "INFORMATION_SCHEMA.COLUMNS", "__TABLES__",
+                           "INFORMATION_SCHEMA.VIEWS"):
+                if marker in sql:
+                    surfaces[marker] = surfaces.get(marker, 0) + 1
+                    break
+        self.assertEqual(max(surfaces.values()), 1, surfaces)
+        self.assertEqual(len(surfaces), 5, surfaces)
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        con.close()
+        # TRUE case, not the folded node name: the fact is pasted into
+        # WHERE clauses by people.
+        self.assertEqual(attrs["partitioned_by"], "Order_Dt")
+        self.assertIs(attrs["require_partition_filter"], True)
+        self.assertEqual(attrs["clustering_columns"],
+                         ["VENDOR_ID", "ORDER_ID"],
+                         "clustering must sort by ordinal (fed 2 then 1)")
+
+    def test_partition_facts_survive_the_field_budget(self):
+        from pstb.metadata import MetadataBuildLimits
+        limits = MetadataBuildLimits(max_fields=1)
+        con, _, _ = self._build(limits=limits)
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        con.close()
+        self.assertEqual(attrs.get("partitioned_by"), "Order_Dt",
+                         "the field cap ate the partition fact -- the "
+                         "capture must run before the budget returns")
+
+    def test_ingestion_time_table_names_the_pseudo_column(self):
+        """require_partition_filter with NO partitioning column in
+        COLUMNS is a real BigQuery shape (ingestion-time tables); the
+        advice must name _PARTITIONTIME, never KeyError."""
+        db = _CollectorDb(options=[
+            {"schema_name": "sales_mart", "object_name": "Vendors",
+             "option_name": "require_partition_filter",
+             "option_value": "true"}])
+        con, _, _ = self._build(db=db)
+        attrs = self._table_attrs(con, "VENDORS")
+        term = con.execute(
+            "SELECT text FROM search_terms WHERE facet='access path' "
+            "AND text LIKE '%_PARTITIONTIME%'").fetchone()
+        con.close()
+        self.assertIs(attrs.get("require_partition_filter"), True)
+        self.assertNotIn("partitioned_by", attrs)
+        self.assertIsNotNone(term)
+
+    def test_access_path_reaches_the_evidence_packet(self):
+        from pstb.metadata import MetadataCatalog
+        con, _, root = self._build()
+        con.close()
+        catalog = MetadataCatalog(root / "c.db", source="warehouse")
+        packet = catalog.object_evidence("Orders_2024",
+                                         source="warehouse")
+        self.assertTrue(packet.get("found"), packet)
+        self.assertEqual(packet["access_path"]["partitioned_by"],
+                         "Order_Dt")
+        self.assertIn("MUST filter on Order_Dt",
+                      packet["access_path_note"])
+        plain = catalog.object_evidence("Vendors", source="warehouse")
+        self.assertIsNone(plain["access_path"])
+        self.assertNotIn("access_path_note", plain,
+                         "the caveat fired on an ordinary table")
+
+    def test_table_options_unreadable_degrades_to_a_note(self):
+        class _NoOptionsDb(_CollectorDb):
+            def query(self, sql, params=None, max_rows=None):
+                if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql:
+                    self.executed.append(sql)
+                    raise DbError("permission denied on TABLE_OPTIONS")
+                return super().query(sql, params, max_rows)
+
+        con, _, _ = self._build(db=_NoOptionsDb())
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        note = con.execute(
+            "SELECT note FROM notes WHERE layer='access_paths'"
+        ).fetchone()
+        con.close()
+        self.assertEqual(attrs.get("partitioned_by"), "Order_Dt",
+                         "column-derived facts must survive")
+        self.assertNotIn("require_partition_filter", attrs,
+                         "unknown must never be claimed as False")
+        self.assertIsNotNone(note)
+        self.assertIn("TABLE_OPTIONS is not readable", note["note"])
+
+
+class ArtifactRowEstimateTests(unittest.TestCase):
+    """_approx_rows on bigquery reads the artifact snapshot -- never a
+    live 10MB-minimum job -- and fails to None, not to a probe."""
+
+    def _artifact(self, root):
+        from pstb.metadata import build_catalog
+        build_catalog(root / "c.db", [("warehouse", _CollectorDb())])
+        return root / "c.db"
+
+    def _engine(self, resolver):
+        from pstb.engine import TBEngine
+
+        def explode(*_a, **_k):
+            raise AssertionError("the meter was touched")
+
+        eng = TBEngine.__new__(TBEngine)
+        eng.db = SimpleNamespace(dialect="bigquery", query=explode)
+        eng.cfg = _bq_cfg()
+        eng._source_name = "warehouse"
+        eng._source_engines = {}
+        if resolver is not None:
+            eng._catalog_resolver = resolver
+        return eng
+
+    def test_approx_rows_reads_the_artifact_not_the_meter(self):
+        from pstb.metadata import MetadataCatalog
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._artifact(Path(tmp))
+            catalog = MetadataCatalog(path, source="warehouse")
+            eng = self._engine(lambda name: catalog)
+            # The equality is the anti-toothless assertion: "no crash"
+            # would pass a no-op.
+            self.assertEqual(eng._approx_rows("Orders_2024"), 120)
+            self.assertIsNone(eng._approx_rows("Order_Lines_V"),
+                              "a view's NULL estimate must stay None")
+
+    def test_no_resolver_means_none_and_zero_queries(self):
+        eng = self._engine(None)
+        calls = []
+        eng.db = SimpleNamespace(dialect="bigquery",
+                                 query=lambda *a, **k: calls.append(a))
+        self.assertIsNone(eng._approx_rows("Orders_2024"))
+        self.assertEqual(calls, [])
+
+    def test_a_rebuilt_artifact_is_picked_up_without_restart(self):
+        from pstb.metadata import MetadataCatalog, build_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self._artifact(root)
+            catalog = MetadataCatalog(path, source="warehouse")
+            eng = self._engine(lambda name: catalog)
+            self.assertEqual(eng._approx_rows("Orders_2024"), 120)
+            db = _CollectorDb(storage=[
+                {"table_id": "Orders_2024", "row_count": 999,
+                 "modified_at": "2026-09-01T00:00:00", "type": 1},
+                {"table_id": "Vendors", "row_count": 0,
+                 "modified_at": "2026-01-01T00:00:00", "type": 1},
+                {"table_id": "Order_Lines_V", "row_count": None,
+                 "modified_at": None, "type": 2}])
+            build_catalog(path, [("warehouse", db)])
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            self.assertEqual(eng._approx_rows("Orders_2024"), 999,
+                             "a rebuild must invalidate the facts cache")
+
+    def test_a_wrong_source_artifact_feeds_nothing(self):
+        from pstb.metadata import MetadataCatalog
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._artifact(Path(tmp))
+            catalog = MetadataCatalog(path, source="elsewhere")
+            eng = self._engine(lambda name: catalog)
+            self.assertIsNone(eng._approx_rows("Orders_2024"),
+                              "_open's fail-closed binding was bypassed")
+
+    def test_children_inherit_the_resolver(self):
+        from pstb.engine import TBEngine
+        eng = TBEngine.__new__(TBEngine)
+        eng._source_engines = {"a": SimpleNamespace()}
+        TBEngine.attach_metadata_catalogs(eng, lambda name: None)
+        self.assertIsNotNone(eng._catalog_resolver)
+        self.assertIsNotNone(
+            eng._source_engines["a"]._catalog_resolver)
+
+
+class GateHintTests(unittest.TestCase):
+    """The over-cap refusal names the partition column when the
+    artifact knows it -- and never loses the refusal to its garnish."""
+
+    def _fake_self(self, facts):
+        from pstb.engine import TBEngine
+        cfg = _bq_cfg()
+        return SimpleNamespace(
+            db=SimpleNamespace(
+                dialect="bigquery", cfg=cfg,
+                explain_plan=lambda sql, p: {
+                    "available": True,
+                    "estimated_bytes": 5_000_000_000,
+                    "cap_bytes": 1_073_741_824}),
+            _artifact_facts=lambda: facts,
+            _table_refs=TBEngine._table_refs.__get__(None) if False
+            else (lambda scrubbed: {"Orders_2024"}),
+            _table_target=lambda name: ("SALES_MART", name.upper()))
+
+    def test_the_refusal_names_the_partition_column(self):
+        from pstb.engine import EngineError, TBEngine
+        facts = {("SALES_MART", "ORDERS_2024"): {
+            "partitioned_by": "Order_Dt",
+            "require_partition_filter": True,
+            "clustering_columns": ["VENDOR_ID", "ORDER_ID"]}}
+        with self.assertRaises(EngineError) as caught:
+            TBEngine._cost_gate(self._fake_self(facts),
+                                "SELECT * FROM Orders_2024",
+                                "SELECT * FROM Orders_2024", {})
+        text = str(caught.exception)
+        self.assertIn("partitioned by Order_Dt", text)
+        self.assertIn("filter REQUIRED", text)
+        self.assertIn("clustered by VENDOR_ID, ORDER_ID", text)
+        self.assertIn("bigquery_max_bytes_billed", text)
+
+    def test_factless_refusal_is_byte_identical_to_before(self):
+        from pstb.engine import EngineError, TBEngine
+        with self.assertRaises(EngineError) as caught:
+            TBEngine._cost_gate(self._fake_self({}),
+                                "SELECT * FROM Orders_2024",
+                                "SELECT * FROM Orders_2024", {})
+        text = str(caught.exception)
+        self.assertNotIn("partitioned by", text)
+        self.assertTrue(text.endswith("LIMIT does not reduce bytes "
+                                      "billed."),
+                        text[-80:])
+
+
+class PartitionFilterTranslateTests(unittest.TestCase):
+    """The server-side require_partition_filter error becomes a remedy
+    naming the column -- and neither neighboring branch may claim it."""
+
+    MESSAGE = ("Cannot query over table 'p.d.T' without a filter over "
+               "column(s) 'order_dt' that can be used for partition "
+               "elimination")
+
+    def _translate(self, text):
+        return str(Database(_bq_cfg())._translate(RuntimeError(text)))
+
+    def test_the_remedy_names_the_column(self):
+        remedy = self._translate(self.MESSAGE)
+        self.assertIn("require_partition_filter", remedy)
+        self.assertIn("order_dt", remedy)
+        self.assertIn("wrapping it in a function", remedy)
+        self.assertNotIn("bytes billed on this backend", remedy)
+
+    def test_a_mangled_message_still_gets_the_generic_remedy(self):
+        remedy = self._translate(
+            "query failed: partition elimination was not possible")
+        self.assertIn("its partition column", remedy)
+
+    def test_branch_order_holds_in_both_directions(self):
+        capped = self._translate(
+            "Query exceeded limit for bytes billed: 1073741824")
+        self.assertNotIn("require_partition_filter", capped)
+        partition = self._translate(self.MESSAGE)
+        self.assertNotIn("operator-owned", partition)
+
+
+class SourceLabelTests(unittest.TestCase):
+    """Per-source job labels: observability that can never fail a job."""
+
+    def test_source_label_rides_default_job_config(self):
+        cfg = _bq_cfg()
+        cfg.db.source_name = "Sales Mart"
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            cfg, rows=[(1, 2)])
+        with ctx:
+            db.query("SELECT a, b FROM t", {})
+        self.assertEqual(
+            constructions[0]["job_config"].kwargs["labels"],
+            {"app": "pstb", "source": "sales-mart"})
+
+    def test_unstamped_config_keeps_slice1_labels_exactly(self):
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            _bq_cfg(), rows=[(1, 2)])
+        with ctx:
+            db.query("SELECT a, b FROM t", {})
+        self.assertEqual(constructions[0]["job_config"].kwargs["labels"],
+                         {"app": "pstb"})
+
+    def test_label_value_always_legal(self):
+        from pstb.db import _bq_label_value
+        for raw in ("", "P2Go", "Ünïcode Mart!!", "___", "!!!",
+                    "x" * 200, "2024 extracts", "sales_mart-2"):
+            with self.subTest(raw=raw[:20]):
+                value = _bq_label_value(raw)
+                if value:
+                    self.assertRegex(value, r"^[a-z0-9_-]{1,63}$")
+        self.assertEqual(_bq_label_value("P2Go"), "p2go")
+        self.assertEqual(_bq_label_value("2024 extracts"),
+                         "2024-extracts")
+        self.assertEqual(len(_bq_label_value("x" * 200)), 63)
+        self.assertEqual(_bq_label_value("!!!"), "")
+
+    def test_the_loader_stamps_and_wins_over_yaml(self):
+        import textwrap
+        from pstb.config import load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text(textwrap.dedent(f"""\
+                db:
+                  backend: sqlite
+                  sqlite_path: {root / 'p.db'}
+                sources:
+                  p2go:
+                    backend: sqlite
+                    sqlite_path: {root / 'x.db'}
+                    schema: MAIN
+                    source_name: spoof
+                """), encoding="utf-8")
+            cfg = load_config(str(root / "config.yaml"))
+        self.assertEqual(cfg.sources["p2go"].source_name, "p2go",
+                         "the loader, not the YAML block, is the "
+                         "authority for source_name")
+        self.assertEqual(cfg.db.source_name, "",
+                         "the primary stays unstamped")
+
+    def test_the_registry_backfills_unstamped_configs(self):
+        from pstb.config import DbCfg
+        from pstb.sources import SourceRegistry
+        cfg = Config.sample(Path(tempfile.mkdtemp()))
+        extra = DbCfg(backend="sqlite",
+                      sqlite_path=cfg.db.sqlite_path, schema="MAIN")
+        cfg.sources = {"extra": extra}
+        registry = SourceRegistry(cfg, Database(cfg))
+        self.assertEqual(extra.source_name, "extra")
+        del registry
+
+
+class IdentifierGrammarTests(unittest.TestCase):
+    """Leading underscore admitted everywhere; digit-leading refused
+    everywhere with the reason; the splice-safe character class never
+    widens."""
+
+    def test_underscore_names_describe_and_scope(self):
+        from pstb.queries import table_describe
+        db = Database(_bq_cfg())
+        params = {}
+        sql = table_describe(db, "_airbyte_raw_orders", params)
+        self.assertEqual(params["tname"], "_AIRBYTE_RAW_ORDERS")
+        self.assertIn(":tname", sql)
+        owner, name = db.table_scope("_airbyte_raw_orders")
+        self.assertEqual(name, "_AIRBYTE_RAW_ORDERS")
+
+    def test_quoted_and_bracketed_underscore_names_match(self):
+        from pstb.queries import IDENT_RE
+        for form in ('_foo', '"_foo"', '[_foo]', 'MAIN._foo'):
+            self.assertIsNotNone(IDENT_RE.match(form), form)
+
+    def test_the_engine_grammar_already_admits_leading_underscore(self):
+        """Pinned so a regex tidy cannot regress what run_sql accepts."""
+        from pstb.engine import TBEngine
+        self.assertIsNotNone(
+            re.fullmatch(TBEngine._UNQUOTED_SQL_IDENTIFIER, "_foo"))
+
+    def test_digit_leading_stays_refused_with_the_reason(self):
+        from pstb.queries import table_describe
+        db = Database(_bq_cfg())
+        with self.assertRaises(ValueError) as caught:
+            table_describe(db, "2024_extract", {})
+        self.assertIn("invalid GoogleSQL", str(caught.exception))
+        self.assertIn("view-wrap", str(caught.exception))
+        oracle_cfg = Config.sample(Path(tempfile.mkdtemp()))
+        with self.assertRaises(ValueError) as plain:
+            table_describe(Database(oracle_cfg), "2024_extract", {})
+        self.assertNotIn("GoogleSQL", str(plain.exception))
+
+    def test_the_dataset_grammar_branches_by_dialect(self):
+        from pstb.config import normalize_db_schemas
+        cfg = _bq_cfg(schema="_staging")
+        self.assertEqual(normalize_db_schemas(cfg.db, section="db"),
+                         ["_staging"])
+        for bad, needle in (("2024_mart", "invalid GoogleSQL"),
+                            ("sales$mart", "invalid GoogleSQL")):
+            with self.subTest(bad=bad):
+                broken = _bq_cfg(schema=bad)
+                with self.assertRaises(RuntimeError) as caught:
+                    normalize_db_schemas(broken.db, section="db")
+                self.assertIn(needle, str(caught.exception))
+        oracle = Config.sample(Path(tempfile.mkdtemp()))
+        oracle.db.backend = "oracle"
+        oracle.db.schema = "_FOO"
+        oracle.db.schemas = ["_FOO"]
+        with self.assertRaises(RuntimeError):
+            normalize_db_schemas(oracle.db, section="db")
+
+    def test_the_splice_class_stays_bounded_after_the_widening(self):
+        from pstb.queries import IDENT_RE
+        for bad in ("_x; DROP TABLE t", "foo bar", "a.b.c",
+                    "_" + "x" * 129, "`orders`", "2024_x"):
+            with self.subTest(bad=bad[:20]):
+                self.assertIsNone(IDENT_RE.match(bad))
+        self.assertIsNotNone(IDENT_RE.match("PS$TABLE"),
+                             "the non-leading class must keep $#")
+
+    def test_digit_leading_objects_get_one_counted_note(self):
+        db = _CollectorDb(tables=[
+            {"schema_name": "sales_mart", "object_name": "2024_x",
+             "object_type": "TABLE"},
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "object_type": "TABLE"},
+        ])
+        from pstb.metadata import build_catalog
+        import sqlite3
+        root = Path(tempfile.mkdtemp())
+        build_catalog(root / "c.db", [("warehouse", db)])
+        con = sqlite3.connect(root / "c.db")
+        con.row_factory = sqlite3.Row
+        notes = [r["note"] for r in con.execute(
+            "SELECT note FROM notes WHERE layer='identifier_grammar'")]
+        con.close()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("1 object(s)", notes[0])
+        self.assertIn("view-wrap", notes[0])
+
+    def test_a_clean_dataset_gets_no_grammar_note(self):
+        from pstb.metadata import build_catalog
+        import sqlite3
+        root = Path(tempfile.mkdtemp())
+        build_catalog(root / "c.db", [("warehouse", _CollectorDb())])
+        con = sqlite3.connect(root / "c.db")
+        rows = con.execute(
+            "SELECT COUNT(*) FROM notes WHERE layer='identifier_grammar'"
+        ).fetchone()
+        con.close()
+        self.assertEqual(rows[0], 0,
+                         "a zero-count note is ambient noise, forbidden")
+
+
+class SpendAccumulatorTests(unittest.TestCase):
+    """Actual bytes billed, per handle, across threads -- and the build
+    banner that prints them in both outcomes."""
+
+    def test_spend_accumulates_across_threads(self):
+        db, executed, constructions, ctx = _fake_bigquery_database(
+            _bq_cfg(), rows=[(1, 2)])
+        with ctx:
+            results = []
+
+            def one():
+                db.query("SELECT a, b FROM t", {})
+                results.append(db.last_query_stats()["bytes_billed"])
+
+            threads = [threading.Thread(target=one) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(results, [12345, 12345],
+                         "last_query_stats must stay per-thread")
+        self.assertEqual(db.bytes_billed_total(), 24690)
+
+    def test_a_capture_without_a_job_adds_nothing(self):
+        db = Database(_bq_cfg())
+        before = db.bytes_billed_total()
+        db._capture_bq_stats(SimpleNamespace())    # no query_job
+        self.assertEqual(db.bytes_billed_total(), before)
+
+    def test_the_spend_line_speaks_only_for_bigquery(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "build_script",
+            Path(__file__).resolve().parents[1]
+            / "scripts" / "build_metadata_catalog.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        line = script._bq_spend_line(
+            SimpleNamespace(dialect="bigquery",
+                            bytes_billed_total=lambda: 500), 100)
+        self.assertIn("400", line)
+        self.assertIn("$", line)
+        # The anti-toothless pair: always-empty fails the assertions
+        # above; always-printing fails this one.
+        self.assertEqual(script._bq_spend_line(
+            SimpleNamespace(dialect="oracle"), 0), "")

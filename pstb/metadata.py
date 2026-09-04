@@ -803,6 +803,30 @@ class _Writer:
              self.collected_at, json.dumps(attrs or {}, sort_keys=True,
                                             default=str)))
 
+    def merge_attrs(self, node_id: str, extra: dict) -> None:
+        """Merge keys into an existing node's attrs, additively.
+
+        Table nodes are written before their columns are read, so a
+        fact discovered during the column pass (a partition column, a
+        clustering ordinal) lands here rather than in a second node.
+        """
+        if not node_id or not extra:
+            return
+        row = self.con.execute(
+            "SELECT attrs FROM nodes WHERE id=?", (node_id,)).fetchone()
+        if row is None:
+            return
+        try:
+            current = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        self.con.execute(
+            "UPDATE nodes SET attrs=? WHERE id=?",
+            (json.dumps({**current, **extra}, sort_keys=True,
+                        default=str), node_id))
+
     def alias(self, source: str, alias: str, node_id: str, facet: str) -> None:
         value = _u(alias)
         if value:
@@ -933,6 +957,7 @@ def _column_pages(db, page_size: int) -> Iterable[tuple[list[dict], bool]]:
             "SELECT table_schema AS schema_name, "
             "table_name AS object_name, column_name, "
             "data_type, NULL AS data_length, "
+            "is_partitioning_column, clustering_ordinal_position, "
             "CASE is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable "
             f"FROM {ds}.INFORMATION_SCHEMA.COLUMNS "
             "ORDER BY table_schema, table_name, ordinal_position",
@@ -1928,9 +1953,31 @@ def _collect_native(state: _Writer, source: str, db,
         state.limit(source, "objects", limits.max_objects, len(objects))
 
     object_keys = {(o["schema"], o["name"]): o for o in objects}
+    if db.dialect == "bigquery":
+        digit_led = sum(1 for o in objects
+                        if str(o.get("name") or "")[:1].isdigit())
+        if digit_led:
+            # A zero-count note is forbidden by test: the disclosure
+            # exists for the site that actually has these, never as
+            # ambient noise.
+            state.note(
+                source, "identifier_grammar",
+                f"{digit_led} object(s) in {db.bigquery_dataset} begin "
+                "with a digit and are not addressable through the "
+                "guarded tools: unquoted digit-leading names are invalid "
+                "GoogleSQL and backtick quoting is refused as a guard "
+                "boundary. Rename or view-wrap them to reach them here.",
+                ok=True)
     fields = 0
     field_overflow = False
     last_owner_id = ""
+    # Access-path facts (BigQuery partition/clustering), keyed like
+    # object_keys and captured BEFORE the column budget's early returns:
+    # the field cap cuts the biggest tables first, and the biggest
+    # tables are exactly the ones that get partitioned -- losing their
+    # partition fact to a budget decision would starve the one consumer
+    # (the cost gate's refusal hint) that exists for big tables.
+    access: dict = {}
 
     # Which objects have provably nothing in them. On the deployment this
     # targets the column budget is the binding constraint by an order of
@@ -1993,6 +2040,15 @@ def _collect_native(state: _Writer, source: str, db,
         owner = object_keys.get(key)
         if owner is None:
             return
+        raw_col = _s(row.get("column_name") or row.get("name"))
+        # True case on purpose (validation uppercase, execution true
+        # case): the fact is rendered into refusal text a person will
+        # paste into a WHERE clause.
+        if str(row.get("is_partitioning_column") or "").upper() == "YES":
+            access.setdefault(key, {})["partitioned_by"] = raw_col
+        if row.get("clustering_ordinal_position") is not None:
+            access.setdefault(key, {}).setdefault("clustering", []).append(
+                (int(row["clustering_ordinal_position"]), raw_col))
         nonlocal empty_fields
         is_empty_object = owner["id"] in deprioritized
         # Adaptive half-budget rule when column counts are unknown: an
@@ -2032,6 +2088,13 @@ def _collect_native(state: _Writer, source: str, db,
             "nullable": _s(row.get("nullable") or row.get("notnull")
                            or row.get("is_notnull")),
         }
+        # Conditional via row.get: absent on oracle/sqlserver/sqlite row
+        # shapes, so those dialects pay nothing.
+        if str(row.get("is_partitioning_column") or "").upper() == "YES":
+            attrs["is_partitioning_column"] = True
+        if row.get("clustering_ordinal_position") is not None:
+            attrs["clustering_ordinal"] = int(
+                row["clustering_ordinal_position"])
         fid = state.node(
             source=source, schema=owner["schema"], kind="column", name=name,
             parent=owner["id"], collector="db_catalog",
@@ -2078,10 +2141,12 @@ def _collect_native(state: _Writer, source: str, db,
             "its limit; this prevents an unbounded full-catalog scan.",
             ok=False, partial=True)
     else:
+        capped = False
         for page, _truncated in _column_pages(db, limits.query_page_size):
             for pos, row in enumerate(page):
                 add_column(row.get("schema_name"), row.get("object_name"), row)
-                if fields >= limits.max_fields:
+                if fields >= limits.max_fields and not capped:
+                    capped = True
                     field_overflow = (pos < len(page) - 1 or _truncated)
                     # Conservative: the object owning the last accepted
                     # column may have had more, and we cannot tell from
@@ -2090,8 +2155,15 @@ def _collect_native(state: _Writer, source: str, db,
                     # false copy from a subset.
                     if last_owner_id:
                         state.partial_columns.add(last_owner_id)
+                if capped and db.dialect != "bigquery":
                     break
-            if fields >= limits.max_fields:
+            if capped and db.dialect != "bigquery":
+                # BigQuery keeps scanning past the cap: its column pages
+                # are already buffered in memory (one billed job), and
+                # the partition/clustering capture must see every row --
+                # the field cap cuts the biggest tables first, which are
+                # exactly the ones that get partitioned. Paged dialects
+                # stop fetching; every further page would be a new query.
                 break
     if field_overflow:
         state.limit(source, "fields", limits.max_fields, fields)
@@ -2103,6 +2175,78 @@ def _collect_native(state: _Writer, source: str, db,
             "cover objects that hold data; those objects keep their "
             "names, statistics and relationships but not a full column "
             "list", ok=True, partial=True)
+
+    if db.dialect == "bigquery":
+        # The ONE new billed job this slice adds: require_partition_filter
+        # and partition expiry live in TABLE_OPTIONS, not COLUMNS. Guarded
+        # so it can never cost the caller the catalog -- a build without
+        # these facts is a build, not a failure.
+        ds = db.bigquery_dataset
+        try:
+            option_rows, _ = db.query(
+                "SELECT table_schema AS schema_name, "
+                "table_name AS object_name, option_name, option_value "
+                f"FROM {ds}.INFORMATION_SCHEMA.TABLE_OPTIONS "
+                "WHERE option_name IN "
+                "('require_partition_filter','partition_expiration_days')",
+                {}, max_rows=200_000)
+        except DbError as exc:
+            option_rows = []
+            state.note(
+                source, "access_paths",
+                f"TABLE_OPTIONS is not readable ({exc}); partition facts "
+                "are limited to what INFORMATION_SCHEMA.COLUMNS declares, "
+                "and require_partition_filter is unknown -- a query "
+                "against such a table still fails server-side with the "
+                "remedy naming the column", ok=False, partial=True)
+        for row in option_rows:
+            key = (_u(row.get("schema_name")) or "MAIN",
+                   _u(row.get("object_name")))
+            if key not in object_keys:
+                continue
+            option = str(row.get("option_name") or "")
+            value = str(row.get("option_value") or "").strip().strip('"')
+            if option == "require_partition_filter" and value == "true":
+                access.setdefault(key, {})["require_partition_filter"] = \
+                    True
+            elif option == "partition_expiration_days":
+                try:
+                    access.setdefault(
+                        key, {})["partition_expiration_days"] = float(value)
+                except ValueError:
+                    pass
+        merged_access = 0
+        for key, facts in access.items():
+            owner = object_keys.get(key)
+            if owner is None:
+                continue
+            extra = {name: facts[name]
+                     for name in ("partitioned_by",
+                                  "require_partition_filter",
+                                  "partition_expiration_days")
+                     if name in facts}
+            clustering = sorted(facts.get("clustering") or [])
+            if clustering:
+                extra["clustering_columns"] = [col for _, col in clustering]
+            if not extra:
+                continue
+            state.merge_attrs(owner["id"], extra)
+            # An ingestion-time table has require_partition_filter with
+            # NO partitioning column in COLUMNS: the pseudo-column is
+            # the honest advice, never a KeyError.
+            col = extra.get("partitioned_by") or "_PARTITIONTIME (ingestion time)"
+            state.term(
+                owner["id"], "access path",
+                f"partitioned by {col}"
+                + (", partition filter required"
+                   if extra.get("require_partition_filter") else ""))
+            merged_access += 1
+        if merged_access:
+            state.note(
+                source, "access_paths",
+                f"partition/clustering access paths recorded for "
+                f"{merged_access} object(s); the cost gate names them "
+                "when it refuses an unfiltered read", ok=True)
 
     index_count = 0
     index_overflow = False
@@ -4005,9 +4149,68 @@ class MetadataCatalog:
         self.source = _s(source)
         self.expected_fingerprint = _s(expected_fingerprint)
         self.binding_error = _s(binding_error)
+        # object_facts() cache: (st_mtime_ns, st_size) -> result dict.
+        # One tuple, replaced whole, so a concurrent read is benign.
+        self._facts_cache: tuple = ()
 
     def available(self) -> bool:
         return self.path.exists()
+
+    def object_facts(self) -> dict:
+        """Bulk access-path and size facts for every table/view, cached
+        per artifact VERSION.
+
+        The artifact is atomically replaced on rebuild (os.replace), so
+        (mtime_ns, size) from one stat() identifies a version: a rebuild
+        is picked up without restart, and nothing re-opens sqlite per
+        ranked candidate. Negative results are cached on the same key --
+        a broken artifact must not re-stat-and-reopen per candidate.
+        Facts come from the validated _open() (source and fingerprint
+        fail closed), never a bypass.
+        """
+        try:
+            stat = self.path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError as exc:
+            return {"available": False, "detail": str(exc)}
+        cached = self._facts_cache
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            con = self._open()
+        except MetadataError as exc:
+            result = {"available": False, "detail": str(exc)}
+            self._facts_cache = (key, result)
+            return result
+        try:
+            facts: dict = {}
+            for row in con.execute(
+                    "SELECT n.schema_name, n.name, n.attrs, "
+                    "p.row_estimate "
+                    "FROM nodes n LEFT JOIN object_profiles p "
+                    "ON p.node_id = n.id "
+                    "WHERE n.kind IN ('table','view') AND n.source = ?",
+                    (self.source,)):
+                try:
+                    attrs = json.loads(row["attrs"] or "{}")
+                except (TypeError, ValueError):
+                    attrs = {}
+                if not isinstance(attrs, dict):
+                    attrs = {}
+                facts[(_u(row["schema_name"]), _u(row["name"]))] = {
+                    "row_estimate": row["row_estimate"],
+                    "partitioned_by": attrs.get("partitioned_by"),
+                    "require_partition_filter": attrs.get(
+                        "require_partition_filter"),
+                    "clustering_columns": attrs.get("clustering_columns"),
+                }
+            result = {"available": True, "facts": facts}
+        except sqlite3.DatabaseError as exc:
+            result = {"available": False, "detail": str(exc)}
+        finally:
+            con.close()
+        self._facts_cache = (key, result)
+        return result
 
     def _open(self) -> sqlite3.Connection:
         if self.binding_error:
@@ -5126,7 +5329,15 @@ class MetadataCatalog:
         empty_verified = (liveness == "empty" and usefulness.get(
             "caveat_branch") == "verified_empty_current")
 
-        return {
+        attributes = subject.get("attributes") or {}
+        access_path = {key: attributes[key]
+                       for key in ("partitioned_by",
+                                   "require_partition_filter",
+                                   "clustering_columns",
+                                   "partition_expiration_days")
+                       if key in attributes}
+
+        packet = {
             "available": True, "found": True,
             "source_database": canonical,
             "schema": subject.get("schema"),
@@ -5150,11 +5361,23 @@ class MetadataCatalog:
             "view_vocabulary": vocabulary,
             "notes": notes,
             "profiler_status": profiler_status,
+            "access_path": access_path or None,
             "coverage_note": (
                 "Structure and evidence only: no row was read from any "
                 "business table to build this packet, and nothing here "
                 "is financial evidence."),
         }
+        if access_path.get("require_partition_filter"):
+            # The note appears ONLY when a fact backs it: a caveat that
+            # fires on an ordinary table is worse than a miss.
+            col = (access_path.get("partitioned_by")
+                   or "_PARTITIONTIME (ingestion time)")
+            packet["access_path_note"] = (
+                f"Queries MUST filter on {col}; unfiltered reads fail "
+                "server-side. Keep the filter directly on the column -- "
+                "wrapping it in a function can defeat partition "
+                "elimination.")
+        return packet
 
     def _evidence_notes(self, source: str) -> dict:
         """view_vocabulary/value_joins notes, verbatim -- so 'nothing

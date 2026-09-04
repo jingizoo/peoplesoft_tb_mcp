@@ -38,6 +38,20 @@ def _say(message: str, quiet: bool = False) -> None:
         print(message, flush=True)
 
 
+def _bq_spend_line(database, before: int) -> str:
+    """What this build actually billed, printed in BOTH outcomes -- a
+    failed build's spend is exactly what an operator must see. Empty
+    for every non-bigquery source (the anti-toothless case: a helper
+    that always prints would nag Oracle builds about dollars that do
+    not exist)."""
+    if getattr(database, "dialect", "") != "bigquery":
+        return ""
+    total = getattr(database, "bytes_billed_total", lambda: 0)()
+    billed = max(int(total) - int(before or 0), 0)
+    return (f"bigquery bytes billed by this build: {billed:,} "
+            f"(~${billed / 2**40 * 6.25:.4f} on-demand)")
+
+
 def _prior_snapshot_id(path: Path) -> str:
     """Read only the prior artifact identity; an unreadable file is none."""
     if not path.is_file():
@@ -221,6 +235,8 @@ def main(argv=None) -> int:
             out = (Path(args.out) if args.out else catalog_path(cfg, name))
             _say(f"{name} artifact: {out}", args.quiet)
             database = registry.get(name)
+            spent_before = getattr(database, "bytes_billed_total",
+                                   lambda: 0)()
             schemas = list(getattr(database, "allowed_schemas", ()) or ())
             if schemas:
                 rendered = [f"{schemas[0]} (default)", *schemas[1:]]
@@ -283,6 +299,9 @@ def main(argv=None) -> int:
                 failures.append((name, exc))
                 print(f"Metadata catalog for {name} was NOT replaced: {exc}")
                 print(f"The prior {name} artifact, if any, remains readable.")
+                spend = _bq_spend_line(database, spent_before)
+                if spend:
+                    print(spend)
                 continue
             built.append((name, out, info, elapsed))
             print(f"wrote {int(info['nodes']):,} metadata facts and "
@@ -290,6 +309,9 @@ def main(argv=None) -> int:
                   f"{out} in {elapsed:.1f}s")
             print("search: " + ("full text" if info["fts"] == "yes"
                                 else "substring fallback"))
+            spend = _bq_spend_line(database, spent_before)
+            if spend:
+                print(spend)
             if info.get("partial") == "yes":
                 print(f"PARTIAL {name}: a configured layer limit or read "
                       "error was recorded. Run describe_metadata_catalog "

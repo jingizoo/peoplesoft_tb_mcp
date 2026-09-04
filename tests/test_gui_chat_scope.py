@@ -633,12 +633,13 @@ class EndpointWiringTests(unittest.TestCase):
         stale_catalog = {"scopes": [{"business_unit": "OLD01"}]}
         old_engine = SimpleNamespace(
             list_financial_scopes=Mock(return_value=stale_catalog))
-        new_engine = object()
         old_security = RowSecurity(old_db, old_cfg)
         old_security._cache["OLDUSER"] = (time.monotonic() + 600, object())
         old_source_expiry = time.monotonic() + 600
         old_security._source_cache = (
             old_source_expiry, ("PS_OLD_SEC", "OPRID", "user"))
+        new_registry = object()
+        new_engine = SimpleNamespace()
         old_objects = {
             "ar": object(),
             "report_runner": object(),
@@ -661,6 +662,8 @@ class EndpointWiringTests(unittest.TestCase):
             patch.object(app, "load_config", return_value=fresh_cfg),
             patch.object(app, "Database", return_value=new_db),
             patch.object(app, "TBEngine", return_value=new_engine),
+            patch.object(app, "_SourceRegistry",
+                         return_value=new_registry) as registry_ctor,
             patch.object(app, "ARBilling", return_value=new_objects["ar"]),
             patch.object(
                 app, "Relationships",
@@ -700,6 +703,12 @@ class EndpointWiringTests(unittest.TestCase):
                 old_security._source_cache,
                 (old_source_expiry, ("PS_OLD_SEC", "OPRID", "user")))
             self.assertIn("business-unit security", result["reloaded"])
+            # The reload that forgot this line silently unplugged every
+            # secondary source until restart -- the chooser saw them,
+            # for_source refused them.
+            self.assertIs(new_engine.registry, new_registry)
+            registry_ctor.assert_called_once_with(fresh_cfg, new_db)
+            self.assertIn("data sources", result["reloaded"])
             self.assertEqual(
                 scope_cache,
                 {"value": None, "expires": 0.0,
@@ -792,7 +801,7 @@ class EndpointWiringTests(unittest.TestCase):
             "procurement": object(),
         }
         new_db = SimpleNamespace(close=Mock())
-        new_engine = object()
+        new_engine = SimpleNamespace()
         scope_value = object()
         scope_cache = {"value": scope_value, "expires": 123.0}
 
@@ -801,6 +810,7 @@ class EndpointWiringTests(unittest.TestCase):
             patch.object(app, "load_config", return_value=fresh_cfg),
             patch.object(app, "Database", return_value=new_db),
             patch.object(app, "TBEngine", return_value=new_engine),
+            patch.object(app, "_SourceRegistry", return_value=object()),
             patch.object(
                 app, "RowSecurity",
                 side_effect=RuntimeError("security policy is invalid")) as ctor,

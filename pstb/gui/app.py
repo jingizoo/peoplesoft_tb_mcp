@@ -4338,6 +4338,13 @@ def _console_reload() -> dict:
     try:
         new_db = Database(fresh)
         new_engine = TBEngine(new_db, fresh)
+        # TBEngine.registry defaults to None, and the boot path sets it
+        # (app.py:65). Without this line one reload silently vanished
+        # every secondary source until restart: for_source raised "No
+        # extra sources are configured" while the config plainly listed
+        # them. Inside the try on purpose -- a registry construction
+        # failure keeps the old serving graph, like everything else here.
+        new_engine.registry = _SourceRegistry(fresh, new_db)
         # Row security owns both a per-operator grant cache and a discovered
         # security-record cache. Reusing it after a reload would keep both
         # the previous database and the previous policy configuration alive.
@@ -4383,7 +4390,8 @@ def _console_reload() -> dict:
             "generation": int(_scope_cache.get("generation", 0)) + 1,
         })
     reloaded = ["trial balance", "AR and billing", "reports", "diagnostics",
-                "vendors and procurement", "business-unit security"]
+                "vendors and procurement", "business-unit security",
+                "data sources"]
     reloaded.append("scope catalog")
     return {"reloaded": reloaded}
 
