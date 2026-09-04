@@ -2971,6 +2971,18 @@ class TBEngine:
                 rows, _ = self.db.query(f"SELECT COUNT(*) AS n FROM {name}",
                                         {}, max_rows=1)
                 return int(rows[0]["n"])
+            if self.db.dialect == "bigquery":
+                # From the artifact's __TABLES__ snapshot -- NEVER a live
+                # 10MB-minimum job per question. No artifact => unknown.
+                # The estimate is build-time-old and feeds only ordering
+                # and hedged prose; views carry NULL and stay None. The
+                # uppercase fold's collision caveat (two true-case names
+                # differing only by case share a fact row) is the
+                # disclosed slice-1 trade, inherited here.
+                owner, name = self._table_target(table)
+                entry = self._artifact_facts().get((owner, name))
+                est = (entry or {}).get("row_estimate")
+                return int(est) if est is not None else None
         except Exception:
             return None
         return None
@@ -3580,6 +3592,7 @@ class TBEngine:
             eng = TBEngine(source_db, source_db.cfg)
             eng._source_name = name
             eng._record_exclusion_resolver = self._record_exclusion_resolver
+            eng._catalog_resolver = getattr(self, "_catalog_resolver", None)
             self._source_engines[name] = eng
         return self._source_engines[name]
 
@@ -3843,6 +3856,35 @@ class TBEngine:
             warn = int(getattr(self.db.cfg.db, "bigquery_warn_bytes", 0)
                        or 268_435_456)
             if cap and estimated > cap:
+                # Name the partition column when the artifact knows it:
+                # the difference between a refusal the reader can act on
+                # and one they give up at. Wrapped whole because the
+                # refusal must never be lost to its own garnish -- and
+                # the existing CostGateTests run this unbound on fakes
+                # with none of these helpers.
+                hint = ""
+                try:
+                    facts = self._artifact_facts()
+                    named = []
+                    for ref in sorted(self._table_refs(scrubbed or sql))[:3]:
+                        owner, name = self._table_target(ref)
+                        f = facts.get((owner, name))
+                        if f and (f.get("partitioned_by")
+                                  or f.get("require_partition_filter")):
+                            col = (f.get("partitioned_by")
+                                   or "_PARTITIONTIME (ingestion time)")
+                            named.append(
+                                f"{name} is partitioned by {col}"
+                                + (" (filter REQUIRED)"
+                                   if f.get("require_partition_filter")
+                                   else "")
+                                + (", clustered by "
+                                   + ", ".join(f["clustering_columns"][:3])
+                                   if f.get("clustering_columns") else ""))
+                    if named:
+                        hint = " " + "; ".join(named) + "."
+                except Exception:                 # noqa: BLE001
+                    hint = ""
                 raise EngineError(
                     f"This query would scan ~{estimated:,} bytes; the "
                     f"per-query cap is {cap:,} "
@@ -3850,7 +3892,8 @@ class TBEngine:
                     "owned; ~="
                     f"${round(cap / 2**40 * 6.25, 4)} at on-demand "
                     "pricing). Add a partition or date filter, or select "
-                    "fewer columns — LIMIT does not reduce bytes billed.")
+                    "fewer columns — LIMIT does not reduce bytes billed."
+                    + hint)
             if estimated > warn:
                 return {"plan": {
                     "estimated_bytes": estimated,
@@ -3927,6 +3970,38 @@ class TBEngine:
         """Give the engine site memory, so record discovery can use what
         people here have taught it about their own tables."""
         self._memory = memory
+
+    def attach_metadata_catalogs(self, resolver) -> None:
+        """resolver(source_name) -> MetadataCatalog or None.
+
+        The server owns catalog construction and validation (source and
+        fingerprint fail closed in MetadataCatalog._open); the engine
+        only consumes facts. Engines built without a resolver -- the
+        GUI, scripts, tests -- keep today's behavior: no probe, no
+        crash, no artifact opened around the validation.
+        """
+        self._catalog_resolver = resolver
+        for child in self._source_engines.values():
+            child._catalog_resolver = resolver
+
+    def _artifact_facts(self) -> dict:
+        """This source's artifact facts, or {} -- never an exception.
+        A missing, foreign, or broken artifact must cost a hint, not a
+        question."""
+        resolver = getattr(self, "_catalog_resolver", None)
+        if resolver is None:
+            return {}
+        try:
+            catalog = resolver(self._source_name)
+        except Exception:                         # noqa: BLE001
+            return {}
+        if catalog is None or not catalog.available():
+            return {}
+        try:
+            body = catalog.object_facts()
+        except Exception:                         # noqa: BLE001
+            return {}
+        return body.get("facts") or {} if body.get("available") else {}
 
     def attach_record_exclusions(self, resolver, source: str = "default") -> None:
         """Attach the source-bound operator veto index used by ad-hoc tools.

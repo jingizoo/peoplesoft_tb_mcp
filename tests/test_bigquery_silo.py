@@ -15,11 +15,14 @@ the miner is off with the artifact saying exactly why.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -449,7 +452,7 @@ class _CollectorDb:
     dialect = "bigquery"
 
     def __init__(self, tables=None, columns=None, storage=None,
-                 views=None):
+                 views=None, options=None):
         self.cfg = _bq_cfg()
         self.executed = []
         self._tables = tables if tables is not None else [
@@ -460,13 +463,24 @@ class _CollectorDb:
             {"schema_name": "sales_mart", "object_name": "Order_Lines_V",
              "object_type": "VIEW"},
         ]
+        self._options = options if options is not None else [
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "option_name": "require_partition_filter",
+             "option_value": "true"},
+        ]
         self._columns = columns if columns is not None else [
             {"schema_name": "sales_mart", "object_name": "Orders_2024",
              "column_name": "ORDER_ID", "data_type": "STRING",
-             "data_length": None, "nullable": "N"},
+             "data_length": None, "nullable": "N",
+             "clustering_ordinal_position": 2},
+            {"schema_name": "sales_mart", "object_name": "Orders_2024",
+             "column_name": "Order_Dt", "data_type": "DATE",
+             "data_length": None, "nullable": "Y",
+             "is_partitioning_column": "YES"},
             {"schema_name": "sales_mart", "object_name": "Orders_2024",
              "column_name": "VENDOR_ID", "data_type": "STRING",
-             "data_length": None, "nullable": "Y"},
+             "data_length": None, "nullable": "Y",
+             "clustering_ordinal_position": 1},
             {"schema_name": "sales_mart", "object_name": "Vendors",
              "column_name": "VENDOR_ID", "data_type": "STRING",
              "data_length": None, "nullable": "N"},
@@ -507,6 +521,11 @@ class _CollectorDb:
 
     def query(self, sql, params=None, max_rows=None):
         self.executed.append(sql)
+        # OPTIONS dispatched first on purpose: "INFORMATION_SCHEMA.TABLES"
+        # happens not to be a substring of the OPTIONS marker today, but
+        # the ordering keeps the scaffold robust if either literal moves.
+        if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql:
+            return list(self._options), False
         if "INFORMATION_SCHEMA.TABLES" in sql:
             return list(self._tables), False
         if "INFORMATION_SCHEMA.COLUMNS" in sql:
@@ -729,3 +748,276 @@ class ShimContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccessPathFactsTests(unittest.TestCase):
+    """Partition and clustering facts ride the EXISTING jobs plus one
+    guarded TABLE_OPTIONS read -- and survive the very budget cuts
+    that target the big tables partitioning exists for."""
+
+    def _build(self, db=None, limits=None):
+        from pstb.metadata import build_catalog
+        root = Path(tempfile.mkdtemp())
+        db = db or _CollectorDb()
+        build_catalog(root / "c.db", [("warehouse", db)], limits=limits)
+        import sqlite3
+        con = sqlite3.connect(root / "c.db")
+        con.row_factory = sqlite3.Row
+        return con, db, root
+
+    def _table_attrs(self, con, name):
+        row = con.execute(
+            "SELECT attrs FROM nodes WHERE kind IN ('table','view') "
+            "AND name=?", (name,)).fetchone()
+        return json.loads(row["attrs"]) if row else {}
+
+    def test_partition_facts_ride_existing_jobs_plus_options(self):
+        con, db, _ = self._build()
+        surfaces = {}
+        for sql in db.executed:
+            for marker in ("INFORMATION_SCHEMA.TABLE_OPTIONS",
+                           "INFORMATION_SCHEMA.TABLES",
+                           "INFORMATION_SCHEMA.COLUMNS", "__TABLES__",
+                           "INFORMATION_SCHEMA.VIEWS"):
+                if marker in sql:
+                    surfaces[marker] = surfaces.get(marker, 0) + 1
+                    break
+        self.assertEqual(max(surfaces.values()), 1, surfaces)
+        self.assertEqual(len(surfaces), 5, surfaces)
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        con.close()
+        # TRUE case, not the folded node name: the fact is pasted into
+        # WHERE clauses by people.
+        self.assertEqual(attrs["partitioned_by"], "Order_Dt")
+        self.assertIs(attrs["require_partition_filter"], True)
+        self.assertEqual(attrs["clustering_columns"],
+                         ["VENDOR_ID", "ORDER_ID"],
+                         "clustering must sort by ordinal (fed 2 then 1)")
+
+    def test_partition_facts_survive_the_field_budget(self):
+        from pstb.metadata import MetadataBuildLimits
+        limits = MetadataBuildLimits(max_fields=1)
+        con, _, _ = self._build(limits=limits)
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        con.close()
+        self.assertEqual(attrs.get("partitioned_by"), "Order_Dt",
+                         "the field cap ate the partition fact -- the "
+                         "capture must run before the budget returns")
+
+    def test_ingestion_time_table_names_the_pseudo_column(self):
+        """require_partition_filter with NO partitioning column in
+        COLUMNS is a real BigQuery shape (ingestion-time tables); the
+        advice must name _PARTITIONTIME, never KeyError."""
+        db = _CollectorDb(options=[
+            {"schema_name": "sales_mart", "object_name": "Vendors",
+             "option_name": "require_partition_filter",
+             "option_value": "true"}])
+        con, _, _ = self._build(db=db)
+        attrs = self._table_attrs(con, "VENDORS")
+        term = con.execute(
+            "SELECT text FROM search_terms WHERE facet='access path' "
+            "AND text LIKE '%_PARTITIONTIME%'").fetchone()
+        con.close()
+        self.assertIs(attrs.get("require_partition_filter"), True)
+        self.assertNotIn("partitioned_by", attrs)
+        self.assertIsNotNone(term)
+
+    def test_access_path_reaches_the_evidence_packet(self):
+        from pstb.metadata import MetadataCatalog
+        con, _, root = self._build()
+        con.close()
+        catalog = MetadataCatalog(root / "c.db", source="warehouse")
+        packet = catalog.object_evidence("Orders_2024",
+                                         source="warehouse")
+        self.assertTrue(packet.get("found"), packet)
+        self.assertEqual(packet["access_path"]["partitioned_by"],
+                         "Order_Dt")
+        self.assertIn("MUST filter on Order_Dt",
+                      packet["access_path_note"])
+        plain = catalog.object_evidence("Vendors", source="warehouse")
+        self.assertIsNone(plain["access_path"])
+        self.assertNotIn("access_path_note", plain,
+                         "the caveat fired on an ordinary table")
+
+    def test_table_options_unreadable_degrades_to_a_note(self):
+        class _NoOptionsDb(_CollectorDb):
+            def query(self, sql, params=None, max_rows=None):
+                if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql:
+                    self.executed.append(sql)
+                    raise DbError("permission denied on TABLE_OPTIONS")
+                return super().query(sql, params, max_rows)
+
+        con, _, _ = self._build(db=_NoOptionsDb())
+        attrs = self._table_attrs(con, "ORDERS_2024")
+        note = con.execute(
+            "SELECT note FROM notes WHERE layer='access_paths'"
+        ).fetchone()
+        con.close()
+        self.assertEqual(attrs.get("partitioned_by"), "Order_Dt",
+                         "column-derived facts must survive")
+        self.assertNotIn("require_partition_filter", attrs,
+                         "unknown must never be claimed as False")
+        self.assertIsNotNone(note)
+        self.assertIn("TABLE_OPTIONS is not readable", note["note"])
+
+
+class ArtifactRowEstimateTests(unittest.TestCase):
+    """_approx_rows on bigquery reads the artifact snapshot -- never a
+    live 10MB-minimum job -- and fails to None, not to a probe."""
+
+    def _artifact(self, root):
+        from pstb.metadata import build_catalog
+        build_catalog(root / "c.db", [("warehouse", _CollectorDb())])
+        return root / "c.db"
+
+    def _engine(self, resolver):
+        from pstb.engine import TBEngine
+
+        def explode(*_a, **_k):
+            raise AssertionError("the meter was touched")
+
+        eng = TBEngine.__new__(TBEngine)
+        eng.db = SimpleNamespace(dialect="bigquery", query=explode)
+        eng.cfg = _bq_cfg()
+        eng._source_name = "warehouse"
+        eng._source_engines = {}
+        if resolver is not None:
+            eng._catalog_resolver = resolver
+        return eng
+
+    def test_approx_rows_reads_the_artifact_not_the_meter(self):
+        from pstb.metadata import MetadataCatalog
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._artifact(Path(tmp))
+            catalog = MetadataCatalog(path, source="warehouse")
+            eng = self._engine(lambda name: catalog)
+            # The equality is the anti-toothless assertion: "no crash"
+            # would pass a no-op.
+            self.assertEqual(eng._approx_rows("Orders_2024"), 120)
+            self.assertIsNone(eng._approx_rows("Order_Lines_V"),
+                              "a view's NULL estimate must stay None")
+
+    def test_no_resolver_means_none_and_zero_queries(self):
+        eng = self._engine(None)
+        calls = []
+        eng.db = SimpleNamespace(dialect="bigquery",
+                                 query=lambda *a, **k: calls.append(a))
+        self.assertIsNone(eng._approx_rows("Orders_2024"))
+        self.assertEqual(calls, [])
+
+    def test_a_rebuilt_artifact_is_picked_up_without_restart(self):
+        from pstb.metadata import MetadataCatalog, build_catalog
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self._artifact(root)
+            catalog = MetadataCatalog(path, source="warehouse")
+            eng = self._engine(lambda name: catalog)
+            self.assertEqual(eng._approx_rows("Orders_2024"), 120)
+            db = _CollectorDb(storage=[
+                {"table_id": "Orders_2024", "row_count": 999,
+                 "modified_at": "2026-09-01T00:00:00", "type": 1},
+                {"table_id": "Vendors", "row_count": 0,
+                 "modified_at": "2026-01-01T00:00:00", "type": 1},
+                {"table_id": "Order_Lines_V", "row_count": None,
+                 "modified_at": None, "type": 2}])
+            build_catalog(path, [("warehouse", db)])
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            self.assertEqual(eng._approx_rows("Orders_2024"), 999,
+                             "a rebuild must invalidate the facts cache")
+
+    def test_a_wrong_source_artifact_feeds_nothing(self):
+        from pstb.metadata import MetadataCatalog
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._artifact(Path(tmp))
+            catalog = MetadataCatalog(path, source="elsewhere")
+            eng = self._engine(lambda name: catalog)
+            self.assertIsNone(eng._approx_rows("Orders_2024"),
+                              "_open's fail-closed binding was bypassed")
+
+    def test_children_inherit_the_resolver(self):
+        from pstb.engine import TBEngine
+        eng = TBEngine.__new__(TBEngine)
+        eng._source_engines = {"a": SimpleNamespace()}
+        TBEngine.attach_metadata_catalogs(eng, lambda name: None)
+        self.assertIsNotNone(eng._catalog_resolver)
+        self.assertIsNotNone(
+            eng._source_engines["a"]._catalog_resolver)
+
+
+class GateHintTests(unittest.TestCase):
+    """The over-cap refusal names the partition column when the
+    artifact knows it -- and never loses the refusal to its garnish."""
+
+    def _fake_self(self, facts):
+        from pstb.engine import TBEngine
+        cfg = _bq_cfg()
+        return SimpleNamespace(
+            db=SimpleNamespace(
+                dialect="bigquery", cfg=cfg,
+                explain_plan=lambda sql, p: {
+                    "available": True,
+                    "estimated_bytes": 5_000_000_000,
+                    "cap_bytes": 1_073_741_824}),
+            _artifact_facts=lambda: facts,
+            _table_refs=TBEngine._table_refs.__get__(None) if False
+            else (lambda scrubbed: {"Orders_2024"}),
+            _table_target=lambda name: ("SALES_MART", name.upper()))
+
+    def test_the_refusal_names_the_partition_column(self):
+        from pstb.engine import EngineError, TBEngine
+        facts = {("SALES_MART", "ORDERS_2024"): {
+            "partitioned_by": "Order_Dt",
+            "require_partition_filter": True,
+            "clustering_columns": ["VENDOR_ID", "ORDER_ID"]}}
+        with self.assertRaises(EngineError) as caught:
+            TBEngine._cost_gate(self._fake_self(facts),
+                                "SELECT * FROM Orders_2024",
+                                "SELECT * FROM Orders_2024", {})
+        text = str(caught.exception)
+        self.assertIn("partitioned by Order_Dt", text)
+        self.assertIn("filter REQUIRED", text)
+        self.assertIn("clustered by VENDOR_ID, ORDER_ID", text)
+        self.assertIn("bigquery_max_bytes_billed", text)
+
+    def test_factless_refusal_is_byte_identical_to_before(self):
+        from pstb.engine import EngineError, TBEngine
+        with self.assertRaises(EngineError) as caught:
+            TBEngine._cost_gate(self._fake_self({}),
+                                "SELECT * FROM Orders_2024",
+                                "SELECT * FROM Orders_2024", {})
+        text = str(caught.exception)
+        self.assertNotIn("partitioned by", text)
+        self.assertTrue(text.endswith("LIMIT does not reduce bytes "
+                                      "billed."),
+                        text[-80:])
+
+
+class PartitionFilterTranslateTests(unittest.TestCase):
+    """The server-side require_partition_filter error becomes a remedy
+    naming the column -- and neither neighboring branch may claim it."""
+
+    MESSAGE = ("Cannot query over table 'p.d.T' without a filter over "
+               "column(s) 'order_dt' that can be used for partition "
+               "elimination")
+
+    def _translate(self, text):
+        return str(Database(_bq_cfg())._translate(RuntimeError(text)))
+
+    def test_the_remedy_names_the_column(self):
+        remedy = self._translate(self.MESSAGE)
+        self.assertIn("require_partition_filter", remedy)
+        self.assertIn("order_dt", remedy)
+        self.assertIn("wrapping it in a function", remedy)
+        self.assertNotIn("bytes billed on this backend", remedy)
+
+    def test_a_mangled_message_still_gets_the_generic_remedy(self):
+        remedy = self._translate(
+            "query failed: partition elimination was not possible")
+        self.assertIn("its partition column", remedy)
+
+    def test_branch_order_holds_in_both_directions(self):
+        capped = self._translate(
+            "Query exceeded limit for bytes billed: 1073741824")
+        self.assertNotIn("require_partition_filter", capped)
+        partition = self._translate(self.MESSAGE)
+        self.assertNotIn("operator-owned", partition)

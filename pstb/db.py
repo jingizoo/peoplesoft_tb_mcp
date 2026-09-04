@@ -1151,6 +1151,28 @@ class Database:
                 "owned). Add a partition or date filter, or select fewer "
                 "columns -- LIMIT does not reduce bytes billed on this "
                 "backend.")
+        if ("without a filter over column" in low
+                or "partition elimination" in low):
+            # Self-contained from the server's own message, so it works
+            # with a stale or absent artifact; the artifact-fed
+            # access_path_note is the before-the-fact twin. Order
+            # matters both ways: this message carries neither "bytes
+            # billed" nor "not found: table", and the branches above
+            # and below must not claim it (the dispatch-order tests pin
+            # both directions). Interaction chain: the dry run fails
+            # with this same error, explain_plan reports unavailable,
+            # the gate degrades to its ran-without-a-byte-check note,
+            # execution raises, and this branch names the column.
+            m = re.search(r"column\(s\) '([^']+)'", msg)
+            cols = m.group(1) if m else "its partition column"
+            return DbError(
+                f"This table declares require_partition_filter: BigQuery "
+                f"refuses unfiltered reads server-side. Add a WHERE "
+                f"directly on {cols} (e.g. {cols} >= DATE '2026-01-01', "
+                "or BETWEEN over the dates you need) -- the same filter "
+                "is what cuts bytes billed. Keep the predicate on the "
+                "bare column: wrapping it in a function can defeat "
+                "partition elimination, and LIMIT does not help.")
         if "not found: table" in low or "not found: dataset" in low:
             return DbError(
                 f"Not found -- {msg.strip()[:300]}. Names are case-"
